@@ -86,15 +86,18 @@ export function bodyWeight(time: number, reduced: boolean): LiquidPoint {
 /** One fixed light, directed from the upper left towards the board. */
 export const BODY_LIGHT = { x: -0.4, y: -0.55, z: Math.sqrt(1 - 0.4 ** 2 - 0.55 ** 2) };
 
-/** The single surface-lighting seam: a future normal map can replace the analytic normal here. */
-export function bodyLighting(x: number, y: number) {
+/** One light for analytic Canvas normals and normalized camera-space map normals. */
+export function bodyLighting(x: number, y: number, mapped?: { x: number; y: number; z: number }) {
   const length = Math.max(1, Math.hypot(x, y));
   const nx = x / length, ny = y / length;
-  const normal = { x: nx, y: ny, z: Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)) };
+  const mappedLength = mapped ? Math.hypot(mapped.x, mapped.y, mapped.z) || 1 : 1;
+  // Camera +Y is up; convert once here, without altering the data's green channel.
+  const normal = mapped ? { x: mapped.x / mappedLength, y: -mapped.y / mappedLength, z: mapped.z / mappedLength }
+    : { x: nx, y: ny, z: Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)) };
   const diffuse = Math.max(0, normal.x * BODY_LIGHT.x + normal.y * BODY_LIGHT.y + normal.z * BODY_LIGHT.z);
   const halfZ = BODY_LIGHT.z + 1;
   const halfLength = Math.hypot(BODY_LIGHT.x, BODY_LIGHT.y, halfZ);
-  const specular = Math.max(0, (nx * BODY_LIGHT.x + ny * BODY_LIGHT.y + normal.z * halfZ) / halfLength) ** 18;
+  const specular = Math.max(0, (normal.x * BODY_LIGHT.x + normal.y * BODY_LIGHT.y + normal.z * halfZ) / halfLength) ** 18;
   return { normal, diffuse, specular, rim: (1 - normal.z) ** 2 * diffuse };
 }
 

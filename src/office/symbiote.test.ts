@@ -3,6 +3,15 @@ import assert from "node:assert/strict";
 import { symbioteParams, bodyContour, tentacleContour, reachAt, DelegationTouches, fragmentPaths, FragmentMotion, fragmentContour, FRAGMENTS, sideways } from "./symbiote.ts";
 import * as symbiote from "./symbiote.ts";
 
+test("mapped camera normals share the analytic light with one Y conversion", () => {
+  const up = symbiote.bodyLighting(0, 0, { x: -0.4, y: 0.55, z: symbiote.BODY_LIGHT.z });
+  const down = symbiote.bodyLighting(0, 0, { x: 0.4, y: -0.55, z: symbiote.BODY_LIGHT.z });
+  assert.ok(up.diffuse > down.diffuse);
+  assert.ok(Math.abs(up.diffuse - 1) < 1e-9);
+  assert.deepEqual(up.normal, { x: -0.4, y: -0.55, z: symbiote.BODY_LIGHT.z });
+  assert.ok(Math.abs(symbiote.bodyLighting(0, 0, { x: 0, y: 0, z: 10 }).normal.z - 1) < 1e-9);
+});
+
 test("Core states distinguish breathing, agitation, spikes and settling", () => {
   const idle = symbioteParams("idle", 1000);
   assert.ok(symbioteParams("thinking", 1000).speed > idle.speed);

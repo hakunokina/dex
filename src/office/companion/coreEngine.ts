@@ -2,7 +2,12 @@
 // eyes and a corner badge; state = ring/LED colour + eye shape + badge (+ motion unless reduced).
 // Colours come from the theme tokens (readPalette), never literals.
 import { LOOKS, type CoreLook } from "./coreState.ts";
-import { BODY_LIGHT, bodyLighting, bodyWeight, bodyContour, fragmentContour, type Fragment, type FragmentBody, type PlantedFoot } from "../symbiote.ts";
+import { BODY_LIGHT, bodyLighting, bodyWeight, bodyContour, fragmentContour, type Fragment, type FragmentBody, type PlantedFoot, type LiquidPoint } from "../symbiote.ts";
+import { textureResolution, TEXTURE_HALF, REFERENCE_EXTENT } from "./symbioteTexture.ts";
+
+let textureSource: typeof import("./symbioteAssets.ts") | null = null;
+// Keep the Vite/PNG loader out of pure node tests and the 32px chip's rendering path.
+if (typeof window !== "undefined") void import("./symbioteAssets.ts").then(source => { textureSource = source; }).catch(() => {});
 
 export interface CorePalette {
   /** Ring/LED colour per state token. */
@@ -281,7 +286,7 @@ function drawContactShadow(ctx: CanvasRenderingContext2D, x: number, y: number, 
 }
 
 /** A single lit body fill, then its rim; eyes/marks are painted later. No extra highlight layer. */
-function drawBodyLighting(ctx: CanvasRenderingContext2D, pal: CorePalette, radius: number) {
+function drawBodyLighting(ctx: CanvasRenderingContext2D, pal: CorePalette, radius: number, texture?: ImageBitmap | null, contour?: readonly LiquidPoint[]) {
   const light = bodyLighting(BODY_LIGHT.x / 2, BODY_LIGHT.y / 2);
   const alpha = ctx.globalAlpha;
   let cached = bodyLights.get(ctx);
@@ -298,8 +303,20 @@ function drawBodyLighting(ctx: CanvasRenderingContext2D, pal: CorePalette, radiu
     cached = { radius, mouth: pal.mouth, pin: pal.pin, top: pal.chipTop, base: pal.badgeBg, liquid, rim };
     bodyLights.set(ctx, cached);
   }
-  ctx.fillStyle = cached.liquid;
-  ctx.fill();
+  if (texture && contour) {
+    // Reference radial UV is baked once. A mild centre-preserving affine warp follows the
+    // current extents; the exact live contour clips the edge-extended texture, never vice versa.
+    let rx = 0, ry = 0;
+    for (const point of contour) { rx = Math.max(rx, Math.abs(point.x)); ry = Math.max(ry, Math.abs(point.y)); }
+    const x = TEXTURE_HALF * rx / REFERENCE_EXTENT.x, y = TEXTURE_HALF * ry / REFERENCE_EXTENT.y;
+    ctx.save();
+    ctx.clip();
+    ctx.drawImage(texture, -x, -y, x * 2, y * 2);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = cached.liquid;
+    ctx.fill();
+  }
   ctx.globalAlpha = alpha * bodyLighting(-0.7, -0.7).rim * 0.65;
   ctx.strokeStyle = cached.rim;
   ctx.lineWidth = Math.max(1, radius * 0.045);
@@ -323,7 +340,13 @@ function hex(v: string): number[] | null {
 }
 
 /** The big Core centred at (cx, cy), body `size` world units (≤ 120). */
-export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, look: CoreLook, f: CoreXLFrame, pal: CorePalette) {
+export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, look: CoreLook, f: CoreXLFrame, pal: CorePalette, texture?: ImageBitmap | null) {
+  if (texture === undefined && textureSource) {
+    const transform = ctx.getTransform();
+    const physical = size * Math.hypot(transform.a, transform.b);
+    const resolution = textureResolution(physical / (window.devicePixelRatio || 1), physical);
+    texture = resolution ? textureSource.bodyTexture(resolution, pal) : null;
+  }
   const target = pal.tokens[look.token] ?? pal.z;
   const fading = f.from !== null && f.age < XL_FADE_MS;
   const color = fading ? mixColor(f.from!, target, f.age / XL_FADE_MS) : target;
@@ -342,7 +365,7 @@ export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number
   ctx.moveTo(contour[0].x, contour[0].y);
   for (let i = 1; i < contour.length; i++) ctx.lineTo(contour[i].x, contour[i].y);
   ctx.closePath();
-  drawBodyLighting(ctx, pal, 58);
+  drawBodyLighting(ctx, pal, 58, size >= 40 ? texture : null, contour);
   ctx.strokeStyle = f.boot > 0 ? colorEye : f.edge;
   ctx.lineWidth = 1.2;
   ctx.stroke();
