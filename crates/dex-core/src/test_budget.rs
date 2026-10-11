@@ -36,8 +36,8 @@ struct Runner {
 }
 
 const RUNNERS: &[Runner] = &[
-    Runner { name: "Playwright", markers: playwright_markers, enforcer: Some(Enforcer { segments: |c, _| segments(c), recognises: unfiltered_playwright, deny: DENY }) },
-    Runner { name: "Godot GUT", markers: |m| m.file("project.godot") && m.dir("addons/gut"), enforcer: Some(Enforcer { segments: |c, _| segments(c), recognises: unfiltered_gut, deny: DENY_GUT }) },
+    Runner { name: "Playwright", markers: playwright_markers, enforcer: Some(Enforcer { segments: e2e_command_words, recognises: unfiltered_playwright, deny: DENY }) },
+    Runner { name: "Godot GUT", markers: |m| m.file("project.godot") && m.dir("addons/gut"), enforcer: Some(Enforcer { segments: e2e_command_words, recognises: unfiltered_gut, deny: DENY_GUT }) },
     Runner { name: "Rust", markers: |m| m.file("Cargo.toml"), enforcer: Some(Enforcer { segments: crate::permit::command_words, recognises: unfiltered_rust, deny: DENY_RUST }) },
     Runner { name: "Android (Gradle)", markers: android_markers, enforcer: None },
     Runner { name: "Maestro", markers: |m| m.dir(".maestro"), enforcer: None },
@@ -292,6 +292,13 @@ fn unfiltered_gut(words: &[String]) -> bool {
     runner && broad_dir && recursive && (!doctool || gdscript_docs)
 }
 
+fn e2e_command_words(command: &str, d: Option<crate::permit::Dialect>) -> Vec<Vec<String>> {
+    let mut words = crate::permit::command_words(command, d);
+    // Keep every legacy denial, including unknown dialects and incomplete Rd parses.
+    words.extend(segments(command));
+    words
+}
+
 /// Shell-ish split into command segments (`&&`, `||`, `;`, `|`, `&`, newline), words unquoted.
 fn segments(command: &str) -> Vec<Vec<String>> {
     let mut out = vec![Vec::new()];
@@ -519,6 +526,163 @@ mod tests {
 
     fn full(cmd: &str) -> bool {
         runs_full_suite(cmd, None)
+    }
+
+    fn e2e_shell_budget(tool: &str, cmd: &str, cwd: Option<&Path>, reason: Option<&str>) {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let input = json!({ "cmd": cmd });
+        let body = json!({ "tool_name": tool, "tool_input": input, "cwd": cwd });
+        for agent in ["kaan", "ayla", "timur", "unknown"] {
+            let out = on_pre_tool(&c, agent, &body);
+            assert_eq!(out.is_some(), reason.is_some(), "{tool}: {agent}: {cmd}");
+            if let Some(out) = out {
+                let out: Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+                assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], reason.unwrap());
+            }
+        }
+        assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {tool}: {cmd}");
+        let root = cwd.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let mut ctx = crate::permit::Ctx { cwd: Some(root.clone()), write: vec![root], ..Default::default() };
+        let budget_reason = |out: crate::permit::Verdict| match out {
+            crate::permit::Verdict::Deny(why) if why.contains(DENY) => Some(DENY),
+            crate::permit::Verdict::Deny(why) if why.contains(DENY_GUT) => Some(DENY_GUT),
+            _ => None,
+        };
+        assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), reason, "permit: {tool}: {cmd}");
+        ctx.qa = true;
+        assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), None, "QA permit: {tool}: {cmd}");
+    }
+
+    fn playwright_shell_table(tool: &str, cwd: Option<&Path>, prefix: &str) {
+        for suffix in ["# kontrol", "2> err.txt", "2>&1 | tail -20", ">> out.txt"] {
+            e2e_shell_budget(tool, &format!("{prefix} {suffix}"), cwd, Some(DENY));
+        }
+        for suffix in ["e2e/x.spec.ts --workers=1", "e2e/x.spec.ts # not", "--grep \"ad\"", "--grep \"ad\" 2> err.txt", "\"e2e/a#b.spec.ts\"", "e2e/a#b.spec.ts", "e2e/x.spec.ts 2>&1 | tail -20", "e2e/x.spec.ts >> out.txt"] {
+            e2e_shell_budget(tool, &format!("{prefix} {suffix}"), cwd, None);
+        }
+        if tool == "PowerShell" {
+            e2e_shell_budget(tool, &format!("{prefix} *> log.txt"), cwd, Some(DENY));
+            e2e_shell_budget(tool, &format!("{prefix} --grep \"ad\" *> log.txt"), cwd, None);
+        }
+    }
+
+    fn gut_shell_table(tool: &str, cwd: Option<&Path>, prefix: &str) {
+        for suffix in ["# -gtest=x", "# --check-only", "> --help", "# kontrol", "2> err.txt", "2>&1 | tail -20", ">> out.txt"] {
+            e2e_shell_budget(tool, &format!("{prefix} {suffix}"), cwd, Some(DENY_GUT));
+        }
+        for suffix in ["-gtest=x # not", "-gselect=test_x # not", "-gtest=x > --help", "-gselect=test_x 2> err.txt", "--check-only # not"] {
+            e2e_shell_budget(tool, &format!("{prefix} {suffix}"), cwd, None);
+        }
+        if tool == "PowerShell" {
+            e2e_shell_budget(tool, &format!("{prefix} *> log.txt"), cwd, Some(DENY_GUT));
+            e2e_shell_budget(tool, &format!("{prefix} -gtest=x *> log.txt"), cwd, None);
+        }
+    }
+
+    #[test]
+    fn playwright_shell_bash() {
+        playwright_shell_table("Bash", None, "npx playwright test");
+    }
+
+    #[test]
+    fn playwright_shell_powershell() {
+        playwright_shell_table("PowerShell", None, "npx playwright test");
+    }
+
+    #[test]
+    fn gut_shell_bash() {
+        gut_shell_table("Bash", None, "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs");
+    }
+
+    #[test]
+    fn gut_shell_powershell() {
+        gut_shell_table("PowerShell", None, "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs");
+    }
+
+    fn e2e_shell_package_table(tool: &str) {
+        let f = marker_fixture(&[], &[]);
+        let gut = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs";
+        let mut scripts = serde_json::Map::new();
+        for (name, command) in [("e2e", "npx playwright test"), ("gut", gut)] {
+            scripts.insert(name.into(), json!(command));
+            for (index, suffix) in ["# kontrol", "2> err.txt", "2>&1 | tail -20", ">> out.txt", "# -gtest=x", "# --check-only", "> --help"].iter().enumerate() {
+                scripts.insert(format!("{name}-{index}"), json!(format!("{command} {suffix}")));
+            }
+        }
+        scripts.insert("nested".into(), json!("npm run e2e-0"));
+        scripts.insert("test".into(), json!("npm run nested"));
+        scripts.insert("stream".into(), json!("npx playwright test *> log.txt"));
+        scripts.insert("gut-stream".into(), json!(format!("{gut} *> log.txt")));
+        std::fs::write(f.0.join("package.json"), json!({ "scripts": scripts }).to_string()).unwrap();
+        playwright_shell_table(tool, Some(&f.0), "npm run e2e --");
+        gut_shell_table(tool, Some(&f.0), "npm run gut --");
+        for (name, reason) in [("e2e", DENY), ("gut", DENY_GUT)] {
+            for index in 0..7 {
+                for pm in ["npm run", "pnpm", "yarn", "bun run"] {
+                    e2e_shell_budget(tool, &format!("{pm} {name}-{index}"), Some(&f.0), Some(reason));
+                }
+            }
+        }
+        e2e_shell_budget(tool, "npm test", Some(&f.0), Some(DENY));
+        // Leader #675: script replay loses the quotes around a leading '#'.
+        e2e_shell_budget(tool, "npm run e2e -- \"#\"", Some(&f.0), Some(DENY));
+        e2e_shell_budget(tool, "npx playwright test \"#\"", Some(&f.0), None);
+        if tool == "PowerShell" {
+            e2e_shell_budget(tool, "npm run stream", Some(&f.0), Some(DENY));
+            e2e_shell_budget(tool, "npm run gut-stream", Some(&f.0), Some(DENY_GUT));
+        }
+    }
+
+    #[test]
+    fn e2e_shell_package_bash() {
+        e2e_shell_package_table("Bash");
+    }
+
+    #[test]
+    fn e2e_shell_package_powershell() {
+        e2e_shell_package_table("PowerShell");
+    }
+
+    #[test]
+    fn playwright_shell_redirection() {
+        e2e_shell_budget("PowerShell", "npx playwright test *> log.txt", None, Some(DENY));
+        for tool in ["Bash", "PowerShell"] {
+            e2e_shell_budget(tool, "npx playwright test 2> err.txt", None, Some(DENY));
+        }
+    }
+
+    #[test]
+    fn gut_shell_redirect_target_is_not_a_flag() {
+        for tool in ["Bash", "PowerShell"] {
+            e2e_shell_budget(tool, "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs > --help", None, Some(DENY_GUT));
+        }
+    }
+
+    #[test]
+    fn e2e_shell_legacy_denials_and_unknown_dialect() {
+        let gut = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs";
+        for d in [Some(crate::permit::Dialect::Bash), Some(crate::permit::Dialect::Pwsh), None] {
+            for (cmd, reason) in [
+                ("npx playwright test".into(), DENY),
+                ("npx playwright test ; echo 'unterminated".into(), DENY),
+                (r"node_modules\playwright\cli.js test".into(), DENY),
+                (gut.into(), DENY_GUT),
+                (format!("{gut} ; echo 'unterminated"), DENY_GUT),
+                (r"C:\Godot\godot_console.exe -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs".into(), DENY_GUT),
+            ] {
+                assert_eq!(full_suite_denial_in_shell(&cmd, None, d), Some(reason), "{d:?}: {cmd}");
+            }
+            for cmd in ["npx playwright test e2e/x.spec.ts --workers=1".into(), "npx playwright test --grep \"ad\"".into(), format!("{gut} -gtest=x"), format!("{gut} -gselect=test_x")] {
+                assert_eq!(full_suite_denial_in_shell(&cmd, None, d), None, "{d:?}: {cmd}");
+            }
+        }
+        for (cmd, reason) in [("npx playwright test".into(), Some(DENY)), (gut.into(), Some(DENY_GUT)), ("npx playwright test # kontrol".into(), None), (format!("{gut} # -gtest=x"), None)] {
+            let c = crate::db::open(Path::new(":memory:")).unwrap();
+            let body = json!({ "tool_name": "exec_command", "tool_input": { "cmd": cmd, "shell": "unknown-shell" } });
+            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), reason.is_some(), "unknown-shell: {cmd}");
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
+        }
     }
 
     fn rust_shell_budget(tool: &str, cmd: &str, denied: bool) {
