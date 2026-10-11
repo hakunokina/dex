@@ -30,6 +30,7 @@ struct Turn {
     accepted: bool,
     pending: Option<Rows>,
     reply: Option<String>,
+    last_feedback: Option<(u64, Option<String>, String)>,
     latest_seq: u64,
     end_seq: u64,
 }
@@ -89,6 +90,7 @@ impl Core {
             accepted: false,
             pending: None,
             reply: None,
+            last_feedback: None,
             latest_seq: seq,
             end_seq: 0,
             interrupted: false,
@@ -113,6 +115,7 @@ impl Core {
                 accepted: false,
                 pending: None,
                 reply: None,
+                last_feedback: None,
                 latest_seq: seq,
                 end_seq: 0,
                 interrupted: false,
@@ -234,7 +237,8 @@ impl Core {
             .lock()
             .unwrap()
             .get(agent)
-            .is_some_and(|t| t.stop.as_ref() == Some(stop) && !t.ended && !t.continued && !t.interrupted)
+            .is_some_and(|t| t.stop.as_ref() == Some(stop) && t.latest_seq == stop.seq
+                && !t.ended && !t.continued && !t.interrupted)
             && self.ptys.generation(agent) == stop.process
     }
 
@@ -247,11 +251,15 @@ impl Core {
         let turns = self.claude_turns.0.lock().unwrap();
         if turns
             .get(agent)
-            .is_some_and(|t| t.stop.as_ref() == Some(stop) && !t.ended && !t.continued && !t.interrupted)
+            .is_some_and(|t| t.stop.as_ref() == Some(stop) && t.latest_seq == stop.seq
+                && !t.ended && !t.continued && !t.interrupted)
             && self.ptys.generation(agent) == stop.process
         {
+            // Transcript acceptance can advance the status sequence after this request
+            // was accepted. The turn lock and Stop identity, not that ingress stamp,
+            // decide whether this publication still owns the live turn.
             self.agent_states
-                .hook_seq(agent, Some(status), Some(&stop.session), stop.seq)
+                .hook_seq(agent, Some(status), Some(&stop.session), next_seq())
         } else {
             audit(agent, Some(stop.seq), "stale_stop");
             self.agent_states.get(agent)
@@ -324,6 +332,7 @@ impl Core {
             accepted: false,
             pending: None,
             reply: None,
+            last_feedback: None,
             latest_seq: 0,
             end_seq: 0,
             interrupted: false,
@@ -345,6 +354,22 @@ impl Core {
         // Delivery evidence belongs to the Stop attempt, even after a tool hook advanced
         // the live turn. A general continuation cannot acknowledge Dex's cancelled reply.
         let continued = continued && turn.stop.as_ref().is_some_and(|s| timestamp >= s.at);
+        if continued {
+            let receipt = (
+                timestamp,
+                row["uuid"].as_str().map(str::to_owned),
+                feedback.unwrap().to_owned(),
+            );
+            // Ingress and the watcher read the same row. Millisecond timestamps
+            // alone cannot distinguish a replay from the next Stop's continuation.
+            if turn.last_feedback.as_ref() == Some(&receipt) {
+                if turn.accepted {
+                    self.accept_stop_rows(agent, turn);
+                }
+                return;
+            }
+            turn.last_feedback = Some(receipt);
+        }
         if cancellation && turn.stop.as_ref().is_some_and(|s| timestamp >= s.after) {
             turn.cancelled = true;
             turn.accepted = false;
@@ -551,6 +576,7 @@ pub(crate) mod tests {
         let ts = timestamp(ms);
         [
             json!({"type":"user","isMeta":true,"isSidechain":false,
+                "uuid":format!("feedback-{}", next_seq()),
                 "sessionId":session,"timestamp":ts,
                 "message":{"role":"user","content":format!("Stop hook feedback:\n{reason}")}}),
             json!({"type":"attachment","isSidechain":false,"sessionId":session,"timestamp":ts,
@@ -681,6 +707,14 @@ pub(crate) mod tests {
             let plan = c.last_insert_rowid();
             c.execute("INSERT INTO plan_items(plan_id, key, title, prompt, target, status) VALUES(?1, 'A', 'A', 'work', 'kaan', ?2)", rusqlite::params![plan, status])
                 .map_err(|e| e.to_string())?;
+            if status == "waiting" {
+                // A waiting item needs an unfinished prerequisite, otherwise Idle
+                // legitimately schedules it and adds work to this completion fixture.
+                c.execute("INSERT INTO plan_items(plan_id, key, title, prompt, target, status) VALUES(?1, 'B', 'B', 'work', 'kaan', 'running')", [plan])
+                    .map_err(|e| e.to_string())?;
+                c.execute("UPDATE plan_items SET depends_on='[\"B\"]' WHERE plan_id=?1 AND key='A'", [plan])
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(plan)
         }).unwrap();
         core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq());
@@ -688,6 +722,8 @@ pub(crate) mod tests {
         assert!(events.0.lock().unwrap().is_empty());
 
         with(&core.db, |c| {
+            // The plan watcher can process the preceding Idle before cancellation.
+            crate::plan::step(c)?;
             c.execute("UPDATE plans SET status='cancelled' WHERE id=?1", [plan]).map_err(|e| e.to_string())?;
             Ok(())
         }).unwrap();
@@ -964,6 +1000,106 @@ pub(crate) mod tests {
         );
         assert_eq!(core.agent_states.get("timur").status, Status::Working);
         finish(&core);
+    }
+
+    #[test]
+    fn newer_hook_status_cannot_be_overwritten_by_stop_publication() {
+        for (event, status) in [
+            ("PermissionRequest", Status::Waiting),
+            ("SessionEnd", Status::Offline),
+        ] {
+            let (core, _) = core("newer-hook-before-stop-publication", NullSink);
+            let _finish = Finish(core.clone());
+            let stop = core
+                .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+                .unwrap();
+            let seq = next_seq();
+            core.claude_hook_received("timur", event, Some("session-a"), seq);
+            core.agent_states.hook_seq("timur", Some(status), Some("session-a"), seq);
+            core.claude_stop_status("timur", &stop, Status::Idle);
+            assert_eq!(core.agent_states.get("timur").status, status, "{event}");
+        }
+    }
+
+    #[test]
+    fn second_stop_closes_turn_after_feedback_overtakes_its_ingress() {
+        let (core, _) = core("feedback-before-stop-processing", NullSink);
+        let _finish = Finish(core.clone());
+        let id = result(&core);
+        core.delegation_on_hook("timur", "Stop", &json!({}), false)
+            .unwrap();
+        let receipt = feedback(&core, "timur");
+        // hooks::accept assigns the request sequence before its thread reads the body.
+        // The transcript watcher can accept the first Stop's feedback in that window.
+        let seq = next_seq();
+        observe(&core, receipt);
+        assert!(with(&core.db, |c| delegate::get(c, id))
+            .unwrap()
+            .delivered_at
+            .is_some());
+        let stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), seq)
+            .unwrap();
+        let out = core.delegation_hook_prepared("timur", "Stop", &json!({}), false, Some(&stop));
+        assert!(!crate::is_blocked(&out));
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+    }
+
+    #[test]
+    fn replayed_feedback_in_same_millisecond_cannot_reopen_second_stop() {
+        let (core, _) = core("feedback-same-millisecond", NullSink);
+        let _finish = Finish(core.clone());
+        result(&core);
+        core.delegation_on_hook("timur", "Stop", &json!({}), false)
+            .unwrap();
+        let mut receipt = feedback(&core, "timur");
+        // Also cover receipts without an explicit transcript row identity.
+        receipt.as_object_mut().unwrap().remove("uuid");
+        observe(&core, receipt.clone());
+        let mut stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+            .unwrap();
+        // Pin the two observations to one millisecond without relying on scheduling.
+        stop.at = crate::chat::parse_ts(&receipt["timestamp"]).unwrap();
+        core.claude_turns
+            .0
+            .lock()
+            .unwrap()
+            .get_mut("timur")
+            .unwrap()
+            .stop = Some(stop.clone());
+        observe(&core, receipt.clone());
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        observe(&core, receipt);
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+    }
+
+    #[test]
+    fn distinct_feedback_in_same_millisecond_still_continues_turn() {
+        let (core, _) = core("distinct-feedback-same-millisecond", NullSink);
+        let _finish = Finish(core.clone());
+        result(&core);
+        core.delegation_on_hook("timur", "Stop", &json!({}), false)
+            .unwrap();
+        let mut receipt = feedback(&core, "timur");
+        receipt["uuid"] = json!("first-feedback");
+        observe(&core, receipt.clone());
+        let mut stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+            .unwrap();
+        stop.at = crate::chat::parse_ts(&receipt["timestamp"]).unwrap();
+        core.claude_turns
+            .0
+            .lock()
+            .unwrap()
+            .get_mut("timur")
+            .unwrap()
+            .stop = Some(stop.clone());
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        receipt["uuid"] = json!("second-feedback");
+        observe(&core, receipt);
+        assert_eq!(core.agent_states.get("timur").status, Status::Working);
     }
 
     #[test]
