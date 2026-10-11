@@ -964,7 +964,10 @@ impl crate::Core {
             let shell = crate::pty::Spawn { id: req.id.clone(), cmd: crate::shell::SHELL_CMD.into(), cols: req.cols, rows: req.rows, ..Default::default() };
             CAPTURE.with(|c| c.borrow_mut().as_mut().map(|v| v.push((req, launch.job))));
             LAUNCHES.with(|l| l.borrow_mut().push(launch));
-            return self.pty_spawn(shell, sink);
+            let (sink, wait_ready) = agent_sink_with_ready_for_test(&shell.id, sink);
+            self.pty_spawn(shell, sink)?;
+            wait_ready();
+            return Ok(());
         }
         crate::pty::spawn_bound(self, req, Some(launch), sink)
     }
@@ -2729,37 +2732,108 @@ mod tests {
     }
 }
 
+/// Keep terminal replies on the real transport while intercepting paste/Enter in test probes.
+#[cfg(test)]
+pub(crate) fn input_probe_for_test(original: Box<dyn std::io::Write + Send>, probe: impl std::io::Write + Send + 'static) -> Box<dyn std::io::Write + Send> {
+    use std::io::Write;
+    struct InputProbe<P> { original: Box<dyn Write + Send>, probe: P }
+    impl<P: Write> Write for InputProbe<P> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // AgentSink can emit several complete replies in one write. Only those replies
+            // bypass the paste/Enter probe; arbitrary escape sequences remain test input.
+            let replies: &[&[u8]] = &[
+                b"\x1b[1;1R", b"\x1b[?1;2c",
+                b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\", b"\x1b]11;rgb:1313/1414/1616\x1b\\",
+            ];
+            let mut remaining = bytes;
+            while let Some(reply) = replies.iter().find(|reply| remaining.starts_with(reply)) {
+                remaining = &remaining[reply.len()..];
+            }
+            if !bytes.is_empty() && remaining.is_empty() {
+                // Complete a partial transport write here so write_all cannot send its suffix
+                // to the user-input probe on the next call.
+                self.original.write_all(bytes)?;
+                Ok(bytes.len())
+            } else {
+                self.probe.write(bytes)
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.original.flush()?;
+            self.probe.flush()
+        }
+    }
+    Box::new(InputProbe { original, probe })
+}
+
+#[cfg(test)]
 /// Shell fixtures still have to service ConPTY's cursor-inheritance query. Discarding it can
 /// block ClosePseudoConsole on windows-2022; use the same terminal replies as agent sessions.
-#[cfg(test)]
 pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
     shell_sink_test_adapter(core, id, sink, None)
 }
 
 #[cfg(test)]
 fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
-    struct ShellSink<S> { terminal: AgentSink, inner: S, ready: Option<std::sync::mpsc::Sender<()>> }
+    terminal_sink_test_adapter(AgentSink::new(core, id), sink, ready)
+}
+
+#[cfg(test)]
+fn terminal_sink_test_adapter(terminal: AgentSink, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
+    struct ShellSink<S> { terminal: AgentSink, inner: S, ready: Option<std::sync::mpsc::Sender<()>>, screen: vt100::Parser }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
         fn data(&mut self, bytes: &[u8]) -> bool {
-            if self.terminal.output(bytes) {
-                if let Some(ready) = self.ready.take() { let _ = ready.send(()); }
+            let cursor_replied = self.terminal.output(bytes);
+            if self.ready.is_some() {
+                self.screen.process(bytes);
+                // Cursor inheritance is optional. A drawn shell also proves startup, but an
+                // unfinished query must be completed before a fixture replaces its input writer.
+                let drawn = self.terminal.pending_len == 0 && !self.screen.screen().contents().trim().is_empty();
+                if cursor_replied || drawn {
+                    if let Some(ready) = self.ready.take() { let _ = ready.send(()); }
+                }
             }
             self.inner.data(bytes)
         }
         fn exit(&mut self) { self.inner.exit(); }
         fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
     }
-    ShellSink { terminal: AgentSink::new(core, id), inner: sink, ready }
+    ShellSink { terminal, inner: sink, ready, screen: vt100::Parser::new(24, 80, 0) }
 }
 
-/// Finish ConPTY's first reply before installing an input probe that would intercept it.
+/// Wait for a cursor reply or visible shell output; ConPTY need not request cursor inheritance.
 #[cfg(test)]
 pub(crate) fn shell_sink_with_ready_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> (impl crate::PtySink, impl FnOnce()) {
+    terminal_sink_with_ready_for_test(id, AgentSink::new(core, id), sink)
+}
+
+#[cfg(test)]
+fn agent_sink_with_ready_for_test(id: &str, terminal: AgentSink) -> (impl crate::PtySink, impl FnOnce()) {
+    struct Sink;
+    impl crate::PtySink for Sink {
+        fn data(&mut self, _: &[u8]) -> bool { true }
+        fn exit(&mut self) {}
+    }
+    terminal_sink_with_ready_for_test(id, terminal, Sink)
+}
+
+#[cfg(test)]
+fn terminal_sink_with_ready_for_test(id: &str, terminal: AgentSink, sink: impl crate::PtySink) -> (impl crate::PtySink, impl FnOnce()) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let ready_id = id.to_owned();
     let wait_ready = move || {
-        if cfg!(windows) { rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }
+        if cfg!(windows) {
+            if let Err(error) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                let message = format!("shell fixture {ready_id} was not ready: no flushed cursor reply or visible output within 5s ({error})");
+                // libtest buffers panic text until all tests finish. Write directly so a different
+                // hung test cannot hide this failure when CI terminates the process.
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "{message}");
+                panic!("{message}");
+            }
+        }
     };
-    (shell_sink_test_adapter(core, id, sink, Some(tx)), wait_ready)
+    (terminal_sink_test_adapter(terminal, sink, Some(tx)), wait_ready)
 }
 
 #[cfg(test)]
@@ -2774,15 +2848,16 @@ mod shell_sink_tests {
     }
 
     struct Input {
-        _original: Box<dyn Write + Send>,
+        original: Box<dyn Write + Send>,
         bytes: Arc<Mutex<Vec<u8>>>,
     }
     impl Write for Input {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.bytes.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+            let written = self.original.write(bytes)?;
+            self.bytes.lock().unwrap().extend_from_slice(&bytes[..written]);
+            Ok(written)
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
     }
 
     struct Fixture { core: Arc<Core>, root: PathBuf, bytes: Arc<Mutex<Vec<u8>>> }
@@ -2797,7 +2872,9 @@ mod shell_sink_tests {
             }, sink).unwrap();
             wait_ready();
             let bytes = Arc::new(Mutex::new(Vec::new()));
-            core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: bytes.clone() }));
+            core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+                Box::new(Input { original, bytes: bytes.clone() }), std::io::sink(),
+            ));
             Self { core, root, bytes }
         }
     }
@@ -2908,6 +2985,93 @@ mod shell_sink_tests {
     }
 
     #[test]
+    fn captured_replacement_keeps_one_terminal_responder() {
+        let fixture = Fixture::new("captured-replacement");
+        fixture.core.ptys.kill("kaan");
+        super::CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+        let started = fixture.core.agent_start("kaan", super::StartOptions::default());
+        let starts = super::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
+        started.unwrap();
+        assert_eq!(starts.len(), 1);
+        fixture.core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+            Box::new(Input { original, bytes: fixture.bytes.clone() }), std::io::sink(),
+        ));
+        fixture.bytes.lock().unwrap().clear();
+        fixture.core.ptys.note("kaan", "\x1b[6");
+        assert!(fixture.bytes.lock().unwrap().is_empty());
+        fixture.core.ptys.note("kaan", "n");
+        assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R", "replacement has exactly one responder");
+    }
+
+    #[test]
+    fn shell_sink_ready_without_a_cursor_query() {
+        let fixture = Fixture::new("ready-no-cursor");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+        assert!(sink.data(b"\x1b[?25h\x1b[2J"));
+        assert!(rx.try_recv().is_err(), "terminal setup is not a shell prompt");
+        assert!(sink.data(b"PS C:\\test> "));
+        assert_eq!(rx.try_recv(), Ok(()), "visible shell output must not require CPR");
+        assert!(fixture.bytes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_sink_services_a_late_cursor_query_after_visible_output() {
+        let fixture = Fixture::new("ready-late-cursor");
+        for split in 1..4 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+            fixture.bytes.lock().unwrap().clear();
+            assert!(sink.data(b"PS C:\\test> "));
+            assert_eq!(rx.try_recv(), Ok(()));
+            assert!(sink.data(&b"\x1b[6n"[..split]));
+            assert!(fixture.bytes.lock().unwrap().is_empty());
+            assert!(sink.data(&b"\x1b[6n"[split..]));
+            assert!(sink.data(b"ordinary output"));
+            assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R", "late query split at {split}");
+            assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected));
+
+            // A prompt and an incomplete query can share a read. Keep the input writer until
+            // that query has been answered even though the screen already contains text.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+            let mut first = b"PS C:\\test> ".to_vec();
+            first.extend_from_slice(&b"\x1b[6n"[..split]);
+            assert!(sink.data(&first));
+            assert_eq!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty));
+            assert!(sink.data(&b"\x1b[6n"[split..]));
+            assert_eq!(rx.try_recv(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn late_cursor_reply_reaches_transport_after_ready_and_probe_installation() {
+        let fixture = Fixture::new("late-cursor-transport");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+        assert!(sink.data(b"PS C:\\test> "));
+        assert_eq!(rx.try_recv(), Ok(()));
+        fixture.bytes.lock().unwrap().clear();
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        fixture.core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+            original, Input { original: Box::new(std::io::sink()), bytes: probe.clone() },
+        ));
+        assert!(sink.data(b"\x1b[6"));
+        assert!(sink.data(b"n"));
+        assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R", "the underlying writer must receive the late reply");
+        assert!(probe.lock().unwrap().is_empty(), "terminal replies must not pollute paste/Enter assertions");
+        assert!(sink.data(b"\x1b[c\x1b]10;?\x1b]11;?"));
+        let replies = fixture.bytes.lock().unwrap().clone();
+        assert_eq!(replies, b"\x1b[1;1R\x1b[?1;2c\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\\x1b]11;rgb:1313/1414/1616\x1b\\");
+        assert!(probe.lock().unwrap().is_empty());
+        let paste = b"\x1b[200~terminal-looking \x1b[1;1R text\x1b[201~";
+        fixture.core.ptys.write("kaan", paste).unwrap();
+        fixture.core.ptys.write("kaan", b"\r").unwrap();
+        assert_eq!(*probe.lock().unwrap(), [paste.as_slice(), b"\r"].concat());
+        assert_eq!(*fixture.bytes.lock().unwrap(), replies, "paste and Enter must stay off the shell transport");
+    }
+
+    #[test]
     fn shell_sink_ready_follows_successful_cursor_flush_once() {
         use std::sync::{atomic::{AtomicU8, Ordering}, mpsc::{self, TryRecvError}};
         struct CheckedInput {
@@ -2917,12 +3081,16 @@ mod shell_sink_tests {
         }
         impl Write for CheckedInput {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) != 3 {
+                    assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                }
                 if self.fail.load(Ordering::SeqCst) == 1 { return Err(std::io::Error::other("test write failed")); }
                 self.original.write(bytes)
             }
             fn flush(&mut self) -> std::io::Result<()> {
-                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) != 3 {
+                    assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                }
                 if self.fail.load(Ordering::SeqCst) == 2 { return Err(std::io::Error::other("test flush failed")); }
                 self.original.flush()
             }
@@ -2952,8 +3120,8 @@ mod shell_sink_tests {
             assert!(sink.data(&completed));
             assert_eq!(rx.lock().unwrap().try_recv(), Ok(()));
             assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Disconnected));
-            // Remove the completed channel's checker before the next iteration.
-            fixture.core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: fixture.bytes.clone() }));
+            // The wrapper remains in the transport chain; stop checking its completed channel.
+            fail.store(3, Ordering::SeqCst);
         }
     }
 }
@@ -3279,7 +3447,9 @@ mod quota_tests {
         })
         .unwrap();
         for id in ["timur", "kaan", "ayla", "bora"] {
-            core.pty_spawn(crate::pty::Spawn { id: id.into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, shell_sink_for_test(core, id, ShellSink)).unwrap();
+            let (sink, wait_ready) = shell_sink_with_ready_for_test(core, id, ShellSink);
+            core.pty_spawn(crate::pty::Spawn { id: id.into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, sink).unwrap();
+            wait_ready();
         }
     }
 

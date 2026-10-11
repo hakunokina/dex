@@ -364,17 +364,34 @@ mod lifecycle_tests {
     }
 
     fn question_shell_ready_after_split(split: usize) {
+        use std::io::Write;
+        struct Transport {
+            original: Box<dyn Write + Send>,
+            replies: std::sync::mpsc::Sender<Vec<u8>>,
+        }
+        impl Write for Transport {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.original.write_all(bytes)?;
+                let _ = self.replies.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
+        }
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(
+            Box::new(Transport { original, replies: reply_tx }), InputProbe { writes: tx, fail_enter: false },
+        ));
         let (mut sink, wait_ready) = question_shell_sink(&c);
         assert!(sink.data(&b"\x1b[6n"[..split]));
-        assert!(rx.try_recv().is_err(), "an incomplete CPR query must not be answered");
+        assert!(reply_rx.try_recv().is_err(), "an incomplete CPR query must not be answered");
         assert!(sink.data(&b"\x1b[6n"[split..]));
-        assert_eq!(rx.try_recv().unwrap(), b"\x1b[1;1R");
+        assert_eq!(reply_rx.try_recv().unwrap(), b"\x1b[1;1R");
         let ready = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wait_ready));
         assert!(sink.data(b"ordinary output"));
-        assert!(rx.try_recv().is_err(), "the completed CPR query must not be replayed");
+        assert!(reply_rx.try_recv().is_err(), "the completed CPR query must not be replayed");
+        assert!(rx.try_recv().is_err(), "terminal replies must not reach the paste/Enter probe");
         finish(&c);
         ready.unwrap();
     }
@@ -471,7 +488,7 @@ mod lifecycle_tests {
         assert!(delegate::on_session_start(&c.db, &c.events, "timur").is_none());
         let d = job(&c, "done_no_report");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         c.wake_sleeping_leaders();
         let early = rx.try_recv().is_ok();
         c.agent_states.hook("timur", Some(agents::Status::Idle), Some("ready-session"));
@@ -494,7 +511,6 @@ mod lifecycle_tests {
     struct InputProbe {
         writes: std::sync::mpsc::Sender<Vec<u8>>,
         fail_enter: bool,
-        _original: Box<dyn std::io::Write + Send>,
     }
     impl std::io::Write for InputProbe {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -512,7 +528,7 @@ mod lifecycle_tests {
         for fail_enter in [true, false] {
             let c = core(); open(&c, "timur");
             let (tx, rx) = std::sync::mpsc::channel();
-            c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter, _original: original }));
+            c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter }));
             let d = job(&c, "done");
             c.leader_notes_wake("timur");
             let text = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
@@ -546,7 +562,7 @@ mod lifecycle_tests {
         for (key, draft) in [("Backspace", false), ("Esc", false), ("Ctrl+U", false), ("typing", true)] {
             let c = core(); open(&c, "timur");
             let (tx, rx) = std::sync::mpsc::channel();
-            c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+            c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
             let d = job(&c, "done");
             let work = job(&c, "running");
             let q = with(&c.db, |db| crate::questions::ask(db, &delegate::caller(db, "kaan")?,
@@ -586,7 +602,7 @@ mod lifecycle_tests {
     fn session_start_context_cancels_old_paste_and_keeps_only_pending_notes() {
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         let d = job(&c, "done");
         with(&c.db, |db| crate::plan::note(db, "timur", "remaining note")).unwrap();
         c.leader_notes_wake("timur");
@@ -607,7 +623,7 @@ mod lifecycle_tests {
     fn patron_prompt_delivers_a_replaced_leader_paste_through_context() {
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         let d = job(&c, "done");
         let work = job(&c, "running");
         let q = with(&c.db, |db| {
@@ -639,7 +655,6 @@ mod lifecycle_tests {
         struct EnterProbe {
             entered: std::sync::mpsc::Sender<()>,
             release: std::sync::mpsc::Receiver<()>,
-            _original: Box<dyn std::io::Write + Send>,
         }
         impl std::io::Write for EnterProbe {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -654,7 +669,7 @@ mod lifecycle_tests {
         let c = core(); open(&c, "timur");
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(EnterProbe { entered: entered_tx, release: release_rx, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, EnterProbe { entered: entered_tx, release: release_rx }));
         let _d = job(&c, "done");
         let sending = c.clone();
         let sender = std::thread::spawn(move || sending.leader_notes_wake("timur"));
@@ -681,7 +696,7 @@ mod lifecycle_tests {
     fn patron_input_at_enter_submission_cancels_the_write() {
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         let d = job(&c, "done");
         let input = c.clone();
         *c.paste_enter_pause.lock().unwrap() = Some(Box::new(move || input.agent_input("timur", false)));
@@ -699,7 +714,7 @@ mod lifecycle_tests {
     fn acceptance_during_redraw_cancels_the_late_enter() {
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         let d = job(&c, "done");
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
         let (go_tx, go_rx) = std::sync::mpsc::channel();
@@ -724,7 +739,7 @@ mod lifecycle_tests {
     fn patron_input_during_redraw_cancels_enter_and_delivers_at_stop() {
         let c = core(); open(&c, "timur");
         let (tx, rx) = std::sync::mpsc::channel();
-        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        c.ptys.input_writer_for_test("timur", |original| crate::agents::input_probe_for_test(original, InputProbe { writes: tx, fail_enter: false }));
         let d = job(&c, "done");
         with(&c.db, |db| crate::plan::note(db, "timur", "stop note")).unwrap();
         let (paused_tx, paused_rx) = std::sync::mpsc::channel();
