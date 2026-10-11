@@ -224,11 +224,20 @@ pub fn parse(text: &str) -> Option<(String, String)> {
 /// Called from `report`: a review's report must carry a verdict; it is stored with the review.
 /// Any other job: nothing.
 pub fn record(conn: &Connection, d: &Delegation, summary: &str, result_path: Option<&str>) -> Result<(), String> {
+    record_with_content(conn, d, summary, result_path, None)
+}
+
+/// Content delivery records the submitted verdict without reopening the mutable archive.
+pub(crate) fn record_with_content(conn: &Connection, d: &Delegation, summary: &str, result_path: Option<&str>, content: Option<&str>) -> Result<(), String> {
     if !is_review(conn, d.id)? {
         return Ok(());
     }
-    let file = result_path.and_then(|p| std::fs::read_to_string(p).ok());
-    let parsed = file.as_deref().and_then(parse).or_else(|| parse(summary));
+    let parsed = if let Some(body) = content {
+        parse(body)
+    } else {
+        let file = result_path.and_then(|p| std::fs::read_to_string(p).ok());
+        file.as_deref().and_then(parse).or_else(|| parse(summary))
+    };
     let Some((verdict, findings)) = parsed else {
         return Err(format!(
             "İnceleme raporunun ilk satırı `karar: onay` ya da `karar: düzelt` olmalı (sonra `## önemli` / `## küçük`). Raporu düzelt ve report'u tekrar çağır. Devretme #{} açık kaldı.",

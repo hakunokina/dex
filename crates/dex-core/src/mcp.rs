@@ -75,7 +75,7 @@ mod worker_note_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod report_content_tests {
     use super::*;
 
@@ -87,7 +87,9 @@ mod report_content_tests {
     }
 
     impl Fixture {
-        fn new() -> Self {
+        fn new() -> Self { Self::job(false, "report") }
+        fn service(prompt: &str) -> Self { Self::job(true, prompt) }
+        fn job(service: bool, prompt: &str) -> Self {
             let dir = crate::projects::tests::Fixture::new();
             let root = dir.dir("report-project");
             // Core background shutdown may still hold SQLite handles on Windows; keep its
@@ -98,11 +100,17 @@ mod report_content_tests {
                 crate::Events::new(crate::events::NullSink)).unwrap();
             let job = crate::db::with(&core.db, |c| {
                 crate::teams::update_team(c, &dir.0, "default", crate::teams::TeamPatch {
-                    cwd: Some(Some(root.to_string_lossy().into_owned())), ..Default::default()
+                    // These jobs exercise delivery, not worktree orchestration. Disable the
+                    // startup sweep so its Git cwd cannot race root-junction fixture cleanup.
+                    cwd: Some(Some(root.to_string_lossy().into_owned())), worktrees: Some(false), ..Default::default()
                 })?;
                 let lead = delegate::caller(c, "timur")?;
-                let job = delegate::insert(c, delegate::NewDelegation { from: &lead, to_agent: "kaan".into(),
-                    team_id: "default".into(), service_team_id: None, prompt: "report".into(), task_id: None,
+                if service {
+                    c.execute_batch("INSERT INTO teams(id,name,kind,created_at) VALUES('service','Service','service',1);
+                        INSERT INTO agents(id,team_id,name,kind,model,shirt,hair,skin) VALUES('svc','service','S','worker','sonnet','a','b','c');").map_err(|e| e.to_string())?;
+                }
+                let job = delegate::insert(c, delegate::NewDelegation { from: &lead, to_agent: if service { "svc" } else { "kaan" }.into(),
+                    team_id: "default".into(), service_team_id: service.then(|| "service".into()), prompt: prompt.into(), task_id: None,
                     patron_words: None, effort: None })?;
                 delegate::set_status(c, job.id, "running")?;
                 Ok(job)
@@ -110,8 +118,8 @@ mod report_content_tests {
             Self { core, job, root, dir }
         }
 
-        fn file(&self) -> PathBuf { self.root.join(".dex").join("results").join(format!("{}.md", self.job.id)) }
-        fn call(&self, args: Value) -> Value { call_with_args_for_test(&self.core, "kaan", "report", args) }
+        fn file(&self) -> PathBuf { crate::db::with(&self.core.db, |c| delegate::result_file(c, &self.job)).unwrap().unwrap() }
+        fn call(&self, args: Value) -> Value { call_with_args_for_test(&self.core, &self.job.to_agent, "report", args) }
         fn state(&self) -> delegate::Delegation {
             crate::db::with(&self.core.db, |c| delegate::get(c, self.job.id)).unwrap()
         }
@@ -169,6 +177,21 @@ mod report_content_tests {
     }
 
     #[test]
+    fn legacy_reviewer_result_path_reads_file_before_summary() {
+        let f = Fixture::new();
+        crate::db::with(&f.core.db, |c| c.execute(
+            "INSERT INTO delegation_reviews(review_id,target_id,sha,created_at) VALUES(?1,?1,'fixture-sha',1)", [f.job.id]
+        ).map_err(|e| e.to_string())).unwrap();
+        std::fs::create_dir_all(f.file().parent().unwrap()).unwrap();
+        std::fs::write(f.file(), "karar: düzelt\n## önemli\n- legacy finding\n").unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"karar: onay","resultPath":f.file()}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        let review = crate::db::with(&f.core.db, |c| crate::review::get(c, f.job.id)).unwrap().unwrap();
+        assert_eq!(review.verdict.as_deref(), Some("düzelt"));
+        assert_eq!(review.findings.as_deref(), Some("- legacy finding"));
+    }
+
+    #[test]
     fn reviewer_content_is_parsed_from_dex_written_file() {
         let f = Fixture::new();
         crate::db::with(&f.core.db, |c| c.execute(
@@ -209,6 +232,264 @@ mod report_content_tests {
         assert!(!outside.join(format!("{}.md", f.job.id)).exists());
         assert_eq!(f.state().status, "running");
         std::fs::remove_dir(f.root.join(".dex/results")).unwrap();
+    }
+
+    fn redirected_snapshot(ancestor: bool) {
+        let f = Fixture::new();
+        let outside = crate::projects::tests::Fixture::new();
+        let target = outside.dir("report-project");
+        let results = target.join(".dex/results");
+        std::fs::create_dir_all(&results).unwrap();
+        let sentinel = results.join(format!("{}.md", f.job.id));
+        std::fs::write(&sentinel, "outside original").unwrap();
+        let path = if ancestor { &f.dir.0 } else { &f.root };
+        let moved = path.with_extension("retained");
+        std::fs::rename(path, &moved).unwrap();
+        let linked = crate::memory::tests::link_dir(if ancestor { &outside.0 } else { &target }, path);
+        if !linked {
+            std::fs::rename(&moved, path).unwrap();
+            panic!("önkoşul hatası: junction/symlink oluşturulamadı");
+        }
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"host body"}));
+        // Restore before assertions; fixture cleanup must never traverse the test junction.
+        std::fs::remove_dir(path).unwrap();
+        std::fs::rename(&moved, path).unwrap();
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "outside original", "host wrote through redirected snapshot");
+        assert_eq!(std::fs::read_dir(results).unwrap().count(), 1, "no outside temp write");
+        assert_eq!(reply["isError"], true, "{reply}");
+        assert_eq!(f.state().status, "running");
+        assert!(f.state().result_path.is_none());
+    }
+
+    #[test]
+    fn content_rejects_snapshot_root_replaced_by_junction() { redirected_snapshot(false); }
+
+    #[test]
+    fn content_rejects_snapshot_ancestor_replaced_by_junction() { redirected_snapshot(true); }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_directory_swap_after_check_never_writes_outside() {
+        let f = Fixture::new();
+        let results = f.file().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&results).unwrap();
+        let moved = results.with_extension("retained");
+        let outside = f.dir.dir("outside-race");
+        let redirected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (r, w, q, p, saved) = (redirected.clone(), wrote.clone(), outside.clone(), results.clone(), moved.clone());
+        let reply = delegate::with_report_io_hook(move |stage, temp| {
+            if stage == "directories" && std::fs::rename(&p, &saved).is_ok() {
+                assert!(crate::memory::tests::link_dir(&q, &p), "önkoşul hatası: junction oluşturulamadı");
+                r.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            if stage == "written" {
+                w.store(q.join(temp.file_name().unwrap()).exists(), std::sync::atomic::Ordering::SeqCst);
+            }
+        }, || f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"host body"})));
+        if redirected.load(std::sync::atomic::Ordering::SeqCst) {
+            std::fs::remove_dir(&results).unwrap();
+            std::fs::rename(&moved, &results).unwrap();
+        }
+        assert!(!wrote.load(std::sync::atomic::Ordering::SeqCst), "host created/wrote temp in Q after check");
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 1, "only fixture .git in Q");
+        if reply["isError"] == true { assert_eq!(f.state().status, "running"); }
+        else { assert_eq!(std::fs::read_to_string(f.file()).unwrap(), "host body"); }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_publish_cannot_redirect_to_prepared_outside_temp() {
+        let f = Fixture::new();
+        let outside = f.dir.dir("prepared-race");
+        let sentinel = outside.join(format!("{}.md", f.job.id));
+        std::fs::write(&sentinel, "outside original").unwrap();
+        let results = f.file().parent().unwrap().to_path_buf();
+        let moved = results.with_extension("retained");
+        let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let redirected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, r, q, p, saved) = (attempted.clone(), redirected.clone(), outside.clone(), results.clone(), moved.clone());
+        let reply = delegate::with_report_io_hook(move |stage, temp| {
+            if stage == "temp_name" { std::fs::write(q.join(temp.file_name().unwrap()), "prepared malicious body").unwrap(); }
+            if stage == "publish" {
+                a.store(true, std::sync::atomic::Ordering::SeqCst);
+                if std::fs::rename(&p, &saved).is_ok() {
+                    assert!(crate::memory::tests::link_dir(&q, &p), "önkoşul hatası: junction oluşturulamadı");
+                    r.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }, || f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"host body"})));
+        if redirected.load(std::sync::atomic::Ordering::SeqCst) {
+            std::fs::remove_dir(&results).unwrap();
+            std::fs::rename(&moved, &results).unwrap();
+        }
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "outside original");
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(std::fs::read_to_string(f.file()).unwrap(), "host body");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_temp_is_not_mutable_before_publication() {
+        let f = Fixture::new();
+        let attacked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a = attacked.clone();
+        let body = "karar: düzelt\n## önemli\n- original finding\n";
+        crate::db::with(&f.core.db, |c| c.execute(
+            "INSERT INTO delegation_reviews(review_id,target_id,sha,created_at) VALUES(?1,?1,'fixture-sha',1)", [f.job.id]
+        ).map_err(|e| e.to_string())).unwrap();
+        let reply = delegate::with_report_io_hook(move |stage, temp| {
+            if stage == "publish" {
+                a.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(std::fs::write(temp, "karar: onay\n").is_err(), "temp can be overwritten");
+                assert!(std::fs::remove_file(temp).is_err(), "temp can be replaced");
+                assert!(std::fs::rename(temp, temp.with_extension("stolen")).is_err(), "temp can be renamed");
+            }
+        }, || f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":body})));
+        assert!(attacked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(std::fs::read_to_string(f.file()).unwrap(), body);
+        let review = crate::db::with(&f.core.db, |c| crate::review::get(c, f.job.id)).unwrap().unwrap();
+        assert_eq!(review.verdict.as_deref(), Some("düzelt"));
+        assert_eq!(review.findings.as_deref(), Some("- original finding"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reviewer_verdict_uses_content_even_if_archive_changes_before_record() {
+        let f = Fixture::new();
+        crate::db::with(&f.core.db, |c| c.execute(
+            "INSERT INTO delegation_reviews(review_id,target_id,sha,created_at) VALUES(?1,?1,'fixture-sha',1)", [f.job.id]
+        ).map_err(|e| e.to_string())).unwrap();
+        let reply = delegate::with_report_io_hook(|stage, path| {
+            if stage == "archived" { std::fs::write(path, "karar: onay\n## önemli\n- forged finding\n").unwrap(); }
+        }, || f.call(json!({"delegationId":f.job.id,"summary":"karar: onay","content":"karar: düzelt\n## önemli\n- original finding\n"})));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        let review = crate::db::with(&f.core.db, |c| crate::review::get(c, f.job.id)).unwrap().unwrap();
+        assert_eq!(review.verdict.as_deref(), Some("düzelt"));
+        assert_eq!(review.findings.as_deref(), Some("- original finding"));
+    }
+
+    #[cfg(windows)]
+    fn reparse_directory(path: &Path, target: Option<&Path>) -> std::io::Result<()> {
+        reparse_directory_with_access(path, target, 0x40000000)
+    }
+
+    #[cfg(windows)]
+    fn reparse_directory_with_access(path: &Path, target: Option<&Path>, access: u32) -> std::io::Result<()> {
+        use std::os::windows::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawHandle};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn DeviceIoControl(handle: *mut std::ffi::c_void, code: u32, input: *const std::ffi::c_void, input_len: u32,
+                output: *mut std::ffi::c_void, output_len: u32, returned: *mut u32, overlapped: *mut std::ffi::c_void) -> i32;
+        }
+        let file = std::fs::OpenOptions::new().access_mode(access).share_mode(7)
+            .custom_flags(0x02000000 | 0x00200000).open(path)?;
+        let mut buffer = Vec::new();
+        buffer.extend_from_slice(&0xA0000003u32.to_le_bytes()); // IO_REPARSE_TAG_MOUNT_POINT
+        if let Some(target) = target {
+            let target = target.canonicalize()?.to_string_lossy().into_owned();
+            let target = format!(r"\??\{}", target.strip_prefix(r"\\?\").unwrap_or(&target));
+            let text: Vec<u16> = std::ffi::OsStr::new(&target).encode_wide().collect();
+            buffer.extend_from_slice(&((8 + (text.len() + 2) * 2) as u16).to_le_bytes());
+            buffer.extend_from_slice(&0u16.to_le_bytes());
+            for value in [0, (text.len() * 2) as u16, ((text.len() + 1) * 2) as u16, 0] {
+                buffer.extend_from_slice(&value.to_le_bytes());
+            }
+            for c in text { buffer.extend_from_slice(&c.to_le_bytes()); }
+            buffer.extend_from_slice(&[0; 4]);
+        } else { buffer.extend_from_slice(&[0; 4]); }
+        let mut returned = 0;
+        // SAFETY: live directory handle, initialized mount-point buffer, synchronous null OVERLAPPED.
+        let ok = unsafe { DeviceIoControl(file.as_raw_handle(), if target.is_some() { 0x000900A4 } else { 0x000900AC },
+            buffer.as_ptr().cast(), buffer.len() as u32, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut()) };
+        if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_in_place_reparse_after_check_cannot_escape_handles() {
+        let f = Fixture::new();
+        let results = f.file().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&results).unwrap();
+        let outside = f.dir.dir("in-place-target");
+        let sentinel = outside.join(format!("{}.md", f.job.id));
+        std::fs::write(&sentinel, "outside original").unwrap();
+        // Positive control: lack of junction support is an explicit prerequisite failure.
+        let control = f.dir.0.join("reparse-control");
+        std::fs::create_dir(&control).unwrap();
+        reparse_directory(&control, Some(&outside)).expect("önkoşul hatası: yerinde junction oluşturulamadı");
+        reparse_directory(&control, None).unwrap();
+        let linked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let escaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (l, e, q, p) = (linked.clone(), escaped.clone(), outside.clone(), results.clone());
+        let root = f.root.clone();
+        let ancestor = f.dir.0.clone();
+        let reply = delegate::with_report_io_hook(move |stage, temp| {
+            if stage == "directories" {
+                for directory in [&ancestor, &root, &root.join(".dex"), &p] {
+                    assert!(std::fs::rename(directory, directory.with_extension("moved")).is_err(), "directory chain not pinned");
+                }
+                // Attribute-only opens are not covered by Windows data sharing checks either.
+                let changed = reparse_directory(&p, Some(&q)).is_ok()
+                    || reparse_directory_with_access(&p, Some(&q), 0x100).is_ok();
+                l.store(changed, std::sync::atomic::Ordering::SeqCst);
+            }
+            if stage == "written" { e.store(q.join(temp.file_name().unwrap()).exists(), std::sync::atomic::Ordering::SeqCst); }
+        }, || f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"host body"})));
+        if linked.load(std::sync::atomic::Ordering::SeqCst) { reparse_directory(&results, None).unwrap(); }
+        assert!(!escaped.load(std::sync::atomic::Ordering::SeqCst), "relative create followed parent reparse");
+        assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "outside original");
+        assert_eq!(std::fs::read_dir(outside).unwrap().count(), 2, "only .git and sentinel in Q");
+        if reply["isError"] == true { assert_eq!(f.state().status, "running"); }
+        else { assert_eq!(std::fs::read_to_string(f.file()).unwrap(), "host body"); }
+    }
+
+    #[test]
+    fn service_content_uses_snapshot_slug_and_does_not_touch_other_job() {
+        let prompt = "Türkçe / ayraç: ../../ başka\\iş | araştırma";
+        let f = Fixture::service(prompt);
+        let other_job = crate::db::with(&f.core.db, |c| {
+            let lead = delegate::caller(c, "timur")?;
+            delegate::insert(c, delegate::NewDelegation { from: &lead, to_agent: "svc".into(), team_id: "default".into(),
+                service_team_id: Some("service".into()), prompt: prompt.into(), task_id: None, patron_words: None, effort: None })
+        }).unwrap();
+        let expected = f.root.join("docs").join("research").join(format!("{}-turkce-ayrac-baska-is-arastirma.md", f.job.id));
+        let foreign = f.root.join("docs").join("research").join(format!("{}-turkce-ayrac-baska-is-arastirma.md", other_job.id));
+        std::fs::create_dir_all(expected.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, "other job original").unwrap();
+        let later = f.dir.dir("later-team-cwd");
+        crate::db::with(&f.core.db, |c| c.execute("UPDATE teams SET cwd=?1 WHERE id='default'", [later.to_string_lossy()])
+            .map_err(|e| e.to_string())).unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"service body"}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(f.state().result_path.as_deref(), expected.to_str());
+        assert_eq!(std::fs::read_to_string(expected).unwrap(), "service body");
+        assert_eq!(std::fs::read_to_string(foreign).unwrap(), "other job original");
+        assert_eq!(crate::db::with(&f.core.db, |c| delegate::get(c, other_job.id)).unwrap().status, "queued");
+        assert!(!later.join("docs").exists());
+        assert!(!f.root.join(".dex/results").exists());
+    }
+
+    #[test]
+    fn service_content_rejects_linked_or_non_directory_research_chain() {
+        for case in ["docs-link", "research-link", "docs-file", "research-file"] {
+            let f = Fixture::service("../../ Türkçe / araştırma");
+            let outside = f.dir.dir("outside-service");
+            let path = if case.starts_with("docs-") { f.root.join("docs") }
+                else { std::fs::create_dir(f.root.join("docs")).unwrap(); f.root.join("docs/research") };
+            if case.ends_with("link") {
+                assert!(crate::memory::tests::link_dir(&outside, &path), "önkoşul hatası: junction oluşturulamadı");
+            } else { std::fs::write(&path, "original file").unwrap(); }
+            let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"service body"}));
+            if case.ends_with("link") { std::fs::remove_dir(path).unwrap(); }
+            else { assert_eq!(std::fs::read_to_string(path).unwrap(), "original file"); }
+            assert_eq!(reply["isError"], true, "{case}: {reply}");
+            assert_eq!(f.state().status, "running");
+            assert!(f.state().result_path.is_none());
+            assert_eq!(std::fs::read_dir(outside).unwrap().count(), 1, "only .git; no outside write");
+        }
     }
 
     #[test]
