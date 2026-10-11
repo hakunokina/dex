@@ -7,6 +7,8 @@
 //! `pnpm -C/--filter`, workspaces, `bash script.sh`, `$(…)`, config-file `testMatch` tricks.
 //! Godot GUT is also denied when a literal broad test directory and recursive discovery
 //! are given without a file/test selector. Unknown wrappers and directory expressions pass.
+//! Rust `cargo test` / `cargo nextest run` require a test-name filter or a single named
+//! target (or `--doc`); unknown options pass rather than guessing which words are filters.
 
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -18,7 +20,11 @@ pub const DENY: &str = "Tüm e2e paketini koşma; ilgili spec'i ver ya da QA'ya 
 const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
     Örn. `godot --headless -s addons/gut/gut_cmdln.gd -gtest=res://tests/e2e/test_x.gd -gexit`.";
 
+const DENY_RUST: &str = "Tüm Rust paketini koşma; dokunduğun modülün filtresini ekle: \
+    `cargo test -p dex-core --lib <modül>`; tam paket QA'nın işi (Dex test bütçesi).";
+
 struct Enforcer {
+    segments: fn(&str, Option<crate::permit::Dialect>) -> Vec<Vec<String>>,
     recognises: fn(&[String]) -> bool,
     deny: &'static str,
 }
@@ -30,8 +36,9 @@ struct Runner {
 }
 
 const RUNNERS: &[Runner] = &[
-    Runner { name: "Playwright", markers: playwright_markers, enforcer: Some(Enforcer { recognises: unfiltered_playwright, deny: DENY }) },
-    Runner { name: "Godot GUT", markers: |m| m.file("project.godot") && m.dir("addons/gut"), enforcer: Some(Enforcer { recognises: unfiltered_gut, deny: DENY_GUT }) },
+    Runner { name: "Playwright", markers: playwright_markers, enforcer: Some(Enforcer { segments: |c, _| segments(c), recognises: unfiltered_playwright, deny: DENY }) },
+    Runner { name: "Godot GUT", markers: |m| m.file("project.godot") && m.dir("addons/gut"), enforcer: Some(Enforcer { segments: |c, _| segments(c), recognises: unfiltered_gut, deny: DENY_GUT }) },
+    Runner { name: "Rust", markers: |m| m.file("Cargo.toml"), enforcer: Some(Enforcer { segments: crate::permit::command_words, recognises: unfiltered_rust, deny: DENY_RUST }) },
     Runner { name: "Android (Gradle)", markers: android_markers, enforcer: None },
     Runner { name: "Maestro", markers: |m| m.dir(".maestro"), enforcer: None },
     Runner { name: "WebdriverIO (Electron)", markers: |m| m.root_config("wdio.conf."), enforcer: None },
@@ -76,7 +83,7 @@ pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<Strin
         _ => return None,
     };
     let cwd = body.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-    let reason = check(&command, cwd, 0)?;
+    let reason = check(&command, cwd, 0, crate::permit::dialect(tool, input))?;
     let role: Option<String> = conn
         .query_row("SELECT role_slug FROM agents WHERE id = ?1", [agent], |r| r.get(0))
         .optional()
@@ -96,12 +103,27 @@ pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<Strin
     )
 }
 
-/// Whether `command` (run in `cwd`) starts a full Playwright or Godot GUT suite.
+/// Whether `command` (run in `cwd`) starts a full registered suite.
 pub fn runs_full_suite(command: &str, cwd: Option<&Path>) -> bool {
-    check(command, cwd.map(Path::to_path_buf), 0).is_some()
+    full_suite_denial(command, cwd).is_some()
 }
 
-fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8) -> Option<&'static str> {
+pub(crate) fn full_suite_denial(command: &str, cwd: Option<&Path>) -> Option<&'static str> {
+    full_suite_denial_in_shell(command, cwd, crate::permit::dialect("", &Value::Null))
+}
+
+pub(crate) fn full_suite_denial_in_shell(command: &str, cwd: Option<&Path>, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
+    check(command, cwd.map(Path::to_path_buf), 0, d)
+}
+
+fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
+    for enforcer in RUNNERS.iter().filter_map(|r| r.enforcer.as_ref()) {
+        for seg in (enforcer.segments)(command, d) {
+            if (enforcer.recognises)(&strip_env(&seg)) {
+                return Some(enforcer.deny);
+            }
+        }
+    }
     for seg in segments(command) {
         let words = strip_env(&seg);
         if words.first().map(String::as_str) == Some("cd") {
@@ -113,17 +135,12 @@ fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8) -> Option<&'static 
             };
             continue;
         }
-        for enforcer in RUNNERS.iter().filter_map(|r| r.enforcer.as_ref()) {
-            if (enforcer.recognises)(&words) {
-                return Some(enforcer.deny);
-            }
-        }
         if depth < 3 {
             if let Some((script, extra)) = script_call(&words) {
                 if let Some(body) = cwd.as_deref().and_then(|c| package_script(c, &script)) {
                     // npm/pnpm/yarn append the extra args to the script's command line.
                     let line = if extra.is_empty() { body } else { format!("{body} {}", extra.join(" ")) };
-                    if let Some(reason) = check(&line, cwd.clone(), depth + 1) {
+                    if let Some(reason) = check(&line, cwd.clone(), depth + 1, d) {
                         return Some(reason);
                     }
                 }
@@ -131,6 +148,85 @@ fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8) -> Option<&'static 
         }
     }
     None
+}
+
+fn unfiltered_rust(words: &[String]) -> bool {
+    let Some(exe) = words.first() else { return false };
+    let base = exe.rsplit(['/', '\\']).next().unwrap_or(exe).to_ascii_lowercase();
+    if !matches!(base.as_str(), "cargo" | "cargo.exe") {
+        return false;
+    }
+    let mut args = words[1..].iter().peekable();
+    if args.peek().is_some_and(|a| a.starts_with('+')) {
+        args.next();
+    }
+    let nextest = match args.next().map(String::as_str) {
+        Some("test") => false,
+        Some("nextest") if args.next().map(String::as_str) == Some("run") => true,
+        _ => return false,
+    };
+    let mut harness = false;
+    let mut named_targets = 0;
+    let mut broad_targets = false;
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            harness = true;
+            continue;
+        }
+        let (flag, value) = arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)));
+        if matches!(flag, "-h" | "--help")
+            || !harness && matches!(flag, "--no-run" | "--doc")
+            || harness && flag == "--list"
+            || nextest && !harness && matches!(flag, "-E" | "--filter-expr")
+        {
+            return false;
+        }
+        if !harness && matches!(flag, "--test" | "--bin" | "--example" | "--bench") {
+            let target = value.or_else(|| args.next().map(String::as_str));
+            let Some(target) = target else { return false };
+            if target.is_empty() || target.starts_with('-') {
+                return false;
+            }
+            named_targets += 1;
+            broad_targets |= target.contains(['*', '?', '[']);
+            continue;
+        }
+        let takes_value = if harness {
+            matches!(flag, "--test-threads" | "--skip" | "--format" | "--color" | "--logfile" | "-Z")
+        } else {
+            matches!(flag, "-p" | "--package" | "--exclude" | "-F" | "--features" | "-j" | "--jobs"
+                | "--profile" | "--target" | "--target-dir" | "--manifest-path" | "--message-format"
+                | "--color" | "--config" | "-Z")
+                || nextest && matches!(flag, "--test-threads" | "--retries" | "--status-level"
+                    | "--final-status-level" | "--failure-output" | "--success-output" | "--partition"
+                    | "--no-tests")
+        };
+        if takes_value {
+            if value.is_none() && args.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if !harness {
+            broad_targets |= matches!(flag, "--lib" | "--bins" | "--examples" | "--tests" | "--benches" | "--all-targets");
+            if matches!(flag, "--lib" | "--bins" | "--examples" | "--tests" | "--benches" | "--all-targets"
+                | "--workspace" | "--all" | "--all-features" | "--no-default-features" | "--no-fail-fast"
+                | "--future-incompat-report" | "-q" | "--quiet" | "-v" | "-vv" | "--verbose"
+                | "-r" | "--release" | "--timings" | "--locked" | "--offline" | "--frozen" | "--ignore-rust-version")
+                || ["-p", "-F", "-j", "-Z"].iter().any(|f| arg.starts_with(f) && arg.len() > f.len())
+            {
+                continue;
+            }
+        } else if matches!(flag, "--nocapture" | "--no-capture" | "--show-output" | "--exact"
+            | "--ignored" | "--include-ignored" | "--quiet" | "-q") {
+            continue;
+        }
+        // A nonempty positional name narrows the run. Unknown flags/expressions pass.
+        if !arg.is_empty() {
+            return false;
+        }
+    }
+    named_targets != 1 || broad_targets
 }
 
 fn unfiltered_gut(words: &[String]) -> bool {
@@ -386,6 +482,7 @@ mod tests {
             (vec![("playwright.config.ts", "")], vec![], "Playwright"),
             (vec![("package.json", r#"{"devDependencies":{"@playwright/test":"1"}}"#)], vec![], "Playwright"),
             (vec![("project.godot", "")], vec!["addons/gut"], "Godot GUT"),
+            (vec![("Cargo.toml", "")], vec![], "Rust"),
         ] {
             let f = marker_fixture(&files, &dirs);
             let runner = RUNNERS.iter().find(|r| r.name == name).unwrap();
@@ -422,6 +519,206 @@ mod tests {
 
     fn full(cmd: &str) -> bool {
         runs_full_suite(cmd, None)
+    }
+
+    fn rust_shell_budget(tool: &str, cmd: &str, denied: bool) {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let input = json!({ "cmd": cmd });
+        let body = json!({ "tool_name": tool, "tool_input": input });
+        for agent in ["kaan", "ayla", "timur", "unknown"] {
+            let out = on_pre_tool(&c, agent, &body);
+            assert_eq!(out.is_some(), denied, "{tool}: {agent}: {cmd}");
+            if let Some(out) = out {
+                let out: Value = serde_json::from_str(&out).unwrap();
+                assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+                assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], DENY_RUST);
+            }
+        }
+        assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {tool}: {cmd}");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut ctx = crate::permit::Ctx { cwd: Some(root.clone()), write: vec![root], ..Default::default() };
+        let out = crate::permit::decide(tool, &input, &ctx);
+        if denied {
+            assert!(matches!(out, crate::permit::Verdict::Deny(ref why) if why.contains(DENY_RUST)), "{tool}: {cmd}: {out:?}");
+        } else {
+            assert_eq!(out, crate::permit::Verdict::Allow, "{tool}: {cmd}");
+        }
+        ctx.qa = true;
+        assert_eq!(crate::permit::decide(tool, &input, &ctx), crate::permit::Verdict::Allow, "QA: {tool}: {cmd}");
+    }
+
+    #[test]
+    fn rust_shell_stream_redirection() {
+        rust_shell_budget("PowerShell", "cargo test -p dex-core --lib *> .dex/tmp/rust.log", true);
+        for tool in ["Bash", "PowerShell"] {
+            for suffix in ["2> err.txt", "2>&1 > out.txt", "3>&1", ">> out.txt"] {
+                rust_shell_budget(tool, &format!("cargo test -p dex-core --lib {suffix}"), true);
+            }
+        }
+    }
+
+    #[test]
+    fn rust_shell_comment_bash() {
+        rust_shell_budget("Bash", "cargo test -p dex-core --lib # kontrol", true);
+    }
+
+    #[test]
+    fn rust_shell_comment_powershell() {
+        rust_shell_budget("PowerShell", "cargo test -p dex-core --lib # kontrol", true);
+    }
+
+    #[test]
+    fn rust_shell_quoted_filters_stay_allowed() {
+        for tool in ["Bash", "PowerShell"] {
+            for suffix in [r#""pty::tests::x""#, "'chat' # not", "'#'", "'*'", r#""chat#*""#, "'chat' 2> err.txt", "'chat' 2>&1 > out.txt", "'chat' >> out.txt"] {
+                rust_shell_budget(tool, &format!("cargo test -p dex-core --lib {suffix}"), false);
+            }
+        }
+        rust_shell_budget("PowerShell", "cargo test -p dex-core --lib chat *> log.txt", false);
+    }
+
+    #[test]
+    fn rust_shell_explicit_dialects_and_unknown_shell() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        for (shell, cmd, denied) in [
+            ("bash", "cargo test -p dex-core --lib # kontrol", true),
+            ("pwsh", "cargo test -p dex-core --lib # kontrol", true),
+            ("powershell.exe", "cargo test -p dex-core --lib *> .dex/tmp/rust.log", true),
+            ("bash", "cargo test -p dex-core --lib '*' > log.txt", false),
+            ("pwsh", "cargo test -p dex-core --lib chat *> log.txt", false),
+            ("unknown-shell", "cargo test -p dex-core --lib", false),
+            ("unknown-shell", "cargo test -p dex-core --lib # kontrol", false),
+            ("unknown-shell", "cargo test -p dex-core --lib *> log.txt", false),
+            ("unknown-shell", "cargo test -p dex-core --lib '*'", false),
+        ] {
+            let input = json!({ "cmd": cmd, "shell": shell });
+            let body = json!({ "tool_name": "exec_command", "tool_input": input });
+            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied, "{shell}: {cmd}");
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {shell}: {cmd}");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let mut ctx = crate::permit::Ctx { cwd: Some(root.clone()), write: vec![root], ..Default::default() };
+            let budget_denied = |out| matches!(out, crate::permit::Verdict::Deny(ref why) if why.contains(DENY_RUST));
+            assert_eq!(budget_denied(crate::permit::decide("exec_command", &input, &ctx)), denied, "{shell}: {cmd}");
+            ctx.qa = true;
+            assert!(!budget_denied(crate::permit::decide("exec_command", &input, &ctx)), "QA: {shell}: {cmd}");
+        }
+    }
+
+    #[test]
+    fn rust_shell_bash_executable_paths() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        for (cmd, denied) in [
+            (r#""C:\Rust\bin\cargo.exe" test --lib"#, true),
+            ("C:/Rust/bin/cargo.exe test --lib", true),
+            ("/c/Rust/bin/cargo.exe test --lib", true),
+            (r"C:\Rust\bin\cargo.exe test --lib", false),
+        ] {
+            let body = json!({ "tool_name": "Bash", "tool_input": { "cmd": cmd } });
+            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied, "Bash: {cmd}");
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
+        }
+    }
+
+    #[test]
+    fn rust_hook_budget_table() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        for (cmd, denied) in [
+            ("cargo test", true),
+            ("cargo test --workspace", true),
+            ("cargo test -p dex-core", true),
+            ("cargo test -p dex-core --lib", true),
+            ("cargo test 2>&1 | tail -20", true),
+            ("cargo test > out.txt", true),
+            ("cargo test -p dex-core --lib | Select-String FAILED", true),
+            ("cargo test -p dex-core --lib -- --nocapture", true),
+            ("cargo test -- --test-threads=1", true),
+            ("cargo test -- --test-threads 1 --skip slow", true),
+            ("cargo.exe test --package=dex-core --lib", true),
+            (r"C:\Rust\bin\cargo.exe test --lib", true),
+            (r#"& "C:\Program Files\Rust\cargo.exe" test --lib"#, true),
+            ("CARGO_TARGET_DIR=.dex/tmp/target cargo test --lib", true),
+            ("env CARGO_TARGET_DIR=.dex/tmp/target cargo test --lib", true),
+            ("env cargo test", true),
+            ("$env:CARGO_TARGET_DIR='.dex/tmp/target'; cargo test --lib", true),
+            ("cd crates/dex-core && cargo test --lib", true),
+            ("cargo +nightly test --lib --features foo --target x86_64-pc-windows-msvc", true),
+            ("cargo test -pdex-core --lib -j2 --profile dev --manifest-path Cargo.toml", true),
+            ("cargo test --test one --test two", true),
+            ("cargo test --test one --lib", true),
+            ("cargo nextest run", true),
+            ("cargo nextest run --workspace", true),
+            ("cargo nextest run -p dex-core --lib", true),
+            ("cargo nextest run --profile ci --test-threads 1", true),
+            ("cargo test -p dex-core --lib chat", false),
+            ("cargo test -p dex-core --lib chat 2>&1 | tail -20", false),
+            ("cargo test \"pty::tests::x\"", false),
+            ("cargo test -p dex-core --lib pty::tests::x -- --exact", false),
+            ("cargo test --lib -- --exact pty::tests::x", false),
+            ("cargo test -- --test-threads 1 chat", false),
+            ("cargo test --test api", false),
+            ("cargo test --test=api", false),
+            ("cargo test --doc", false),
+            ("cargo test --bin dexd", false),
+            ("cargo test --example demo", false),
+            ("cargo test --no-run", false),
+            ("cargo test --help", false),
+            ("cargo test -- --list", false),
+            ("cargo check", false),
+            ("cargo clippy -p dex-core -- -D warnings", false),
+            ("cargo build", false),
+            ("cargo nextest run chat", false),
+            ("cargo nextest run -E 'test(chat)'", false),
+            ("cargo nextest run --filter-expr='test(chat)'", false),
+            ("cargo nextest run --test api", false),
+            ("cargo nextest list", false),
+            ("cargo test --unknown-option value", false),
+            ("bash script.sh", false),
+            ("bash -lc 'cargo test'", false),
+            ("echo 'cargo test'", false),
+            ("npm test", false),
+        ] {
+            assert_eq!(full(cmd), denied, "{cmd}");
+            // Bash consumes unquoted backslashes; its actual executable-path cases are above.
+            let tools: &[&str] = if cmd == r"C:\Rust\bin\cargo.exe test --lib" {
+                &["PowerShell", "shell", "exec_command", "local_shell"]
+            } else {
+                &["Bash", "PowerShell", "shell", "exec_command", "local_shell"]
+            };
+            for tool in tools {
+                let body = json!({ "tool_name": tool, "tool_input": { "cmd": cmd } });
+                for agent in ["kaan", "ayla", "timur", "unknown"] {
+                    let out = on_pre_tool(&c, agent, &body);
+                    assert_eq!(out.is_some(), denied, "{tool}: {agent}: {cmd}");
+                    if let Some(out) = out {
+                        let out: Value = serde_json::from_str(&out).unwrap();
+                        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+                        let reason = out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+                        assert!(reason.contains("cargo test -p dex-core --lib <modül>"), "{reason}");
+                        assert!(reason.contains("tam paket QA'nın işi"), "{reason}");
+                    }
+                }
+                assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
+            }
+        }
+        for (argv, denied) in [
+            (json!(["cargo", "test", "-p", "dex-core", "--lib"]), true),
+            (json!(["cargo", "test", "-p", "dex-core", "--lib", "chat"]), false),
+        ] {
+            let body = json!({ "tool_name": "shell", "tool_input": { "command": argv } });
+            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied);
+            assert!(on_pre_tool(&c, "bora", &body).is_none());
+        }
+    }
+
+    #[test]
+    fn rust_test_budget_permit_message() {
+        let mut ctx = crate::permit::Ctx::default();
+        let input = json!({ "cmd": "cargo test -p dex-core --lib" });
+        let out = crate::permit::decide("exec_command", &input, &ctx);
+        assert!(matches!(out, crate::permit::Verdict::Deny(ref reason)
+            if reason.contains("cargo test -p dex-core --lib <modül>") && reason.contains("tam paket QA'nın işi")), "{out:?}");
+        ctx.qa = true;
+        assert_eq!(crate::permit::decide("exec_command", &input, &ctx), crate::permit::Verdict::Allow);
     }
 
     #[test]
@@ -539,7 +836,7 @@ mod tests {
             "npx playwright install chromium",
             "echo 'npx playwright test'",
             "grep -r \"playwright test\" docs",
-            "cargo test --workspace",
+            "cargo check --workspace",
             "npx vitest run",
         ] {
             assert!(!full(c), "{c}");
