@@ -568,6 +568,12 @@ pub fn set_status(conn: &Connection, id: i64, status: &str) -> Result<(), String
 }
 
 pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path: Option<&str>) -> Result<Delegation, String> {
+    report_with_content(conn, c, id, summary, result_path, None)
+}
+
+pub(crate) const REPORT_CONTENT_LIMIT: usize = 1024 * 1024;
+
+pub(crate) fn report_with_content(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path: Option<&str>, content: Option<&str>) -> Result<Delegation, String> {
     let d = get(conn, id)?;
     if d.to_agent != c.id {
         return Err(format!("#{id} sana devredilmedi (alıcı: {})", d.to_agent));
@@ -582,9 +588,22 @@ pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path
     if summary.is_empty() {
         return Err("summary boş olamaz".into());
     }
-    let result_path = result_path.map(str::trim).filter(|p| !p.is_empty());
+    if content.is_some() && result_path.is_some() {
+        return Err("content ve resultPath birlikte verilemez; content yolunu Dex belirler".into());
+    }
+    let owned_path = if let Some(body) = content {
+        if body.is_empty() || body.len() > REPORT_CONTENT_LIMIT {
+            return Err(format!("content 1..{REPORT_CONTENT_LIMIT} UTF-8 bayt olmalı"));
+        }
+        if crate::review::is_review(conn, id)? && crate::review::parse(body).is_none() {
+            return Err("content inceleme raporunun ilk satırı `karar: onay` ya da `karar: düzelt` olmalı".into());
+        }
+        Some(write_report_content(&d, body)?)
+    } else { None };
+    let result_path = owned_path.as_deref().or_else(|| result_path.map(str::trim).filter(|p| !p.is_empty()));
     // A team without a project folder has nowhere to keep the file: summary only, as before.
-    if let Some(dir) = result_dir(conn, &d)? {
+    let legacy_dir = if content.is_none() { result_dir(conn, &d)? } else { None };
+    if let Some(dir) = legacy_dir {
         let want = dir.join(result_name(&d));
         let p = result_path
             .ok_or_else(|| format!("resultPath gerekli: raporun tamamını önce {} dosyasına yaz, sonra report'ta o yolu ver", want.display()))?;
@@ -606,6 +625,67 @@ pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path
     .map_err(e)?;
     crate::diagnostics::event("delegation", serde_json::json!({"id": id, "agent": c.id, "status": "done", "bytes": summary.len()}));
     get(conn, id)
+}
+
+/// The host chooses the archive path from the job snapshot, never the MCP caller.
+/// Create a private sibling exclusively, then replace the report without following a file link.
+fn write_report_content(d: &Delegation, content: &str) -> Result<String, String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let stored = d.project_root.as_deref().ok_or("content için işin kayıtlı proje kökü gerekli")?;
+    let stored = Path::new(stored);
+    if !stored.is_absolute() || stored.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("rapor dosyası için güvenli proje kökü gerekli".into());
+    }
+    let root = std::fs::canonicalize(stored).map_err(|e| format!("rapor dosyası proje kökü okunamadı: {e}"))?;
+    let dirs = if d.service_team_id.is_some() { ["docs", "research"] } else { [".dex", "results"] };
+    let mut dir = root.clone();
+    for name in dirs {
+        dir.push(name);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {},
+            Ok(_) => return Err("rapor dosyası dizini güvenli değil (link/dosya)".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+                crate::private_fs::create_dir(&dir).map_err(|e| format!("rapor dosyası dizini oluşturulamadı: {e}"))?,
+            Err(e) => return Err(format!("rapor dosyası dizini okunamadı: {e}")),
+        }
+        if std::fs::canonicalize(&dir).ok().as_deref() != Some(dir.as_path()) {
+            return Err("rapor dosyası dizini güvenli değil (yol yönlendirmesi)".into());
+        }
+    }
+    let file = dir.join(result_name(d));
+    let check = || -> Result<(), String> {
+        if std::fs::canonicalize(&dir).ok().as_deref() != Some(dir.as_path()) {
+            return Err("rapor dosyası dizini güvenli değil (yol yönlendirmesi)".into());
+        }
+        match std::fs::symlink_metadata(&file) {
+            Ok(m) if m.is_file() && !m.file_type().is_symlink() => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err("rapor dosyası güvenli değil (link/dizin)".into()),
+            Err(e) => Err(format!("rapor dosyası okunamadı: {e}")),
+        }
+    };
+    check()?;
+    let temp = dir.join(format!(".report-{}-{}-{}.tmp", d.id, std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut out = options.open(&temp).map_err(|e| format!("geçici rapor dosyası oluşturulamadı: {e}"))?;
+    let written = (|| {
+        out.write_all(content.as_bytes()).and_then(|_| out.sync_all()).map_err(|e| format!("rapor dosyası yazılamadı: {e}"))?;
+        drop(out);
+        check()?;
+        std::fs::rename(&temp, &file).map_err(|e| format!("rapor dosyası atomik taşınamadı: {e}"))
+    })();
+    if let Err(error) = written {
+        return match std::fs::remove_file(&temp) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(format!("{error}; geçici rapor dosyası temizlenemedi: {cleanup}")),
+        };
+    }
+    Ok(stored.join(dirs[0]).join(dirs[1]).join(result_name(d)).to_string_lossy().into_owned())
 }
 
 /// Finished rows the leader has not been told about yet; marks them told (`delivered_at`) and
@@ -806,11 +886,11 @@ pub fn worker_prompt(conn: &Connection, d: &Delegation) -> Result<String, String
     }
     match result_file(conn, d)? {
         Some(file) => s.push_str(&format!(
-            "Teslim: önce raporun TAMAMINI şu dosyaya yaz: {}\n\
-             Sonra dex MCP'sinin `report` aracını çağır: delegationId={}, resultPath=<o dosya>, summary=\"bitti: <tek cümle>\". \
-             Lider yalnız summary'yi ve dosyayı görür; sohbet mesajın ona gitmez. Rapor vermeden durursan iş \"raporsuz bitti\" sayılır.",
-            file.display(),
-            d.id
+            "Teslim: raporun TAMAMINI dex MCP'sinin `report` aracında content ile ver: delegationId={}, content=<tam rapor>, summary=\"bitti: <tek cümle>\". \
+             Dosyayı Dex yazar (arşiv: {}); rapor için dosya yazman gerekmez. content ile resultPath birlikte verilmez. \
+             Lider summary'yi ve raporu görür; sohbet mesajın ona gitmez. Rapor vermeden durursan iş \"raporsuz bitti\" sayılır.",
+            d.id,
+            file.display()
         )),
         None => s.push_str(&format!(
             "Bitince dex MCP'sinin `report` aracıyla teslim et: delegationId={}, summary=<teslimin tamamı; sohbet mesajın lidere gitmez>. \
@@ -2226,6 +2306,19 @@ mod tests {
         let (out, _) = on_stop(&c, &Turns::default(), "timur", false, None).unwrap();
         let reason = out.unwrap()["reason"].as_str().unwrap().to_string();
         assert!(reason.contains("RAPORSUZ") && reason.contains(&format!("report'suz kaydedilmiş): {} — oku", b_file.display())), "{reason}");
+    }
+
+    #[test]
+    fn content_writer_rejects_parent_components_before_creating_files() {
+        let c = mem();
+        let lead = leader(&c);
+        let mut d = insert(&c, NewDelegation { from: &lead, to_agent: "kaan".into(), team_id: "default".into(),
+            service_team_id: None, prompt: "report".into(), task_id: None, patron_words: None, effort: None }).unwrap();
+        let fixture = crate::projects::tests::Fixture::new();
+        let root = fixture.dir("project");
+        d.project_root = Some(root.join("..").join("project").to_string_lossy().into_owned());
+        assert!(write_report_content(&d, "body").unwrap_err().contains("güvenli proje kökü"));
+        assert!(!root.join(".dex").exists());
     }
 
     /// #298: a new team has no `.dex/results` — the start makes it, so a read-only reviewer's

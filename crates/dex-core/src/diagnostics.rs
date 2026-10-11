@@ -155,6 +155,84 @@ pub fn event(name: &'static str, fields: Value) {
     log::info!(target: "dex::audit", "{}", json!({"event": name, "fields": fields}));
 }
 
+/// Metadata only: an opaque shell body is deliberately unknown, never guessed or logged.
+pub(crate) fn permit_fields(agent: &str, decision: &str, rule: &str, final_rule: &str, tool: &str, input: &Value,
+    ctx: Option<&crate::permit::Ctx>, id: Option<i64>) -> Value {
+    let mut fields = json!({"agent":agent,"decision":decision,"rule":rule,"final_rule":final_rule,
+        "path_class":permit_path_class(tool, input, ctx),"bytes":input.to_string().len()});
+    if let Some(id) = id { fields["id"] = json!(id); }
+    fields
+}
+
+pub(crate) fn denial_rule(reason: &str) -> &'static str {
+    let reason = reason.strip_prefix("Dex politikası izin vermiyor: ").unwrap_or(reason);
+    for (prefix, rule) in [
+        ("çalışma dizini dışına yazma", "outside_write"),
+        ("başka takımın klasörüne yazma", "other_team_write"),
+        ("salt okuma", "read_only"), ("sır/kimlik dosyası", "secret"),
+        ("ajan/git yapılandırması", "protected"), ("hook atlatma yasak", "hook_bypass"),
+        ("git push", "git_push"), ("git reset --hard", "destructive_git"), ("git clean", "destructive_git"),
+        ("Tüm e2e paketini koşma", "test_budget"), ("Tüm GUT paketini koşma", "test_budget"),
+        ("Alt takım kabuk çalıştıramaz", "service_shell"), ("Alt takım yalnız", "service_write"),
+    ] {
+        if reason.starts_with(prefix) { return rule; }
+    }
+    if reason.starts_with("Dex politikası dışı") { "permit_required" } else { "policy_deny" }
+}
+
+/// Later Dex gates can veto a call that the permit policy deferred (service jobs, questions).
+pub(crate) fn permit_hook_reply(agent: &str, body: &Value, reply: Option<&str>) {
+    if let Some(fields) = permit_hook_reply_fields(agent, body, reply) { event("permit", fields); }
+}
+
+fn permit_hook_reply_fields(agent: &str, body: &Value, reply: Option<&str>) -> Option<Value> {
+    let reply: Value = serde_json::from_str(reply?).ok()?;
+    let decision = &reply["hookSpecificOutput"];
+    if decision["permissionDecision"] != "deny" { return None; }
+    let reason = decision["permissionDecisionReason"].as_str().unwrap_or("");
+    let tool = body["tool_name"].as_str().unwrap_or("");
+    let rule = if tool == "AskUserQuestion" { "ask_user" } else { denial_rule(reason) };
+    Some(permit_fields(agent, "deny", "deny", rule, tool, &body["tool_input"], None, None))
+}
+
+fn permit_path_class(tool: &str, input: &Value, ctx: Option<&crate::permit::Ctx>) -> &'static str {
+    use std::path::Component;
+    if matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell" | "apply_patch") {
+        return "unknown"; // The authoritative shell/patch parser is private to permit, and is unchanged.
+    }
+    let Some(path) = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(k).and_then(Value::as_str)) else {
+        return "no_path";
+    };
+    let Some(ctx) = ctx else { return "unknown" };
+    if path.starts_with('~') || (cfg!(windows) && path.starts_with('/')) { return "unknown"; }
+    let path = Path::new(path);
+    let path = if path.is_absolute() { path.to_path_buf() } else {
+        let Some(cwd) = &ctx.cwd else { return "unknown" };
+        cwd.join(path)
+    };
+    let normalize = |p: &Path| {
+        let mut normalized = PathBuf::new();
+        for part in p.components() {
+            match part { Component::ParentDir => { normalized.pop(); }, Component::CurDir => {}, _ => normalized.push(part.as_os_str()) }
+        }
+        let key = normalized.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_string();
+        if cfg!(windows) { key.to_lowercase() } else { key }
+    };
+    let path = normalize(&path);
+    let inside = |root: &Path| {
+        let root = normalize(root);
+        !root.is_empty() && (path == root || path.starts_with(&format!("{root}/")))
+    };
+    if let Some(project) = &ctx.team_root {
+        if inside(&project.join(".dex/results")) { return "results"; }
+        if inside(&project.join(".dex/tmp")) { return "tmp"; }
+        // permit_ctx puts the job worktree first; no-worktree and service sessions put P/home first.
+        if ctx.write.first().is_some_and(|w| normalize(w) != normalize(project) && inside(w)) { return "worktree"; }
+        if inside(project) { return "project"; }
+    }
+    if ctx.write.iter().any(|p| inside(p)) { "authorized_root" } else { "outside" }
+}
+
 fn sanitize(fields: Value) -> Value {
     let mut out = serde_json::Map::new();
     if let Some(fields) = fields.as_object() {
@@ -193,6 +271,13 @@ fn sanitize(fields: Value) -> Value {
                 "rule" => value
                     .as_str()
                     .is_some_and(|s| matches!(s, "policy" | "leader_bypass" | "grant" | "deny")),
+                "final_rule" => value.as_str().is_some_and(|s| matches!(s,
+                    "policy_unavailable" | "outside_write" | "other_team_write" | "read_only" | "secret" | "protected"
+                    | "hook_bypass" | "git_push" | "destructive_git" | "test_budget" | "policy_deny"
+                    | "deferred" | "leader_bypass" | "permit_required" | "permit_grant" | "allow_policy"
+                    | "service_shell" | "service_write" | "ask_user")),
+                "path_class" => value.as_str().is_some_and(|s| matches!(s,
+                    "project" | "worktree" | "results" | "tmp" | "outside" | "no_path" | "unknown" | "authorized_root")),
                 "reason" => value.as_str().is_some_and(|s| {
                     matches!(s, "idle_close" | "reset" | "user" | "replacement" | "exit"
                         | "stop_prepare" | "stop_accept" | "stop_retry" | "stale_stop" | "turn_end"
@@ -240,6 +325,8 @@ fn sanitize(fields: Value) -> Value {
                     | "after"
                     | "decision"
                     | "rule"
+                    | "final_rule"
+                    | "path_class"
                     | "reason"
                     | "hook"
                     | "command"
@@ -265,6 +352,56 @@ fn sanitize(fields: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn report_content_permit_metadata_is_closed_and_redacted() {
+        let safe = sanitize(json!({"final_rule":"deferred","path_class":"results","command":"secret command","path":"/private/person/file"}));
+        assert_eq!(safe["final_rule"], "deferred");
+        assert_eq!(safe["path_class"], "results");
+        assert!(!safe.to_string().contains("secret command"));
+        assert!(!safe.to_string().contains("/private/person"));
+        let unsafe_fields = sanitize(json!({"final_rule":"deny /private/person","path_class":"/private/person"}));
+        assert_eq!(unsafe_fields["final_rule"], "[REDACTED]");
+        assert_eq!(unsafe_fields["path_class"], "[REDACTED]");
+    }
+
+    #[test]
+    fn permit_metadata_classifies_literal_paths_and_never_copies_inputs() {
+        let base = if cfg!(windows) { PathBuf::from(r"C:\private-person\project") } else { PathBuf::from("/private-person/project") };
+        let worktree = base.join(".dex/wt/worker");
+        let ctx = crate::permit::Ctx { team_root: Some(base.clone()), cwd: Some(worktree.clone()),
+            write: vec![worktree.clone(), base.join(".dex/results"), base.join(".dex/tmp")], ..Default::default() };
+        for (path, class) in [
+            (base.join("source.rs"), "project"), (worktree.join("source.rs"), "worktree"),
+            (base.join(".dex/results/1.md"), "results"), (base.join(".dex/tmp/log.txt"), "tmp"),
+            (base.parent().unwrap().join("outside/file"), "outside"),
+        ] {
+            let fields = sanitize(permit_fields("worker", "deny", "deny", "outside_write", "Write", &json!({"file_path":path,"content":"secret body"}), Some(&ctx), None));
+            assert_eq!(fields["path_class"], class);
+            assert!(!fields.to_string().contains("private-person"));
+            assert!(!fields.to_string().contains("secret body"));
+        }
+        let fields = sanitize(permit_fields("worker", "leader", "policy", "deferred", "exec_command",
+            &json!({"cmd":"secret body /private-person/path"}), Some(&ctx), None));
+        assert_eq!(fields["final_rule"], "deferred");
+        assert_eq!(fields["path_class"], "unknown");
+        assert!(!fields.to_string().contains("secret body"));
+        assert_eq!(permit_path_class("Skill", &json!({}), Some(&ctx)), "no_path");
+        assert_eq!(denial_rule("Dex politikası izin vermiyor: çalışma dizini dışına yazma: /private-person"), "outside_write");
+    }
+
+    #[test]
+    fn later_dex_gate_denial_is_distinct_from_a_deferred_permit() {
+        let body = json!({"tool_name":"exec_command","tool_input":{"cmd":"private command"}});
+        let reply = json!({"hookSpecificOutput":{"permissionDecision":"deny",
+            "permissionDecisionReason":"Alt takım kabuk çalıştıramaz; private path"}}).to_string();
+        let fields = sanitize(permit_hook_reply_fields("worker", &body, Some(&reply)).unwrap());
+        assert_eq!(fields["decision"], "deny");
+        assert_eq!(fields["final_rule"], "service_shell");
+        assert_eq!(fields["path_class"], "unknown");
+        assert!(!fields.to_string().contains("private"));
+        assert!(permit_hook_reply_fields("worker", &body, None).is_none());
+    }
+
     #[test]
     fn teardown_fields_only_accept_numeric_metadata() {
         assert_eq!(super::sanitize(serde_json::json!({"duration_ms": 5000, "pending": 2})),
@@ -394,7 +531,7 @@ mod tests {
                 .args(format_args!("Authorization: Bearer private-token"))
                 .build(),
         );
-        logger.log(&log::Record::builder().target("dex::audit").level(log::Level::Info).args(format_args!("{}", json!({"event": "permit", "fields": {"command": "KEY=private-token", "private-token": "value", "decision": "deny"}}))).build());
+        logger.log(&log::Record::builder().target("dex::audit").level(log::Level::Info).args(format_args!("{}", json!({"event": "permit", "fields": {"command": "KEY=private-token", "private-token": "value", "decision": "deny", "final_rule":"outside_write", "path_class":"outside", "path":"/private/person"}}))).build());
         logger.log(
             &log::Record::builder()
                 .target("dependency")
@@ -408,6 +545,9 @@ mod tests {
         assert_eq!(content.lines().count(), 2);
         assert!(!content.contains("private-token"), "{content}");
         assert!(!content.contains("Authorization"));
+        assert!(!content.contains("/private/person"));
+        assert!(content.contains("outside_write"));
+        assert!(content.contains("\"path_class\":\"outside\""));
         assert!(content.contains("[REDACTED]"));
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -446,6 +446,7 @@ impl Core {
         // DEX-33: the whole e2e suite is QA's (test budget); others give a spec or a grep.
         if event == "PreToolUse" {
             if let Some(out) = with(&self.db, |c| Ok(test_budget::on_pre_tool(c, agent, body))).ok().flatten() {
+                diagnostics::permit_hook_reply(agent, body, Some(&out));
                 return Some(out);
             }
         }
@@ -459,6 +460,7 @@ impl Core {
             // DEX-22: plan / member-proposal notes for the leader ride along.
             plan::with_notes_pending(&self.db, agent, event, out, pending.as_ref())
         });
+        if event == "PreToolUse" { diagnostics::permit_hook_reply(agent, body, out.as_deref()); }
         if let Some(pending) = pending.filter(|_| is_blocked(&out)) {
             if let (Some(stop), Some(reply)) = (stop, out.as_deref().and_then(|o| serde_json::from_str::<Value>(o).ok())) {
                 if let Some(reason) = reply["reason"].as_str() {
@@ -1377,7 +1379,7 @@ impl Core {
         let (ctx, claude, worker, running) = match placed {
             Ok((Some((ctx, claude, worker)), running)) => (ctx, claude, worker, running),
             _ if self.hooks.is_fail_closed(agent) => {
-                diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "deny", "rule": "policy"}));
+                diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "policy", "policy_unavailable", tool, &input, None, None));
                 self.permit_audit(agent, "deny", "policy_unavailable", None, input.to_string().len());
                 return Some((Err("Dex izin denetimi şu an karar veremiyor; araç engellendi. Biraz sonra aynı adımı yeniden dene; sürerse raporunda belirt.".into()), true));
             }
@@ -1385,17 +1387,17 @@ impl Core {
         };
         let answer = match permit::decide(tool, &input, &ctx) {
             permit::Verdict::Deny(why) if !worker => {
-                diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "deny", "rule": "deny", "bytes": input.to_string().len()}));
+                diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "deny", diagnostics::denial_rule(&why), tool, &input, Some(&ctx), None));
                 self.permit_audit(agent, "deny", "deny", None, input.to_string().len());
                 Err(format!("Dex politikası izin vermiyor: {why}. Bu patron işi: bu adımı atla; gerekiyorsa patrona bildir."))
             }
             _ if !worker => {
-                diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "allow", "rule": "leader_bypass", "bytes": input.to_string().len()}));
+                diagnostics::event("permit", diagnostics::permit_fields(agent, "allow", "leader_bypass", "leader_bypass", tool, &input, Some(&ctx), None));
                 return None;
             }
             permit::Verdict::Allow => Ok(()),
             permit::Verdict::Deny(why) => {
-                diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "deny", "rule": "deny", "bytes": input.to_string().len()}));
+                diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "deny", diagnostics::denial_rule(&why), tool, &input, Some(&ctx), None));
                 self.permit_audit(agent, "deny", "deny", None, input.to_string().len());
                 Err(format!(
                     "Dex politikası izin vermiyor: {why}. Bu patron işi: ask_leader'a gerek yok, lider de açamaz. \
@@ -1403,18 +1405,18 @@ impl Core {
                 ))
             }
             permit::Verdict::Leader(_) if !gray => {
-                diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "leader", "rule": "policy", "bytes": input.to_string().len()}));
+                diagnostics::event("permit", diagnostics::permit_fields(agent, "leader", "policy", "deferred", tool, &input, Some(&ctx), None));
                 return None;
             }
             permit::Verdict::Leader(what) => {
                 let what = format!("{tool}: {}", if what.is_empty() { tool } else { &what });
                 if let Some(id) = self.permits.take(agent, &what, running) {
-                    diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "allow", "rule": "grant", "id": id}));
+                    diagnostics::event("permit", diagnostics::permit_fields(agent, "allow", "grant", "permit_grant", tool, &input, Some(&ctx), Some(id)));
                     self.permit_audit(agent, "allow", "grant", Some(id), input.to_string().len());
                     Ok(())
                 } else {
                     let id = self.permits.ask(agent, &what);
-                    diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": "leader", "rule": "policy", "id": id}));
+                    diagnostics::event("permit", diagnostics::permit_fields(agent, "leader", "policy", "permit_required", tool, &input, Some(&ctx), Some(id)));
                     self.permit_audit(agent, "leader", "policy", Some(id), input.to_string().len());
                     Err(format!(
                         "Dex politikası dışı (izin #{id}): `{what}`. ask_leader ile liderinden iste, soruda izin #{id}'i an; \
@@ -1423,7 +1425,8 @@ impl Core {
                 }
             }
         };
-        diagnostics::event("permit", serde_json::json!({"agent": agent, "decision": if answer.is_ok() { "allow" } else { "deny" }, "rule": "policy", "bytes": input.to_string().len()}));
+        diagnostics::event("permit", diagnostics::permit_fields(agent, if answer.is_ok() { "allow" } else { "deny" }, "policy",
+            answer.as_ref().err().map_or("allow_policy", |why| diagnostics::denial_rule(why)), tool, &input, Some(&ctx), None));
         Some((answer, claude))
     }
 
