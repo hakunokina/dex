@@ -965,8 +965,10 @@ impl crate::Core {
                 self.turns.prompt(conn, agent, text);
                 Ok(())
             });
-            let state = self.agent_states.hook(agent, Some(crate::agents::Status::Working), None);
-            let _ = self.events.emit("agent-status", &state);
+            if self.agent_states.get(agent).engine.as_deref() == Some("codex") {
+                let state = self.agent_states.hook(agent, Some(crate::agents::Status::Working), None);
+                let _ = self.events.emit("agent-status", &state);
+            }
         })
     }
 
@@ -976,7 +978,7 @@ impl crate::Core {
 
     /// Separate Enter allows a leader's unaccepted paste to retry without duplicating its text.
     pub(crate) fn paste_enter(&self, agent: &str) -> Result<(), String> {
-        self.paste_enter_with(|| self.ptys.write(agent, b"\r"))
+        self.paste_enter_with(|| self.claude_prompt_submit(agent, true, None, || self.ptys.write(agent, b"\r")))
     }
 
     /// Run the final check and write together, after the redraw delay.
@@ -1124,6 +1126,7 @@ mod patron_turn_tests {
         let path = root.join("transcript.jsonl");
         std::fs::write(&path, "").unwrap();
         core.agent_states.hook("timur", Some(Status::Working), Some("session-a"));
+        core.claude_hook_received("timur", "UserPromptSubmit", Some("session-a"), crate::agents::next_seq());
         core.agent_states.set_transcript("timur", path.to_str().unwrap());
         core.chat_rescan("timur");
         std::fs::write(&path, format!("{}\n", json!({

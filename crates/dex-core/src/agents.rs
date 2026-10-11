@@ -165,13 +165,13 @@ impl States {
         self.hook_turn_seq(id, status, session_id, seq, false)
     }
 
-    /// A delayed Claude hook may cross only the exact status written by its transcript.
+    /// A delayed Claude update may cross only the exact status written by its turn.
     /// Check and publish under one lock; a paste, exit or wait keeps its newer status.
-    pub(crate) fn hook_if_current(&self, id: &str, status: Status, session: &str, ingress: u64, transcript_seq: Option<u64>, seq: u64) -> Option<State> {
+    pub(crate) fn hook_if_current(&self, id: &str, status: Status, session: &str, ingress: u64, owned_seq: Option<u64>, seq: u64) -> Option<State> {
         let mut states = self.0.lock().unwrap();
         let state = states.get_mut(id)?;
         if state.session_id.as_deref() != Some(session)
-            || state.status_seq > ingress && Some(state.status_seq) != transcript_seq
+            || state.status_seq > ingress && Some(state.status_seq) != owned_seq
         {
             return None;
         }
@@ -186,6 +186,24 @@ impl States {
 
     pub(crate) fn prompt_seq(&self, id: &str, session_id: Option<&str>, seq: u64) -> State {
         self.hook_turn_seq(id, Some(Status::Working), session_id, seq, true)
+    }
+
+    /// Publish successful Enter after its write, preserving changes made during that write.
+    /// Pending leader delivery keeps Idle but still fences older accepted hook callbacks.
+    pub(crate) fn submitted_prompt(&self, before: &State, ingress: u64, seq: u64, working: bool) -> Option<State> {
+        let mut states = self.0.lock().unwrap();
+        let state = states.entry(before.agent_id.clone()).or_insert_with(|| before.clone());
+        if state.session_id != before.session_id || state.status_seq > ingress { return None; }
+        // A fresh local turn can complete without UPS, even while delivery stays Idle.
+        state.team_turn_interrupted = false;
+        state.team_turn_checked = false;
+        if working {
+            state.pre_session = false;
+            state.hook_at = now();
+            state.set_status(Status::Working);
+        }
+        state.status_seq = seq;
+        Some(state.clone())
     }
 
     fn hook_turn_seq(&self, id: &str, status: Option<Status>, session_id: Option<&str>, seq: u64, new_turn: bool) -> State {

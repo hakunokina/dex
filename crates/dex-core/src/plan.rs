@@ -488,7 +488,7 @@ impl crate::Core {
                 && !self.agent_states.pre_session(id);
             if allowed {
                 delivery_audit(id, "enter");
-                self.ptys.write(id, b"\r")
+                self.claude_prompt_submit(id, false, flights.get(id).map(|p| (p.notes.clone(), p.questions.clone(), p.results.clone())), || self.ptys.write(id, b"\r"))
             } else { delivery_audit(id, "readiness"); Ok(()) }
         }).is_err() { delivery_audit(id, "write_error"); log::warn!("leader prompt Enter failed; awaiting retry"); }
         drop(turn);
