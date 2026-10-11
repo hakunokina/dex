@@ -11,8 +11,10 @@ use crate::Core;
 
 struct Session {
     gen: u64,
-    master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// Serialize size ownership and its I/O within this generation, never across PTYs.
+    resize_gate: Arc<Mutex<()>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Output fan-out; outlives any one subscriber (S2: several clients, reconnects).
     stream: Arc<PtyStream>,
@@ -387,8 +389,9 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // short-lived process visible, this lets the backend terminal sink answer startup queries.
     let old = core.ptys.insert(id.clone(), Session {
         gen,
-        master: pair.master,
-        writer,
+        master: Arc::new(Mutex::new(pair.master)),
+        writer: Arc::new(Mutex::new(writer)),
+        resize_gate: Arc::default(),
         killer,
         stream: stream.clone(),
         replay: !is_shell && engine.is_some(),
@@ -554,43 +557,65 @@ impl Ptys {
 
     #[cfg(test)]
     pub(crate) fn input_writer_for_test(&self, id: &str, wrap: impl FnOnce(Box<dyn Write + Send>) -> Box<dyn Write + Send>) {
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.get_mut(id).unwrap();
-        let original = std::mem::replace(&mut session.writer, Box::new(Vec::<u8>::new()));
-        session.writer = wrap(original);
+        let writer = self.sessions.lock().unwrap().get(id).unwrap().writer.clone();
+        let mut writer = writer.lock().unwrap();
+        let original = std::mem::replace(&mut *writer, Box::new(Vec::<u8>::new()));
+        *writer = wrap(original);
     }
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
-        let mut map = self.sessions.lock().unwrap();
-        let s = map.get_mut(id).ok_or("no session")?;
-        s.writer.write_all(data).map_err(|e| e.to_string())?;
-        s.writer.flush().map_err(|e| e.to_string())
+        let writer = self.sessions.lock().unwrap().get(id).ok_or("no session")?.writer.clone();
+        let mut writer = writer.lock().unwrap();
+        writer.write_all(data).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
     }
 
     /// #62: `client`'s view is `cols`×`rows`. `claim` (the patron typed or focused there) makes it
     /// the size owner; otherwise the size applies only while it owns the size or nobody does.
     pub fn resize(&self, id: &str, client: &str, cols: u16, rows: u16, claim: bool) -> Result<(), String> {
         validate_size(cols, rows)?;
-        let mut map = self.sessions.lock().unwrap();
-        let s = map.get_mut(id).ok_or("no session")?;
-        let size = if claim { s.sizes.claim(client, cols, rows) } else { s.sizes.report(client, cols, rows) };
-        apply(s, size)
+        self.apply(id, None, |sizes| if claim { sizes.claim(client, cols, rows) } else { sizes.report(client, cols, rows) })
     }
 
     /// #62: `client` stopped showing `id` (detach); a size it owned passes on.
     pub fn release(&self, id: &str, client: &str) {
-        if let Some(s) = self.sessions.lock().unwrap().get_mut(id) {
-            let size = s.sizes.release(client);
-            let _ = apply(s, size);
-        }
+        let _ = self.apply(id, None, |sizes| sizes.release(client));
     }
 
     /// #62: `client` is gone (connection closed) from every PTY.
     pub fn release_client(&self, client: &str) {
-        for s in self.sessions.lock().unwrap().values_mut() {
-            let size = s.sizes.release(client);
-            let _ = apply(s, size);
+        let sessions: Vec<_> = self.sessions.lock().unwrap().iter().map(|(id, s)| (id.clone(), s.gen)).collect();
+        for (id, gen) in sessions {
+            let _ = self.apply(&id, Some(gen), |sizes| sizes.release(client));
         }
+    }
+
+    fn apply(&self, id: &str, expected: Option<u64>, update: impl FnOnce(&mut Sizes) -> Option<(u16, u16)>) -> Result<(), String> {
+        let (gen, gate) = {
+            let map = self.sessions.lock().unwrap();
+            let s = map.get(id).filter(|s| expected.is_none_or(|gen| s.gen == gen)).ok_or("no session")?;
+            (s.gen, s.resize_gate.clone())
+        };
+        // Wait outside the registry: output can answer queries through write while this resize
+        // waits for ConPTY/stream. A replacement has its own gate and must not inherit this size.
+        let _resize = gate.lock().unwrap();
+        let (master, stream, cols, rows) = {
+            let mut map = self.sessions.lock().unwrap();
+            let s = map.get_mut(id).filter(|s| s.gen == gen).ok_or("no session")?;
+            let Some((cols, rows)) = update(&mut s.sizes).filter(|&(c, r)| (c, r) != (s.cols, s.rows)) else { return Ok(()) };
+            (s.master.clone(), s.stream.clone(), cols, rows)
+        };
+        #[cfg(test)]
+        BEFORE_RESIZE.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
+        master.lock().unwrap()
+            .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .map_err(|e| e.to_string())?;
+        stream.resize(rows, cols);
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(id).filter(|s| s.gen == gen) {
+            s.cols = cols;
+            s.rows = rows;
+        }
+        Ok(())
     }
 
     /// DEX-30: the agent's CLI is running (its engine/model can't change under it).
@@ -666,27 +691,22 @@ impl Ptys {
     }
 
     pub fn subscribe(&self, id: &str, sink: impl PtySink) -> Result<(), String> {
-        let map = self.sessions.lock().unwrap();
-        map.get(id).ok_or("no session")?.stream.subscribe(sink)?;
+        let stream = self.sessions.lock().unwrap().get(id).ok_or("no session")?.stream.clone();
+        stream.subscribe(sink)?;
         Ok(())
     }
 
     /// S5-B: the PTY's visible screen as text — the waiting question shown in the chat card.
     pub fn screen(&self, id: &str) -> Result<String, String> {
-        let map = self.sessions.lock().unwrap();
-        Ok(map.get(id).ok_or("no session")?.stream.contents())
+        let stream = self.sessions.lock().unwrap().get(id).ok_or("no session")?.stream.clone();
+        Ok(stream.contents())
     }
 }
 
-fn apply(s: &mut Session, size: Option<(u16, u16)>) -> Result<(), String> {
-    let Some((cols, rows)) = size.filter(|&(c, r)| (c, r) != (s.cols, s.rows)) else { return Ok(()) };
-    s.master
-        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| e.to_string())?;
-    s.stream.resize(rows, cols);
-    s.cols = cols;
-    s.rows = rows;
-    Ok(())
+#[cfg(test)]
+thread_local! {
+    /// Pause the real resize path without depending on ConPTY scheduling.
+    static BEFORE_RESIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 const MAX_COLS: u16 = 512;
@@ -714,6 +734,176 @@ fn scrollback_lines() -> usize {
 mod tests {
     use super::*;
 
+    fn isolated_lock_test(test: &str) -> bool {
+        use std::{process::{Command, Stdio}, sync::mpsc, time::Duration};
+        const CHILD: &str = "DEX_PTY_LOCK_TEST_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok(test) {
+            // A broken lock order leaves two threads blocked. Keep them in a child so neither
+            // a panic nor a regression can strand the main test suite's PTY registry.
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, test).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let output = std::thread::spawn(move || {
+                let mut text = String::new();
+                stderr.read_to_string(&mut text).unwrap();
+                let _ = tx.send(text);
+            });
+            let text = match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(text) => text,
+                Err(error) => {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    output.join().unwrap();
+                    panic!("isolated PTY lock test did not exit: {error}");
+                }
+            };
+            let status = child.wait().unwrap();
+            output.join().unwrap();
+            assert!(status.success(), "isolated PTY lock test failed: {text}");
+            return true;
+        }
+        false
+    }
+
+    #[test]
+    fn resize_and_cursor_reply_do_not_deadlock() {
+        use std::{sync::mpsc, time::Duration};
+        if isolated_lock_test("pty::tests::resize_and_cursor_reply_do_not_deadlock") { return; }
+        let timeout = Duration::from_secs(2);
+
+        struct Query<S> { sink: S, entered: mpsc::Sender<()> }
+        impl<S: PtySink> PtySink for Query<S> {
+            fn data(&mut self, bytes: &[u8]) -> bool {
+                if bytes == b"6n" { self.entered.send(()).unwrap(); }
+                self.sink.data(bytes)
+            }
+            fn exit(&mut self) { self.sink.exit(); }
+        }
+        struct Reply { _original: Box<dyn Write + Send>, tx: mpsc::Sender<Vec<u8>> }
+        impl Write for Reply {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.tx.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let core = replay_core();
+        let stream = Arc::new(PtyStream::default());
+        core.ptys.insert("kaan".into(), replay_session(1, stream.clone()));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core.ptys.input_writer_for_test("kaan", |original| Box::new(Reply { _original: original, tx: reply_tx }));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        // This adapter calls the production AgentSink, including its split-query parser/write.
+        stream.subscribe(Query { sink: crate::agents::shell_sink_for_test(&core, "kaan", Exited::default()), entered: entered_tx }).unwrap();
+        stream.publish(b"\x1b[");
+        let (resizing_tx, resizing_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (resized_tx, resized_rx) = mpsc::channel();
+        let ptys = core.ptys.clone();
+        let resize = std::thread::spawn(move || {
+            BEFORE_RESIZE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                resizing_tx.send(()).unwrap();
+                release_rx.recv_timeout(timeout).unwrap();
+            })));
+            let result = ptys.resize("kaan", "desktop", 100, 30, true);
+            resized_tx.send(result).unwrap();
+        });
+        resizing_rx.recv_timeout(timeout).expect("resize reached its master call");
+        let (published_tx, published_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || { stream.publish(b"6n"); published_tx.send(()).unwrap(); });
+        entered_rx.recv_timeout(timeout).expect("reader holds the stream lock and enters AgentSink");
+        release_tx.send(()).unwrap();
+        // Before the fix, resize waits for stream while the real CPR responder waits for sessions.
+        assert_eq!(reply_rx.recv_timeout(timeout).expect("CPR blocked by sessions -> stream -> sessions"), b"\x1b[1;1R");
+        published_rx.recv_timeout(timeout).expect("reader completed");
+        resized_rx.recv_timeout(timeout).expect("resize completed").unwrap();
+        reader.join().unwrap();
+        resize.join().unwrap();
+        assert_eq!((core.ptys.list()[0].cols, core.ptys.list()[0].rows), (100, 30));
+        core.ptys.kill("kaan");
+        core.shutdown();
+    }
+
+    #[test]
+    fn size_operations_are_serial_and_generation_scoped() {
+        use std::{sync::mpsc, time::Duration};
+        if isolated_lock_test("pty::tests::size_operations_are_serial_and_generation_scoped") { return; }
+        let timeout = Duration::from_secs(2);
+        let ptys = Ptys::default();
+        let stream = Arc::new(PtyStream::new(24, 120, 2_000));
+        ptys.insert("kaan".into(), replay_session(1, stream.clone()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let resize = {
+            let ptys = ptys.clone();
+            std::thread::spawn(move || {
+                BEFORE_RESIZE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(timeout).unwrap();
+                })));
+                ptys.resize("kaan", "desktop", 100, 30, true).unwrap();
+            })
+        };
+        entered_rx.recv_timeout(timeout).unwrap();
+        let gate = {
+            let map = ptys.sessions.try_lock().expect("ConPTY resize must leave the registry available");
+            map["kaan"].resize_gate.clone()
+        };
+        assert!(gate.try_lock().is_err(), "size ownership and I/O share one session gate");
+        // A second operation is queued on the same generation, but leaves the registry free.
+        let (started_tx, started_rx) = mpsc::channel();
+        let (updated_tx, updated_rx) = mpsc::channel();
+        let next = {
+            let ptys = ptys.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                ptys.apply("kaan", Some(1), |sizes| {
+                    updated_tx.send(()).unwrap();
+                    sizes.claim("phone", 80, 20)
+                }).unwrap();
+            })
+        };
+        started_rx.recv_timeout(timeout).unwrap();
+        assert!(matches!(updated_rx.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(ptys.sessions.try_lock().is_ok(), "waiting for the gate must leave the registry available");
+        release_tx.send(()).unwrap();
+        updated_rx.recv_timeout(timeout).unwrap();
+        resize.join().unwrap();
+        next.join().unwrap();
+        assert_eq!((ptys.list()[0].cols, ptys.list()[0].rows), (80, 20));
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        assert_eq!((snapshot.cols, snapshot.rows), (80, 20));
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_resize = {
+            let ptys = ptys.clone();
+            std::thread::spawn(move || {
+                BEFORE_RESIZE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(timeout).unwrap();
+                })));
+                ptys.resize("kaan", "desktop", 90, 25, true).unwrap();
+            })
+        };
+        entered_rx.recv_timeout(timeout).unwrap();
+        let replacement = Arc::new(PtyStream::new(24, 120, 2_000));
+        let old = ptys.insert("kaan".into(), replay_session(2, replacement));
+        // A replacement proceeds through its own gate even while the old ConPTY call is paused.
+        ptys.resize("kaan", "phone", 70, 15, true).unwrap();
+        release_tx.send(()).unwrap();
+        old_resize.join().unwrap();
+        assert_eq!((ptys.list()[0].cols, ptys.list()[0].rows), (70, 15), "old completion cannot overwrite a replacement");
+        assert_eq!(ptys.apply("kaan", Some(1), |sizes| sizes.release("phone")), Err("no session".into()));
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        assert_eq!((snapshot.cols, snapshot.rows), (70, 15));
+        assert_eq!(ptys.sessions.lock().unwrap()["kaan"].sizes.owner.as_deref(), Some("phone"));
+        drop(old);
+        ptys.kill("kaan");
+    }
+
     #[derive(Clone, Default)]
     struct Exited(Arc<std::sync::atomic::AtomicBool>);
     impl PtySink for Exited {
@@ -730,7 +920,7 @@ mod tests {
 
     fn replay_session(gen: u64, stream: Arc<PtyStream>) -> Session {
         let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
-        Session { gen, writer: pair.master.take_writer().unwrap(), master: pair.master,
+        Session { gen, writer: Arc::new(Mutex::new(pair.master.take_writer().unwrap())), master: Arc::new(Mutex::new(pair.master)), resize_gate: Arc::default(),
             killer: Box::new(NoChild), stream, replay: true, kind: "agent".into(),
             cols: 120, rows: 24, started_at: 0, sizes: Sizes::default() }
     }
