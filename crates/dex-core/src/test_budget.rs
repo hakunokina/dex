@@ -293,6 +293,11 @@ fn unfiltered_gut(words: &[String]) -> bool {
 }
 
 fn e2e_command_words(command: &str, d: Option<crate::permit::Dialect>) -> Vec<Vec<String>> {
+    // Rd splits braces into synthetic commands, losing narrow brace-expanded selectors.
+    // Prefer the legacy path here; braces in comments also fall back (budget guard, not security).
+    if command.contains(['{', '}']) {
+        return segments(command);
+    }
     let mut words = crate::permit::command_words(command, d);
     // Keep every legacy denial, including unknown dialects and incomplete Rd parses.
     words.extend(segments(command));
@@ -583,6 +588,77 @@ mod tests {
     #[test]
     fn playwright_shell_bash() {
         playwright_shell_table("Bash", None, "npx playwright test");
+    }
+
+    #[test]
+    fn playwright_shell_brace_filters() {
+        for suffix in ["{e2e/a,e2e/b}.spec.ts --workers=1", "e2e/{a,b}.spec.ts"] {
+            e2e_shell_budget("Bash", &format!("npx playwright test {suffix}"), None, None);
+        }
+    }
+
+    fn e2e_shell_package_brace_table(script_body: bool) {
+        let f = marker_fixture(&[], &[]);
+        let gut = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs";
+        let mut scripts = serde_json::Map::new();
+        scripts.insert("e2e".into(), json!("npx playwright test"));
+        scripts.insert("gut".into(), json!(gut));
+        for (name, prefix, suffixes) in [
+            ("e2e", "npx playwright test", vec!["{e2e/a,e2e/b}.spec.ts --workers=1", "e2e/{a,b}.spec.ts"]),
+            ("gut", gut, vec!["-gselect=test_{jump,run}"]),
+        ] {
+            for (i, suffix) in suffixes.iter().enumerate() {
+                scripts.insert(format!("{name}-brace-{i}"), json!(format!("{prefix} {suffix}")));
+            }
+        }
+        std::fs::write(f.0.join("package.json"), json!({ "scripts": scripts }).to_string()).unwrap();
+        for (name, suffixes) in [
+            ("e2e", vec!["{e2e/a,e2e/b}.spec.ts --workers=1", "e2e/{a,b}.spec.ts"]),
+            ("gut", vec!["-gselect=test_{jump,run}"]),
+        ] {
+            for (i, suffix) in suffixes.iter().enumerate() {
+                let cmd = if script_body { format!("npm run {name}-brace-{i}") } else { format!("npm run {name} -- {suffix}") };
+                e2e_shell_budget("Bash", &cmd, Some(&f.0), None);
+            }
+        }
+    }
+
+    #[test]
+    fn e2e_shell_package_brace_filters() {
+        e2e_shell_package_brace_table(false);
+    }
+
+    #[test]
+    fn e2e_shell_package_brace_bodies() {
+        e2e_shell_package_brace_table(true);
+    }
+
+    #[test]
+    fn gut_shell_brace_selector() {
+        e2e_shell_budget("Bash", "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs -gselect=test_{jump,run}", None, None);
+    }
+
+    #[test]
+    fn rust_shell_grouped_filters_stay_allowed() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        for (tool, cmd) in [
+            ("Bash", "{ cargo test -p dex-core --lib chat; }"),
+            ("Bash", "(cargo test -p dex-core --lib chat)"),
+            ("PowerShell", "& { cargo test -p dex-core --lib chat }"),
+        ] {
+            let input = json!({ "cmd": cmd });
+            let body = json!({ "tool_name": tool, "tool_input": input });
+            assert_eq!(full_suite_denial_in_shell(cmd, None, crate::permit::dialect(tool, &input)), None, "{tool}: {cmd}");
+            assert!(on_pre_tool(&c, "kaan", &body).is_none(), "{tool}: {cmd}");
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {tool}: {cmd}");
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let mut ctx = crate::permit::Ctx { cwd: Some(root.clone()), write: vec![root], ..Default::default() };
+            for qa in [false, true] {
+                ctx.qa = qa;
+                let out = crate::permit::decide(tool, &input, &ctx);
+                assert!(!matches!(out, crate::permit::Verdict::Deny(ref why) if why.contains(DENY_RUST)), "permit: QA={qa}: {tool}: {cmd}: {out:?}");
+            }
+        }
     }
 
     #[test]
