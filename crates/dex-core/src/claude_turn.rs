@@ -29,6 +29,7 @@ struct Turn {
     interrupted: bool,
     accepted: bool,
     pending: Option<Rows>,
+    reply: Option<String>,
     latest_seq: u64,
     end_seq: u64,
 }
@@ -87,6 +88,7 @@ impl Core {
             cancelled: false,
             accepted: false,
             pending: None,
+            reply: None,
             latest_seq: seq,
             end_seq: 0,
             interrupted: false,
@@ -110,6 +112,7 @@ impl Core {
                 cancelled: false,
                 accepted: false,
                 pending: None,
+                reply: None,
                 latest_seq: seq,
                 end_seq: 0,
                 interrupted: false,
@@ -143,6 +146,7 @@ impl Core {
             turn.cancelled = false;
             turn.accepted = false;
             turn.pending = None;
+            turn.reply = None;
             return Some(stop);
         }
         None
@@ -207,7 +211,7 @@ impl Core {
         }
     }
 
-    pub(crate) fn claude_stage_stop(&self, agent: &str, stop: &Stop, rows: Rows) {
+    pub(crate) fn claude_stage_stop(&self, agent: &str, stop: &Stop, rows: Rows, reason: &str) {
         let mut turns = self.claude_turns.0.lock().unwrap();
         let Some(turn) = turns
             .get_mut(agent)
@@ -217,6 +221,7 @@ impl Core {
             return;
         };
         turn.pending = Some(rows);
+        turn.reply = Some(format!("Stop hook feedback:\n{reason}"));
         audit(agent, Some(stop.seq), "stop_prepare");
         if turn.accepted {
             self.accept_stop_rows(agent, turn);
@@ -262,6 +267,7 @@ impl Core {
             turn.interrupted = true;
             turn.pending = None;
             turn.accepted = false;
+            turn.reply = None;
         }
     }
 
@@ -289,15 +295,20 @@ impl Core {
         let Some(timestamp) = crate::chat::parse_ts(&row["timestamp"]) else {
             return;
         };
+        let cancellation = row["type"] == "attachment"
+            && row["attachment"]["type"] == "hook_cancelled"
+            && row["attachment"]["hookEvent"] == "Stop";
         let ended = row["type"] == "system" && row["subtype"] == "turn_duration"
-            || row["type"] == "attachment"
-                && row["attachment"]["type"] == "hook_cancelled"
-                && row["attachment"]["hookEvent"] == "Stop"
-                && row["attachment"]["timedOut"] == true;
-        let continued = row["type"] == "system"
-            && row["subtype"] == "stop_hook_summary"
-            && row["preventedContinuation"] == true;
-        if !ended && !continued {
+            || cancellation && row["attachment"]["timedOut"] == true;
+        // A summary (including preventedContinuation) says nothing about which
+        // hook reached model context. The CLI's meta user feedback is the receipt.
+        let feedback =
+            (row["type"] == "user" && row["isMeta"] == true && row["message"]["role"] == "user")
+                .then(|| row["message"]["content"].as_str())
+                .flatten()
+                .filter(|s| s.starts_with("Stop hook feedback:\n"));
+        let continued = feedback.is_some();
+        if !ended && !continued && !cancellation {
             return;
         }
         let mut turns = self.claude_turns.0.lock().unwrap();
@@ -312,6 +323,7 @@ impl Core {
             cancelled: false,
             accepted: false,
             pending: None,
+            reply: None,
             latest_seq: 0,
             end_seq: 0,
             interrupted: false,
@@ -332,13 +344,17 @@ impl Core {
         }
         // Delivery evidence belongs to the Stop attempt, even after a tool hook advanced
         // the live turn. A general continuation cannot acknowledge Dex's cancelled reply.
-        let cancellation = row["type"] == "attachment" && ended;
+        let continued = continued && turn.stop.as_ref().is_some_and(|s| timestamp >= s.at);
         if cancellation && turn.stop.as_ref().is_some_and(|s| timestamp >= s.after) {
             turn.cancelled = true;
             turn.accepted = false;
             turn.pending = None;
         }
-        if continued && turn.stop.as_ref().is_some_and(|s| timestamp >= s.at) && !turn.cancelled {
+        if feedback.is_some()
+            && feedback == turn.reply.as_deref()
+            && turn.stop.as_ref().is_some_and(|s| timestamp >= s.at)
+            && !turn.cancelled
+        {
             turn.accepted = true;
             self.accept_stop_rows(agent, turn);
         }
@@ -529,12 +545,44 @@ pub(crate) mod tests {
     fn row(subtype: &str, ms: u64) -> Value {
         json!({"type":"system","subtype":subtype,"sessionId":"session-a","timestamp":timestamp(ms)})
     }
+    // Claude Code 2.1.296 writes these rows in this order for decision:block.
+    // Keep the real shape, including the nested blockingError and string content.
+    fn blocked_stop_rows(session: &str, reason: &str, ms: u64) -> [Value; 3] {
+        let ts = timestamp(ms);
+        [
+            json!({"type":"user","isMeta":true,"isSidechain":false,
+                "sessionId":session,"timestamp":ts,
+                "message":{"role":"user","content":format!("Stop hook feedback:\n{reason}")}}),
+            json!({"type":"attachment","isSidechain":false,"sessionId":session,"timestamp":ts,
+                "attachment":{"type":"hook_blocking_error","hookName":"Stop","hookEvent":"Stop",
+                    "blockingError":{"blockingError":reason,"command":"fixture-hook"}}}),
+            json!({"type":"system","subtype":"stop_hook_summary","isSidechain":false,
+                "sessionId":session,"timestamp":ts,"hookCount":1,"hookErrors":[reason],
+                "hasOutput":true,"preventedContinuation":false}),
+        ]
+    }
+    fn feedback(core: &Core, agent: &str) -> Value {
+        let reply = core
+            .claude_turns
+            .0
+            .lock()
+            .unwrap()
+            .get(agent)
+            .unwrap()
+            .reply
+            .clone()
+            .unwrap();
+        blocked_stop_rows(
+            core.agent_states.get(agent).session_id.as_deref().unwrap(),
+            reply.strip_prefix("Stop hook feedback:\n").unwrap(),
+            crate::diagnostics::now_ms(),
+        )[0]
+        .clone()
+    }
     /// Existing delivery fixtures need a live process and an actual CLI acceptance row.
     pub(crate) fn accepted_stop(core: &Core, agent: &str) {
         assert!(core.ptys.generation(agent).is_some());
-        let summary = json!({"type":"system","subtype":"stop_hook_summary",
-            "sessionId":core.agent_states.get(agent).session_id.unwrap(),
-            "timestamp":timestamp(crate::diagnostics::now_ms()),"preventedContinuation":true});
+        let summary = feedback(core, agent);
         let transcript = core.paths.data_dir.join(format!("accepted-{agent}.jsonl"));
         std::fs::write(&transcript, format!("{summary}\n")).unwrap();
         core.agent_states
@@ -919,7 +967,174 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn stop_summary_accepts_payload_once_and_late_report_stays_pending() {
+    fn blocked_stop_feedback_is_delivered_once_and_second_stop_ends_turn() {
+        let (core, input) = core("blocked-stop-feedback", NullSink);
+        let _finish = Finish(core.clone());
+        let id = result(&core);
+        with(&core.db, |c| crate::plan::note(c, "timur", "note-canary")).unwrap();
+        let transcript = core.paths.data_dir.join("transcript.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        core.agent_states
+            .set_transcript("timur", transcript.to_str().unwrap());
+        let first: Value = post(&core, "Stop", "", Duration::from_secs(2))
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(first["decision"], "block");
+        let reason = first["reason"].as_str().unwrap();
+        assert_eq!(reason.matches("result-canary").count(), 1);
+        assert_eq!(reason.matches("note-canary").count(), 1);
+        assert!(with(&core.db, |c| delegate::get(c, id))
+            .unwrap()
+            .delivered_at
+            .is_none());
+        // The watcher may lag: the next Stop must reconcile all three real CLI rows.
+        let rows = blocked_stop_rows("session-a", reason, crate::diagnostics::now_ms());
+        let jsonl = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+        std::fs::write(&transcript, jsonl).unwrap();
+        let second = post(&core, "Stop", "", Duration::from_secs(2))
+            .unwrap()
+            .into_string()
+            .unwrap();
+        assert!(
+            !crate::is_blocked(&Some(second.clone())),
+            "accepted feedback must not block again"
+        );
+        assert!(!second.contains("result-canary"));
+        assert!(!second.contains("note-canary"));
+        assert!(with(&core.db, |c| delegate::get(c, id))
+            .unwrap()
+            .delivered_at
+            .is_some());
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+        assert!(input.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_exact_live_stop_feedback_accepts_payload() {
+        for case in [
+            "summary",
+            "attachment",
+            "other-hook",
+            "combined-hooks",
+            "crlf",
+            "trimmed",
+            "truncated",
+            "no-prefix",
+            "not-meta",
+            "wrong-role",
+            "sidechain",
+            "old",
+            "wrong-session",
+            "wrong-process",
+            "malformed",
+        ] {
+            let (core, _) = core("feedback-mismatch", NullSink);
+            let _finish = Finish(core.clone());
+            let id = result(&core);
+            let out = core
+                .delegation_on_hook("timur", "Stop", &json!({}), false)
+                .unwrap();
+            let reply: Value = serde_json::from_str(&out).unwrap();
+            let reason = reply["reason"].as_str().unwrap();
+            assert!(reason.ends_with('\n'));
+            let rows = blocked_stop_rows("session-a", reason, crate::diagnostics::now_ms());
+            let mut evidence = rows[0].clone();
+            let exact = evidence["message"]["content"].as_str().unwrap().to_owned();
+            match case {
+                "summary" => evidence = rows[2].clone(),
+                "attachment" => evidence = rows[1].clone(),
+                "other-hook" => {
+                    evidence["message"]["content"] = json!("Stop hook feedback:\nother hook")
+                }
+                "combined-hooks" => {
+                    evidence["message"]["content"] = json!(format!("{exact}\nother hook"))
+                }
+                "crlf" => evidence["message"]["content"] = json!(exact.replace('\n', "\r\n")),
+                "trimmed" => evidence["message"]["content"] = json!(exact.trim_end()),
+                "truncated" => {
+                    evidence["message"]["content"] = json!(exact.replace("result-canary", "result"))
+                }
+                "no-prefix" => evidence["message"]["content"] = json!(reason),
+                "not-meta" => evidence["isMeta"] = json!(false),
+                "wrong-role" => evidence["message"]["role"] = json!("assistant"),
+                "sidechain" => evidence["isSidechain"] = json!(true),
+                "old" => {
+                    let at = core
+                        .claude_turns
+                        .0
+                        .lock()
+                        .unwrap()
+                        .get("timur")
+                        .unwrap()
+                        .stop
+                        .as_ref()
+                        .unwrap()
+                        .at;
+                    evidence["timestamp"] = json!(timestamp(at - 1));
+                }
+                "wrong-session" => evidence["sessionId"] = json!("other-session"),
+                "wrong-process" => {}
+                "malformed" => evidence["message"]["content"] = json!({"text":exact}),
+                _ => unreachable!(),
+            }
+            let process = if case == "wrong-process" {
+                Some(0)
+            } else {
+                core.ptys.generation("timur")
+            };
+            core.claude_transcript_row("timur", &evidence, process);
+            assert!(
+                with(&core.db, |c| delegate::get(c, id))
+                    .unwrap()
+                    .delivered_at
+                    .is_none(),
+                "{case}"
+            );
+            observe(&core, feedback(&core, "timur"));
+            assert!(
+                with(&core.db, |c| delegate::get(c, id))
+                    .unwrap()
+                    .delivered_at
+                    .is_some(),
+                "{case}: payload must remain retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_stop_never_accepts_even_exact_feedback() {
+        for timed_out in [json!(true), json!(false), Value::Null] {
+            let (core, _) = core("cancelled-exact-feedback", NullSink);
+            let _finish = Finish(core.clone());
+            let id = result(&core);
+            core.delegation_on_hook("timur", "Stop", &json!({}), false)
+                .unwrap();
+            let receipt = feedback(&core, "timur");
+            observe(
+                &core,
+                json!({"type":"attachment","sessionId":"session-a","timestamp":receipt["timestamp"],
+                "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":timed_out}}),
+            );
+            observe(&core, receipt);
+            assert!(with(&core.db, |c| delegate::get(c, id))
+                .unwrap()
+                .delivered_at
+                .is_none());
+            let retry = core
+                .delegation_on_hook("timur", "Stop", &json!({}), false)
+                .unwrap();
+            assert_eq!(retry.matches("result-canary").count(), 1);
+            observe(&core, feedback(&core, "timur"));
+            assert!(with(&core.db, |c| delegate::get(c, id))
+                .unwrap()
+                .delivered_at
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn stop_feedback_accepts_payload_once_and_late_report_stays_pending() {
         let (core, _) = core("accept", NullSink);
         let id = result(&core);
         core.delegation_on_hook("timur", "Stop", &json!({}), false)
@@ -928,8 +1143,7 @@ pub(crate) mod tests {
             .unwrap()
             .delivered_at
             .is_none());
-        let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-        summary["preventedContinuation"] = json!(true);
+        let summary = feedback(&core, "timur");
         observe(&core, summary.clone());
         let stamp = with(&core.db, |c| delegate::get(c, id))
             .unwrap()
@@ -998,8 +1212,7 @@ pub(crate) mod tests {
             .set_transcript("timur", transcript.to_str().unwrap());
         core.delegation_on_hook("timur", "Stop", &json!({}), false)
             .unwrap();
-        let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-        summary["preventedContinuation"] = json!(true);
+        let summary = feedback(&core, "timur");
         std::fs::write(&transcript, format!("{summary}\n")).unwrap();
         let old_end = row("turn_duration", crate::diagnostics::now_ms() + 1);
         std::thread::sleep(Duration::from_millis(2));
@@ -1058,8 +1271,8 @@ pub(crate) mod tests {
             "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":true}}),
         );
         std::thread::sleep(Duration::from_millis(2));
-        let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-        summary["preventedContinuation"] = json!(true);
+        let summary =
+            blocked_stop_rows("session-a", "other hook", crate::diagnostics::now_ms())[0].clone();
         observe(&core, summary);
         observe(&core, old_end);
         assert_eq!(
@@ -1095,8 +1308,9 @@ pub(crate) mod tests {
                     "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":true}});
                 // A different Stop hook blocked, although Dex's response never arrived.
                 std::thread::sleep(Duration::from_millis(2));
-                let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-                summary["preventedContinuation"] = json!(true);
+                let summary =
+                    blocked_stop_rows("session-a", "other hook", crate::diagnostics::now_ms())[0]
+                        .clone();
                 let output = json!({"type":"assistant","message":{"content":"x".repeat(padding)}});
                 std::fs::write(&transcript, format!("{cancelled}\n{output}\n{summary}\n")).unwrap();
                 if watch_rows > 0 {
@@ -1196,8 +1410,7 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(first.matches("result-canary").count(), 1);
             assert_eq!(first.matches("question-canary").count(), 1);
-            let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-            summary["preventedContinuation"] = json!(true);
+            let summary = feedback(&core, "timur");
             // The acceptance is outside both a bounded whole-window read and a tail read.
             std::fs::OpenOptions::new()
                 .append(true)
@@ -1272,8 +1485,7 @@ pub(crate) mod tests {
                     .unwrap();
                 core.delegation_on_hook("timur", "Stop", &json!({}), false)
                     .unwrap();
-                let mut summary = row("stop_hook_summary", crate::diagnostics::now_ms());
-                summary["preventedContinuation"] = json!(true);
+                let summary = feedback(&core, "timur");
                 std::fs::OpenOptions::new()
                     .append(true)
                     .open(&transcript)
