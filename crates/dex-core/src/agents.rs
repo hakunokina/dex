@@ -736,6 +736,7 @@ const TERMINAL_QUERY_LEN: usize = b"\x1b]10;?".len();
 struct AgentSink {
     core: std::sync::Weak<crate::Core>,
     id: String,
+    input: Option<crate::pty::PtyInput>,
     /// FIX-4: recent output while a resume is unconfirmed (the marker may span two reads).
     tail: String,
     /// Only an unfinished terminal-query prefix survives a read (at most 5 bytes).
@@ -745,7 +746,7 @@ struct AgentSink {
 
 impl AgentSink {
     fn new(core: &crate::Core, id: &str) -> Self {
-        Self { core: core.weak_self.clone(), id: id.into(), tail: String::new(), pending: [0; TERMINAL_QUERY_LEN], pending_len: 0 }
+        Self { core: core.weak_self.clone(), id: id.into(), input: core.ptys.input(id), tail: String::new(), pending: [0; TERMINAL_QUERY_LEN], pending_len: 0 }
     }
 
     /// Observe resume output and answer queries; true only after a successful cursor reply flush.
@@ -778,8 +779,8 @@ impl AgentSink {
             }
         }
         if !reply.is_empty() {
-            if let Some(core) = self.core.upgrade() {
-                return core.ptys.write(&self.id, &reply).is_ok() && cursor;
+            if let Some(input) = &self.input {
+                return input.write(&reply).is_ok() && cursor;
             }
         }
         false
@@ -787,6 +788,7 @@ impl AgentSink {
 }
 
 impl crate::PtySink for AgentSink {
+    fn bind_input(&mut self, input: crate::pty::PtyInput) { self.input = Some(input); }
     fn data(&mut self, bytes: &[u8]) -> bool {
         self.output(bytes);
         true
@@ -2782,6 +2784,7 @@ fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySi
 fn terminal_sink_test_adapter(terminal: AgentSink, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
     struct ShellSink<S> { terminal: AgentSink, inner: S, ready: Option<std::sync::mpsc::Sender<()>>, screen: vt100::Parser }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
+        fn bind_input(&mut self, input: crate::pty::PtyInput) { self.terminal.bind_input(input); }
         fn data(&mut self, bytes: &[u8]) -> bool {
             let cursor_replied = self.terminal.output(bytes);
             if self.ready.is_some() {
@@ -3158,6 +3161,7 @@ mod draft_tests {
         let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
         let mut sink = super::shell_sink_for_test(&core, "kaan", Sink);
         core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", Sink)).unwrap();
+        sink.bind_input(core.ptys.input("kaan").unwrap());
         let bytes = Arc::new(Mutex::new(Vec::new()));
         core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { original, bytes: bytes.clone() }));
         // portable-pty requests cursor inheritance even when the child is just a shell.
