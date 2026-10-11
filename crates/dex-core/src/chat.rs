@@ -307,7 +307,8 @@ pub(crate) fn claude_turn_ended(path: &Path) -> bool {
 pub(crate) fn claude_tail_rows(bytes: &[u8]) -> impl Iterator<Item = Value> + '_ {
     bytes[bytes.len().saturating_sub(64 * 1024)..].split(|b| *b == b'\n')
         .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
-        .filter(|row| row["type"] == "system" || row["type"] == "attachment")
+        .filter(|row| row["type"] == "system" || row["type"] == "attachment"
+            || row["type"] == "user" && row["isMeta"] == true)
 }
 
 /// Görev #15: Esc ends a claude turn with no hook at all; the transcript gets a user row
@@ -1515,6 +1516,19 @@ mod tests {
 {"type":"system","subtype":"turn_duration","uuid":"s1","content":"ignore"}
 {"type":"assistant","uuid":"a4","timestamp":"2002-01-01T00:00:09.000Z","message":{"content":[{"type":"text","text":"tamamlandı"}]}}
 "##;
+
+    #[test]
+    fn claude_tail_includes_stop_feedback_context_receipt() {
+        let rows = br##"{"type":"user","isMeta":true,"message":{"role":"user","content":"Stop hook feedback:\n# Dex: fixture\n"}}
+{"type":"attachment","attachment":{"type":"hook_blocking_error","hookEvent":"Stop"}}
+{"type":"system","subtype":"stop_hook_summary","hasOutput":true,"preventedContinuation":false}
+{"type":"user","message":{"role":"user","content":"patron prompt"}}
+"##;
+        let tail: Vec<_> = claude_tail_rows(rows).collect();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0]["type"], "user");
+        assert_eq!(tail[0]["isMeta"], true);
+    }
 
     /// Synthetic turn end using Claude CLI 2.1.289 row shapes; trailing metadata must not hide the end.
     #[test]

@@ -460,7 +460,11 @@ impl Core {
             plan::with_notes_pending(&self.db, agent, event, out, pending.as_ref())
         });
         if let Some(pending) = pending.filter(|_| is_blocked(&out)) {
-            if let Some(stop) = stop { self.claude_stage_stop(agent, stop, pending.0.into_inner().unwrap()); }
+            if let (Some(stop), Some(reply)) = (stop, out.as_deref().and_then(|o| serde_json::from_str::<Value>(o).ok())) {
+                if let Some(reason) = reply["reason"].as_str() {
+                    self.claude_stage_stop(agent, stop, pending.0.into_inner().unwrap(), reason);
+                }
+            }
         }
         // Görev #26: an allowed call skips the patron's dialog — unless a Dex rule above answered
         // (service-worker limits, AskUserQuestion). Codex: deny only (a bare allow is not its shape).
