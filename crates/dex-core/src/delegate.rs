@@ -16,6 +16,9 @@ use crate::db::{with, Db};
 use crate::events::Events;
 use crate::project_context::{self, ContextMode, ProjectContext, ResolveRequest};
 
+#[path = "report_fs.rs"]
+mod report_fs;
+
 pub(crate) const ROLE_QUEUE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS delegation_role_queue (
     delegation_id INTEGER PRIMARY KEY REFERENCES delegations(id) ON DELETE CASCADE,
     team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
@@ -568,6 +571,33 @@ pub fn set_status(conn: &Connection, id: i64, status: &str) -> Result<(), String
 }
 
 pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path: Option<&str>) -> Result<Delegation, String> {
+    report_with_content(conn, c, id, summary, result_path, None)
+}
+
+pub(crate) const REPORT_CONTENT_LIMIT: usize = 1024 * 1024;
+
+#[cfg(all(test, windows))]
+thread_local! {
+    static REPORT_IO_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str, &Path)>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn with_report_io_hook<T>(hook: impl FnMut(&str, &Path) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) { REPORT_IO_HOOK.with(|h| { h.borrow_mut().take(); }); }
+    }
+    REPORT_IO_HOOK.with(|h| { assert!(h.borrow_mut().replace(Box::new(hook)).is_none()); });
+    let _reset = Reset;
+    run()
+}
+
+#[cfg(all(test, windows))]
+fn report_io_hook(stage: &str, path: &Path) {
+    REPORT_IO_HOOK.with(|h| { if let Some(hook) = h.borrow_mut().as_mut() { hook(stage, path); } });
+}
+
+pub(crate) fn report_with_content(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path: Option<&str>, content: Option<&str>) -> Result<Delegation, String> {
     let d = get(conn, id)?;
     if d.to_agent != c.id {
         return Err(format!("#{id} sana devredilmedi (alıcı: {})", d.to_agent));
@@ -582,9 +612,22 @@ pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path
     if summary.is_empty() {
         return Err("summary boş olamaz".into());
     }
-    let result_path = result_path.map(str::trim).filter(|p| !p.is_empty());
+    if content.is_some() && result_path.is_some() {
+        return Err("content ve resultPath birlikte verilemez; content yolunu Dex belirler".into());
+    }
+    let owned_path = if let Some(body) = content {
+        if body.is_empty() || body.len() > REPORT_CONTENT_LIMIT {
+            return Err(format!("content 1..{REPORT_CONTENT_LIMIT} UTF-8 bayt olmalı"));
+        }
+        if crate::review::is_review(conn, id)? && crate::review::parse(body).is_none() {
+            return Err("content inceleme raporunun ilk satırı `karar: onay` ya da `karar: düzelt` olmalı".into());
+        }
+        Some(write_report_content(&d, body)?)
+    } else { None };
+    let result_path = owned_path.as_deref().or_else(|| result_path.map(str::trim).filter(|p| !p.is_empty()));
     // A team without a project folder has nowhere to keep the file: summary only, as before.
-    if let Some(dir) = result_dir(conn, &d)? {
+    let legacy_dir = if content.is_none() { result_dir(conn, &d)? } else { None };
+    if let Some(dir) = legacy_dir {
         let want = dir.join(result_name(&d));
         let p = result_path
             .ok_or_else(|| format!("resultPath gerekli: raporun tamamını önce {} dosyasına yaz, sonra report'ta o yolu ver", want.display()))?;
@@ -597,7 +640,13 @@ pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path
         }
     }
     // Görev #286: a review's report carries its verdict.
-    crate::review::record(conn, &d, summary, result_path)?;
+    #[cfg(all(test, windows))]
+    if content.is_some() { report_io_hook("archived", Path::new(result_path.unwrap())); }
+    if content.is_some() {
+        crate::review::record_with_content(conn, &d, summary, result_path, content)?;
+    } else {
+        crate::review::record(conn, &d, summary, result_path)?;
+    }
     conn.execute(
         "UPDATE delegations SET status = 'done', summary = ?2, result_path = ?3, notified = 0,
              delivered_at = NULL, read_at = NULL, seen_at = NULL, updated_at = ?4 WHERE id = ?1",
@@ -606,6 +655,19 @@ pub fn report(conn: &Connection, c: &Caller, id: i64, summary: &str, result_path
     .map_err(e)?;
     crate::diagnostics::event("delegation", serde_json::json!({"id": id, "agent": c.id, "status": "done", "bytes": summary.len()}));
     get(conn, id)
+}
+
+/// The host chooses the archive path from the job snapshot, never the MCP caller.
+/// Create a private sibling exclusively, then replace the report without following a file link.
+fn write_report_content(d: &Delegation, content: &str) -> Result<String, String> {
+    let stored = d.project_root.as_deref().ok_or("content için işin kayıtlı proje kökü gerekli")?;
+    let stored = Path::new(stored);
+    if !stored.is_absolute() || stored.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("rapor dosyası için güvenli proje kökü gerekli".into());
+    }
+    let dirs = if d.service_team_id.is_some() { ["docs", "research"] } else { [".dex", "results"] };
+    report_fs::write(stored, dirs, &result_name(d), content)?;
+    Ok(stored.join(dirs[0]).join(dirs[1]).join(result_name(d)).to_string_lossy().into_owned())
 }
 
 /// Finished rows the leader has not been told about yet; marks them told (`delivered_at`) and
@@ -806,11 +868,11 @@ pub fn worker_prompt(conn: &Connection, d: &Delegation) -> Result<String, String
     }
     match result_file(conn, d)? {
         Some(file) => s.push_str(&format!(
-            "Teslim: önce raporun TAMAMINI şu dosyaya yaz: {}\n\
-             Sonra dex MCP'sinin `report` aracını çağır: delegationId={}, resultPath=<o dosya>, summary=\"bitti: <tek cümle>\". \
-             Lider yalnız summary'yi ve dosyayı görür; sohbet mesajın ona gitmez. Rapor vermeden durursan iş \"raporsuz bitti\" sayılır.",
-            file.display(),
-            d.id
+            "Teslim: raporun TAMAMINI dex MCP'sinin `report` aracında content ile ver: delegationId={}, content=<tam rapor>, summary=\"bitti: <tek cümle>\". \
+             Dosyayı Dex yazar (arşiv: {}); rapor için dosya yazman gerekmez. content ile resultPath birlikte verilmez. \
+             Lider summary'yi ve raporu görür; sohbet mesajın ona gitmez. Rapor vermeden durursan iş \"raporsuz bitti\" sayılır.",
+            d.id,
+            file.display()
         )),
         None => s.push_str(&format!(
             "Bitince dex MCP'sinin `report` aracıyla teslim et: delegationId={}, summary=<teslimin tamamı; sohbet mesajın lidere gitmez>. \
@@ -2226,6 +2288,52 @@ mod tests {
         let (out, _) = on_stop(&c, &Turns::default(), "timur", false, None).unwrap();
         let reason = out.unwrap()["reason"].as_str().unwrap().to_string();
         assert!(reason.contains("RAPORSUZ") && reason.contains(&format!("report'suz kaydedilmiş): {} — oku", b_file.display())), "{reason}");
+    }
+
+    #[test]
+    fn content_writer_rejects_parent_components_before_creating_files() {
+        let c = mem();
+        let lead = leader(&c);
+        let mut d = insert(&c, NewDelegation { from: &lead, to_agent: "kaan".into(), team_id: "default".into(),
+            service_team_id: None, prompt: "report".into(), task_id: None, patron_words: None, effort: None }).unwrap();
+        let fixture = crate::projects::tests::Fixture::new();
+        let root = fixture.dir("project");
+        d.project_root = Some(root.join("..").join("project").to_string_lossy().into_owned());
+        assert!(write_report_content(&d, "body").unwrap_err().contains("güvenli proje kökü"));
+        assert!(!root.join(".dex").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_writer_normalizes_windows_snapshot_prefix_and_case() {
+        let c = mem();
+        let lead = leader(&c);
+        let mut d = insert(&c, NewDelegation { from: &lead, to_agent: "kaan".into(), team_id: "default".into(),
+            service_team_id: None, prompt: "report".into(), task_id: None, patron_words: None, effort: None }).unwrap();
+        let fixture = crate::projects::tests::Fixture::new();
+        let root = fixture.dir("snapshot-case");
+        d.project_root = Some(format!(r"\\?\{}", root.to_string_lossy().to_uppercase()));
+        write_report_content(&d, "body").unwrap();
+        assert_eq!(std::fs::read_to_string(root.join(".dex/results").join(format!("{}.md", d.id))).unwrap(), "body");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn content_writer_unsupported_platform_keeps_job_open_without_io() {
+        let c = mem();
+        let fixture = crate::projects::tests::Fixture::new();
+        let root = fixture.dir("unsupported-report");
+        crate::teams::update_team(&c, &fixture.0, "default", crate::teams::TeamPatch {
+            cwd: Some(Some(root.to_string_lossy().into_owned())), ..Default::default()
+        }).unwrap();
+        let lead = leader(&c);
+        let d = insert(&c, NewDelegation { from: &lead, to_agent: "kaan".into(), team_id: "default".into(),
+            service_team_id: None, prompt: "report".into(), task_id: None, patron_words: None, effort: None }).unwrap();
+        let error = report_with_content(&c, &caller(&c, "kaan").unwrap(), d.id, "bitti", None, Some("body")).unwrap_err();
+        assert!(error.contains("bu platformda desteklenmiyor"), "{error}");
+        assert_eq!(get(&c, d.id).unwrap().status, "queued");
+        assert!(get(&c, d.id).unwrap().result_path.is_none());
+        assert!(!root.join(".dex").exists());
     }
 
     /// #298: a new team has no `.dex/results` — the start makes it, so a read-only reviewer's
