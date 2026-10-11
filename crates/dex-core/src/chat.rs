@@ -1352,7 +1352,8 @@ mod patron_turn_tests {
         let wrong = json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"old"}});
         core.chat_codex_turn("timur", &wrong);
         let complete = json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"A"}});
-        core.chat_codex_turn_in_process("timur", &complete, Some(0));
+        let foreign_process = core.ptys.generation("timur").unwrap().wrapping_add(1);
+        core.chat_codex_turn_in_process("timur", &complete, Some(foreign_process));
         core.chat_codex_turn("timur", &json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"A","error":"failed"}}));
         assert!(events.lock().unwrap().is_empty());
         core.chat_codex_turn("timur", &complete);
