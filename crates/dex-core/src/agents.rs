@@ -731,33 +731,64 @@ pub(crate) struct ResumeWatch {
     lost: bool,
 }
 
+const TERMINAL_QUERY_LEN: usize = b"\x1b]10;?".len();
+
 struct AgentSink {
     core: std::sync::Weak<crate::Core>,
     id: String,
     /// FIX-4: recent output while a resume is unconfirmed (the marker may span two reads).
     tail: String,
+    /// Only an unfinished terminal-query prefix survives a read (at most 5 bytes).
+    pending: [u8; TERMINAL_QUERY_LEN],
+    pending_len: usize,
 }
 
-impl crate::PtySink for AgentSink {
-    fn data(&mut self, bytes: &[u8]) -> bool {
+impl AgentSink {
+    fn new(core: &crate::Core, id: &str) -> Self {
+        Self { core: core.weak_self.clone(), id: id.into(), tail: String::new(), pending: [0; TERMINAL_QUERY_LEN], pending_len: 0 }
+    }
+
+    /// Observe resume output and answer queries; true only after a successful cursor reply flush.
+    fn output(&mut self, bytes: &[u8]) -> bool {
         let text = String::from_utf8_lossy(bytes);
         if let Some(core) = self.core.upgrade() {
             core.resume_output(&self.id, &mut self.tail, &text);
         }
-        let mut reply = String::new();
-        for (query, answer) in [
-            ("\x1b[6n", "\x1b[1;1R"),
-            ("\x1b[c", "\x1b[?1;2c"),
-            ("\x1b]10;?", "\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\"),
-            ("\x1b]11;?", "\x1b]11;rgb:1313/1414/1616\x1b\\"),
-        ] {
-            reply.push_str(&answer.repeat(text.matches(query).count()));
+        let queries: &[(&[u8], &[u8])] = &[
+            (b"\x1b[6n", b"\x1b[1;1R"),
+            (b"\x1b[c", b"\x1b[?1;2c"),
+            (b"\x1b]10;?", b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\"),
+            (b"\x1b]11;?", b"\x1b]11;rgb:1313/1414/1616\x1b\\"),
+        ];
+        let mut reply = Vec::new();
+        let mut cursor = false;
+        for byte in bytes {
+            if self.pending_len == 0 && *byte != b'\x1b' { continue; }
+            self.pending[self.pending_len] = *byte;
+            self.pending_len += 1;
+            if let Some((query, answer)) = queries.iter().find(|(query, _)| *query == &self.pending[..self.pending_len]) {
+                reply.extend_from_slice(answer);
+                cursor |= *query == b"\x1b[6n";
+                self.pending_len = 0;
+            } else {
+                while self.pending_len > 0 && !queries.iter().any(|(query, _)| query.starts_with(&self.pending[..self.pending_len])) {
+                    self.pending.copy_within(1..self.pending_len, 0);
+                    self.pending_len -= 1;
+                }
+            }
         }
         if !reply.is_empty() {
             if let Some(core) = self.core.upgrade() {
-                let _ = core.ptys.write(&self.id, reply.as_bytes());
+                return core.ptys.write(&self.id, &reply).is_ok() && cursor;
             }
         }
+        false
+    }
+}
+
+impl crate::PtySink for AgentSink {
+    fn data(&mut self, bytes: &[u8]) -> bool {
+        self.output(bytes);
         true
     }
     fn exit(&mut self) {}
@@ -895,7 +926,7 @@ impl crate::Core {
                 env,
             },
             launch,
-            AgentSink { core: self.weak_self.clone(), id: id.into(), tail: String::new() },
+            AgentSink::new(self, id),
         )
         .inspect_err(|_| {
             self.gateway.revoke_agent(id);
@@ -2707,42 +2738,18 @@ pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate
 
 #[cfg(test)]
 fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
-    struct ShellSink<S> { terminal: AgentSink, pending: Vec<u8>, inner: S, ready: Option<std::sync::mpsc::Sender<()>> }
+    struct ShellSink<S> { terminal: AgentSink, inner: S, ready: Option<std::sync::mpsc::Sender<()>> }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
         fn data(&mut self, bytes: &[u8]) -> bool {
-            let queries: &[(&[u8], &[u8])] = &[
-                (b"\x1b[6n", b"\x1b[1;1R"),
-                (b"\x1b[c", b"\x1b[?1;2c"),
-                (b"\x1b]10;?", b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\"),
-                (b"\x1b]11;?", b"\x1b]11;rgb:1313/1414/1616\x1b\\"),
-            ];
-            let mut reply = Vec::new();
-            let mut cursor = false;
-            // Keep only an unfinished query prefix, never an already answered query.
-            for byte in bytes {
-                self.pending.push(*byte);
-                if let Some((query, answer)) = queries.iter().find(|(query, _)| *query == self.pending) {
-                    reply.extend_from_slice(answer);
-                    cursor |= *query == b"\x1b[6n";
-                    self.pending.clear();
-                } else {
-                    while !self.pending.is_empty() && !queries.iter().any(|(query, _)| query.starts_with(&self.pending)) {
-                        self.pending.remove(0);
-                    }
-                }
-            }
-            if let Some(core) = self.terminal.core.upgrade() {
-                core.resume_output(&self.terminal.id, &mut self.terminal.tail, &String::from_utf8_lossy(bytes));
-                if !reply.is_empty() && core.ptys.write(&self.terminal.id, &reply).is_ok() && cursor {
-                    if let Some(ready) = self.ready.take() { let _ = ready.send(()); }
-                }
+            if self.terminal.output(bytes) {
+                if let Some(ready) = self.ready.take() { let _ = ready.send(()); }
             }
             self.inner.data(bytes)
         }
         fn exit(&mut self) { self.inner.exit(); }
         fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
     }
-    ShellSink { terminal: AgentSink { core: core.weak_self.clone(), id: id.into(), tail: String::new() }, pending: Vec::new(), inner: sink, ready }
+    ShellSink { terminal: AgentSink::new(core, id), inner: sink, ready }
 }
 
 /// Finish ConPTY's first reply before installing an input probe that would intercept it.
@@ -2800,6 +2807,76 @@ mod shell_sink_tests {
             self.core.shutdown();
             let _ = std::fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn production_answers_each_split_query_once() {
+        let fixture = Fixture::new("production-split");
+        for (query, answer) in [
+            (b"\x1b[6n".as_slice(), b"\x1b[1;1R".as_slice()),
+            (b"\x1b[c", b"\x1b[?1;2c"),
+            (b"\x1b]10;?", b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\"),
+            (b"\x1b]11;?", b"\x1b]11;rgb:1313/1414/1616\x1b\\"),
+        ] {
+            for split in 1..query.len() {
+                let mut sink = super::AgentSink::new(&fixture.core, "kaan");
+                fixture.bytes.lock().unwrap().clear();
+                assert!(sink.data(&query[..split]));
+                assert!(fixture.bytes.lock().unwrap().is_empty(), "incomplete {query:?} at {split}");
+                assert!(sink.data(&query[split..]));
+                assert!(sink.data(b"ordinary output"));
+                assert_eq!(*fixture.bytes.lock().unwrap(), answer, "{query:?} split at {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn production_answers_multiple_queries_without_replaying_them() {
+        let fixture = Fixture::new("production-multiple");
+        let mut sink = super::AgentSink::new(&fixture.core, "kaan");
+        assert!(sink.data(b"\x1b]11;?\x1b[6n\x1b]10;?\x1b[c\x1b[6n\x1b[6"));
+        let mut expected = b"\x1b]11;rgb:1313/1414/1616\x1b\\\x1b[1;1R\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\\x1b[?1;2c\x1b[1;1R".to_vec();
+        assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+        assert!(sink.data(b""));
+        assert!(sink.data(b"n"));
+        expected.extend_from_slice(b"\x1b[1;1R");
+        assert!(sink.data(b"ordinary output"));
+        assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn production_discards_interrupted_query_prefixes() {
+        let fixture = Fixture::new("production-interrupted");
+        for query in [b"\x1b[6n".as_slice(), b"\x1b[c", b"\x1b]10;?", b"\x1b]11;?"] {
+            for split in 1..query.len() {
+                let mut sink = super::AgentSink::new(&fixture.core, "kaan");
+                fixture.bytes.lock().unwrap().clear();
+                assert!(sink.data(&query[..split]));
+                assert!(sink.data(b"unrelated output"));
+                assert!(sink.data(&query[split..]));
+                assert!(fixture.bytes.lock().unwrap().is_empty(), "interrupted {query:?} at {split}");
+                // A new ESC replaces the stale prefix and a byte-at-a-time query still works.
+                assert!(sink.data(&query[..split]));
+                for byte in b"\x1b[6n" { assert!(sink.data(&[*byte])); }
+                assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R");
+            }
+        }
+    }
+
+    #[test]
+    fn production_handles_large_output_and_split_utf8_bytes() {
+        let fixture = Fixture::new("production-large-utf8");
+        let mut sink = super::AgentSink::new(&fixture.core, "kaan");
+        let mut large = vec![b'x'; 256 * 1024];
+        large.extend_from_slice(b"\x1b]10;");
+        assert!(sink.data(&large));
+        assert!(fixture.bytes.lock().unwrap().is_empty());
+        // These UTF-8 bytes interrupt the OSC prefix, then a split CPR follows them.
+        for bytes in [b"\xc4".as_slice(), b"\x9f\xf0\x9f", b"\xa6\x80?\x1b[6", b"n"] {
+            assert!(sink.data(bytes));
+        }
+        assert!(sink.data(&large[..256 * 1024]));
+        assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R");
     }
 
     #[test]
