@@ -698,7 +698,7 @@ mod tests {
             id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(),
             cwd: Some(root.join("cwd").to_string_lossy().into_owned()), cols: 80, rows: 24,
             ..Default::default()
-        }, Sink).unwrap();
+        }, crate::agents::shell_sink_for_test(&core, "kaan", Sink)).unwrap();
         let (d, next, q) = with(&core.db, |c| {
             let leader = caller(c, "timur")?;
             let new_job = || insert(c, NewDelegation { from: &leader, to_agent: "kaan".into(), team_id: "default".into(), service_team_id: None, prompt: "iş".into(), task_id: None, patron_words: None, effort: None });
@@ -876,7 +876,7 @@ mod wake_tests {
         let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
-        core.pty_spawn(pty::Spawn { id: "timur".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink).unwrap();
+        core.pty_spawn(pty::Spawn { id: "timur".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, crate::agents::shell_sink_for_test(&core, "timur", Sink)).unwrap();
         core.agent_states.hook("timur", Some(agents::Status::Idle), None);
         let d = with(&core.db, |c| {
             let d = insert(c, NewDelegation { from: &caller(c, "timur")?, to_agent: "kaan".into(), team_id: "default".into(), service_team_id: None, prompt: "x".into(), task_id: None, patron_words: None, effort: None })?;

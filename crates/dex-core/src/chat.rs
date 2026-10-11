@@ -1081,9 +1081,40 @@ mod patron_turn_tests {
     }
 
     fn live(core: &crate::Core, agent: &str) {
+        let (sink, wait_ready) = crate::agents::shell_sink_with_ready_for_test(core, agent, Sink);
         core.pty_spawn(crate::pty::Spawn {
             id: agent.into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default()
-        }, Sink).unwrap();
+        }, sink).unwrap();
+        wait_ready();
+    }
+
+    #[test]
+    fn live_fixture_answers_terminal_queries() {
+        use std::{io::Write, sync::{Arc, Mutex}};
+        struct Input {
+            original: Box<dyn Write + Send>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = self.original.write(bytes)?;
+                self.bytes.lock().unwrap().extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
+        }
+        let (core, root) = core("terminal-queries");
+        live(&core, "timur");
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        core.ptys.input_writer_for_test("timur", |original| Box::new(Input { original, bytes: bytes.clone() }));
+        // Inject the queries through the live fixture's output, independently of the host OS.
+        core.ptys.note("timur", "\x1b[6n\x1b[c\x1b]10;?\x1b]11;?");
+        let reply = bytes.lock().unwrap().clone();
+        core.ptys.kill("timur");
+        core.shutdown();
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
+        assert!(reply.ends_with(b"\x1b[1;1R\x1b[?1;2c\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\\x1b]11;rgb:1313/1414/1616\x1b\\"), "the live fixture must answer terminal queries: {reply:?}");
     }
 
     #[test]

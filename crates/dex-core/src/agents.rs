@@ -2506,7 +2506,7 @@ mod tests {
         })
         .unwrap();
         // Çalışan oturum: gerçek kabuk PTY'si (CLI spawn yok).
-        core.pty_spawn(crate::pty::Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() }, ShellSink).unwrap();
+        core.pty_spawn(crate::pty::Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", ShellSink)).unwrap();
         assert!(core.ptys.is_running("kaan"));
         core.chain_return("muse");
         let a = crate::db::with(&core.db, |c| crate::teams::get_agent(c, "kaan")).unwrap();
@@ -2701,17 +2701,184 @@ mod tests {
 /// Shell fixtures still have to service ConPTY's cursor-inheritance query. Discarding it can
 /// block ClosePseudoConsole on windows-2022; use the same terminal replies as agent sessions.
 #[cfg(test)]
-fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
-    struct ShellSink<S> { terminal: AgentSink, inner: S }
+pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
+    shell_sink_test_adapter(core, id, sink, None)
+}
+
+#[cfg(test)]
+fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
+    struct ShellSink<S> { terminal: AgentSink, pending: Vec<u8>, inner: S, ready: Option<std::sync::mpsc::Sender<()>> }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
         fn data(&mut self, bytes: &[u8]) -> bool {
-            self.terminal.data(bytes);
+            let queries: &[(&[u8], &[u8])] = &[
+                (b"\x1b[6n", b"\x1b[1;1R"),
+                (b"\x1b[c", b"\x1b[?1;2c"),
+                (b"\x1b]10;?", b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\"),
+                (b"\x1b]11;?", b"\x1b]11;rgb:1313/1414/1616\x1b\\"),
+            ];
+            let mut reply = Vec::new();
+            let mut cursor = false;
+            // Keep only an unfinished query prefix, never an already answered query.
+            for byte in bytes {
+                self.pending.push(*byte);
+                if let Some((query, answer)) = queries.iter().find(|(query, _)| *query == self.pending) {
+                    reply.extend_from_slice(answer);
+                    cursor |= *query == b"\x1b[6n";
+                    self.pending.clear();
+                } else {
+                    while !self.pending.is_empty() && !queries.iter().any(|(query, _)| query.starts_with(&self.pending)) {
+                        self.pending.remove(0);
+                    }
+                }
+            }
+            if let Some(core) = self.terminal.core.upgrade() {
+                core.resume_output(&self.terminal.id, &mut self.terminal.tail, &String::from_utf8_lossy(bytes));
+                if !reply.is_empty() && core.ptys.write(&self.terminal.id, &reply).is_ok() && cursor {
+                    if let Some(ready) = self.ready.take() { let _ = ready.send(()); }
+                }
+            }
             self.inner.data(bytes)
         }
         fn exit(&mut self) { self.inner.exit(); }
         fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
     }
-    ShellSink { terminal: AgentSink { core: core.weak_self.clone(), id: id.into(), tail: String::new() }, inner: sink }
+    ShellSink { terminal: AgentSink { core: core.weak_self.clone(), id: id.into(), tail: String::new() }, pending: Vec::new(), inner: sink, ready }
+}
+
+/// Finish ConPTY's first reply before installing an input probe that would intercept it.
+#[cfg(test)]
+pub(crate) fn shell_sink_with_ready_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> (impl crate::PtySink, impl FnOnce()) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wait_ready = move || {
+        if cfg!(windows) { rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }
+    };
+    (shell_sink_test_adapter(core, id, sink, Some(tx)), wait_ready)
+}
+
+#[cfg(test)]
+mod shell_sink_tests {
+    use crate::{Core, Events, Paths, PtySink};
+    use std::{io::Write, path::PathBuf, sync::{Arc, Mutex}};
+
+    struct Sink;
+    impl PtySink for Sink {
+        fn data(&mut self, _: &[u8]) -> bool { true }
+        fn exit(&mut self) {}
+    }
+
+    struct Input {
+        _original: Box<dyn Write + Send>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Write for Input {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    struct Fixture { core: Arc<Core>, root: PathBuf, bytes: Arc<Mutex<Vec<u8>>> }
+    impl Fixture {
+        fn new(tag: &str) -> Self {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+                .join(format!("shell-sink-{tag}-{}", std::process::id()));
+            let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(crate::events::NullSink)).unwrap();
+            let (sink, wait_ready) = super::shell_sink_with_ready_for_test(&core, "kaan", Sink);
+            core.pty_spawn(crate::pty::Spawn {
+                id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default()
+            }, sink).unwrap();
+            wait_ready();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: bytes.clone() }));
+            Self { core, root, bytes }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.core.ptys.kill("kaan");
+            self.core.shutdown();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn shell_sink_answers_each_split_cursor_query_once() {
+        let fixture = Fixture::new("split-cursor");
+        for split in 1..4 {
+            let mut sink = super::shell_sink_for_test(&fixture.core, "kaan", Sink);
+            fixture.bytes.lock().unwrap().clear();
+            assert!(sink.data(&b"\x1b[6n"[..split]));
+            assert!(fixture.bytes.lock().unwrap().is_empty(), "incomplete query at {split}");
+            assert!(sink.data(&b"\x1b[6n"[split..]));
+            assert!(sink.data(b"ordinary output"));
+            assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R", "split at {split}");
+        }
+    }
+
+    #[test]
+    fn shell_sink_answers_multiple_queries_without_replaying_them() {
+        let fixture = Fixture::new("multiple-queries");
+        let mut sink = super::shell_sink_for_test(&fixture.core, "kaan", Sink);
+        assert!(sink.data(b"\x1b[6n\x1b[6n\x1b[c\x1b]10;?\x1b]11;?\x1b[6"));
+        let mut expected = b"\x1b[1;1R\x1b[1;1R\x1b[?1;2c\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\\x1b]11;rgb:1313/1414/1616\x1b\\".to_vec();
+        assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+        assert!(sink.data(b"n"));
+        expected.extend_from_slice(b"\x1b[1;1R");
+        assert!(sink.data(b"ordinary output\x1b[not-a-query"));
+        assert!(sink.data(b""));
+        assert_eq!(*fixture.bytes.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn shell_sink_ready_follows_successful_cursor_flush_once() {
+        use std::sync::{atomic::{AtomicU8, Ordering}, mpsc::{self, TryRecvError}};
+        struct CheckedInput {
+            original: Box<dyn Write + Send>,
+            ready: Arc<Mutex<mpsc::Receiver<()>>>,
+            fail: Arc<AtomicU8>,
+        }
+        impl Write for CheckedInput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) == 1 { return Err(std::io::Error::other("test write failed")); }
+                self.original.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) == 2 { return Err(std::io::Error::other("test flush failed")); }
+                self.original.flush()
+            }
+        }
+        let fixture = Fixture::new("ready-after-flush");
+        for split in 1..4 {
+            let (tx, rx) = mpsc::channel();
+            let rx = Arc::new(Mutex::new(rx));
+            let fail = Arc::new(AtomicU8::new(0));
+            fixture.core.ptys.input_writer_for_test("kaan", |original| Box::new(CheckedInput { original, ready: rx.clone(), fail: fail.clone() }));
+            let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+            assert!(sink.data(&b"\x1b[6n"[..split]));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+            fail.store(1, Ordering::SeqCst);
+            assert!(sink.data(&b"\x1b[6n"[split..]));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+            fail.store(2, Ordering::SeqCst);
+            assert!(sink.data(b"\x1b[6n"));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+            fail.store(0, Ordering::SeqCst);
+            assert!(sink.data(b"\x1b[c"));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+            assert!(sink.data(&b"\x1b[6n"[..split]));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+            let mut completed = b"\x1b[6n"[split..].to_vec();
+            completed.extend_from_slice(b"\x1b[6n");
+            assert!(sink.data(&completed));
+            assert_eq!(rx.lock().unwrap().try_recv(), Ok(()));
+            assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Disconnected));
+            // Remove the completed channel's checker before the next iteration.
+            fixture.core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: fixture.bytes.clone() }));
+        }
+    }
 }
 
 /// #18: a job queued while the patron had a draft goes once the draft ends — event-driven, once.

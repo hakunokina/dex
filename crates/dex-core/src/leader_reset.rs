@@ -294,7 +294,7 @@ mod tests {
         let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
-        core.pty_spawn(pty::Spawn { id: "timur".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink).unwrap();
+        core.pty_spawn(pty::Spawn { id: "timur".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, agents::shell_sink_for_test(&core, "timur", Sink)).unwrap();
         // A pasted reset prompt would make the shell look busy; the test drives the status itself.
         core.agent_states.hook("timur", Some(agents::Status::Idle), None);
         (core, root)

@@ -318,7 +318,7 @@ mod tests {
         // Retry / cancel need a live session (a shell stands in for claude); the bytes they send
         // are recorded through the writer seam.
         assert!(core.agent_first_reply_retry(&id).is_err(), "no session");
-        core.pty_spawn(pty::Spawn { id: id.clone(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, Sink)
+        core.pty_spawn(pty::Spawn { id: id.clone(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, crate::agents::shell_sink_for_test(&core, &id, Sink))
             .unwrap();
         let sent = Mutex::new(Vec::<Vec<u8>>::new());
         let rec_write = |b: &[u8]| {
