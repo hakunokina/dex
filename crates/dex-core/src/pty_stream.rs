@@ -7,6 +7,8 @@ pub type SubscriberId = u64;
 const MAX_SUBSCRIBERS: usize = 32;
 
 pub trait PtySink: Send + 'static {
+    /// Bound before the first output byte; a responder must never look up a replacement by id.
+    fn bind_input(&mut self, _input: crate::pty::PtyInput) {}
     /// `false` = the subscriber is gone; it is removed from the stream.
     fn data(&mut self, bytes: &[u8]) -> bool;
     fn exit(&mut self);

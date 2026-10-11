@@ -85,6 +85,8 @@ impl log::Log for Logger {
                         | "pty_spawn"
                         | "pty_exit"
                         | "pty_kill"
+                        | "pty_teardown_timeout"
+                        | "pty_teardown_complete"
                         | "question"
                         | "leader_delivery"
                         | "permit"
@@ -161,6 +163,7 @@ fn sanitize(fields: Value) -> Value {
                 "seq" | "pid" | "id" | "bytes" | "line" | "generation" | "deleted" | "skipped" => {
                     value.is_u64() || value.is_null()
                 }
+                "duration_ms" | "pending" => value.is_u64(),
                 "agent" => value.as_str().is_some_and(|s| {
                     s.len() <= 80
                         && s.chars()
@@ -229,6 +232,8 @@ fn sanitize(fields: Value) -> Value {
                     | "skipped"
                     | "line"
                     | "generation"
+                    | "duration_ms"
+                    | "pending"
                     | "agent"
                     | "status"
                     | "before"
@@ -260,6 +265,32 @@ fn sanitize(fields: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn teardown_fields_only_accept_numeric_metadata() {
+        assert_eq!(super::sanitize(serde_json::json!({"duration_ms": 5000, "pending": 2})),
+            serde_json::json!({"duration_ms": 5000, "pending": 2}));
+        assert_eq!(super::sanitize(serde_json::json!({"duration_ms": "private", "pending": "private"})),
+            serde_json::json!({"duration_ms": "[REDACTED]", "pending": "[REDACTED]"}));
+    }
+    #[test]
+    fn teardown_event_names_survive_persistence() {
+        use log::Log;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("teardown-log-{}-{}", std::process::id(), crate::agents::next_seq()));
+        let logger = Logger { rolling: Mutex::new(Rolling { dir: dir.clone(), limit: 2048 }), level: log::LevelFilter::Info };
+        for event in ["pty_teardown_timeout", "pty_teardown_complete"] {
+            logger.log(&log::Record::builder().target("dex::audit").level(log::Level::Error)
+                .args(format_args!("{}", json!({"event": event, "fields": {"agent": "kaan", "generation": 1, "duration_ms": 5000, "pending": 2}}))).build());
+        }
+        let content = std::fs::read_to_string(dir.join(format!("dex-{}-0.jsonl", now_ms() / 86_400_000))).unwrap();
+        let records: Vec<Value> = content.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(), 2);
+        for (record, event) in records.iter().zip(["pty_teardown_timeout", "pty_teardown_complete"]) {
+            assert_eq!(record["event"], event);
+            assert_eq!(record["fields"], json!({"agent": "kaan", "generation": 1, "duration_ms": 5000, "pending": 2}));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[cfg(unix)]
     #[test]
     fn existing_log_modes_are_repaired_before_append() {
