@@ -359,27 +359,42 @@ mod lifecycle_tests {
             finish(&c);
         }
     }
-    struct QuestionSink(std::sync::mpsc::Sender<()>);
-    impl PtySink for QuestionSink {
-        fn data(&mut self, bytes: &[u8]) -> bool {
-            // ConPTY waits for a cursor report before accepting any input.
-            if bytes.windows(4).any(|b| b == b"\x1b[6n") {
-                let _ = self.0.send(());
-            }
-            true
-        }
-        fn exit(&mut self) {}
+    fn question_shell_sink(c: &Core) -> (impl PtySink, impl FnOnce()) {
+        agents::shell_sink_with_ready_for_test(c, "timur", Sink)
     }
+
+    fn question_shell_ready_after_split(split: usize) {
+        let c = core(); open(&c, "timur");
+        let (tx, rx) = std::sync::mpsc::channel();
+        c.ptys.input_writer_for_test("timur", |original| Box::new(InputProbe { writes: tx, fail_enter: false, _original: original }));
+        let (mut sink, wait_ready) = question_shell_sink(&c);
+        assert!(sink.data(&b"\x1b[6n"[..split]));
+        assert!(rx.try_recv().is_err(), "an incomplete CPR query must not be answered");
+        assert!(sink.data(&b"\x1b[6n"[split..]));
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[1;1R");
+        let ready = std::panic::catch_unwind(std::panic::AssertUnwindSafe(wait_ready));
+        assert!(sink.data(b"ordinary output"));
+        assert!(rx.try_recv().is_err(), "the completed CPR query must not be replayed");
+        finish(&c);
+        ready.unwrap();
+    }
+
+    #[test]
+    fn question_shell_ready_after_split_escape() { question_shell_ready_after_split(1); }
+
+    #[test]
+    fn question_shell_ready_after_split_bracket() { question_shell_ready_after_split(2); }
+
+    #[test]
+    fn question_shell_ready_after_split_number() { question_shell_ready_after_split(3); }
 
     #[test]
     fn idle_leader_gets_worker_question_text_without_a_ui_once() {
         let c = core();
         let (cmd, args) = if cfg!(windows) { ("cmd.exe", vec!["/Q".into()]) } else { ("/bin/sh", vec![]) };
-        let (tx, rx) = std::sync::mpsc::channel();
-        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, agents::shell_sink_for_test(&c, "timur", QuestionSink(tx))).unwrap();
-        if cfg!(windows) {
-            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        }
+        let (sink, wait_ready) = question_shell_sink(&c);
+        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, sink).unwrap();
+        wait_ready();
         c.agent_states.hook("timur", Some(agents::Status::Idle), None);
         let d = job(&c, "running");
         let q = with(&c.db, |db| crate::questions::ask(db, &delegate::caller(db, "kaan")?,
@@ -410,11 +425,9 @@ mod lifecycle_tests {
     fn drain_end_delivers_held_worker_question_text_once() {
         let c = core();
         let (cmd, args) = if cfg!(windows) { ("cmd.exe", vec!["/Q".into()]) } else { ("/bin/sh", vec![]) };
-        let (tx, rx) = std::sync::mpsc::channel();
-        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, agents::shell_sink_for_test(&c, "timur", QuestionSink(tx))).unwrap();
-        if cfg!(windows) {
-            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        }
+        let (sink, wait_ready) = question_shell_sink(&c);
+        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, sink).unwrap();
+        wait_ready();
         c.agent_states.hook("timur", Some(agents::Status::Idle), None);
         let d = job(&c, "running");
         c.drain(true);

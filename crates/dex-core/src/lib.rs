@@ -2567,6 +2567,7 @@ mod queue_tests {
         let (core, root) = core("trigger");
         core.ptys.kill("kaan");
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let (sink, wait_ready) = agents::shell_sink_with_ready_for_test(&core, "kaan", Tap(seen.clone()));
         core.pty_spawn(
             pty::Spawn {
                 id: "kaan".into(),
@@ -2576,14 +2577,10 @@ mod queue_tests {
                 rows: 24,
                 ..Default::default()
             },
-            agents::shell_sink_for_test(&core, "kaan", Tap(seen.clone())),
+            sink,
         )
         .unwrap();
-        // ConPTY asks for the cursor position first and waits for the answer (a terminal's job).
-        let end = Instant::now() + Duration::from_secs(5);
-        while !String::from_utf8_lossy(&seen.lock().unwrap()).contains("\x1b[6n") && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        wait_ready();
         std::thread::sleep(Duration::from_millis(1_500)); // shell prompt up
         set(&core, agents::Status::Idle);
         let d = delegate(&core, "UZUNGOREVMETNI");
