@@ -1013,10 +1013,16 @@ mod tests {
         let core = Core::start(paths, crate::Events::new(crate::events::NullSink)).unwrap();
         let spawn = Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() };
         let (desk, phone) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
-        core.pty_spawn(spawn, crate::agents::shell_sink_for_test(&core, "kaan", Seen(desk.clone()))).unwrap();
+        let (sink, wait_ready) = crate::agents::shell_sink_with_ready_for_test(&core, "kaan", Seen(desk.clone()));
+        core.pty_spawn(spawn, sink).unwrap();
+        wait_ready();
+        // #1586 teşhis — neden bulununca kaldırılacak. No terminal bytes or fixture paths.
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "two_clients fixture: startup ready");
         core.ptys.attach("kaan", Seen(phone.clone())).unwrap();
         let size = |core: &Core| core.ptys.list().iter().find(|p| p.id == "kaan").map(|p| (p.cols, p.rows)).unwrap();
 
+        let _ = writeln!(std::io::stderr(), "two_clients fixture: resizing");
         core.ptys.resize("kaan", "desk", 200, 50, false).unwrap();
         core.ptys.resize("kaan", "phone", 45, 30, false).unwrap();
         assert_eq!(size(&core), (200, 50), "pasif telefon PTY'yi daraltmaz");
@@ -1033,7 +1039,9 @@ mod tests {
         core.ptys.resize("kaan", "phone", 45, 30, true).unwrap();
         core.ptys.release_client("phone");
         assert_eq!(size(&core), (200, 50), "telefon kopunca masaüstü boyutu döner");
+        let _ = writeln!(std::io::stderr(), "two_clients fixture: closing");
         core.ptys.kill("kaan");
+        let _ = writeln!(std::io::stderr(), "two_clients fixture: closed");
         drop(core);
         let _ = std::fs::remove_dir_all(&root);
     }
