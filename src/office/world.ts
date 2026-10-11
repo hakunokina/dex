@@ -12,7 +12,7 @@ import {
 import { PCB_TILE_PX, workerSlices } from "./sprites";
 import { pcbImage, workerImage } from "./assets";
 import { chipNameStyle, coreLabel, OFFLINE_NAME_ALPHA, teamSignature } from "./label";
-import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, plantedFeet, type FragmentBox } from "./symbiote";
+import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, type FragmentBox } from "./symbiote";
 import { drawCoreName, ellipsis, roundRect } from "./coreName";
 
 /** The world before Office measures its panel (#270: then the panel in world units). */
@@ -289,7 +289,7 @@ export class World {
       blocks.push({ x: body.x - (chip.w + 40) / 2, y: body.y + body.s / 2 + XL_PIN, w: chip.w + 40, h: 40 });
       const paths = fragmentPaths(body, this.traces.filter(t => t.leaderId === chip.agent.id).map(t => t.points), blocks, board);
       drawCoreFragments(ctx, body, core.fragments.sample(paths, body, this.reduced), core.fragments.phase, pal, p.chipEdge);
-      drawCoreFeet(ctx, body, plantedFeet(paths, body, this.time * 1000, this.reduced || core.state === "sleep"), pal, p.chipEdge);
+      drawCoreFeet(ctx, body, core.sampleFeet(paths, body, this.time * 1000, this.reduced || core.state === "sleep", ctx.canvas), pal, p.chipEdge);
     }
   }
 

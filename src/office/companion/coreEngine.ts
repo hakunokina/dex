@@ -374,7 +374,7 @@ export function drawCoreFeet(ctx: CanvasRenderingContext2D, body: FragmentBody, 
   ctx.lineJoin = "round";
   ctx.beginPath();
   for (const foot of feet) {
-    ctx.moveTo(foot.path.points[0].x, foot.path.points[0].y);
+    ctx.moveTo(body.x, body.y);
     let distance = 0;
     for (let i = 0; i < foot.path.lengths.length && distance + foot.path.lengths[i] < foot.distance; i++) {
       distance += foot.path.lengths[i];

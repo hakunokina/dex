@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { drawCoreXL, drawCoreFeet, XL_EYE, type CorePalette, type CoreXLFrame } from "./coreEngine.ts";
 import { LOOKS } from "./coreState.ts";
-import { fragmentPaths, plantedFeet } from "../symbiote.ts";
+import { createFootState, fragmentPaths, plantedFeet } from "../symbiote.ts";
+import { CoreXL, FOOT_RESET_GAP_MS } from "./coreXL.ts";
 
 const generatedStamps: { width: number; height: number; stops: [number, string][] }[] = [];
 const originalOffscreenCanvas = globalThis.OffscreenCanvas;
@@ -111,7 +112,7 @@ test("static contact/light gradients are reused and palette changes refresh the 
 test("four support feet share two ribbon strokes and retain all planted contacts", () => {
   const body = { x: 160, y: 160, s: 120 };
   const paths = fragmentPaths(body, [], [], { x: 0, y: 0, w: 320, h: 320 });
-  const feet = plantedFeet(paths, body, 0, true);
+  const feet = plantedFeet(paths, body, 0, true, createFootState());
   assert.equal(feet.length, 4);
   const { ctx, strokes, fills, images } = record("idle", {}, []);
   drawCoreFeet(ctx, body, feet, palette, "#333333");
@@ -127,4 +128,50 @@ test("one blink lid covers the enlarged eye; hover scales the shared body/eye sp
   assert.deepEqual(rects, [[-17, -17, 34, 33]]);
   assert.deepEqual(scales, [[1.025, 1.025]]);
   assert.deepEqual(record("idle", { hover: 1, reduced: true }).scales, [[1, 1]]);
+});
+
+test("Core foot state is reused but resets on a new canvas, visibility gap and motion preference", () => {
+  const body = { x: 160, y: 160, s: 120 }, moved = { ...body, x: 170 };
+  const board = { x: 0, y: 0, w: 400, h: 400 };
+  const paths = fragmentPaths(body, [], [], board), movedPaths = fragmentPaths(moved, [], [], board);
+  const core = new CoreXL(), surface = {}, replacement = {};
+  const feet = core.sampleFeet(paths, body, 0, false, surface, 0);
+  const slot = feet[0], x = slot.x, y = slot.y;
+  assert.equal(core.sampleFeet(movedPaths, moved, 100, false, surface, 100), feet);
+  assert.equal(feet[0], slot);
+  assert.deepEqual({ x: slot.x, y: slot.y }, { x, y });
+  core.sampleFeet(movedPaths, moved, 100, false, replacement, 101);
+  assert.notEqual(slot.x, x);
+  core.sampleFeet(paths, body, 100, false, replacement, 2000);
+  assert.equal(slot.x, x);
+  core.sampleFeet(movedPaths, moved, 200, true, replacement, 2010);
+  assert.equal(slot.lift, 0);
+  const reducedX = slot.x;
+  core.sampleFeet(movedPaths, moved, 9000, true, replacement, 2020);
+  assert.equal(slot.x, reducedX);
+  core.sampleFeet(paths, body, 300, false, replacement, 2030);
+  assert.equal(slot.x, x);
+  const fresh = new CoreXL().sampleFeet(movedPaths, moved, 300, false, surface, 2030);
+  assert.notEqual(fresh[0], slot);
+});
+
+test("500ms gaps preserve stance or early stepping; longer gaps replant on the first frame", () => {
+  const body = { x: 160, y: 160, s: 120 }, moved = { ...body, x: 230 };
+  const board = { x: 0, y: 0, w: 480, h: 320 }, surface = {};
+  const paths = fragmentPaths(body, [], [], board), movedPaths = fragmentPaths(moved, [], [], board);
+  const core = new CoreXL();
+  const foot = core.sampleFeet(paths, body, 0, false, surface, 0)[0];
+  const contact = { x: foot.x, y: foot.y };
+  core.sampleFeet(paths, body, 100, false, surface, FOOT_RESET_GAP_MS);
+  assert.deepEqual({ x: foot.x, y: foot.y }, contact);
+  core.sampleFeet(movedPaths, moved, 110, false, surface, FOOT_RESET_GAP_MS + 10);
+  assert.deepEqual({ x: foot.x, y: foot.y }, contact);
+  core.sampleFeet(movedPaths, moved, 260, false, surface, FOOT_RESET_GAP_MS + 160);
+  assert.ok(foot.lift > 0);
+  core.sampleFeet(movedPaths, moved, 410, false, surface, FOOT_RESET_GAP_MS + 310);
+  assert.equal(foot.lift, 0);
+  assert.notDeepEqual({ x: foot.x, y: foot.y }, contact);
+  core.sampleFeet(paths, body, 410, false, surface, 2 * FOOT_RESET_GAP_MS + 311);
+  assert.deepEqual({ x: foot.x, y: foot.y }, contact);
+  assert.equal(foot.lift, 0);
 });

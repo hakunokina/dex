@@ -98,22 +98,116 @@ export function bodyLighting(x: number, y: number) {
   return { normal, diffuse, specular, rim: (1 - normal.z) ** 2 * diffuse };
 }
 
-/** Three quarters of a stride are planted; only the last quarter lifts to the next trace point. */
-export function plantedFeet(paths: readonly FragmentPath[], body: FragmentBody, time: number, reduced: boolean): PlantedFoot[] {
-  return paths.slice(0, 4).filter(path => path.length > 0 && path.lengths.length > 0).map((path, i) => {
-    const clock = reduced ? 0 : Math.max(0, time) / STEP_MS + i / 4;
+interface FootSlot extends PlantedFoot {
+  valid: boolean; seen: boolean; stride: number; swingAt: number; next: number;
+  fromDistance: number; targetDistance: number; offsetX: number; offsetY: number; fromLift: number;
+  swingPath: FragmentPath;
+}
+export interface FootState { slots: FootSlot[]; feet: PlantedFoot[]; target: LiquidPoint }
+
+/** Allocate once per Core; both the result array and its four slots are reused. */
+export function createFootState(): FootState {
+  const empty: FragmentPath = { points: [], lengths: [], length: 0 };
+  return { feet: [], target: { x: 0, y: 0 }, slots: Array.from({ length: 4 }, () => ({
+    x: 0, y: 0, lift: 0, distance: 0, path: empty, swingPath: empty,
+    valid: false, seen: false, stride: 0, swingAt: -Infinity, next: 0.82,
+    fromDistance: 0, targetDistance: 0, offsetX: 0, offsetY: 0, fromLift: 0,
+  })) };
+}
+
+function pointOnPath(path: FragmentPath, distance: number, out: LiquidPoint) {
+  let remaining = distance, segment = 0;
+  while (segment < path.lengths.length - 1 && remaining > path.lengths[segment]) remaining -= path.lengths[segment++];
+  const a = path.points[segment], b = path.points[segment + 1];
+  const k = path.lengths[segment] ? remaining / path.lengths[segment] : 0;
+  out.x = a.x + (b.x - a.x) * k;
+  out.y = a.y + (b.y - a.y) * k;
+}
+
+/** Project the held contact onto the current route for the cable, without moving the contact. */
+function distanceOnPath(path: FragmentPath, point: LiquidPoint, nearest: LiquidPoint): number {
+  const x = point.x, y = point.y;
+  let best = Infinity, result = 0, distance = 0;
+  for (let i = 0; i < path.lengths.length; i++) {
+    const a = path.points[i], b = path.points[i + 1], length = path.lengths[i];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const k = length ? Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / (length * length))) : 0;
+    const error = (x - a.x - dx * k) ** 2 + (y - a.y - dy * k) ** 2;
+    if (error < best) {
+      best = error; result = distance + length * k;
+      nearest.x = a.x + dx * k; nearest.y = a.y + dy * k;
+    }
+    distance += length;
+  }
+  return result;
+}
+
+/** Pure, caller-owned state transition: stance retains world coordinates, swing captures a new route. */
+export function plantedFeet(paths: readonly FragmentPath[], body: FragmentBody, time: number, reduced: boolean, state: FootState): PlantedFoot[] {
+  let count = 0;
+  for (let i = 0; i < state.slots.length; i++) {
+    const foot = state.slots[i], path = paths[i];
+    if (!path || path.length <= 0 || !path.lengths.length) { foot.valid = false; continue; }
+    const clock = Math.max(0, time) / STEP_MS + i / 4;
     const cycle = Math.floor(clock), phase = clock - cycle;
-    const swing = Math.max(0, (phase - 0.75) / 0.25);
-    const ease = swing * swing * (3 - 2 * swing);
-    const travel = cycle % 2 ? 1 - ease : ease;
-    const distance = path.length * (0.54 + 0.28 * travel);
-    let remaining = distance, segment = 0;
-    while (segment < path.lengths.length - 1 && remaining > path.lengths[segment]) remaining -= path.lengths[segment++];
-    const a = path.points[segment], b = path.points[segment + 1];
-    const k = path.lengths[segment] ? remaining / path.lengths[segment] : 0;
-    return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k,
-      lift: reduced ? 0 : Math.sin(swing * Math.PI) * body.s / 40, distance, path };
-  });
+    const stride = Math.floor(clock + 0.25);
+    const fresh = !foot.valid || reduced;
+    const projected = distanceOnPath(path, foot, state.target);
+    const dx = foot.x - body.x, dy = foot.y - body.y, reachSquared = dx * dx + dy * dy;
+    const routeDx = foot.x - state.target.x, routeDy = foot.y - state.target.y;
+    const routeToleranceSquared = (body.s * 0.25) ** 2;
+    const early = reachSquared > (body.s * 0.95) ** 2 || routeDx * routeDx + routeDy * routeDy > routeToleranceSquared;
+    // A layout snap cannot retain a cable across the board. Withdraw under the body,
+    // then grow along the new safe prefix over a full swing instead of snapping to its tip.
+    const recover = foot.seen && !reduced && (!foot.valid || reachSquared > (body.s * 1.15) ** 2);
+    let redirect = false;
+    if (foot.valid && foot.swingAt !== -Infinity && !reduced) {
+      pointOnPath(foot.swingPath, foot.targetDistance, state.target);
+      const x = state.target.x, y = state.target.y;
+      distanceOnPath(path, state.target, state.target);
+      redirect = (x - state.target.x) ** 2 + (y - state.target.y) ** 2 > routeToleranceSquared;
+    }
+    if ((!foot.valid && !foot.seen) || reduced) {
+      foot.distance = path.length * (reduced || cycle % 2 === 0 ? 0.54 : 0.82);
+      pointOnPath(path, foot.distance, foot);
+      foot.valid = foot.seen = true; foot.stride = reduced ? 0 : stride; foot.swingAt = -Infinity;
+      foot.next = reduced || cycle % 2 === 0 ? 0.82 : 0.54;
+      foot.lift = 0;
+    } else if (recover) {
+      foot.valid = true;
+      foot.fromDistance = 0; foot.targetDistance = path.length * 0.54;
+      foot.offsetX = 0; foot.offsetY = 0; foot.fromLift = 0;
+      foot.next = 0.82; foot.swingPath = path; foot.swingAt = time; foot.stride = stride;
+    } else if (redirect || (foot.swingAt === -Infinity && (stride > foot.stride || early))) {
+      const x = foot.x, y = foot.y;
+      foot.fromLift = foot.lift;
+      foot.fromDistance = projected;
+      pointOnPath(path, foot.fromDistance, foot);
+      foot.offsetX = x - foot.x; foot.offsetY = y - foot.y;
+      foot.targetDistance = path.length * (redirect ? (foot.next === 0.82 ? 0.54 : 0.82) : foot.next);
+      if (!redirect) foot.next = foot.next === 0.82 ? 0.54 : 0.82;
+      foot.swingPath = path;
+      foot.swingAt = !redirect && !early && phase >= 0.75 ? (cycle + 0.75 - i / 4) * STEP_MS : time;
+      foot.stride = stride;
+    }
+    if (foot.swingAt !== -Infinity) {
+      const swing = Math.max(0, Math.min(1, (time - foot.swingAt) / (STEP_MS / 4)));
+      const ease = swing * swing * (3 - 2 * swing);
+      foot.distance = foot.fromDistance + (foot.targetDistance - foot.fromDistance) * ease;
+      pointOnPath(foot.swingPath, foot.distance, foot);
+      foot.x += foot.offsetX * (1 - ease); foot.y += foot.offsetY * (1 - ease);
+      const heldLift = Math.min(body.s / 40, foot.fromLift) * (1 - ease);
+      foot.lift = swing === 1 ? 0 : heldLift + Math.sin(swing * Math.PI) * (body.s / 40 - heldLift);
+      foot.path = foot.swingPath;
+      if (swing === 1) foot.swingAt = -Infinity;
+    } else {
+      foot.path = path;
+      foot.distance = fresh ? distanceOnPath(path, foot, state.target) : projected;
+    }
+    state.feet[count++] = foot;
+  }
+  state.feet.length = count;
+  return state.feet;
 }
 
 /** Segment's entry/exit parameters through a rectangle (slab intersection). */
