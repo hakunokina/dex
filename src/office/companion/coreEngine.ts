@@ -2,7 +2,7 @@
 // eyes and a corner badge; state = ring/LED colour + eye shape + badge (+ motion unless reduced).
 // Colours come from the theme tokens (readPalette), never literals.
 import { LOOKS, type CoreLook } from "./coreState.ts";
-import { bodyContour, fragmentContour, type Fragment, type FragmentBody } from "../symbiote.ts";
+import { BODY_LIGHT, bodyLighting, bodyWeight, bodyContour, fragmentContour, type Fragment, type FragmentBody, type PlantedFoot } from "../symbiote.ts";
 
 export interface CorePalette {
   /** Ring/LED colour per state token. */
@@ -50,6 +50,7 @@ export function drawCore(ctx: CanvasRenderingContext2D, look: CoreLook, t: numbe
   ctx.save();
   ctx.scale(k, k);
   ctx.translate(REF / 2, REF / 2 + 2);
+  drawContactShadow(ctx, 1.5, BODY / 2 + 1, BODY * 0.65, 5);
 
   let dx = 0, dy = 0, sc = 1;
   if (!reduced) {
@@ -80,11 +81,7 @@ export function drawCore(ctx: CanvasRenderingContext2D, look: CoreLook, t: numbe
   // body + ring (dashed while failing / running a tool — #229's broken ring)
   ctx.beginPath();
   ctx.roundRect(-half, -half, b, b, 7);
-  const g = ctx.createLinearGradient(0, -half, 0, half);
-  g.addColorStop(0, pal.chipTop);
-  g.addColorStop(1, pal.chip);
-  ctx.fillStyle = g;
-  ctx.fill();
+  drawBodyLighting(ctx, pal, half);
   ctx.lineWidth = 1.6;
   ctx.strokeStyle = color;
   if (look.motion === "shake" || look.motion === "tremble") ctx.setLineDash([5, 3]);
@@ -254,6 +251,61 @@ export interface CoreXLFrame {
   boardBg: string;
   edge: string;
   mono: string;
+  /** Delayed weight shift in body units; omitted by standalone renderers. */
+  weight?: { x: number; y: number };
+}
+
+let contactShadow: ImageBitmap | null = null;
+const bodyLights = new WeakMap<CanvasRenderingContext2D, { radius: number; mouth: string; pin: string; top: string; base: string; liquid: CanvasGradient; rim: CanvasGradient }>();
+
+/** Shared 24KB procedural stamp: radial falloff and dense contact occlusion are rasterized once. */
+function drawContactShadow(ctx: CanvasRenderingContext2D, x: number, y: number, rx: number, ry: number, alpha = 1) {
+  if (!contactShadow) {
+    const surface = new OffscreenCanvas(128, 48);
+    // A CPU-backed immutable stamp avoids cross-canvas GPU synchronization on every contact.
+    const stamp = surface.getContext("2d", { willReadFrequently: true })!;
+    stamp.translate(64, 24); stamp.scale(64, 24);
+    const shadow = stamp.createRadialGradient(0, 0, 0, 0, 0, 1);
+    shadow.addColorStop(0, "rgba(0,0,0,.65)");
+    shadow.addColorStop(0.45, "rgba(0,0,0,.32)");
+    shadow.addColorStop(1, "rgba(0,0,0,0)");
+    stamp.fillStyle = shadow;
+    stamp.beginPath(); stamp.arc(0, 0, 1, 0, Math.PI * 2); stamp.fill();
+    contactShadow = surface.transferToImageBitmap();
+  }
+  ctx.save();
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha *= alpha;
+  ctx.drawImage(contactShadow, x - rx, y - ry, rx * 2, ry * 2);
+  ctx.restore();
+}
+
+/** A single lit body fill, then its rim; eyes/marks are painted later. No extra highlight layer. */
+function drawBodyLighting(ctx: CanvasRenderingContext2D, pal: CorePalette, radius: number) {
+  const light = bodyLighting(BODY_LIGHT.x / 2, BODY_LIGHT.y / 2);
+  const alpha = ctx.globalAlpha;
+  let cached = bodyLights.get(ctx);
+  if (!cached || cached.radius !== radius || cached.mouth !== pal.mouth || cached.pin !== pal.pin || cached.top !== pal.chipTop || cached.base !== pal.badgeBg) {
+    const x = BODY_LIGHT.x * radius, y = BODY_LIGHT.y * radius;
+    const liquid = ctx.createRadialGradient(x, y, radius * 0.025, 0, 0, radius * 1.1);
+    liquid.addColorStop(0, pal.pin);
+    liquid.addColorStop(0.08 + light.specular * 0.06, pal.chipTop);
+    liquid.addColorStop(0.35 + light.diffuse * 0.15, pal.badgeBg);
+    liquid.addColorStop(1, "#030405");
+    const rim = ctx.createLinearGradient(-radius, -radius, radius, radius);
+    rim.addColorStop(0, pal.mouth);
+    rim.addColorStop(0.55, "transparent");
+    cached = { radius, mouth: pal.mouth, pin: pal.pin, top: pal.chipTop, base: pal.badgeBg, liquid, rim };
+    bodyLights.set(ctx, cached);
+  }
+  ctx.fillStyle = cached.liquid;
+  ctx.fill();
+  ctx.globalAlpha = alpha * bodyLighting(-0.7, -0.7).rim * 0.65;
+  ctx.strokeStyle = cached.rim;
+  ctx.lineWidth = Math.max(1, radius * 0.045);
+  // Caller keeps the body's path current for a rim that follows the organic silhouette.
+  ctx.stroke();
+  ctx.globalAlpha = alpha;
 }
 
 /** `#rgb`/`#rrggbb` lerp; anything else snaps to `b` (theme tokens are hex today). */
@@ -282,36 +334,18 @@ export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number
   ctx.translate(cx, cy);
   ctx.scale(size / XL_BODY * grow, size / XL_BODY * grow);
   if (look.id === "sleep") ctx.globalAlpha *= 0.6;
+  drawContactShadow(ctx, 3 / grow, 39 / grow, 56 / grow, 16 / grow);
+  const weight = f.weight ?? bodyWeight(f.t, f.reduced);
+  ctx.translate(weight.x / grow, weight.y / grow);
   const contour = bodyContour(look.id, f.t, f.age, f.reduced);
   ctx.beginPath();
   ctx.moveTo(contour[0].x, contour[0].y);
   for (let i = 1; i < contour.length; i++) ctx.lineTo(contour[i].x, contour[i].y);
   ctx.closePath();
-  const liquid = ctx.createRadialGradient(-18, -22, 2, 0, 0, 64);
-  liquid.addColorStop(0, pal.chip);
-  liquid.addColorStop(0.45, pal.badgeBg);
-  liquid.addColorStop(1, "#030405");
-  ctx.fillStyle = liquid;
-  ctx.fill();
+  drawBodyLighting(ctx, pal, 58);
   ctx.strokeStyle = f.boot > 0 ? colorEye : f.edge;
   ctx.lineWidth = 1.2;
   ctx.stroke();
-  // Reflections stay clipped to the small body; no full-board filters or pixel reads.
-  ctx.save();
-  ctx.clip();
-  const phase = f.reduced ? 0 : f.t / 1700;
-  ctx.strokeStyle = pal.mouth;
-  ctx.lineCap = "round";
-  for (let i = 0; i < 3; i++) {
-    const flow = Math.sin(phase + i * 2) * 7;
-    ctx.globalAlpha *= i ? 0.65 : 0.2;
-    ctx.lineWidth = 3 - i * 0.8;
-    ctx.beginPath();
-    ctx.moveTo(-39 + i * 10, 25);
-    ctx.bezierCurveTo(-52 + i * 12 + flow, -20, -19 + flow, -51 + i * 7, 21 + i * 9, -30 + flow);
-    ctx.stroke();
-  }
-  ctx.restore();
   drawEyeXL(ctx, look, colorEye, Math.max(10, glow), XL_EYE.x, f.pupil, f.lid, pal);
   // mouth: letterbox line; error = open square
   ctx.save();
@@ -325,6 +359,41 @@ export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number
   ctx.stroke();
   ctx.restore();
   drawMarksXL(ctx, look, color, f, pal);
+  ctx.restore();
+}
+
+/** Short support tentacles follow the same protected PCB prefixes as the droplets. */
+export function drawCoreFeet(ctx: CanvasRenderingContext2D, body: FragmentBody, feet: readonly PlantedFoot[], pal: CorePalette, edge: string) {
+  if (!feet.length) return;
+  const k = body.s / XL_BODY;
+  for (const foot of feet) {
+    drawContactShadow(ctx, foot.x + k, foot.y + k, 5 * k, 2.5 * k, 1 - foot.lift / (body.s / 30));
+  }
+  ctx.save();
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  for (const foot of feet) {
+    ctx.moveTo(foot.path.points[0].x, foot.path.points[0].y);
+    let distance = 0;
+    for (let i = 0; i < foot.path.lengths.length && distance + foot.path.lengths[i] < foot.distance; i++) {
+      distance += foot.path.lengths[i];
+      ctx.lineTo(foot.path.points[i + 1].x, foot.path.points[i + 1].y);
+    }
+    ctx.lineTo(foot.x, foot.y - foot.lift);
+  }
+  ctx.strokeStyle = pal.badgeBg; ctx.lineWidth = 5 * k; ctx.stroke();
+  ctx.strokeStyle = edge; ctx.lineWidth = 0.7 * k; ctx.stroke();
+  ctx.fillStyle = pal.pin;
+  ctx.globalAlpha *= 0.35;
+  ctx.beginPath();
+  for (const foot of feet) {
+    if (foot.lift === 0) {
+      ctx.moveTo(foot.x + 2.6 * k, foot.y);
+      ctx.ellipse(foot.x, foot.y, 2.6 * k, 1.2 * k, 0, 0, Math.PI * 2);
+    }
+  }
+  ctx.fill();
   ctx.restore();
 }
 

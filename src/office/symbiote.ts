@@ -73,6 +73,49 @@ export interface FragmentBox extends LiquidPoint { w: number; h: number }
 export interface FragmentPath { points: LiquidPoint[]; lengths: number[]; length: number }
 export interface Fragment extends LiquidPoint { radius: number; angle: number }
 
+export interface PlantedFoot extends LiquidPoint { lift: number; distance: number; path: FragmentPath }
+export const STEP_MS = 1200;
+
+/** Small weight shift, 100ms behind the feet; the old body/hover square remains the hard bound. */
+export function bodyWeight(time: number, reduced: boolean): LiquidPoint {
+  if (reduced) return { x: 0, y: 0 };
+  const phase = (time - 100) / STEP_MS * Math.PI * 2;
+  return { x: Math.sin(phase) * 0.5, y: Math.cos(phase * 2) * 0.35 };
+}
+
+/** One fixed light, directed from the upper left towards the board. */
+export const BODY_LIGHT = { x: -0.4, y: -0.55, z: Math.sqrt(1 - 0.4 ** 2 - 0.55 ** 2) };
+
+/** The single surface-lighting seam: a future normal map can replace the analytic normal here. */
+export function bodyLighting(x: number, y: number) {
+  const length = Math.max(1, Math.hypot(x, y));
+  const nx = x / length, ny = y / length;
+  const normal = { x: nx, y: ny, z: Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny)) };
+  const diffuse = Math.max(0, normal.x * BODY_LIGHT.x + normal.y * BODY_LIGHT.y + normal.z * BODY_LIGHT.z);
+  const halfZ = BODY_LIGHT.z + 1;
+  const halfLength = Math.hypot(BODY_LIGHT.x, BODY_LIGHT.y, halfZ);
+  const specular = Math.max(0, (nx * BODY_LIGHT.x + ny * BODY_LIGHT.y + normal.z * halfZ) / halfLength) ** 18;
+  return { normal, diffuse, specular, rim: (1 - normal.z) ** 2 * diffuse };
+}
+
+/** Three quarters of a stride are planted; only the last quarter lifts to the next trace point. */
+export function plantedFeet(paths: readonly FragmentPath[], body: FragmentBody, time: number, reduced: boolean): PlantedFoot[] {
+  return paths.slice(0, 4).filter(path => path.length > 0 && path.lengths.length > 0).map((path, i) => {
+    const clock = reduced ? 0 : Math.max(0, time) / STEP_MS + i / 4;
+    const cycle = Math.floor(clock), phase = clock - cycle;
+    const swing = Math.max(0, (phase - 0.75) / 0.25);
+    const ease = swing * swing * (3 - 2 * swing);
+    const travel = cycle % 2 ? 1 - ease : ease;
+    const distance = path.length * (0.54 + 0.28 * travel);
+    let remaining = distance, segment = 0;
+    while (segment < path.lengths.length - 1 && remaining > path.lengths[segment]) remaining -= path.lengths[segment++];
+    const a = path.points[segment], b = path.points[segment + 1];
+    const k = path.lengths[segment] ? remaining / path.lengths[segment] : 0;
+    return { x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k,
+      lift: reduced ? 0 : Math.sin(swing * Math.PI) * body.s / 40, distance, path };
+  });
+}
+
 /** Segment's entry/exit parameters through a rectangle (slab intersection). */
 function crossing(a: LiquidPoint, b: LiquidPoint, box: FragmentBox): [number, number] | null {
   let enter = 0, exit = 1;
