@@ -488,6 +488,8 @@ pub(crate) mod tests {
             Events::new(sink),
         )
         .unwrap();
+        let (sink, wait_ready) =
+            crate::agents::shell_sink_with_ready_for_test(&core, "timur", Sink);
         core.pty_spawn(
             crate::pty::Spawn {
                 id: "timur".into(),
@@ -496,9 +498,10 @@ pub(crate) mod tests {
                 rows: 24,
                 ..Default::default()
             },
-            Sink,
+            sink,
         )
         .unwrap();
+        wait_ready();
         let input = Arc::new(Mutex::new(Vec::new()));
         core.ptys.input_writer_for_test("timur", |original| {
             Box::new(Input {
