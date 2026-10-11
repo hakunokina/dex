@@ -2487,7 +2487,7 @@ mod tests {
         })
         .unwrap();
         // Çalışan oturum: gerçek kabuk PTY'si (CLI spawn yok).
-        core.pty_spawn(crate::pty::Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() }, ShellSink).unwrap();
+        core.pty_spawn(crate::pty::Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", ShellSink)).unwrap();
         assert!(core.ptys.is_running("kaan"));
         core.chain_return("muse");
         let a = crate::db::with(&core.db, |c| crate::teams::get_agent(c, "kaan")).unwrap();
@@ -2682,7 +2682,7 @@ mod tests {
 /// Shell fixtures still have to service ConPTY's cursor-inheritance query. Discarding it can
 /// block ClosePseudoConsole on windows-2022; use the same terminal replies as agent sessions.
 #[cfg(test)]
-fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
+pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
     struct ShellSink<S> { terminal: AgentSink, inner: S }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
         fn data(&mut self, bytes: &[u8]) -> bool {
@@ -2693,6 +2693,26 @@ fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) 
         fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
     }
     ShellSink { terminal: AgentSink { core: core.weak_self.clone(), id: id.into(), tail: String::new() }, inner: sink }
+}
+
+/// Finish ConPTY's first reply before installing an input probe that would intercept it.
+#[cfg(test)]
+pub(crate) fn shell_sink_with_ready_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> (impl crate::PtySink, impl FnOnce()) {
+    struct Ready<S> { inner: S, ready: std::sync::mpsc::Sender<()> }
+    impl<S: crate::PtySink> crate::PtySink for Ready<S> {
+        fn data(&mut self, bytes: &[u8]) -> bool {
+            // The outer ShellSink has already written the terminal reply.
+            if bytes.windows(4).any(|b| b == b"\x1b[6n") { let _ = self.ready.send(()); }
+            self.inner.data(bytes)
+        }
+        fn exit(&mut self) { self.inner.exit(); }
+        fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wait_ready = move || {
+        if cfg!(windows) { rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(); }
+    };
+    (shell_sink_for_test(core, id, Ready { inner: sink, ready: tx }), wait_ready)
 }
 
 /// #18: a job queued while the patron had a draft goes once the draft ends — event-driven, once.

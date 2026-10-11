@@ -179,6 +179,7 @@ mod lifecycle_tests {
     use super::*;
     use crate::{delegate, events, pty, shell, Events, Paths, PtySink};
     use std::sync::Arc;
+
     struct Sink;
     impl PtySink for Sink {
         fn data(&mut self, _: &[u8]) -> bool { true }
@@ -190,7 +191,9 @@ mod lifecycle_tests {
         Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap()
     }
     fn open(c: &Core, id: &str) {
-        c.pty_spawn(pty::Spawn { id: id.into(), cmd: shell::SHELL_CMD.into(), cols:80, rows:24, ..Default::default() }, Sink).unwrap();
+        let (sink, wait_ready) = agents::shell_sink_with_ready_for_test(c, id, Sink);
+        c.pty_spawn(pty::Spawn { id: id.into(), cmd: shell::SHELL_CMD.into(), cols:80, rows:24, ..Default::default() }, sink).unwrap();
+        wait_ready();
         c.agent_states.hook(id, Some(agents::Status::Idle), None);
     }
     fn job(c: &Core, status: &str) -> delegate::Delegation {
@@ -373,10 +376,9 @@ mod lifecycle_tests {
         let c = core();
         let (cmd, args) = if cfg!(windows) { ("cmd.exe", vec!["/Q".into()]) } else { ("/bin/sh", vec![]) };
         let (tx, rx) = std::sync::mpsc::channel();
-        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, QuestionSink(tx)).unwrap();
+        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, agents::shell_sink_for_test(&c, "timur", QuestionSink(tx))).unwrap();
         if cfg!(windows) {
             rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            c.ptys.write("timur", b"\x1b[1;1R").unwrap();
         }
         c.agent_states.hook("timur", Some(agents::Status::Idle), None);
         let d = job(&c, "running");
@@ -409,10 +411,9 @@ mod lifecycle_tests {
         let c = core();
         let (cmd, args) = if cfg!(windows) { ("cmd.exe", vec!["/Q".into()]) } else { ("/bin/sh", vec![]) };
         let (tx, rx) = std::sync::mpsc::channel();
-        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, QuestionSink(tx)).unwrap();
+        c.pty_spawn(pty::Spawn { id:"timur".into(), cmd:cmd.into(), args, cols:200, rows:80, ..Default::default() }, agents::shell_sink_for_test(&c, "timur", QuestionSink(tx))).unwrap();
         if cfg!(windows) {
             rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            c.ptys.write("timur", b"\x1b[1;1R").unwrap();
         }
         c.agent_states.hook("timur", Some(agents::Status::Idle), None);
         let d = job(&c, "running");

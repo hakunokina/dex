@@ -1013,7 +1013,7 @@ mod tests {
         let core = Core::start(paths, crate::Events::new(crate::events::NullSink)).unwrap();
         let spawn = Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 120, rows: 40, ..Default::default() };
         let (desk, phone) = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())));
-        core.pty_spawn(spawn, Seen(desk.clone())).unwrap();
+        core.pty_spawn(spawn, crate::agents::shell_sink_for_test(&core, "kaan", Seen(desk.clone()))).unwrap();
         core.ptys.attach("kaan", Seen(phone.clone())).unwrap();
         let size = |core: &Core| core.ptys.list().iter().find(|p| p.id == "kaan").map(|p| (p.cols, p.rows)).unwrap();
 

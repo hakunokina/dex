@@ -1691,7 +1691,7 @@ mod security_tests {
             pty::Spawn {
                 id: agent.id.clone(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default()
             },
-            Sink,
+            agents::shell_sink_for_test(&core, &agent.id, Sink),
         )
         .unwrap();
         assert!(core.ptys.is_running(&agent.id));
@@ -1742,7 +1742,7 @@ mod security_tests {
         .unwrap();
         core.pty_spawn(
             pty::Spawn { id: agent.id.clone(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() },
-            Sink,
+            agents::shell_sink_for_test(&core, &agent.id, Sink),
         )
         .unwrap();
 
@@ -2133,7 +2133,7 @@ mod fresh_tests {
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         for id in ids {
             let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
-            core.pty_spawn(pty::Spawn { id: (*id).into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink).unwrap();
+            core.pty_spawn(pty::Spawn { id: (*id).into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, agents::shell_sink_for_test(&core, id, Sink)).unwrap();
             core.chain_guard.lock().unwrap().insert((*id).into());
         }
         (core, root)
@@ -2325,7 +2325,7 @@ mod queue_tests {
                 rows: 24,
                 ..Default::default()
             },
-            Sink,
+            agents::shell_sink_for_test(&core, "kaan", Sink),
         )
         .unwrap();
         patron_session(&core);
@@ -2576,7 +2576,7 @@ mod queue_tests {
                 rows: 24,
                 ..Default::default()
             },
-            Tap(seen.clone()),
+            agents::shell_sink_for_test(&core, "kaan", Tap(seen.clone())),
         )
         .unwrap();
         // ConPTY asks for the cursor position first and waits for the answer (a terminal's job).
@@ -2584,7 +2584,6 @@ mod queue_tests {
         while !String::from_utf8_lossy(&seen.lock().unwrap()).contains("\x1b[6n") && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = core.ptys.write("kaan", b"\x1b[1;1R");
         std::thread::sleep(Duration::from_millis(1_500)); // shell prompt up
         set(&core, agents::Status::Idle);
         let d = delegate(&core, "UZUNGOREVMETNI");
@@ -2748,7 +2747,7 @@ mod worktree_release_tests {
         std::fs::write(w.path.join("b.txt"), "b\n").unwrap();
         worktree::tests::commit(&w.path, "b ekle");
         let cwd = Some(w.path.to_string_lossy().into_owned());
-        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink).unwrap();
+        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, agents::shell_sink_for_test(&core, "kaan", Sink)).unwrap();
         core.agent_states.hook("kaan", Some(agents::Status::Idle), None);
         with(&core.db, |c| delegate::set_status(c, d.id, "done")).unwrap();
         (core, data, w)
@@ -3194,7 +3193,7 @@ mod project_bind_tests {
     fn a_same_project_paste_moves_the_sessions_job_and_key_together() {
         let e = env("paste");
         let core = &e.core;
-        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd: e.p1.root_path.clone(), cols: 80, rows: 24, ..Default::default() }, Sink).unwrap();
+        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd: e.p1.root_path.clone(), cols: 80, rows: 24, ..Default::default() }, agents::shell_sink_for_test(core, "kaan", Sink)).unwrap();
         core.chain_guard.lock().unwrap().insert("kaan".into());
         job(&e, 1, "kaan", &e.p1, "done");
         sql(&e, "INSERT INTO agent_sessions(agent_id,session_id,engine,updated_at,project_id,delegation_id) VALUES('kaan','s1','claude',1,?1,1)", &[&e.p1.id]);

@@ -602,7 +602,7 @@ mod tests {
                     rows: 24,
                     ..Default::default()
                 },
-                Sink,
+                crate::agents::shell_sink_for_test(&core, "kaan", Sink),
             )
             .unwrap();
             core.agent_states.started("kaan", engine, true);
