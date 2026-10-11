@@ -741,12 +741,23 @@ fn leader_colors_env(
 /// FIX-4: what the CLI prints when `--resume <id>` names no conversation, then exits.
 const RESUME_LOST: &[&str] = &["No conversation found", "No saved session found"];
 
+/// Additive IPC envelope; hook state and its internal ordering remain unchanged.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyState {
+    #[serde(flatten)]
+    pub state: State,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+}
+
 /// FIX-4: a start that resumed a session, until its first hook proves the session opened.
 pub(crate) struct ResumeWatch {
     session: String,
     engine: String,
     retry: StartOptions,
     lost: bool,
+    input: Option<crate::pty::PtyInput>,
 }
 
 const TERMINAL_QUERY_LEN: usize = b"\x1b]10;?".len();
@@ -754,6 +765,7 @@ const TERMINAL_QUERY_LEN: usize = b"\x1b]10;?".len();
 struct AgentSink {
     core: std::sync::Weak<crate::Core>,
     id: String,
+    input: Option<crate::pty::PtyInput>,
     /// FIX-4: recent output while a resume is unconfirmed (the marker may span two reads).
     tail: String,
     /// Only an unfinished terminal-query prefix survives a read (at most 5 bytes).
@@ -763,14 +775,14 @@ struct AgentSink {
 
 impl AgentSink {
     fn new(core: &crate::Core, id: &str) -> Self {
-        Self { core: core.weak_self.clone(), id: id.into(), tail: String::new(), pending: [0; TERMINAL_QUERY_LEN], pending_len: 0 }
+        Self { core: core.weak_self.clone(), id: id.into(), input: core.ptys.input(id), tail: String::new(), pending: [0; TERMINAL_QUERY_LEN], pending_len: 0 }
     }
 
     /// Observe resume output and answer queries; true only after a successful cursor reply flush.
     fn output(&mut self, bytes: &[u8]) -> bool {
         let text = String::from_utf8_lossy(bytes);
         if let Some(core) = self.core.upgrade() {
-            core.resume_output(&self.id, &mut self.tail, &text);
+            core.resume_output(&self.id, self.input.as_ref(), &mut self.tail, &text);
         }
         let queries: &[(&[u8], &[u8])] = &[
             (b"\x1b[6n", b"\x1b[1;1R"),
@@ -796,8 +808,8 @@ impl AgentSink {
             }
         }
         if !reply.is_empty() {
-            if let Some(core) = self.core.upgrade() {
-                return core.ptys.write(&self.id, &reply).is_ok() && cursor;
+            if let Some(input) = &self.input {
+                return input.write(&reply).is_ok() && cursor;
             }
         }
         false
@@ -805,6 +817,14 @@ impl AgentSink {
 }
 
 impl crate::PtySink for AgentSink {
+    fn bind_input(&mut self, input: crate::pty::PtyInput) {
+        if let Some(core) = self.core.upgrade() {
+            if let Some(watch) = core.resume_watch.lock().unwrap().get_mut(&self.id) {
+                watch.input = Some(input.clone());
+            }
+        }
+        self.input = Some(input);
+    }
     fn data(&mut self, bytes: &[u8]) -> bool {
         self.output(bytes);
         true
@@ -875,7 +895,7 @@ impl crate::Core {
             crate::db::with(&self.db, |c| crate::cost::reset_context(c, id))?;
             let _ = self.agent_context(id);
         }
-        let watch = resume.clone().map(|session| ResumeWatch { session, engine: engine.clone(), retry, lost: false });
+        let watch = resume.clone().map(|session| ResumeWatch { session, engine: engine.clone(), retry, lost: false, input: None });
         // DEX-17: zincirle geçici motor/sağlayıcı/modeldeyse onlar kullanılır; asıl ayar değişmez.
         let eff_provider = agent.active_provider.clone().unwrap_or_else(|| agent.provider.clone());
         let eff_model = agent.active_model.clone().unwrap_or_else(|| agent.model.clone());
@@ -970,7 +990,7 @@ impl crate::Core {
         self.reported_workers.lock().unwrap().remove(id);
         self.sleeping_leaders.lock().unwrap().remove(id);
         if agent.kind == "leader" { self.team_idle_reset(&agent.team_id); }
-        let _ = self.events.emit("agent-status", &state);
+        let _ = self.events.emit("agent-status", &PtyState { generation: self.ptys.generation(id), state });
         self.ptys.list().into_iter().find(|pty| pty.id == id).ok_or_else(|| "agent PTY başlatılamadı".into())
     }
 
@@ -1005,8 +1025,8 @@ impl crate::Core {
         .unwrap_or(false)
     }
 
-    pub fn agent_status_list(&self) -> Vec<State> {
-        self.agent_states.list()
+    pub fn agent_status_list(&self) -> Vec<PtyState> {
+        self.agent_states.list().into_iter().map(|state| PtyState { generation: self.ptys.generation(&state.agent_id), state }).collect()
     }
 
     /// #18: an ended draft frees the worker — its queued job goes right after the quiet window,
@@ -1079,9 +1099,9 @@ impl crate::Core {
     }
 
     /// FIX-4: output of an agent whose resume is unconfirmed — look for the CLI's "not found" line.
-    fn resume_output(&self, id: &str, tail: &mut String, text: &str) {
+    fn resume_output(&self, id: &str, input: Option<&crate::pty::PtyInput>, tail: &mut String, text: &str) {
         let mut watch = self.resume_watch.lock().unwrap();
-        let Some(w) = watch.get_mut(id).filter(|w| !w.lost) else { return };
+        let Some(w) = watch.get_mut(id).filter(|w| !w.lost && w.input.as_ref().zip(input).is_some_and(|(a, b)| a.same_transport(b))) else { return };
         tail.push_str(text);
         if RESUME_LOST.iter().any(|m| tail.contains(m)) {
             w.lost = true;
@@ -2792,6 +2812,21 @@ pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate
 }
 
 #[cfg(test)]
+pub(crate) fn watch_resume_for_test<'a>(core: &'a crate::Core, id: &'a str, session: &'a str) -> impl Fn() + 'a {
+    crate::db::with(&core.db, |c| record_session(c, id, session, "claude", None)).unwrap();
+    core.resume_watch.lock().unwrap().insert(id.into(), ResumeWatch {
+        session: session.into(), engine: "claude".into(), retry: StartOptions::default(), lost: false, input: core.ptys.input(id),
+    });
+    move || {
+        let watches = core.resume_watch.lock().unwrap();
+        let watch = watches.get(id).unwrap();
+        assert_eq!(watch.session, session);
+        assert!(!watch.lost, "retired output must not poison the replacement resume");
+        assert_eq!(crate::db::with(&core.db, |c| Ok(session_row(c, id)?.unwrap().session)).unwrap(), session);
+    }
+}
+
+#[cfg(test)]
 fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
     terminal_sink_test_adapter(AgentSink::new(core, id), sink, ready)
 }
@@ -2800,6 +2835,7 @@ fn shell_sink_test_adapter(core: &crate::Core, id: &str, sink: impl crate::PtySi
 fn terminal_sink_test_adapter(terminal: AgentSink, sink: impl crate::PtySink, ready: Option<std::sync::mpsc::Sender<()>>) -> impl crate::PtySink {
     struct ShellSink<S> { terminal: AgentSink, inner: S, ready: Option<std::sync::mpsc::Sender<()>>, screen: vt100::Parser }
     impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
+        fn bind_input(&mut self, input: crate::pty::PtyInput) { self.terminal.bind_input(input); }
         fn data(&mut self, bytes: &[u8]) -> bool {
             let cursor_replied = self.terminal.output(bytes);
             if self.ready.is_some() {
@@ -2858,6 +2894,36 @@ fn terminal_sink_with_ready_for_test(id: &str, terminal: AgentSink, sink: impl c
 mod shell_sink_tests {
     use crate::{Core, Events, Paths, PtySink};
     use std::{io::Write, path::PathBuf, sync::{Arc, Mutex}};
+
+    #[test]
+    fn pty_status_envelope_preserves_existing_json_fields() {
+        let state = super::State { agent_id: "kaan".into(), status: super::Status::Idle,
+            session_id: Some("saved".into()), engine: Some("claude".into()), ..Default::default() };
+        let original = serde_json::to_value(&state).unwrap();
+        let original_json = serde_json::to_string(&state).unwrap();
+        let absent = super::PtyState { state: state.clone(), generation: None };
+        assert_eq!(serde_json::to_string(&absent).unwrap(), original_json);
+        assert_eq!(serde_json::to_value(absent).unwrap(), original);
+        let mut present = serde_json::to_value(super::PtyState { state, generation: Some(0) }).unwrap();
+        assert_eq!(present.as_object_mut().unwrap().remove("generation"), Some(serde_json::json!(0)));
+        assert_eq!(present, original, "only the optional generation field is added");
+    }
+
+    #[test]
+    fn current_transport_observes_split_resume_markers() {
+        for (tag, prefix) in [("resume-conversation", "No conversation"), ("resume-session", "No saved session")] {
+            let fixture = Fixture::new(tag);
+            let check = super::watch_resume_for_test(&fixture.core, "kaan", "saved");
+            fixture.core.resume_watch.lock().unwrap().get_mut("kaan").unwrap().input = None;
+            let mut sink = super::AgentSink::new(&fixture.core, "kaan");
+            sink.bind_input(fixture.core.ptys.input("kaan").unwrap());
+            // Drive this bound production sink directly: unrelated shell reads cannot split a marker.
+            sink.data(prefix.as_bytes());
+            check();
+            sink.data(b" found");
+            assert!(fixture.core.resume_watch.lock().unwrap().get("kaan").unwrap().lost);
+        }
+    }
 
     struct Sink;
     impl PtySink for Sink {
@@ -3176,6 +3242,7 @@ mod draft_tests {
         let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
         let mut sink = super::shell_sink_for_test(&core, "kaan", Sink);
         core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", Sink)).unwrap();
+        sink.bind_input(core.ptys.input("kaan").unwrap());
         let bytes = Arc::new(Mutex::new(Vec::new()));
         core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { original, bytes: bytes.clone() }));
         // portable-pty requests cursor inheritance even when the child is just a shell.

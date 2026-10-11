@@ -40,10 +40,13 @@ const RESET = new TextEncoder().encode("c");
 // attached now. The newest spawn per id is current; a replaced session's late output/exit is dropped.
 interface Live {
   relay: PtyRelay;
+  generation?: number;
+  sink?: PtySink;
   attachment?: Promise<void>;
   remoteDetach?: () => Promise<void>;
 }
 function handOver(me: Live, sink: PtySink) {
+  me.sink = sink;
   me.relay.attach(sink);
   return !me.relay.ended;
 }
@@ -85,20 +88,21 @@ export async function spawnPty(o: SpawnOptions, sink: PtySink) {
 }
 
 /** Subscribe on the backend's online signal, before React or xterm is ready. */
-export async function capturePty(id: string) {
+export async function capturePty(id: string, generation?: number) {
   const current = live.get(id);
-  if (current && !current.relay.ended) return current.attachment;
-  const me = connectPty(id);
+  if (current && !current.relay.ended && (generation === undefined || current.generation === generation)) return current.attachment;
+  const me = connectPty(id, current?.sink, generation);
   return me.attachment;
 }
 
-function connectPty(id: string, sink?: PtySink): Live {
+function connectPty(id: string, sink?: PtySink, generation?: number): Live {
   const [host, raw] = splitId(id);
-  const me: Live = { relay: new PtyRelay(!sink) };
+  const me: Live = { relay: new PtyRelay(!sink), generation };
   if (sink) handOver(me, sink);
   live.set(id, me);
   me.relay.onData(RESET);
   me.attachment = transportOf(host).attachPty(raw, {
+    onGeneration: generation => { if (live.get(id) === me) me.generation = generation; },
     onData: bytes => { if (live.get(id) === me) me.relay.onData(bytes); },
     onSize: (cols, rows) => { if (live.get(id) === me) me.relay.onSize(cols, rows); },
     onReattach: () => { if (live.get(id) === me) me.relay.onReattach(); },
@@ -108,7 +112,10 @@ function connectPty(id: string, sink?: PtySink): Live {
       // An ended session without a view still owns the bytes waiting for that view.
       if (me.relay.hasSink) live.delete(id);
     },
-  }).then(detach => { me.remoteDetach = detach; }).catch(error => {
+  }).then(detach => {
+    me.remoteDetach = detach;
+    if (sink && live.get(id) === me && !me.relay.ended) me.relay.onReattach();
+  }).catch(error => {
     if (live.get(id) === me) live.delete(id);
     throw error;
   });
@@ -128,7 +135,10 @@ export async function attachPty(id: string, sink: PtySink): Promise<boolean> {
   try {
     // The live-only list cannot tell whether a finished agent still has replay.
     await me.attachment;
+    // An online signal can replace the subscription while its snapshot is in flight.
+    if (live.get(id) && live.get(id) !== me) return attachPty(id, sink);
   } catch (error) {
+    if (live.get(id) && live.get(id) !== me) return attachPty(id, sink);
     if (String(error) === "no session") return false;
     throw error;
   }
@@ -144,6 +154,7 @@ export async function attachPty(id: string, sink: PtySink): Promise<boolean> {
 export function detachPty(id: string, sink: PtySink) {
   const s = live.get(id);
   s?.relay.detach(sink);
+  if (s?.sink === sink) s.sink = undefined;
 }
 
 /**

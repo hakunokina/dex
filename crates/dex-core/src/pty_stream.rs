@@ -7,6 +7,8 @@ pub type SubscriberId = u64;
 const MAX_SUBSCRIBERS: usize = 32;
 
 pub trait PtySink: Send + 'static {
+    /// Bound before the first output byte; a responder must never look up a replacement by id.
+    fn bind_input(&mut self, _input: crate::pty::PtyInput) {}
     /// `false` = the subscriber is gone; it is removed from the stream.
     fn data(&mut self, bytes: &[u8]) -> bool;
     fn exit(&mut self);
@@ -88,7 +90,8 @@ impl PtyStream {
         if state.subs.len() >= MAX_SUBSCRIBERS {
             return Err("too many PTY subscribers".into());
         }
-        let snapshot = snapshot(&state.terminal);
+        // A retired reader may still complete parser state; cap its replay without rebuilding it.
+        let snapshot = snapshot_limited(&state.terminal, state.pending_scrollback.unwrap_or(usize::MAX));
         let id = state.next_subscriber;
         state.next_subscriber = state.next_subscriber.wrapping_add(1).max(1);
         state.subs.insert(id, Box::new(sink));
@@ -235,6 +238,10 @@ fn resized(old: &vt100::Screen, rows: u16, scrollback: usize) -> vt100::Parser {
 }
 
 fn snapshot(parser: &vt100::Parser) -> Snapshot {
+    snapshot_limited(parser, usize::MAX)
+}
+
+fn snapshot_limited(parser: &vt100::Parser, lines: usize) -> Snapshot {
     let screen = parser.screen();
     let (rows, cols) = screen.size();
     let alternate_screen = screen.alternate_screen();
@@ -243,7 +250,7 @@ fn snapshot(parser: &vt100::Parser) -> Snapshot {
     if !alternate_screen {
         let mut history = screen.clone();
         history.set_scrollback(usize::MAX);
-        let count = history.scrollback();
+        let count = history.scrollback().min(lines);
         for offset in (1..=count).rev() {
             history.set_scrollback(offset);
             scrollback

@@ -34,3 +34,23 @@ test("ajan pane'i çekirdeğin cevapladığı sorgulara cevap yazmaz; yeniden y�
   expect(await writes(app, worker.id)).toEqual([]);
   expect(await dexd.call<string>("chat_screen", { agentId: worker.id })).not.toContain("RX:");
 });
+
+test("aynı ajan hızlı yeniden başlatılınca yeni terminal çıktısı görünür ve açık kalır", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Generation ${test.info().workerIndex}`);
+  const worker = (await teamAgents(dexd, team.id)).find((a) => a.kind === "worker")!;
+  await app.reload();
+  await openTeam(app, team.name);
+  const pane = await paneOf(app, worker.name);
+  await pane.getByRole("button", { name: "Claude'u başlat" }).click();
+  await expect(pane.locator(".xterm-rows")).toContainText("fake-claude hazir");
+  const before = (await dexd.call<{ id: string; generation?: number }[]>("pty.list")).find(p => p.id === worker.id)!;
+  await dexd.call("pty_kill", { id: worker.id });
+  const after = await dexd.call<{ generation?: number }>("agent_start", { id: worker.id });
+  expect(after.generation).toBeDefined();
+  expect(after.generation).not.toBe(before.generation);
+  await dexd.call("pty_write", { id: worker.id, data: "GENERATION_NEW\r" });
+  await expect(pane.locator(".xterm-rows")).toContainText("RX:GENERATION_NEW");
+  await expect(pane.getByRole("button", { name: "Claude'u başlat" })).toHaveCount(0);
+  await dexd.call("pty_write", { id: worker.id, data: "GENERATION_STILL_LIVE\r" });
+  await expect(pane.locator(".xterm-rows")).toContainText("RX:GENERATION_STILL_LIVE");
+});

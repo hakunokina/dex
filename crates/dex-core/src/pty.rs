@@ -3,21 +3,40 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::providers;
 use crate::pty_stream::{PtySink, PtyStream, Snapshot, SubscriberId};
 use crate::Core;
 
+/// Input for one generation; terminal replies remain valid after registry retirement.
+#[derive(Clone)]
+pub struct PtyInput(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl PtyInput {
+    pub(crate) fn same_transport(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    pub(crate) fn write(&self, data: &[u8]) -> Result<(), String> {
+        let mut writer = self.0.lock().map_err(|_| "PTY input kilidi zehirli")?;
+        writer.write_all(data).map_err(|e| e.to_string())?;
+        writer.flush().map_err(|e| e.to_string())
+    }
+}
+
 struct Session {
     gen: u64,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Serialize size ownership and its I/O within this generation, never across PTYs.
     resize_gate: Arc<Mutex<()>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     /// Output fan-out; outlives any one subscriber (S2: several clients, reconnects).
     stream: Arc<PtyStream>,
+    /// Signalled after reader EOF and the stream's single exit notification.
+    reader_done: Option<std::sync::mpsc::Receiver<()>>,
     /// Only registered agents retain output after exit; transient shell ids do not accumulate.
     replay: bool,
     kind: String,
@@ -75,6 +94,8 @@ pub struct PtyInfo {
     pub rows: u16,
     pub alive: bool,
     pub started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,6 +103,8 @@ pub struct PtyInfo {
 pub struct Attachment {
     pub subscriber: SubscriberId,
     pub snapshot: Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 /// Live sessions by PTY id (= agent id). Clones share the map.
@@ -89,19 +112,28 @@ pub struct Attachment {
 pub struct Ptys {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     /// At most one finished stream per registered agent, replaced on spawn and cleared on deletion.
-    finished: Arc<Mutex<HashMap<String, Arc<PtyStream>>>>,
+    finished: Arc<Mutex<HashMap<String, (u64, Arc<PtyStream>)>>>,
+    /// Retired jobs remain visible here until resource release, including deadline overruns.
+    teardowns: Arc<Teardowns>,
     owner: std::sync::Weak<Core>,
+}
+
+#[derive(Default)]
+struct Teardowns {
+    /// true = the deadline was exceeded; retained until the job actually completes.
+    jobs: Mutex<HashMap<u64, bool>>,
+    changed: Condvar,
 }
 
 impl Default for Ptys {
     fn default() -> Self {
-        Self { sessions: Arc::default(), finished: Arc::default(), owner: std::sync::Weak::new() }
+        Self { sessions: Arc::default(), finished: Arc::default(), teardowns: Arc::default(), owner: std::sync::Weak::new() }
     }
 }
 
 impl Ptys {
     pub fn bound(owner: std::sync::Weak<Core>) -> Self {
-        Self { sessions: Arc::default(), finished: Arc::default(), owner }
+        Self { sessions: Arc::default(), finished: Arc::default(), teardowns: Arc::default(), owner }
     }
 
     pub(crate) fn core(&self) -> Option<Arc<Core>> {
@@ -158,7 +190,7 @@ pub fn spawn(core: &Core, req: Spawn, sink: impl PtySink) -> Result<(), String> 
 }
 
 /// [`spawn`] of an agent session with its [`AgentLaunch`]; `None` is the IPC's spawn (unchanged).
-pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, sink: impl PtySink) -> Result<(), String> {
+pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, mut sink: impl PtySink) -> Result<(), String> {
     let Spawn { id, cmd, args, cwd, memory_dir, provider, cols, rows, codex, env } = req;
     let delegation_id = launch.as_ref().and_then(|l| l.job);
     validate_size(cols, rows)?;
@@ -374,11 +406,14 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let writer = Arc::new(Mutex::new(writer));
+    sink.bind_input(PtyInput(writer.clone()));
     let killer = child.clone_killer();
     let gen = GEN.fetch_add(1, Ordering::Relaxed);
 
     let stream = Arc::new(PtyStream::new(rows, cols, scrollback_lines()));
     stream.subscribe(sink)?;
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
 
     if is_claude {
         core.agent_states.spawned(&id);
@@ -389,11 +424,12 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // short-lived process visible, this lets the backend terminal sink answer startup queries.
     let old = core.ptys.insert(id.clone(), Session {
         gen,
-        master: Arc::new(Mutex::new(pair.master)),
-        writer: Arc::new(Mutex::new(writer)),
+        master: Arc::new(Mutex::new(Some(pair.master))),
+        writer,
         resize_gate: Arc::default(),
         killer,
         stream: stream.clone(),
+        reader_done: Some(reader_done_rx),
         replay: !is_shell && engine.is_some(),
         kind: if is_shell { "shell" } else { "agent" }.into(),
         cols,
@@ -404,9 +440,9 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
             .as_millis() as u64,
         sizes: Sizes::default(),
     });
-    if let Some(mut old) = old {
+    if let Some(old) = old {
         crate::diagnostics::event("pty_kill", serde_json::json!({"agent": id, "reason": "replacement", "generation": old.gen}));
-        let _ = old.killer.kill();
+        core.ptys.teardown(&id, old, true);
     }
     core.observations.spawn(&id, child.process_id(), gen);
     // #126: an idle worker session is closed after a while (leaders and shells are not watched).
@@ -425,6 +461,7 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
             }
         }
         out.close();
+        let _ = reader_done_tx.send(());
     });
 
     // ConPTY does not EOF the reader when the child exits; dropping the master does.
@@ -434,8 +471,8 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
         let _ = child.wait();
         crate::diagnostics::event("pty_exit", serde_json::json!({"agent": waiter_id, "generation": gen, "reason": "exit"}));
         drop(tree);
-        let removed = ptys.retire(&waiter_id, Some(gen)).is_some();
-        if removed {
+        if let Some(session) = ptys.retire(&waiter_id, Some(gen)) {
+            ptys.teardown(&waiter_id, session, false);
             if let Some(core) = ptys.owner.upgrade() {
                 core.pty_exited(&waiter_id);
             }
@@ -534,7 +571,7 @@ impl Ptys {
         self.finished.lock().unwrap().remove(id);
     }
 
-    /// Publish replay before dropping the master unblocks EOF; attach can still receive the tail.
+    /// Publish replay without entering the stream; teardown drains its tail outside caller gates.
     fn retire(&self, id: &str, gen: Option<u64>) -> Option<Session> {
         let mut map = self.sessions.lock().unwrap();
         if gen.is_some_and(|gen| map.get(id).is_none_or(|s| s.gen != gen)) {
@@ -542,13 +579,73 @@ impl Ptys {
         }
         let session = map.remove(id)?;
         if session.replay {
-            self.finished.lock().unwrap().insert(id.to_string(), session.stream.clone());
-        }
-        drop(map);
-        if session.replay {
-            session.stream.limit_scrollback(FINISHED_SCROLLBACK_LINES);
+            self.finished.lock().unwrap().insert(id.to_string(), (session.gen, session.stream.clone()));
         }
         Some(session)
+    }
+
+    fn teardown(&self, id: &str, session: Session, kill: bool) {
+        let timeout = TEARDOWN_TIMEOUT;
+        #[cfg(test)]
+        let timeout = TEST_TEARDOWN_TIMEOUT.with(|value| value.borrow_mut().take()).unwrap_or(timeout);
+        self.teardown_with_timeout(id, session, kill, timeout);
+    }
+
+    fn teardown_with_timeout(&self, id: &str, mut session: Session, kill: bool, timeout: Duration) {
+        let gen = session.gen;
+        let started = Instant::now();
+        self.teardowns.jobs.lock().unwrap().insert(gen, false);
+        let jobs = self.teardowns.clone();
+        let worker_id = id.to_string();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let records = Arc::new(Mutex::new(()));
+        let worker_records = records.clone();
+        // No Core or caller gate is retained. Detached jobs cannot hold up process shutdown.
+        std::thread::spawn(move || {
+            let killed = !kill || session.killer.kill().is_ok();
+            if session.replay { session.stream.limit_scrollback(FINISHED_SCROLLBACK_LINES); }
+            // Take the resource, not just an Arc: an in-flight resize must not become its last
+            // owner and run ClosePseudoConsole on a start/admission caller later.
+            let master = session.master.lock().unwrap().take();
+            drop(master);
+            // ConPTY only EOFs after master close. Drain concurrently with close, keeping input
+            // and the responder alive for queries already buffered when registry retirement won.
+            let drained = session.reader_done.take().is_none_or(|reader| reader.recv().is_ok());
+            drop(session);
+            let _record = worker_records.lock().unwrap();
+            let pending = {
+                let mut pending = jobs.jobs.lock().unwrap();
+                pending.remove(&gen);
+                jobs.changed.notify_all();
+                pending.len()
+            };
+            let fields = serde_json::json!({"agent": worker_id, "generation": gen, "duration_ms": started.elapsed().as_millis() as u64, "pending": pending});
+            if killed && drained {
+                crate::diagnostics::event("pty_teardown_complete", fields);
+            } else {
+                log::error!(target: "dex::audit", "{}", serde_json::json!({"event": "pty_teardown_complete", "fields": fields}));
+            }
+            let _ = done_tx.send(());
+        });
+        let jobs = self.teardowns.clone();
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(timeout.saturating_sub(started.elapsed())).is_err() {
+                let _record = records.lock().unwrap();
+                let pending = {
+                    let mut pending = jobs.jobs.lock().unwrap();
+                    let Some(timed_out) = pending.get_mut(&gen) else { return };
+                    *timed_out = true;
+                    pending.len()
+                };
+                // Serialize timeout and completion records so a recovered job cannot log
+                // completion before its deadline overrun. Only this job's record gate is held.
+                log::error!(target: "dex::audit", "{}", serde_json::json!({"event": "pty_teardown_timeout", "fields": {
+                    "agent": id, "generation": gen, "duration_ms": started.elapsed().as_millis() as u64, "pending": pending
+                }}));
+                jobs.changed.notify_all();
+            }
+        });
     }
 
     pub(crate) fn generation(&self, id: &str) -> Option<u64> {
@@ -564,10 +661,11 @@ impl Ptys {
     }
 
     pub fn write(&self, id: &str, data: &[u8]) -> Result<(), String> {
-        let writer = self.sessions.lock().unwrap().get(id).ok_or("no session")?.writer.clone();
-        let mut writer = writer.lock().unwrap();
-        writer.write_all(data).map_err(|e| e.to_string())?;
-        writer.flush().map_err(|e| e.to_string())
+        self.input(id).ok_or("no session")?.write(data)
+    }
+
+    pub(crate) fn input(&self, id: &str) -> Option<PtyInput> {
+        self.sessions.lock().unwrap().get(id).map(|s| PtyInput(s.writer.clone()))
     }
 
     /// #62: `client`'s view is `cols`×`rows`. `claim` (the patron typed or focused there) makes it
@@ -608,6 +706,7 @@ impl Ptys {
         #[cfg(test)]
         BEFORE_RESIZE.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
         master.lock().unwrap()
+            .as_ref().ok_or("no session")?
             .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| e.to_string())?;
         stream.resize(rows, cols);
@@ -641,8 +740,8 @@ impl Ptys {
     pub fn kill(&self, id: &str) -> bool {
         crate::diagnostics::event("pty_kill", serde_json::json!({"agent": id}));
         let session = self.retire(id, None);
-        let Some(mut s) = session else { return false };
-        let _ = s.killer.kill();
+        let Some(s) = session else { return false };
+        self.teardown(id, s, true);
         if let Some(core) = self.core() {
             core.resume_forget(id);
             core.pty_exited(id);
@@ -661,6 +760,7 @@ impl Ptys {
                 rows: s.rows,
                 alive: true,
                 started_at: s.started_at,
+                generation: Some(s.gen),
             })
             .collect();
         result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -668,24 +768,24 @@ impl Ptys {
     }
 
     pub fn attach(&self, id: &str, sink: impl PtySink) -> Result<Attachment, String> {
-        let (stream, finished) = {
+        let (gen, stream, finished) = {
             let map = self.sessions.lock().unwrap();
-            map.get(id).map(|s| (s.stream.clone(), false))
-                .or_else(|| self.finished.lock().unwrap().get(id).cloned().map(|s| (s, true)))
+            map.get(id).map(|s| (s.gen, s.stream.clone(), false))
+                .or_else(|| self.finished.lock().unwrap().get(id).cloned().map(|(gen, s)| (gen, s, true)))
                 .ok_or("no session")?
         };
         if finished {
             stream.limit_scrollback(FINISHED_SCROLLBACK_LINES);
         }
         let (subscriber, snapshot) = stream.attach(sink)?;
-        Ok(Attachment { subscriber, snapshot })
+        Ok(Attachment { subscriber, snapshot, generation: Some(gen) })
     }
 
     pub fn detach(&self, id: &str, subscriber: SubscriberId) -> bool {
         let stream = {
             let map = self.sessions.lock().unwrap();
             map.get(id).map(|s| s.stream.clone())
-                .or_else(|| self.finished.lock().unwrap().get(id).cloned())
+                .or_else(|| self.finished.lock().unwrap().get(id).map(|(_, s)| s.clone()))
         };
         stream.is_some_and(|stream| stream.detach(subscriber))
     }
@@ -707,9 +807,11 @@ impl Ptys {
 thread_local! {
     /// Pause the real resize path without depending on ConPTY scheduling.
     static BEFORE_RESIZE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static TEST_TEARDOWN_TIMEOUT: std::cell::RefCell<Option<Duration>> = const { std::cell::RefCell::new(None) };
 }
 
 const MAX_COLS: u16 = 512;
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ROWS: u16 = 256;
 const MAX_SCROLLBACK_LINES: usize = 10_000;
 // After output EOF: registered agent count × at most 2000 history rows + the size-bounded viewport.
@@ -920,8 +1022,8 @@ mod tests {
 
     fn replay_session(gen: u64, stream: Arc<PtyStream>) -> Session {
         let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 120, pixel_width: 0, pixel_height: 0 }).unwrap();
-        Session { gen, writer: Arc::new(Mutex::new(pair.master.take_writer().unwrap())), master: Arc::new(Mutex::new(pair.master)), resize_gate: Arc::default(),
-            killer: Box::new(NoChild), stream, replay: true, kind: "agent".into(),
+        Session { gen, writer: Arc::new(Mutex::new(pair.master.take_writer().unwrap())), master: Arc::new(Mutex::new(Some(pair.master))), resize_gate: Arc::default(),
+            killer: Box::new(NoChild), stream, reader_done: None, replay: true, kind: "agent".into(),
             cols: 120, rows: 24, started_at: 0, sizes: Sizes::default() }
     }
 
@@ -930,6 +1032,325 @@ mod tests {
             .join(format!("{}-{}", std::process::id(), GEN.fetch_add(1, Ordering::Relaxed)));
         Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
             crate::Events::new(crate::events::NullSink)).unwrap()
+    }
+
+    #[test]
+    fn early_teardown_answers_a_retired_generation() {
+        use std::{sync::mpsc, time::Duration};
+        if isolated_lock_test("pty::tests::early_teardown_answers_a_retired_generation") { return; }
+        struct Reply(mpsc::Sender<Vec<u8>>);
+        impl Write for Reply {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let core = replay_core();
+        let stream = Arc::new(PtyStream::default());
+        let (tx, rx) = mpsc::channel();
+        let mut session = replay_session(1, stream.clone());
+        let (drained_tx, drained_rx) = mpsc::channel();
+        session.reader_done = Some(drained_rx);
+        session.writer = Arc::new(Mutex::new(Box::new(Reply(tx))));
+        core.ptys.insert("kaan".into(), session);
+        stream.subscribe(crate::agents::shell_sink_for_test(&core, "kaan", Exited::default())).unwrap();
+        stream.publish(b"\x1b[");
+        assert!(core.ptys.kill("kaan"));
+        assert!(!core.ptys.is_running("kaan"));
+        stream.publish(b"6n");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).expect("retired generation must still answer CPR"), b"\x1b[1;1R");
+        stream.close();
+        drained_tx.send(()).unwrap();
+        wait_teardowns(&core.ptys, HashMap::is_empty);
+    }
+
+    fn wait_teardowns(ptys: &Ptys, done: impl Fn(&HashMap<u64, bool>) -> bool) {
+        let jobs = ptys.teardowns.jobs.lock().unwrap();
+        let (jobs, _) = ptys.teardowns.changed.wait_timeout_while(jobs, Duration::from_secs(2), |jobs| !done(jobs)).unwrap();
+        assert!(done(&jobs), "teardown state did not reach its expected boundary: {jobs:?}");
+    }
+
+    #[test]
+    fn early_teardown_replacement_attachment_identifies_new_generation() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::early_teardown_replacement_attachment_identifies_new_generation") { return; }
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>, Exited);
+        impl PtySink for Output {
+            fn data(&mut self, bytes: &[u8]) -> bool { self.0.lock().unwrap().extend_from_slice(bytes); true }
+            fn exit(&mut self) { self.1.exit(); }
+        }
+        let ptys = Ptys::default();
+        let old = Arc::new(PtyStream::default());
+        let (release_tx, release_rx) = mpsc::channel();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let mut session = replay_session(0, old.clone());
+        session.reader_done = Some(drained_rx);
+        ptys.insert("kaan".into(), session);
+        let old_output = Output::default();
+        ptys.attach("kaan", old_output.clone()).unwrap();
+        let reader = {
+            let old = old.clone();
+            std::thread::spawn(move || {
+                release_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+                old.publish(b"LATE_OLD_OUTPUT");
+                old.close();
+                drained_tx.send(()).unwrap();
+            })
+        };
+        assert!(ptys.kill("kaan"));
+        let new = Arc::new(PtyStream::default());
+        ptys.insert("kaan".into(), replay_session(1, new.clone()));
+        let output = Output::default();
+        let attachment = ptys.attach("kaan", output.clone()).unwrap();
+        new.publish(b"NEW_OUTPUT");
+        assert_eq!(*output.0.lock().unwrap(), b"NEW_OUTPUT");
+        assert!(!old_output.1.0.load(Ordering::SeqCst), "old reader is still held");
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        wait_teardowns(&ptys, HashMap::is_empty);
+        assert!(old_output.1.0.load(Ordering::SeqCst));
+        assert!(!output.1.0.load(Ordering::SeqCst), "old exit cannot end the replacement stream");
+        assert_eq!(serde_json::to_value(&attachment).unwrap()["generation"], 1);
+        assert_eq!(serde_json::to_value(&ptys.list()[0]).unwrap()["generation"], 1);
+        new.close();
+        ptys.kill("kaan");
+        wait_teardowns(&ptys, HashMap::is_empty);
+    }
+
+    #[test]
+    fn early_teardown_never_answers_into_a_replacement() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::early_teardown_never_answers_into_a_replacement") { return; }
+        struct Reply(mpsc::Sender<Vec<u8>>);
+        impl Write for Reply {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.send(bytes.to_vec()).unwrap(); Ok(bytes.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let core = replay_core();
+        let old = Arc::new(PtyStream::default());
+        let (old_tx, old_rx) = mpsc::channel();
+        let (new_tx, new_rx) = mpsc::channel();
+        let mut session = replay_session(1, old.clone());
+        session.writer = Arc::new(Mutex::new(Box::new(Reply(old_tx))));
+        core.ptys.insert("kaan".into(), session);
+        let _old_watch = crate::agents::watch_resume_for_test(&core, "kaan", "saved-old");
+        old.subscribe(crate::agents::shell_sink_for_test(&core, "kaan", Exited::default())).unwrap();
+        let mut old_tail = crate::agents::shell_sink_for_test(&core, "kaan", Exited::default());
+        old_tail.data(b"No conversation");
+        old.publish(b"\x1b[");
+        assert!(core.ptys.kill("kaan"));
+        let new = Arc::new(PtyStream::default());
+        let mut session = replay_session(2, new.clone());
+        session.writer = Arc::new(Mutex::new(Box::new(Reply(new_tx))));
+        core.ptys.insert("kaan".into(), session);
+        let new_watch = crate::agents::watch_resume_for_test(&core, "kaan", "saved-new");
+        old.publish(b"6n");
+        assert_eq!(old_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"\x1b[1;1R");
+        assert_eq!(new_rx.try_recv(), Err(mpsc::TryRecvError::Empty), "late reply must not enter the replacement input");
+        old_tail.data(b" found");
+        new_watch();
+        old.publish(b"No saved session found");
+        new_watch();
+        assert!(core.ptys.retire("kaan", Some(1)).is_none(), "old waiter cannot claim a second exit or the replacement");
+        assert_eq!(core.ptys.generation("kaan"), Some(2));
+        core.ptys.write("kaan", b"USER_INPUT").unwrap();
+        assert_eq!(new_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"USER_INPUT");
+        old.close();
+        new.close();
+        core.ptys.kill("kaan");
+        wait_teardowns(&core.ptys, HashMap::is_empty);
+    }
+
+    #[test]
+    fn early_teardown_timeout_keeps_replacement_and_shutdown_available() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::early_teardown_timeout_keeps_replacement_and_shutdown_available") { return; }
+        struct Logs(mpsc::Sender<(String, serde_json::Value)>);
+        impl log::Log for Logs {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool { true }
+            fn log(&self, record: &log::Record<'_>) {
+                if record.target() != "dex::audit" { return; }
+                let payload: serde_json::Value = serde_json::from_str(&record.args().to_string()).unwrap();
+                if matches!(payload["event"].as_str(), Some("pty_teardown_timeout" | "pty_teardown_complete")) {
+                    let _ = self.0.send((record.level().to_string(), payload));
+                }
+            }
+            fn flush(&self) {}
+        }
+        let (log_tx, log_rx) = mpsc::channel();
+        // This logger lives only in the isolated test process; other tests keep their logger.
+        log::set_logger(Box::leak(Box::new(Logs(log_tx)))).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        #[derive(Clone, Default)]
+        struct Exits(Arc<std::sync::atomic::AtomicUsize>);
+        impl crate::events::EventSink for Exits {
+            fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+                if event == "agent-status" && payload["agentId"] == "kaan" && payload["status"] == "offline" {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        }
+        let exits = Exits::default();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp/pty-timeout-tests")
+            .join(format!("{}-{}", std::process::id(), GEN.fetch_add(1, Ordering::Relaxed)));
+        let core = Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(exits.clone())).unwrap();
+        let old_gen = GEN.fetch_add(1, Ordering::Relaxed);
+        let session = replay_session(old_gen, Arc::new(PtyStream::default()));
+        let master = session.master.clone();
+        let stalled = master.lock().unwrap();
+        core.ptys.insert("kaan".into(), session);
+        TEST_TEARDOWN_TIMEOUT.with(|value| *value.borrow_mut() = Some(Duration::ZERO));
+        assert!(core.ptys.kill("kaan"));
+        assert!(!core.ptys.is_running("kaan"));
+        assert_eq!(exits.0.load(Ordering::SeqCst), 1, "offline callback must not wait for close");
+        assert!(!core.ptys.kill("kaan"));
+        wait_teardowns(&core.ptys, |jobs| jobs.get(&old_gen) == Some(&true));
+        let (level, timed_out) = log_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(level, "ERROR");
+        assert_eq!(timed_out["event"], "pty_teardown_timeout");
+        assert_eq!(timed_out["fields"]["generation"], old_gen);
+        assert_eq!(timed_out["fields"]["pending"], 1);
+        assert_eq!(timed_out["fields"].as_object().unwrap().len(), 4, "only id, generation, duration and count are logged");
+        assert_eq!(core.ptys.teardowns.jobs.lock().unwrap().len(), 1, "overrun remains tracked");
+        // Real spawn with the same id: the old master lock and teardown cannot affect it.
+        core.pty_spawn(Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() },
+            crate::agents::shell_sink_for_test(&core, "kaan", Exited::default())).unwrap();
+        assert!(core.ptys.is_running("kaan"));
+        core.shutdown();
+        assert_eq!(exits.0.load(Ordering::SeqCst), 1, "old close has one callback even after respawn/shutdown");
+        drop(stalled);
+        wait_teardowns(&core.ptys, |jobs| !jobs.contains_key(&old_gen));
+        let (_, completed) = log_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(completed["event"], "pty_teardown_complete");
+        assert_eq!(completed["fields"]["generation"], old_gen);
+        assert_eq!(completed["fields"]["pending"], 0);
+        assert_eq!(log_rx.try_recv(), Err(mpsc::TryRecvError::Empty), "one timeout and one late completion per generation");
+        assert!(master.lock().unwrap().is_none(), "only the teardown worker consumes the master, despite retained Arcs");
+        core.ptys.kill("kaan");
+        wait_teardowns(&core.ptys, HashMap::is_empty);
+    }
+
+    #[test]
+    fn early_teardown_releases_start_and_admission_gates() {
+        use std::{sync::mpsc, time::Duration};
+        if isolated_lock_test("pty::tests::early_teardown_releases_start_and_admission_gates") { return; }
+        let timeout = Duration::from_secs(2);
+        #[derive(Debug)]
+        struct Killing { entered: mpsc::Sender<()>, release: Mutex<mpsc::Receiver<()>> }
+        impl ChildKiller for Killing {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv_timeout(Duration::from_secs(6)).expect("test releases the stalled kill");
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> { unreachable!() }
+        }
+        let core = replay_core();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let mut session = replay_session(GEN.fetch_add(1, Ordering::Relaxed), Arc::new(PtyStream::default()));
+        session.killer = Box::new(Killing { entered: entered_tx, release: Mutex::new(release_rx) });
+        core.ptys.insert("kaan".into(), session);
+        let closing = {
+            let core = core.clone();
+            std::thread::spawn(move || {
+                let _admission = core.admit("kaan").unwrap();
+                let _start = core.agent_start_gate.lock().unwrap();
+                assert!(core.ptys.kill("kaan"));
+                returned_tx.send(()).unwrap();
+            })
+        };
+        entered_rx.recv_timeout(timeout).unwrap();
+        returned_rx.recv_timeout(timeout).expect("kill must return while teardown is stalled");
+        closing.join().unwrap();
+        assert!(!core.ptys.is_running("kaan"));
+        assert!(!core.ptys.kill("kaan"), "retirement and exit notification happen once");
+        let _admission = core.admit("kaan").expect("admission gate was released");
+        let _start = core.agent_start_gate.try_lock().expect("start gate was released");
+        core.pty_spawn(Spawn { id: "independent".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() },
+            crate::agents::shell_sink_for_test(&core, "independent", Exited::default())).unwrap();
+        release_tx.send(()).unwrap();
+        core.ptys.kill("independent");
+        wait_teardowns(&core.ptys, HashMap::is_empty);
+    }
+
+    #[test]
+    fn early_teardown_spawn_binds_before_its_first_query() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::early_teardown_spawn_binds_before_its_first_query") { return; }
+        struct Replies { original: Box<dyn Write + Send>, tx: mpsc::Sender<Vec<u8>> }
+        impl Write for Replies {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.original.write_all(bytes)?;
+                self.tx.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
+        }
+        struct Paused<S> {
+            sink: S,
+            pause: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+            replies: mpsc::Sender<Vec<u8>>,
+            exited: mpsc::Sender<()>,
+        }
+        impl<S: PtySink> PtySink for Paused<S> {
+            fn bind_input(&mut self, input: PtyInput) {
+                {
+                    let mut writer = input.0.lock().unwrap();
+                    let original = std::mem::replace(&mut *writer, Box::new(Vec::<u8>::new()));
+                    *writer = Box::new(Replies { original, tx: self.replies.clone() });
+                }
+                self.sink.bind_input(input);
+            }
+            fn data(&mut self, bytes: &[u8]) -> bool {
+                if let Some((entered, release)) = self.pause.take() {
+                    // Replay an incomplete cursor query at the first real reader callback. This
+                    // works even when this Windows version does not request cursor inheritance.
+                    self.sink.data(b"\x1b[");
+                    entered.send(()).unwrap();
+                    release.recv_timeout(Duration::from_secs(2)).unwrap();
+                    self.sink.data(b"6n");
+                }
+                self.sink.data(bytes)
+            }
+            fn exit(&mut self) { self.sink.exit(); self.exited.send(()).unwrap(); }
+        }
+        let core = replay_core();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        core.pty_spawn(Spawn { id: "kaan".into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() },
+            Paused { sink: crate::agents::shell_sink_for_test(&core, "kaan", Exited::default()), pause: Some((entered_tx, release_rx)), replies: reply_tx, exited: exit_tx }).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(core.ptys.kill("kaan"), "retire must not wait on the paused reader's stream lock");
+        release_tx.send(()).unwrap();
+        assert_eq!(reply_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"\x1b[1;1R");
+        exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        wait_teardowns(&core.ptys, HashMap::is_empty);
+        assert_eq!(exit_rx.try_recv(), Err(mpsc::TryRecvError::Disconnected), "reader emits exit exactly once");
+        assert!(!core.ptys.kill("kaan"));
+        core.shutdown();
+    }
+
+    #[test]
+    fn early_teardown_stalled_job_does_not_keep_the_process_alive() {
+        if isolated_lock_test("pty::tests::early_teardown_stalled_job_does_not_keep_the_process_alive") { return; }
+        let ptys = Ptys::default();
+        let session = replay_session(1, Arc::new(PtyStream::default()));
+        let master = session.master.clone();
+        let stalled = master.lock().unwrap();
+        ptys.insert("kaan".into(), session);
+        TEST_TEARDOWN_TIMEOUT.with(|value| *value.borrow_mut() = Some(Duration::ZERO));
+        assert!(ptys.kill("kaan"));
+        wait_teardowns(&ptys, |jobs| jobs.get(&1) == Some(&true));
+        // Deliberately leave only this child's teardown blocked until process exit. The parent
+        // requires bounded child exit; Rust must not join the detached closer on shutdown.
+        std::mem::forget(stalled);
     }
 
     #[test]
@@ -946,6 +1367,32 @@ mod tests {
         assert!(String::from_utf8_lossy(&attachment.snapshot.bytes()).contains("RX:FAST_FINAL_OUTPUT"));
         assert!(exited.0.load(Ordering::SeqCst));
         assert!(ptys.write("kaan", b"input").is_err());
+    }
+
+    #[test]
+    fn finished_attach_is_capped_while_reader_is_draining() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::finished_attach_is_capped_while_reader_is_draining") { return; }
+        let ptys = Ptys::default();
+        let stream = Arc::new(PtyStream::new(2, 40, 10_000));
+        let output: String = (0..3_005).map(|i| format!("line-{i:04}\r\n")).collect();
+        stream.publish(output.as_bytes());
+        stream.publish(b"\x1b[31");
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let mut session = replay_session(0, stream.clone());
+        session.reader_done = Some(drained_rx);
+        ptys.insert("kaan".into(), session);
+        assert!(ptys.kill("kaan"));
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        let history = String::from_utf8(snapshot.scrollback).unwrap();
+        assert_eq!(history.lines().filter(|line| line.starts_with("line-")).count(), 2_000, "retired replay is capped before EOF too");
+        assert!(!history.contains("line-0000"));
+        stream.publish(b"mTAIL");
+        stream.close();
+        drained_tx.send(()).unwrap();
+        wait_teardowns(&ptys, HashMap::is_empty);
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        assert!(String::from_utf8_lossy(&snapshot.ansi).contains("\x1b[31mTAIL"), "capping the snapshot preserves the unfinished parser sequence");
     }
 
     #[test]

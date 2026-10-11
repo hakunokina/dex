@@ -254,13 +254,14 @@ interface BackendAgentState {
   status: AgentStatus;
   sessionId: string | null;
   engine: string | null;
+  generation?: number;
 }
 
 function applyBackendState(s: BackendAgentState) {
   if (s.status === "offline") running.delete(s.agentId);
   else {
     running.add(s.agentId);
-    if (!MOBILE) void capturePty(s.agentId).catch(error => setAgentError(s.agentId, String(error)));
+    if (!MOBILE) void capturePty(s.agentId, s.generation).catch(error => setAgentError(s.agentId, String(error)));
   }
   hookStatus.set(s.agentId, s.status);
   if (s.status === "idle") idleSince.set(s.agentId, Date.now());
