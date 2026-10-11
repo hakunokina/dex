@@ -4,7 +4,7 @@
 // world.ts feeds it once per step; node:test covers it. Drawing is coreEngine.ts `drawCoreXL`.
 import { XL_BODY, XL_EYE } from "./coreEngine.ts";
 import { DONE_MS, ERROR_MS, pickState, type AgentStatus, type CoreStateId, type Step } from "./coreState.ts";
-import { FragmentMotion } from "../symbiote.ts";
+import { FragmentMotion, bodyWeight } from "../symbiote.ts";
 
 export type Vec = { x: number; y: number };
 /** Centre-based layout target (world units). */
@@ -214,6 +214,7 @@ export class CoreXL {
   readonly tracker = new CoreTracker();
   readonly pupil: Vec = { x: 0, y: 0 };
   readonly fragments = new FragmentMotion();
+  readonly weight: Vec = { x: 0, y: 0 };
   hover = 0;
   private blinkAt = -1;
   private blinkStart = -1;
@@ -228,6 +229,10 @@ export class CoreXL {
     this.pupil.x = approach(this.pupil.x, g.to.x, i.dt, g.rate);
     this.pupil.y = approach(this.pupil.y, g.to.y, i.dt, g.rate);
     this.fragments.step(id, i.dt, i.reduced);
+    const weight = bodyWeight(i.anim, i.reduced || id === "sleep");
+    const rate = i.reduced ? Infinity : FOLLOW_RATE;
+    this.weight.x = approach(this.weight.x, weight.x, i.dt, rate);
+    this.weight.y = approach(this.weight.y, weight.y, i.dt, rate);
     this.hover = i.reduced ? Number(i.hovered) : approach(this.hover, Number(i.hovered), i.dt, HOVER_RATE);
     if (!blinks(id, i.reduced)) {
       this.blinkStart = -1;

@@ -1,34 +1,61 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { drawCoreXL, XL_EYE, type CorePalette, type CoreXLFrame } from "./coreEngine.ts";
+import { drawCoreXL, drawCoreFeet, XL_EYE, type CorePalette, type CoreXLFrame } from "./coreEngine.ts";
 import { LOOKS } from "./coreState.ts";
+import { fragmentPaths, plantedFeet } from "../symbiote.ts";
+
+const generatedStamps: { width: number; height: number; stops: [number, string][] }[] = [];
+const originalOffscreenCanvas = globalThis.OffscreenCanvas;
+globalThis.OffscreenCanvas = class {
+  width: number; height: number;
+  constructor(w: number, h: number) { this.width = w; this.height = h; }
+  getContext() {
+    const stops: [number, string][] = [];
+    generatedStamps.push({ width: this.width, height: this.height, stops });
+    return { translate() {}, scale() {}, beginPath() {}, arc() {}, fill() {},
+      createRadialGradient: () => ({ addColorStop: (at: number, color: string) => stops.push([at, color]) }) };
+  }
+  transferToImageBitmap() { return { width: this.width, height: this.height }; }
+} as unknown as typeof OffscreenCanvas;
+test.after(() => { globalThis.OffscreenCanvas = originalOffscreenCanvas; });
 
 const palette: CorePalette = { tokens: { "--red-hi": "#ff0000" }, chip: "#111111", chipTop: "#222222", pin: "#777777", via: "#555555", badgeBg: "#080808", mouth: "#eeeeee", z: "#666666" };
 const frame: CoreXLFrame = { t: 0, age: 5000, from: null, pupil: { x: 4, y: 0 }, lid: 0, hover: 0, reduced: false, provider: null, boot: 0, boardBg: "#111111", edge: "#333333", mono: "monospace" };
 
-function record(id: keyof typeof LOOKS, overrides: Partial<CoreXLFrame> = {}) {
+function record(id: keyof typeof LOOKS, overrides: Partial<CoreXLFrame> = {}, palettes = [palette]) {
   type Op = { name: string; args: number[] };
   const fills: { color: unknown; path: Op[] }[] = [], strokes: { color: unknown; path: Op[] }[] = [];
   const rects: number[][] = [];
+  const images: { surface: unknown; args: number[]; beforeFills: number }[] = [];
   const scales: number[][] = [];
+  const gradients: { kind: string; args: number[]; stops: [number, string][] }[] = [];
+  const gradient = (kind: string, args: number[]) => {
+    const stops: [number, string][] = [];
+    const value = { kind, args, stops, addColorStop: (at: number, color: string) => stops.push([at, color]) };
+    gradients.push(value);
+    return value;
+  };
   let path: Op[] = [];
   const ctx = {
     globalAlpha: 1, fillStyle: "", strokeStyle: "",
     save() {}, restore() {}, translate() {}, clip() {}, closePath() {}, fillText() {},
     scale: (...args: number[]) => scales.push(args),
-    createRadialGradient: () => ({ addColorStop() {} }),
+    drawImage: (surface: unknown, ...args: number[]) => images.push({ surface, args, beforeFills: fills.length }),
+    createRadialGradient: (...args: number[]) => gradient("radial", args),
+    createLinearGradient: (...args: number[]) => gradient("linear", args),
     beginPath: () => { path = []; },
     moveTo: (...args: number[]) => path.push({ name: "move", args }),
     lineTo: (...args: number[]) => path.push({ name: "line", args }),
     arc: (...args: number[]) => path.push({ name: "arc", args }),
+    ellipse: (...args: number[]) => path.push({ name: "ellipse", args }),
     rect: (...args: number[]) => path.push({ name: "rect", args }),
     bezierCurveTo: (...args: number[]) => path.push({ name: "curve", args }),
     fillRect: (...args: number[]) => rects.push(args),
     fill() { fills.push({ color: this.fillStyle, path: [...path] }); },
     stroke() { strokes.push({ color: this.strokeStyle, path: [...path] }); },
   };
-  drawCoreXL(ctx as unknown as CanvasRenderingContext2D, 100, 100, 120, LOOKS[id], { ...frame, ...overrides }, palette);
-  return { fills, strokes, rects, scales };
+  for (const pal of palettes) drawCoreXL(ctx as unknown as CanvasRenderingContext2D, 100, 100, 120, LOOKS[id], { ...frame, ...overrides }, pal);
+  return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, strokes, rects, scales, gradients, images };
 }
 
 test("all eight XL expressions draw one centred red eye and preserve the mouth", () => {
@@ -52,6 +79,47 @@ test("all eight XL expressions draw one centred red eye and preserve the mouth",
     }
     assert.ok(strokes.some(p => p.color === palette.mouth && (id === "error" ? p.path[0].name === "rect" : p.path.some(o => o.name === "move" && o.args[1] === 32))), id);
   }
+});
+
+test("contact shadow precedes the body and fixed highlight/rim remain with reduced motion", () => {
+  for (const reduced of [false, true]) {
+    const { fills, strokes, gradients, images } = record("idle", { reduced });
+    assert.deepEqual(images[0].args, [-53, 23, 112, 32]);
+    assert.equal(images[0].beforeFills, 0);
+    assert.deepEqual(generatedStamps[0].stops, [[0, "rgba(0,0,0,.65)"], [0.45, "rgba(0,0,0,.32)"], [1, "rgba(0,0,0,0)"]]);
+    const liquid = gradients.find(g => g.kind === "radial")!;
+    assert.ok(liquid.args[0] < 0 && liquid.args[1] < 0);
+    assert.deepEqual(liquid.stops[0], [0, palette.pin]);
+    assert.ok(fills.some(p => p.color === liquid));
+    const rim = gradients.find(g => g.kind === "linear")!;
+    assert.deepEqual(rim.args, [-58, -58, 58, 58]);
+    assert.ok(strokes.some(p => p.color === rim));
+  }
+});
+
+test("static contact/light gradients are reused and palette changes refresh the light", () => {
+  const same = record("idle", {}, [palette, palette]);
+  assert.equal(generatedStamps.filter(s => s.height === 48).length, 1);
+  assert.equal(same.images[0].surface, same.images[1].surface);
+  assert.equal(same.gradients.filter(g => g.kind === "radial").length, 1);
+  assert.equal(same.gradients.filter(g => g.kind === "linear").length, 1);
+  const changed = record("idle", {}, [palette, { ...palette, mouth: "#ffffff" }]).gradients;
+  assert.equal(changed.filter(g => g.kind === "linear").length, 2);
+  assert.ok(changed.some(g => g.kind === "linear" && g.stops[0][1] === "#ffffff"));
+});
+
+test("four support feet share two ribbon strokes and retain all planted contacts", () => {
+  const body = { x: 160, y: 160, s: 120 };
+  const paths = fragmentPaths(body, [], [], { x: 0, y: 0, w: 320, h: 320 });
+  const feet = plantedFeet(paths, body, 0, true);
+  assert.equal(feet.length, 4);
+  const { ctx, strokes, fills, images } = record("idle", {}, []);
+  drawCoreFeet(ctx, body, feet, palette, "#333333");
+  assert.equal(strokes.length, 2);
+  assert.equal(strokes[0].path.filter(p => p.name === "move").length, 4);
+  assert.equal(images.length, 4);
+  assert.equal(fills.length, 1);
+  assert.equal(fills[0].path.filter(p => p.name === "ellipse").length, 4);
 });
 
 test("one blink lid covers the enlarged eye; hover scales the shared body/eye space", () => {
