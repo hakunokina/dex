@@ -17,6 +17,8 @@ pub(crate) struct Stop {
     transcript_from: u64,
 }
 
+type SubmissionRows = (Vec<i64>, Vec<i64>, Vec<i64>);
+
 struct Turn {
     session: String,
     process: Option<u64>,
@@ -28,10 +30,14 @@ struct Turn {
     cancelled: bool,
     interrupted: bool,
     accepted: bool,
+    /// A local Enter awaits its confirming UPS; retries keep the original boundary.
+    submitted: bool,
+    submission_rows: Option<SubmissionRows>,
     pending: Option<Rows>,
     reply: Option<String>,
     last_feedback: Option<(u64, Option<String>, String)>,
-    transcript_seq: Option<u64>,
+    /// Exact status stamp owned by this turn (local Enter, UPS or transcript).
+    status_seq: Option<u64>,
     latest_seq: u64,
     end_seq: u64,
 }
@@ -47,6 +53,53 @@ fn audit(agent: &str, seq: Option<u64>, reason: &str) {
 }
 
 impl Core {
+    /// Enter establishes the turn even if its UPS hook never reaches Dex.
+    /// Hold the turn lock through the write; a failed write leaves ownership untouched.
+    /// Leader delivery retains Idle until UPS; chat publishes Working at successful Enter.
+    pub(crate) fn claude_prompt_submit(
+        &self,
+        agent: &str,
+        publish_working: bool,
+        submission_rows: Option<SubmissionRows>,
+        submit: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.agent_states.get(agent).engine.as_deref() == Some("codex") {
+            return submit();
+        }
+        let mut turns = self.claude_turns.0.lock().unwrap();
+        let seq = next_seq();
+        let after = crate::diagnostics::now_ms();
+        let previous = self.agent_states.get(agent);
+        if !publish_working && (previous.in_turn() || self.agent_states.typing(agent) || self.agent_states.pre_session(agent)) {
+            return Ok(());
+        }
+        let process = self.ptys.generation(agent);
+        let retry = !publish_working && submission_rows.is_some() && turns.get(agent).is_some_and(|turn| {
+            turn.submitted && turn.submission_rows == submission_rows && previous.status == Status::Idle
+                && previous.session_id.as_deref() == Some(&turn.session)
+                && process == turn.process
+                && (previous.status_seq <= turn.latest_seq || Some(previous.status_seq) == turn.status_seq)
+        });
+        let transcript_from = previous.transcript.as_ref()
+            .and_then(|p| std::fs::metadata(p).ok()).map_or(0, |m| m.len());
+        submit()?;
+        if retry { return Ok(()); }
+        let published = next_seq();
+        if let Some(state) = self.agent_states.submitted_prompt(&previous, seq, published, publish_working) {
+            if let Some(session) = previous.session_id {
+                turns.insert(agent.into(), Turn {
+                    session, process, after, transcript_from,
+                    stop: None, ended: false, continued: false, cancelled: false,
+                    interrupted: false, accepted: false, submitted: true, submission_rows, pending: None, reply: None,
+                    last_feedback: None, status_seq: Some(state.status_seq), latest_seq: seq, end_seq: published,
+                });
+            }
+            drop(turns);
+            if publish_working { let _ = self.events.emit("agent-status", &state); }
+        }
+        Ok(())
+    }
+
     /// Ingress precedes DB/context work. A newer UPS fences every old Stop callback.
     pub(crate) fn claude_hook_received(
         &self,
@@ -63,7 +116,7 @@ impl Core {
         }
         if matches!(
             event,
-            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop"
+            "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "StopFailure"
         ) {
             self.claude_reconcile_unread_stop(agent);
         }
@@ -89,15 +142,17 @@ impl Core {
             continued: false,
             cancelled: false,
             accepted: false,
+            submitted: false,
+            submission_rows: None,
             pending: None,
             reply: None,
             last_feedback: None,
-            transcript_seq: None,
+            status_seq: None,
             latest_seq: seq,
             end_seq: 0,
             interrupted: false,
         });
-        if seq < turn.latest_seq || (event != "UserPromptSubmit" && seq < turn.end_seq) {
+        if seq < turn.latest_seq || (seq < turn.end_seq && (event != "UserPromptSubmit" || turn.submitted && turn.ended)) {
             return None;
         }
         if turn.session != session
@@ -105,20 +160,26 @@ impl Core {
             || event == "UserPromptSubmit"
             || event == "SessionStart" && !turn.interrupted
         {
+            let confirmation = event == "UserPromptSubmit" && turn.submitted
+                && turn.session == session && turn.process == process;
+            let after = if confirmation { turn.after } else { now };
+            let transcript_from = if confirmation { turn.transcript_from } else { transcript_from };
             *turn = Turn {
                 session: session.clone(),
                 process,
-                after: now,
+                after,
                 transcript_from,
                 stop: None,
                 ended: false,
                 continued: false,
                 cancelled: false,
                 accepted: false,
+                submitted: false,
+                submission_rows: None,
                 pending: None,
                 reply: None,
                 last_feedback: None,
-                transcript_seq: None,
+                status_seq: None,
                 latest_seq: seq,
                 end_seq: 0,
                 interrupted: false,
@@ -126,8 +187,11 @@ impl Core {
         }
         turn.latest_seq = seq;
         if event == "UserPromptSubmit" {
-            self.agent_states
-                .prompt_seq(agent, Some(&session), next_seq());
+            let fence = next_seq();
+            let state = self.agent_states.prompt_seq(agent, Some(&session), fence);
+            if state.status_seq == fence {
+                turn.status_seq = Some(fence);
+            }
         } else if matches!(event, "PreToolUse" | "PostToolUse" | "PostToolUseFailure") {
             turn.continued = true;
             turn.ended = false;
@@ -261,7 +325,7 @@ impl Core {
                 // A watcher can overtake ingress, but a newer non-transcript status owns
                 // the agent even before UPS arrives. Test that stamp atomically at publish.
                 if let Some(state) = self.agent_states.hook_if_current(
-                    agent, status, &stop.session, stop.seq, turn.transcript_seq, stop.seq,
+                    agent, status, &stop.session, stop.seq, turn.status_seq, stop.seq,
                 ) {
                     return state;
                 }
@@ -335,10 +399,12 @@ impl Core {
             continued: false,
             cancelled: false,
             accepted: false,
+            submitted: false,
+            submission_rows: None,
             pending: None,
             reply: None,
             last_feedback: None,
-            transcript_seq: None,
+            status_seq: None,
             latest_seq: 0,
             end_seq: 0,
             interrupted: false,
@@ -404,9 +470,9 @@ impl Core {
             }
             let fence = next_seq();
             if let Some(state) = self.agent_states.hook_if_current(
-                agent, Status::Working, session, turn.latest_seq, turn.transcript_seq, fence,
+                agent, Status::Working, session, turn.latest_seq, turn.status_seq, fence,
             ) {
-                turn.transcript_seq = Some(state.status_seq);
+                turn.status_seq = Some(state.status_seq);
             }
             return;
         }
@@ -420,12 +486,13 @@ impl Core {
         let was_busy = matches!(state.status, Status::Working | Status::Waiting);
         let fence = next_seq();
         turn.end_seq = fence;
-        let state = self
-            .agent_states
-            .hook_seq(agent, Some(Status::Idle), Some(session), fence);
-        if state.status_seq == fence {
-            turn.transcript_seq = Some(fence);
-        }
+        // Completion owns only this turn's hook/transcript status, never a newer paste.
+        let Some(state) = self.agent_states.hook_if_current(
+            agent, Status::Idle, session, turn.latest_seq, turn.status_seq, fence,
+        ) else {
+            return;
+        };
+        turn.status_seq = Some(state.status_seq);
         drop(turns);
         if was_busy {
             crate::hooks::after_turn_ended(self, agent, "Settled", &state);
@@ -1005,16 +1072,277 @@ pub(crate) mod tests {
             Status::Working,
             "real continuation owns the turn"
         );
-        let mut foreign = row("turn_duration", crate::diagnostics::now_ms());
+        let ended_at = core.claude_turns.0.lock().unwrap().get("timur").unwrap().after + 1;
+        let mut foreign = row("turn_duration", ended_at);
         foreign["sessionId"] = json!("other-session");
         observe(&core, foreign);
+        // Zero is the first live PTY generation, not a foreign-process sentinel.
+        let foreign_process = core.ptys.generation("timur").unwrap().wrapping_add(1);
         core.claude_transcript_row(
             "timur",
-            &row("turn_duration", crate::diagnostics::now_ms()),
-            Some(0),
+            &row("turn_duration", ended_at),
+            Some(foreign_process),
         );
         assert_eq!(core.agent_states.get("timur").status, Status::Working);
         finish(&core);
+    }
+
+    #[test]
+    fn local_leader_enter_rearms_completion_when_ups_never_arrives() {
+        let events = Arc::new(DoneEvents::default());
+        let (core, _) = core("leader-submit-rearms-end", events.clone());
+        let _finish = Finish(core.clone());
+        core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq());
+        let ended_at = core.claude_turns.0.lock().unwrap().get("timur").unwrap().after + 1;
+        observe(&core, row("turn_duration", ended_at));
+        assert_eq!(events.0.lock().unwrap().len(), 1);
+
+        let job = result(&core);
+        let stale_ups = next_seq();
+        core.leader_notes_wake("timur");
+        let ended_at = {
+            let turns = core.claude_turns.0.lock().unwrap();
+            let turn = turns.get("timur").unwrap();
+            assert!(turn.submitted);
+            turn.after + 1
+        };
+        let submitted = core.agent_states.get("timur");
+        assert_eq!(submitted.status, Status::Idle);
+        // An earlier accepted UPS body can run only after the local Enter owns the lock.
+        core.claude_hook_received("timur", "UserPromptSubmit", Some("session-a"), stale_ups);
+        core.agent_states.hook_seq("timur", Some(Status::Working), Some("session-a"), stale_ups);
+        assert_eq!(core.agent_states.get("timur").status_seq, submitted.status_seq);
+        // The CLI processed its result; the confirming UPS never reached Dex.
+        with(&core.db, |c| {
+            c.execute("UPDATE delegations SET notified=1 WHERE id=?1", [job]).map_err(|e| e.to_string())?;
+            Ok(())
+        }).unwrap();
+        core.leader_pastes.lock().unwrap().remove("timur");
+        observe(&core, row("turn_duration", ended_at));
+        assert_eq!(events.0.lock().unwrap().len(), 2, "a local turn needs its own completion claim");
+    }
+
+    #[test]
+    fn new_leader_delivery_gets_its_own_boundary_without_ups() {
+        let (core, _) = core("new-delivery-boundary", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        let first_job = result(&core);
+        core.leader_notes_wake("timur");
+        let first = core.claude_turns.0.lock().unwrap().get("timur").unwrap().latest_seq;
+        // The first flight was delivered through context, not a matching UPS.
+        with(&core.db, |c| {
+            c.execute("UPDATE delegations SET notified=1 WHERE id=?1", [first_job]).map_err(|e| e.to_string())?;
+            Ok(())
+        }).unwrap();
+        core.leader_pastes.lock().unwrap().remove("timur");
+        result(&core);
+        core.leader_notes_wake("timur");
+        assert!(core.claude_turns.0.lock().unwrap().get("timur").unwrap().latest_seq > first);
+    }
+
+    #[test]
+    fn pending_leader_enter_cannot_replace_another_working_turn() {
+        let (core, _) = core("busy-before-leader-enter", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        core.chat_send("timur", "patron-turn-canary").unwrap();
+        let before = core.agent_states.get("timur");
+        let mut wrote = false;
+        core.claude_prompt_submit("timur", false, Some((vec![1], vec![], vec![])), || { wrote = true; Ok(()) }).unwrap();
+        assert!(!wrote, "readiness must still hold under the turn lock at Enter");
+        assert_eq!(core.agent_states.get("timur").status_seq, before.status_seq);
+    }
+
+    #[test]
+    fn stop_failure_reconciles_accepted_reply_before_new_enter() {
+        let (core, _) = core("accepted-before-new-enter", NullSink);
+        let _finish = Finish(core.clone());
+        let id = result(&core);
+        core.delegation_on_hook("timur", "Stop", &json!({}), false).unwrap();
+        accepted_stop(&core, "timur");
+        let failed = next_seq();
+        core.claude_hook_received("timur", "StopFailure", Some("session-a"), failed);
+        core.agent_states.hook_seq("timur", Some(Status::Idle), Some("session-a"), failed);
+        core.chat_send("timur", "new-prompt-canary").unwrap();
+        assert!(with(&core.db, |c| delegate::get(c, id)).unwrap().delivered_at.is_some(),
+            "a new boundary cannot discard the old CLI acceptance receipt");
+    }
+
+    #[test]
+    fn enter_preserves_newer_status_written_during_submit() {
+        for working in [true, false] {
+            for status in [Status::Waiting, Status::Offline] {
+                let (core, _) = core("new-status-during-enter", NullSink);
+                let _finish = Finish(core.clone());
+                let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+                core.claude_stop_status("timur", &stop, Status::Idle);
+                let mut expected = None;
+                core.claude_prompt_submit("timur", working, None, || {
+                    expected = Some(core.agent_states.hook("timur", Some(status), None));
+                    core.ptys.write("timur", b"\r")
+                }).unwrap();
+                let expected = expected.unwrap();
+                let actual = core.agent_states.get("timur");
+                assert_eq!(actual.status, expected.status);
+                assert_eq!(actual.status_seq, expected.status_seq);
+                assert!(core.claude_stop_is_current("timur", &stop), "rejected publication cannot replace ownership");
+            }
+        }
+    }
+
+    #[test]
+    fn enter_publication_fences_stop_accepted_during_submit() {
+        let (core, _) = core("stop-during-enter", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        let mut accepted = 0;
+        core.claude_prompt_submit("timur", true, None, || {
+            // The old Stop connection arrives before this Enter actually reaches the PTY.
+            accepted = next_seq();
+            core.ptys.write("timur", b"\r")
+        }).unwrap();
+        let working = core.agent_states.get("timur");
+        if let Some(late) = core.claude_hook_received("timur", "Stop", Some("session-a"), accepted) {
+            core.claude_stop_status("timur", &late, Status::Idle);
+        } else {
+            // hooks::serve falls back to the accepted sequence when no Stop is current.
+            core.agent_states.hook_seq("timur", Some(Status::Idle), Some("session-a"), accepted);
+        }
+        assert_eq!(core.agent_states.get("timur").status, Status::Working);
+        assert_eq!(core.agent_states.get("timur").status_seq, working.status_seq);
+    }
+
+    #[test]
+    fn submitted_turn_end_fences_ups_accepted_before_completion() {
+        let (core, _) = core("late-submitted-ups", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        core.chat_send("timur", "new-prompt-canary").unwrap();
+        let accepted_ups = next_seq();
+        let ended_at = core.claude_turns.0.lock().unwrap().get("timur").unwrap().after + 1;
+        observe(&core, row("turn_duration", ended_at));
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+        // Its connection was accepted while this locally submitted turn was still live.
+        core.claude_hook_received("timur", "UserPromptSubmit", Some("session-a"), accepted_ups);
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+    }
+
+    #[test]
+    fn ups_confirmation_keeps_submitted_turn_boundary() {
+        let (core, _) = core("ups-confirms-submit", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        core.chat_send("timur", "new-prompt-canary").unwrap();
+        // The CLI completed before its delayed UPS body reached reconciliation.
+        // Age the submitted boundary directly; no scheduler delay is needed.
+        let submitted_at = crate::diagnostics::now_ms().saturating_sub(1000);
+        core.claude_turns.0.lock().unwrap().get_mut("timur").unwrap().after = submitted_at;
+        core.claude_hook_received("timur", "UserPromptSubmit", Some("session-a"), next_seq());
+        observe(&core, row("turn_duration", submitted_at + 1));
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+    }
+
+    #[test]
+    fn leader_enter_retry_keeps_first_turn_boundary() {
+        let (core, _) = core("retry-turn-boundary", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        core.claude_stop_status("timur", &stop, Status::Idle);
+        core.claude_prompt_submit("timur", false, Some((vec![1], vec![], vec![])), || core.ptys.write("timur", b"\r")).unwrap();
+        let first = {
+            let turns = core.claude_turns.0.lock().unwrap();
+            let turn = turns.get("timur").unwrap();
+            (turn.after, turn.latest_seq, turn.transcript_from)
+        };
+        core.claude_prompt_submit("timur", false, Some((vec![1], vec![], vec![])), || core.ptys.write("timur", b"\r")).unwrap();
+        let turns = core.claude_turns.0.lock().unwrap();
+        let turn = turns.get("timur").unwrap();
+        assert_eq!((turn.after, turn.latest_seq, turn.transcript_from), first);
+    }
+
+    #[test]
+    fn failed_prompt_enter_keeps_previous_turn_owner() {
+        struct RejectEnter(Box<dyn Write + Send>);
+        impl Write for RejectEnter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes == b"\r" {
+                    Err(std::io::Error::other("fixture Enter failure"))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+        }
+        let (core, _) = core("failed-enter-owner", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core.claude_hook_received("timur", "Stop", Some("session-a"), next_seq()).unwrap();
+        let before = core.claude_stop_status("timur", &stop, Status::Idle);
+        core.ptys.input_writer_for_test("timur", |original| Box::new(RejectEnter(original)));
+        assert!(core.paste_prompt("timur", "new-prompt-canary").is_err());
+        let after = core.agent_states.get("timur");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.status_seq, before.status_seq);
+        assert!(core.claude_stop_is_current("timur", &stop));
+    }
+
+    #[test]
+    fn transcript_end_releases_prompt_when_ups_never_arrives() {
+        for completion in ["turn_duration", "timeout"] {
+            let (core, _) = core("end-without-ups", NullSink);
+            let _finish = Finish(core.clone());
+            let stop = core
+                .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+                .unwrap();
+            core.claude_stop_status("timur", &stop, Status::Idle);
+            assert_eq!(core.chat_send("timur", "new-prompt-canary").unwrap(), "sent");
+            let ended_at = crate::diagnostics::now_ms() + 1;
+            let ended = if completion == "timeout" {
+                json!({"type":"attachment","sessionId":"session-a","timestamp":timestamp(ended_at),
+                    "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":true}})
+            } else {
+                row("turn_duration", ended_at)
+            };
+            // This new turn really completed, even though its UPS never reached Dex.
+            observe(&core, ended);
+            assert_eq!(core.agent_states.get("timur").status, Status::Idle, "{completion}");
+        }
+    }
+
+    #[test]
+    fn transcript_end_preserves_prompt_pasted_before_ups() {
+        for completion in ["turn_duration", "timeout"] {
+            let (core, input) = core("end-after-paste", NullSink);
+            let _finish = Finish(core.clone());
+            let stop = core
+                .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+                .unwrap();
+            core.claude_stop_status("timur", &stop, Status::Idle);
+            let ended_at = stop.at + 1;
+            let ended = if completion == "timeout" {
+                json!({"type":"attachment","sessionId":"session-a","timestamp":timestamp(ended_at),
+                    "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":true}})
+            } else {
+                row("turn_duration", ended_at)
+            };
+            assert_eq!(core.chat_send("timur", "new-prompt-canary").unwrap(), "sent");
+            let expected = core.agent_states.get("timur");
+            assert_eq!(expected.status, Status::Working);
+            assert_eq!(core.chat_send("timur", "queued-canary").unwrap(), "queued");
+
+            // The watcher reads the old turn's completion only after the new paste's Enter.
+            observe(&core, ended);
+            let actual = core.agent_states.get("timur");
+            assert_eq!(actual.status, Status::Working, "{completion}: new prompt owns the turn");
+            assert_eq!(actual.status_seq, expected.status_seq, "{completion}");
+            assert_eq!(core.chat_queues.lock().unwrap().get("timur").unwrap().len(), 1);
+            assert_eq!(input.lock().unwrap().windows(6).filter(|w| *w == b"\x1b[200~").count(), 1);
+        }
     }
 
     #[test]
@@ -1529,15 +1857,18 @@ pub(crate) mod tests {
         let id = result(&core);
         core.delegation_on_hook("timur", "Stop", &json!({}), false)
             .unwrap();
-        let old_end = row("turn_duration", crate::diagnostics::now_ms());
+        let ended_at = core.claude_turns.0.lock().unwrap().get("timur").unwrap().stop.as_ref().unwrap().at + 1;
+        let old_end = row("turn_duration", ended_at);
         observe(
             &core,
             json!({"type":"attachment","sessionId":"session-a","timestamp":old_end["timestamp"],
             "attachment":{"type":"hook_cancelled","hookEvent":"Stop","timedOut":true}}),
         );
-        std::thread::sleep(Duration::from_millis(2));
+        let idle = core.agent_states.get("timur");
+        assert_eq!(idle.status, Status::Idle);
+        assert_eq!(core.claude_turns.0.lock().unwrap().get("timur").unwrap().status_seq, Some(idle.status_seq));
         let summary =
-            blocked_stop_rows("session-a", "other hook", crate::diagnostics::now_ms())[0].clone();
+            blocked_stop_rows("session-a", "other hook", ended_at + 1)[0].clone();
         observe(&core, summary);
         observe(&core, old_end);
         assert_eq!(
