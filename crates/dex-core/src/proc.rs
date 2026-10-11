@@ -628,6 +628,21 @@ fn job_process_ids(job: windows_sys::Win32::Foundation::HANDLE, cap: usize) -> R
 /// A root whose job cannot be read carries the error; the other roots are unaffected.
 #[cfg(windows)]
 fn processes_of(roots: &[u32]) -> Result<std::collections::BTreeMap<u32, AgentProcs>, String> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+    processes_of_sampled(roots, cores,
+        |h| (std::time::Instant::now(), cpu_time(h)),
+        || std::thread::sleep(std::time::Duration::from_millis(SAMPLE_MS)))
+}
+
+/// Pair each CPU counter with its own clock reading. Tests can supply exact samples without
+/// assuming that a live process received CPU during a fixed wall-clock window.
+#[cfg(windows)]
+fn processes_of_sampled(
+    roots: &[u32],
+    cores: f64,
+    mut sample: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> (std::time::Instant, u64),
+    wait: impl FnOnce(),
+) -> Result<std::collections::BTreeMap<u32, AgentProcs>, String> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
@@ -657,18 +672,19 @@ fn processes_of(roots: &[u32]) -> Result<std::collections::BTreeMap<u32, AgentPr
                     unsafe { CloseHandle(h) };
                     continue;
                 }
-                open.push(Open { pid, root, handle: h, t0: std::time::Instant::now(), cpu0: cpu_time(h) });
+                let (t0, cpu0) = sample(h);
+                open.push(Open { pid, root, handle: h, t0, cpu0 });
             }
         }
     }
     if !open.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(SAMPLE_MS));
+        wait();
     }
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
     let parents = parents();
     for o in open {
-        let wall = o.t0.elapsed().as_secs_f64() * 1e7; // 100 ns units, like FILETIME
-        let busy = cpu_time(o.handle).saturating_sub(o.cpu0) as f64;
+        let (now, cpu) = sample(o.handle);
+        let wall = now.duration_since(o.t0).as_secs_f64() * 1e7; // 100 ns units, like FILETIME
+        let busy = cpu.saturating_sub(o.cpu0) as f64;
         let (ppid, snap_name) = parents.get(&o.pid).cloned().unwrap_or_default();
         let name = image_name(o.handle).unwrap_or(snap_name);
         let raw = command_line(o.handle).unwrap_or_default();
@@ -691,6 +707,126 @@ fn processes_of(roots: &[u32]) -> Result<std::collections::BTreeMap<u32, AgentPr
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn process_fixture() {
+        use std::io::{Read, Write};
+        if std::env::var_os("DEX_PROC_FIXTURE").is_none() { return; }
+        println!("DEX_PROCESS_READY {}", std::process::id());
+        std::io::stdout().flush().unwrap();
+        let mut go = [0];
+        std::io::stdin().read_exact(&mut go).unwrap();
+    }
+
+    /// The shell cannot spawn its child until adopt has returned. The child reports its PID
+    /// and holds on stdin, so its lifetime is independent of scheduler load and ping duration.
+    #[cfg(windows)]
+    struct TestPane {
+        child: std::process::Child,
+        input: std::process::ChildStdin,
+        ready: std::sync::mpsc::Receiver<String>,
+        tree: Option<super::Tree>,
+    }
+
+    #[cfg(windows)]
+    impl TestPane {
+        fn spawn(parent: windows_sys::Win32::Foundation::HANDLE, limits: &super::Limits, successive: bool) -> Self {
+            use std::io::BufRead;
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            let exe = std::env::current_exe().unwrap();
+            let fixture = format!(r#""{}" --exact proc::tests::process_fixture --nocapture"#, exe.display());
+            let command = format!("set /p dex_go= & {fixture}{}", if successive { format!(" & {fixture}") } else { String::new() });
+            let mut child = Command::new("cmd").args(["/d", "/q", "/c"]).raw_arg(command)
+                .env("DEX_PROC_FIXTURE", "1").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            let input = child.stdin.take().unwrap();
+            let output = child.stdout.take().unwrap();
+            let (tx, ready) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in std::io::BufReader::new(output).lines() {
+                    let Ok(line) = line else { break };
+                    if tx.send(line).is_err() { break; }
+                }
+            });
+            let mut pane = Self { child, input, ready, tree: None };
+            pane.tree = Some(super::Tree::adopt_in(pane.child.id(), limits, Some(parent)).expect("adopt gated shell"));
+            pane
+        }
+
+        fn start(&mut self) -> super::Open {
+            use std::io::Write;
+            self.input.write_all(b"go\r\n").unwrap();
+            self.next_child()
+        }
+
+        fn next_child(&mut self) -> super::Open {
+            use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+            use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let line = self.ready.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or_else(|e| panic!("child-ready root {}: {e:?}; exit {:?}", self.child.id(), self.child.try_wait()));
+                let Some(pid) = line.strip_prefix("DEX_PROCESS_READY ").and_then(|p| p.parse::<u32>().ok()) else { continue };
+                let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+                assert!(!handle.is_null(), "ready child {pid}");
+                let open = super::Open { pid, root: self.child.id(), handle, t0: std::time::Instant::now(), cpu0: 0 };
+                let mut inside = 0;
+                assert_ne!(unsafe { IsProcessInJob(handle, self.tree.as_ref().unwrap().job, &mut inside) }, 0);
+                assert_ne!(inside, 0, "ready child {pid} belongs to root {}", self.child.id());
+                return open;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestPane {
+        fn drop(&mut self) {
+            drop(self.tree.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(windows)]
+    fn exit_code(process: &super::Open) -> u32 {
+        let mut code = 0;
+        assert_ne!(unsafe { windows_sys::Win32::System::Threading::GetExitCodeProcess(process.handle, &mut code) }, 0);
+        code
+    }
+
+    #[cfg(windows)]
+    fn wait_exit(process: &super::Open) -> u32 {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        assert_eq!(unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(process.handle, 15_000) }, WAIT_OBJECT_0,
+            "pid {} still active, exit {}", process.pid, exit_code(process));
+        exit_code(process)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_completed_child_does_not_mean_its_sibling_pane_was_killed() {
+        use std::io::Write;
+        use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+        let parent = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        let lim = super::Limits { total_cpu_percent: 80, agent_cpu_percent: 0, mem_bytes: 0 };
+        let mut a = TestPane::spawn(parent, &lim, false);
+        let mut b = TestPane::spawn(parent, &lim, true);
+        let _ca = a.start();
+        let transient = b.start();
+        assert!(job_pids(b.tree.as_ref().unwrap().job).contains(&transient.pid));
+        b.input.write_all(b"x").unwrap();
+        let live = b.next_child();
+        let code = wait_exit(&transient);
+        drop(a.tree.take());
+        assert_eq!(code, 0, "pid {} exited normally before the other job closed", transient.pid);
+        assert_eq!(b.child.try_wait().unwrap(), None, "sibling root {}", b.child.id());
+        assert_eq!(exit_code(&live), windows_sys::Win32::Foundation::STILL_ACTIVE as u32, "sibling child {}", live.pid);
+        assert!(!super::alive(transient.pid));
+        drop(a);
+        drop(b);
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(parent) };
+    }
+
     #[test]
     fn own_process_is_alive() {
         assert!(super::alive(std::process::id()));
@@ -822,28 +958,30 @@ mod tests {
         let parent = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         assert!(!parent.is_null());
         let lim = |total| super::Limits { total_cpu_percent: total, agent_cpu_percent: 0, mem_bytes: 0 };
-        // The second ping is born ~1 s later, surely after adopt: it lands in the job by auto-join.
-        let ping = || std::process::Command::new("cmd").args(["/c", "ping -n 2 127.0.0.1 >NUL & ping -n 30 127.0.0.1 >NUL"]).spawn().unwrap();
-        let (mut a, mut b) = (ping(), ping());
-        let ta = super::Tree::adopt_in(a.id(), &lim(80), Some(parent)).expect("job a");
+        let mut a = TestPane::spawn(parent, &lim(80), false);
         assert_eq!(cpu_rate(parent).1, 8000);
-        let tb = super::Tree::adopt_in(b.id(), &lim(7), Some(parent)).expect("job b");
+        let mut b = TestPane::spawn(parent, &lim(7), false);
         assert_eq!(cpu_rate(parent).1, 700); // son ayar geçerli, çalışanlar dahil
-        assert_eq!(cpu_rate(tb.job).0, 0, "ajan başı tavan varsayılan kapalı");
-        std::thread::sleep(std::time::Duration::from_millis(1600));
-        let (pa, pb) = (job_pids(ta.job), job_pids(tb.job));
+        assert_eq!(cpu_rate(b.tree.as_ref().unwrap().job).0, 0, "ajan başı tavan varsayılan kapalı");
+        let (ca, cb) = (a.start(), b.start());
+        let (pa, pb) = (job_pids(a.tree.as_ref().unwrap().job), job_pids(b.tree.as_ref().unwrap().job));
         let all = job_pids(parent);
-        assert!(pa.len() >= 2 && pb.len() >= 2, "cmd+ping: {pa:?} {pb:?}");
+        assert!(pa.len() >= 2 && pb.len() >= 2, "cmd+child: {pa:?} {pb:?}");
+        assert!(pa.contains(&ca.pid) && pb.contains(&cb.pid));
+        assert!(!pa.iter().any(|p| pb.contains(p)), "sibling pane jobs must be disjoint: {pa:?} {pb:?}");
         assert!(pa.iter().chain(&pb).all(|p| all.contains(p)), "üst job iki ağacı da görür: {all:?}");
-        drop(ta);
-        let _ = a.wait();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(a.tree.take());
+        let closed = a.child.wait().unwrap();
+        let child_code = wait_exit(&ca);
         assert!(pa.iter().all(|&p| !super::alive(p)), "kapanan pane'in ağacı öldü");
-        assert!(pb.iter().all(|&p| super::alive(p)), "diğer pane yaşıyor");
+        assert!(pb.iter().all(|&p| super::alive(p)), "diğer pane yaşıyor: {pb:?}; root {} exit {:?}, child {} exit {}; closed root {} exit {closed}, child {} exit {child_code}",
+            b.child.id(), b.child.try_wait(), cb.pid, exit_code(&cb), a.child.id(), ca.pid);
+        assert_eq!(b.child.try_wait().unwrap(), None);
+        assert_eq!(exit_code(&cb), windows_sys::Win32::Foundation::STILL_ACTIVE as u32);
         assert!(unsafe { super::set_cpu_cap(parent, 0) });
         assert_eq!(cpu_rate(parent).0, 0, "0 = sınırsız → rate control kapalı");
-        drop(tb);
-        let _ = b.wait();
+        drop(a);
+        drop(b);
         unsafe { CloseHandle(parent) };
     }
 
@@ -952,49 +1090,60 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn panel_lists_own_tree_and_kills_only_inside() {
-        use super::{kill_in_tree, processes_of, Tree};
+        use super::{kill_in_tree, processes_of};
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
         let parent = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        let lim = super::Limits { total_cpu_percent: 0, agent_cpu_percent: 0, mem_bytes: 0 };
-        // The listed ping starts ~1 s after adopt: one born before cmd joins the job is not in it.
-        let mut a = std::process::Command::new("cmd").args(["/c", "ping -n 2 127.0.0.1 >NUL & ping -n 30 127.0.0.1 >NUL"]).spawn().unwrap();
-        let mut b = std::process::Command::new("cmd").args(["/d", "/c", "for /l %i in (0,0,1) do @rem"]).spawn().unwrap();
-        let (ra, rb) = (a.id(), b.id());
-        let ta = Tree::adopt_in(ra, &lim, Some(parent)).expect("job a");
-        let tb = Tree::adopt_in(rb, &lim, Some(parent)).expect("job b");
-        std::thread::sleep(std::time::Duration::from_millis(1600));
-        let map = processes_of(&[ra, rb, 1]).unwrap();
+        assert!(!parent.is_null());
+        let lim = super::Limits { total_cpu_percent: 80, agent_cpu_percent: 0, mem_bytes: 0 };
+        let mut a = TestPane::spawn(parent, &lim, false);
+        let mut b = TestPane::spawn(parent, &lim, false);
+        let (ca, cb) = (a.start(), b.start());
+        let (ra, rb) = (a.child.id(), b.child.id());
+        // Exercise OS reads as well as exact CPU math. A live process is allowed to get zero
+        // CPU under load; the formula is checked with two controlled samples on real handles.
+        let actual = processes_of(&[ra, rb]).unwrap();
+        assert!(actual[&ra].processes.iter().any(|p| p.pid == ca.pid));
+        assert!(actual[&rb].processes.iter().any(|p| p.pid == cb.pid));
+        let base = std::time::Instant::now();
+        let mut sampled = std::collections::HashSet::new();
+        let map = super::processes_of_sampled(&[ra, rb, 1], 4.0, |h| {
+            if sampled.insert(h as usize) { (base, 123) }
+            else { (base + std::time::Duration::from_secs(1), 10_000_123) }
+        }, || {}).unwrap();
         assert!(!map.contains_key(&1), "Dex'in job'u olmayan kök listelenmez");
         let la = &map[&ra].processes;
         assert!(la[0].root && la[0].pid == ra && la[0].kind == super::ProcKind::Shell, "{la:?}");
-        let ping = la.iter().find(|p| p.name.eq_ignore_ascii_case("ping.exe")).unwrap_or_else(|| panic!("ping in a: {la:?}"));
-        assert!(!ping.root && ping.ppid == ra && ping.cmd.contains("127.0.0.1") && ping.mem_mb > 0.0, "{ping:?}");
+        let child = la.iter().find(|p| p.pid == ca.pid).unwrap_or_else(|| panic!("ready child in a: {la:?}"));
+        assert!(!child.root && child.ppid == ra && child.cmd.contains("process_fixture") && !child.name.is_empty() && child.mem_mb > 0.0, "{child:?}");
         let burner = &map[&rb].processes[0];
         assert!(burner.root && burner.cpu_pct > 0.5, "iki örnek farkı: {burner:?}");
+        assert_eq!(burner.cpu_pct, 25.0, "1 CPU-second / 1 wall-second / 4 cores");
 
         assert!(kill_in_tree(ra, ra).is_err(), "kök korunur");
         assert!(kill_in_tree(ra, rb).is_err(), "başka ajanın süreci");
         assert!(kill_in_tree(ra, std::process::id()).is_err(), "job dışı süreç");
-        assert!(kill_in_tree(1, ping.pid).is_err(), "bilinmeyen kök");
+        assert!(kill_in_tree(1, child.pid).is_err(), "bilinmeyen kök");
         // #918: no handle is "cannot reach" / "gone", never "not in this tree".
         let denied = kill_in_tree(ra, 4).unwrap_err();
         assert!(denied.contains("erişilemedi"), "System (4): {denied}");
         let gone = kill_in_tree(ra, 0).unwrap_err();
         assert!(gone.contains("bulunamadı"), "pid 0: {gone}");
         // #918: a list larger than the first buffer grows instead of coming back empty.
-        let all = super::job_process_ids(ta.job, 1).unwrap();
-        assert!(all.len() >= 2 && all.contains(&ra) && all.contains(&ping.pid), "{all:?}");
-        assert!(super::alive(ra) && super::alive(rb) && super::alive(ping.pid));
-        kill_in_tree(ra, ping.pid).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(!super::alive(ping.pid));
-        let _ = a.wait();
+        let all = super::job_process_ids(a.tree.as_ref().unwrap().job, 1).unwrap();
+        assert!(all.len() >= 2 && all.contains(&ra) && all.contains(&child.pid), "{all:?}");
+        assert!(super::alive(ra) && super::alive(rb) && super::alive(child.pid));
+        kill_in_tree(ra, child.pid).unwrap();
+        assert_eq!(wait_exit(&ca), 1, "only the selected handle was terminated");
+        assert!(!super::alive(child.pid));
+        let _ = a.child.wait().unwrap();
+        assert_eq!(b.child.try_wait().unwrap(), None, "sibling root {rb}");
+        assert_eq!(exit_code(&cb), windows_sys::Win32::Foundation::STILL_ACTIVE as u32, "sibling child {}", cb.pid);
 
-        drop(ta);
+        drop(a.tree.take());
         assert!(!processes_of(&[ra]).unwrap().contains_key(&ra), "kapanan ağaç kayıttan düşer");
-        drop(tb);
-        let _ = b.wait();
+        drop(a);
+        drop(b);
         unsafe { CloseHandle(parent) };
     }
 

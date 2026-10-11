@@ -610,7 +610,8 @@ pub(crate) fn memory_scope(conn: &rusqlite::Connection, ctx: &crate::project_con
     Ok(scope)
 }
 
-/// Index derived from each memory file's frontmatter (no hand-kept MEMORY.md), newest first,
+/// Index derived from each memory file's frontmatter (no hand-kept MEMORY.md), newest first
+/// (equal timestamps use descending filename order),
 /// team-shared before agent-specific. Both sections share `limit`: "Sana özel" is guaranteed
 /// [`INDEX_PRIVATE_MIN`], the rest goes to whichever section needs it (a section that uses less
 /// leaves the remainder to the other). Each section notes its own dropped count.
@@ -867,7 +868,11 @@ fn memory_entries_ranked(root_canon: &Path, dir: &Path, project: Option<Option<&
         .filter(|p| !p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("MEMORY.md")))
         .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
         .collect();
-    files.sort_by_key(|(time, path)| (ranks.get(path).copied().unwrap_or(usize::MAX), std::cmp::Reverse(*time)));
+    files.sort_by(|(ta, pa), (tb, pb)| {
+        ranks.get(pa).copied().unwrap_or(usize::MAX).cmp(&ranks.get(pb).copied().unwrap_or(usize::MAX))
+            .then_with(|| tb.cmp(ta))
+            .then_with(|| pb.cmp(pa))
+    });
     files
         .into_iter()
         .filter_map(|(_, p)| {
@@ -1565,18 +1570,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Ranking precedes recency; tied timestamps use a stable filename order.
+    #[test]
+    fn memory_entry_order_uses_rank_then_mtime_then_filename() {
+        let root = std::env::temp_dir().join(format!("dex-mem-order-{}", std::process::id()));
+        for (name, seconds) in [("a", 50), ("b", 200), ("c", 100), ("z", 100)] {
+            let path = root.join(format!("shared/{name}.md"));
+            put(&path, &format!("---\nname: {name}\ndescription: order\n---\n"));
+            std::fs::File::options().write(true).open(path).unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)).unwrap();
+        }
+        let canonical = root.canonicalize().unwrap();
+        let names = |lines: Vec<String>| lines.iter().map(|l| l.split_whitespace().nth(1).unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(names(memory_entries(&canonical, &root.join("shared"))), ["b", "z", "c", "a"]);
+        let ranks = HashMap::from([(root.join("shared/a.md"), 0)]);
+        assert_eq!(names(memory_entries_ranked(&canonical, &root.join("shared"), None, &ranks)), ["a", "b", "z", "c"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Özel bölüm boşken ortak tüm sınırı kullanır (artanı devralır), özelde not olmaz.
     #[test]
     fn index_quota_unused_passes_to_other() {
         let root = std::env::temp_dir().join(format!("dex-mem-quota2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         for i in 0..60 {
+            let path = root.join(format!("shared/s{i:02}.md"));
             put(
-                &root.join(format!("shared/s{i:02}.md")),
+                &path,
                 &format!("---\nname: s{i:02}\ndescription: ortak kayıt numara {i:02} doldurma metni doldurma doldurma doldurma\nmetadata:\n  type: project\n---\n"),
             );
+            // Coarse filesystem timestamps must not decide which tied entry survives the cut.
+            std::fs::File::options().write(true).open(path).unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100)).unwrap();
         }
-        let idx = memory_index(&root, "nobody", INDEX_LIMIT);
+        // Budget exactly 40 rows plus the real headers: changing TEMP's path length cannot
+        // change this quota test's cut. All 60 mtimes tie; filename order selects s59 first.
+        let full = memory_index(&root, "nobody", usize::MAX);
+        let rows: Vec<_> = full.lines().filter(|l| l.starts_with("- s")).collect();
+        let row_budget: usize = rows[..40].iter().map(|l| l.len() + 1).sum();
+        let fixed = full.len() - rows.iter().map(|l| l.len() + 1).sum::<usize>();
+        let limit = fixed + row_budget;
+        let idx = memory_index(&root, "nobody", limit);
         assert!(idx.contains("(boş)"), "{idx}");
         assert!(idx.contains("- s59 [project]"), "{idx}");
         assert_eq!(idx.matches("kayıt daha sığmadı; memory_search ile ara.").count(), 1, "{idx}");
@@ -1588,13 +1622,14 @@ mod tests {
             .filter(|l| l.starts_with("- s"))
             .map(|l| l.len() + 1)
             .sum();
-        assert!(shared_shown > INDEX_LIMIT / 2, "ortak {shared_shown} bayt");
+        assert_eq!(idx.lines().filter(|l| l.starts_with("- s")).count(), 40, "{idx}");
+        assert!(shared_shown > row_budget / 2, "ortak {shared_shown} bayt");
         let notes: usize = idx
             .lines()
             .filter(|l| l.contains("kayıt daha sığmadı"))
             .map(|l| l.len() + 1)
             .sum();
-        assert!(idx.len() - notes <= INDEX_LIMIT, "toplam {}", idx.len());
+        assert!(idx.len() - notes <= limit, "toplam {}", idx.len());
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -1,8 +1,9 @@
 //! #41: one Core per data dir. Two processes on the same `dex.db` (release + `tauri dev`, or a
 //! `dexd --data-dir` pointed at the app's dir) would each run `reconcile_on_start` and close the
 //! other's open delegations. The guard is an exclusive OS lock on `<data_dir>/dex.lock`
-//! (`LockFileEx` / `flock`): the OS drops it with the handle, so a crashed process never leaves a
-//! stale lock behind. Held for the Core's lifetime; released by [`Lock`]'s drop.
+//! (`LockFileEx` / `flock`): a crashed process never leaves a stale lock behind once inherited
+//! descriptors close. Held for the Core's lifetime; explicitly released by [`Lock`]'s drop on
+//! Unix, where a forked child's descriptor could otherwise prolong the lock until exec.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::Path;
@@ -11,6 +12,19 @@ pub const LOCK_FILE: &str = "dex.lock";
 
 #[derive(Debug)]
 pub struct Lock(#[allow(dead_code)] File);
+
+#[cfg(unix)]
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // CLOEXEC prevents inheritance past exec, not during fork -> pre_exec. Unlock the
+        // shared open-file description now; close alone may leave the child's reference locked.
+        if let Err(e) = self.0.unlock() {
+            // No panic during shutdown. File still closes; on failure a retained reference
+            // stays locked (fail closed) until the child closes it, rather than allowing overlap.
+            eprintln!("dex: instance kilidi bırakılamadı: {e}");
+        }
+    }
+}
 
 /// Takes the data dir's lock, or explains that another Dex already holds it.
 pub fn acquire(data_dir: &Path) -> Result<Lock, String> {
@@ -57,6 +71,43 @@ mod tests {
         let (a, b) = (dir("a"), dir("b"));
         let _la = acquire(&a).unwrap();
         let _lb = acquire(&b).unwrap();
+    }
+
+    /// dup and fork retain the same flock reference. CLOEXEC only closes it at exec,
+    /// so shutdown must release the lock even while a child is still in pre_exec.
+    #[cfg(unix)]
+    #[test]
+    fn drop_releases_lock_while_an_inherited_descriptor_lives() {
+        use std::os::fd::AsRawFd;
+        let d = dir("inherited");
+        let first = acquire(&d).unwrap();
+        let flags = unsafe { libc::fcntl(first.0.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let inherited = first.0.try_clone().unwrap();
+        assert!(acquire(&d).is_err(), "a live Lock still excludes a second instance");
+        drop(first);
+        let second = acquire(&d).expect("shutdown releases flock before the child's exec");
+        // Closing the old child's descriptor must not release the NEW instance's lock.
+        drop(inherited);
+        assert!(acquire(&d).is_err());
+        drop(second);
+        acquire(&d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn core_shutdown_releases_an_inherited_lock_before_restart() {
+        let root = dir("core-inherited");
+        let paths = || crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") };
+        let first = crate::Core::start(paths(), crate::Events::new(crate::events::NullSink)).unwrap();
+        let inherited = first.instance.lock().unwrap().as_ref().unwrap().0.try_clone().unwrap();
+        assert!(crate::Core::start_bare(paths(), crate::Events::new(crate::events::NullSink)).is_err());
+        first.shutdown();
+        let second = crate::Core::start(paths(), crate::Events::new(crate::events::NullSink)).unwrap();
+        drop(inherited);
+        assert!(crate::Core::start_bare(paths(), crate::Events::new(crate::events::NullSink)).is_err());
+        second.shutdown();
     }
 
     /// The case that broke #48: a second Core on the same dir must fail before reconcile runs.
