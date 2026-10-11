@@ -79,7 +79,7 @@ test("Ofis gizliyken kararlar köşe listesinde; lider pane'inde Core geri gelme
   await hideOffice(app);
   await openTeam(app, team.name);
   const pane = await paneOf(app, leader.name);
-  const corner = app.getByRole("complementary", { name: "Üye önerileri" });
+  const corner = app.getByRole("complementary", { name: "Patron onayları" });
   await expect(pane.locator(".core-strip, .core-balloon, .pane-core")).toHaveCount(0);
   await expect(corner).toBeVisible();
   await expect(corner).toContainText("Checkout akışında regresyon");
@@ -101,7 +101,7 @@ test("Ofis Core'u: karar kartları, klavye ve dar görünüm; gizlenince köşe 
   const pane = await paneOf(app, leader.name);
   const balloon = app.locator(".office-box .core-balloon");
   const canvas = app.locator("canvas.office");
-  const corner = app.getByRole("complementary", { name: "Üye önerileri" });
+  const corner = app.getByRole("complementary", { name: "Patron onayları" });
   await expect(balloon).toBeVisible();
   await expect(balloon.locator(".core-pager")).toHaveText("1/3");
   await expect(pane.locator(".core-strip, .core-balloon")).toHaveCount(0);
