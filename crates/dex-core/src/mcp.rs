@@ -75,6 +75,217 @@ mod worker_note_tests {
     }
 }
 
+#[cfg(test)]
+mod report_content_tests {
+    use super::*;
+
+    struct Fixture {
+        core: std::sync::Arc<Core>,
+        job: delegate::Delegation,
+        root: PathBuf,
+        dir: crate::projects::tests::Fixture,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = crate::projects::tests::Fixture::new();
+            let root = dir.dir("report-project");
+            // Core background shutdown may still hold SQLite handles on Windows; keep its
+            // storage outside the project fixture's synchronous directory cleanup.
+            let storage = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+                .join(format!("report-core-{}-{}", std::process::id(), crate::agents::next_seq()));
+            let core = Core::start(crate::Paths { data_dir: storage.join("data"), config_dir: storage.join("config") },
+                crate::Events::new(crate::events::NullSink)).unwrap();
+            let job = crate::db::with(&core.db, |c| {
+                crate::teams::update_team(c, &dir.0, "default", crate::teams::TeamPatch {
+                    cwd: Some(Some(root.to_string_lossy().into_owned())), ..Default::default()
+                })?;
+                let lead = delegate::caller(c, "timur")?;
+                let job = delegate::insert(c, delegate::NewDelegation { from: &lead, to_agent: "kaan".into(),
+                    team_id: "default".into(), service_team_id: None, prompt: "report".into(), task_id: None,
+                    patron_words: None, effort: None })?;
+                delegate::set_status(c, job.id, "running")?;
+                Ok(job)
+            }).unwrap();
+            Self { core, job, root, dir }
+        }
+
+        fn file(&self) -> PathBuf { self.root.join(".dex").join("results").join(format!("{}.md", self.job.id)) }
+        fn call(&self, args: Value) -> Value { call_with_args_for_test(&self.core, "kaan", "report", args) }
+        fn state(&self) -> delegate::Delegation {
+            crate::db::with(&self.core.db, |c| delegate::get(c, self.job.id)).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) { self.core.shutdown(); }
+    }
+
+    #[test]
+    fn worker_cannot_write_file_but_content_delivers_to_snapshot_root() {
+        let f = Fixture::new();
+        let file = f.file();
+        crate::db::with(&f.core.db, |c| c.execute("UPDATE agents SET role_slug='code-review' WHERE id='kaan'", [])
+            .map_err(|e| e.to_string())).unwrap();
+        let blocked = f.core.delegation_on_hook("kaan", "PreToolUse", &json!({"tool_name":"Write","tool_input":{"file_path":file}}), false).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&blocked).unwrap()["hookSpecificOutput"]["permissionDecision"], "deny");
+        let other = f.dir.dir("other-project");
+        crate::db::with(&f.core.db, |c| c.execute("UPDATE teams SET cwd=?1 WHERE id='default'",
+            [other.to_string_lossy()]).map_err(|e| e.to_string())).unwrap();
+        let content = "engelli: derleme komutu reddedildi\nTam rapor.";
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti: engelli teslim","content":content}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), content);
+        assert_eq!(f.state().result_path.as_deref(), file.to_str());
+        assert!(!other.join(".dex/results").join(format!("{}.md", f.job.id)).exists());
+    }
+
+    #[test]
+    fn content_cannot_select_foreign_or_outside_path() {
+        let f = Fixture::new();
+        for path in [f.root.join(".dex/results/99999.md"), f.dir.0.join("outside.md")] {
+            let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"body","resultPath":path}));
+            assert_eq!(reply["isError"], true, "{reply}");
+            assert!(reply.to_string().contains("birlikte"), "explicit conflict: {reply}");
+            assert!(!path.exists());
+            assert!(!f.file().exists());
+            assert_eq!(f.state().status, "running");
+        }
+        let reply = call_with_args_for_test(&f.core, "ayla", "report", json!({"delegationId":f.job.id,"summary":"bitti","content":"body"}));
+        assert_eq!(reply["isError"], true);
+        assert!(!f.file().exists());
+    }
+
+    #[test]
+    fn legacy_result_path_is_preserved_without_content() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.file().parent().unwrap()).unwrap();
+        let file = f.file().parent().unwrap().join("legacy-name.md");
+        std::fs::write(&file, "legacy report").unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","resultPath":file}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(f.state().result_path.as_deref(), file.to_str());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "legacy report");
+    }
+
+    #[test]
+    fn reviewer_content_is_parsed_from_dex_written_file() {
+        let f = Fixture::new();
+        crate::db::with(&f.core.db, |c| c.execute(
+            "INSERT INTO delegation_reviews(review_id,target_id,sha,created_at) VALUES(?1,?1,'fixture-sha',1)", [f.job.id]
+        ).map_err(|e| e.to_string())).unwrap();
+        let rejected = f.call(json!({"delegationId":f.job.id,"summary":"karar: onay","content":"inceledim\nkarar: onay"}));
+        assert_eq!(rejected["isError"], true, "{rejected}");
+        assert_eq!(f.state().status, "running");
+        let body = "karar: düzelt\n## önemli\n- file.rs:1 — hata\n## küçük\nyok\n";
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":body}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        let review = crate::db::with(&f.core.db, |c| crate::review::get(c, f.job.id)).unwrap().unwrap();
+        assert_eq!(review.verdict.as_deref(), Some("düzelt"));
+        assert!(review.findings.unwrap().contains("file.rs:1"));
+        assert_eq!(std::fs::read_to_string(f.file()).unwrap(), body);
+    }
+
+    #[test]
+    fn content_io_failure_keeps_job_open_and_reports_error() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.file()).unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"body"}));
+        assert_eq!(reply["isError"], true, "{reply}");
+        assert!(reply.to_string().contains("rapor dosyası"), "I/O reason: {reply}");
+        assert_eq!(f.state().status, "running");
+        assert!(f.file().is_dir());
+    }
+
+    #[test]
+    fn content_rejects_linked_results_directory() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.root.join(".dex")).unwrap();
+        let outside = f.dir.dir("outside");
+        assert!(crate::memory::tests::link_dir(&outside, &f.root.join(".dex/results")));
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"body"}));
+        assert_eq!(reply["isError"], true);
+        assert!(reply.to_string().contains("güvenli"), "{reply}");
+        assert!(!outside.join(format!("{}.md", f.job.id)).exists());
+        assert_eq!(f.state().status, "running");
+        std::fs::remove_dir(f.root.join(".dex/results")).unwrap();
+    }
+
+    #[test]
+    fn content_has_a_byte_limit_and_requires_a_string() {
+        let f = Fixture::new();
+        for content in [json!("x".repeat(1024 * 1024 + 1)), json!(null), json!(42)] {
+            let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":content}));
+            assert_eq!(reply["isError"], true);
+            assert!(reply.to_string().contains("content"));
+            assert!(!f.file().exists());
+            assert_eq!(f.state().status, "running");
+        }
+    }
+
+    #[test]
+    fn content_preserves_unanswered_question_and_closed_job_guards() {
+        let f = Fixture::new();
+        crate::db::with(&f.core.db, |c| {
+            let worker = delegate::caller(c, "kaan")?;
+            crate::questions::ask(c, &worker, &json!({"delegationId":f.job.id,"question":"decision?"}))
+        }).unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"body"}));
+        assert_eq!(reply["isError"], true);
+        assert!(reply.to_string().contains("Açık sorun"));
+        assert!(!f.file().exists());
+        assert_eq!(f.state().status, "running");
+        crate::db::with(&f.core.db, |c| delegate::set_status(c, f.job.id, "done")).unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"body"}));
+        assert_eq!(reply["isError"], true);
+        assert!(reply.to_string().contains("zaten kapandı"));
+        assert!(!f.file().exists());
+    }
+
+    #[test]
+    fn content_cannot_corrupt_snapshot_through_database() {
+        let f = Fixture::new();
+        let invalid = f.root.join("..").join("report-project");
+        let error = crate::db::with(&f.core.db, |c| c.execute("UPDATE delegations SET project_root=?2 WHERE id=?1",
+            rusqlite::params![f.job.id, invalid.to_string_lossy()]).map_err(|e| e.to_string())).unwrap_err();
+        assert!(error.contains("project_mismatch"), "{error}");
+        assert_eq!(f.state().project_root, f.job.project_root);
+        assert!(!f.file().exists());
+    }
+
+    #[test]
+    fn content_atomically_replaces_existing_report_without_temp_residue() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.file().parent().unwrap()).unwrap();
+        std::fs::write(f.file(), "old report").unwrap();
+        let body = "complete new report\n";
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":body}));
+        assert_eq!(reply["structuredContent"]["status"], "done", "{reply}");
+        assert_eq!(std::fs::read_to_string(f.file()).unwrap(), body);
+        assert_eq!(std::fs::read_dir(f.file().parent().unwrap()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn content_failed_replace_keeps_original_and_cleans_temp() {
+        let f = Fixture::new();
+        std::fs::create_dir_all(f.file().parent().unwrap()).unwrap();
+        std::fs::write(f.file(), "original").unwrap();
+        let mut permissions = std::fs::metadata(f.file()).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(f.file(), permissions.clone()).unwrap();
+        let reply = f.call(json!({"delegationId":f.job.id,"summary":"bitti","content":"new body"}));
+        // Restore before assertions so a failed assertion can still clean up the fixture.
+        permissions.set_readonly(false);
+        std::fs::set_permissions(f.file(), permissions).unwrap();
+        assert_eq!(reply["isError"], true, "{reply}");
+        assert!(reply.to_string().contains("atomik taşınamadı"), "{reply}");
+        assert_eq!(f.state().status, "running");
+        assert_eq!(std::fs::read_to_string(f.file()).unwrap(), "original");
+        assert_eq!(std::fs::read_dir(f.file().parent().unwrap()).unwrap().count(), 1);
+    }
+}
+
 impl Mcp {
     /// Fresh key for this spawn of `agent`; the previous process of that id is gone (pty_spawn kills it).
     pub fn key_for(&self, agent: &str) -> String {
@@ -1128,10 +1339,13 @@ mod auth_tests {
     #[test]
     fn report_rejects_unknown_fields() {
         assert!(report_args(&json!({ "delegationId": 1, "summary": "bitti: x", "resultPath": "a.md" })).is_ok());
+        assert!(report_args(&json!({ "delegationId": 1, "summary": "bitti: x", "content": "full report" })).is_ok());
         let err = report_args(&json!({ "delegationId": 1, "summary": "x", "body": "uzun rapor" })).unwrap_err();
         assert!(err.contains("body"), "{err}");
         let schema = tools().as_array().unwrap().iter().find(|t| t["name"] == "report").cloned().unwrap();
         assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+        assert_eq!(schema["inputSchema"]["properties"]["content"]["type"], "string");
+        assert_eq!(schema["inputSchema"]["required"], json!(["delegationId", "summary"]));
     }
 
     /// Görev #20: `report` reminds of the memory once, and says to skip it when there is nothing.
@@ -1194,9 +1408,10 @@ fn tools() -> Value {
               "delegationId": { "type": "integer" }, "text": { "type": "string", "minLength": 1 } } } },
         { "name": "delegation_status", "description": "Devretmelerin durumu ve pendingNotes bekleyen not sayısı (id verilmezse gönderdiğin/aldığın son devretmeler).",
           "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } } } },
-        { "name": "report", "description": "Sana devredilen işi teslim et. Devretmenin cevaplanmamış (open/escalated) ask_leader sorusu varsa reddedilir; cevabı aynı turda ask_leader veya wait_answer ile bekle, işe devam et ve bitince report ver. Önce raporun TAMAMINI devretme metnindeki dosyaya yaz (<proje>/.dex/results/<delegationId>.md), sonra burada resultPath ile o yolu ver (projeli takımda zorunlu; projesiz takımda yalnız summary); summary tek satır (\"bitti: <1 cümle>\"). Sohbet mesajın lidere gitmez.",
+        { "name": "report", "description": "Sana devredilen işi teslim et. Devretmenin cevaplanmamış (open/escalated) ask_leader sorusu varsa reddedilir; cevabı bekle ve bitince teslim et. Tam raporu content ile ver (en fazla 1 MiB UTF-8); dosyayı işin kayıtlı proje kökünde Dex yazar, worker dosya yazmaz. content ile resultPath birlikte verilmez. Eski dosya teslimi resultPath ile korunur; projesiz takım yalnız summary verir. summary tek satır (\"bitti: <1 cümle>\"). Sohbet mesajın lidere gitmez.",
           "inputSchema": { "type": "object", "additionalProperties": false, "required": ["delegationId", "summary"], "properties": {
-              "delegationId": { "type": "integer" }, "summary": { "type": "string" }, "resultPath": { "type": "string" } } } },
+              "delegationId": { "type": "integer" }, "summary": { "type": "string" }, "resultPath": { "type": "string" },
+              "content": { "type": "string", "minLength": 1, "maxLength": delegate::REPORT_CONTENT_LIMIT } } } },
         { "name": "reset_ready", "description": "YALNIZ LİDER. Dex oturum sıfırlaması istediğinde devir notunu hafızana yazdıktan sonra çağır; Dex oturumunu kapatıp temiz açar. Dex istemediyse reddedilir.",
           "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} } }
     ]);
@@ -1684,7 +1899,7 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
         "report" => {
             report_args(args)?;
             let id = args.get("delegationId").and_then(Value::as_i64).ok_or("delegationId gerekli")?;
-            let d = delegate::report(&conn, &c, id, s(args, "summary").unwrap_or(""), s(args, "resultPath"))?;
+            let d = delegate::report_with_content(&conn, &c, id, s(args, "summary").unwrap_or(""), s(args, "resultPath"), s(args, "content"))?;
             drop(conn);
             let _ = core.events.emit("delegations-changed", &Some(&d));
             core.worker_delivered(&d);
@@ -1769,8 +1984,14 @@ impl Core {
 
 /// Anything beside these would be dropped silently — the report body once was (Hata A).
 fn report_args(args: &Value) -> Result<(), String> {
-    match args.as_object().and_then(|o| o.keys().find(|k| !matches!(k.as_str(), "delegationId" | "summary" | "resultPath"))) {
-        Some(k) => Err(format!("report bilinmeyen alan: {k}. Yalnız delegationId, summary, resultPath; raporun tamamı resultPath dosyasında olmalı.")),
+    if args.get("content").is_some() && args.get("resultPath").is_some() {
+        return Err("content ve resultPath birlikte verilemez; content yolunu Dex belirler".into());
+    }
+    if args.get("content").is_some_and(|v| !v.is_string()) {
+        return Err("content metin olmalı".into());
+    }
+    match args.as_object().and_then(|o| o.keys().find(|k| !matches!(k.as_str(), "delegationId" | "summary" | "resultPath" | "content"))) {
+        Some(k) => Err(format!("report bilinmeyen alan: {k}. Yalnız delegationId, summary, content veya resultPath.")),
         None => Ok(()),
     }
 }

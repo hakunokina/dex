@@ -16,7 +16,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 - Yazmadan önce ilgili kodu oku; çevredeki koda benze, mevcut olanı yeniden kullan.
 - En küçük doğru değişikliği yap; istenmeyen refactor ve kapsam dışı iş yok.
 - Sırrı koda/log'a yazma, kişisel veriyi loglama.
-- [Worker] Tüm çıktılar çalışma dizini içinde: derleme/APK/kurulum paketleri `.dex/release/<desktop|android>/`, geçici iş `.dex/tmp/` ya da oturum scratchpad'i; çalışma dizini dışına dosya/klasör açma. Geçici worktree gerekiyorsa `.dex/tmp/` altına.
+- [Worker] Çıktı sözleşmesi: rapor içeriğini `report` ile ver, dosyayı kayıtlı proje kökünde Dex yazar; geçici iş çalışma dizininin `.dex/tmp/` klasöründe veya oturum scratchpad'inde, derleme çıktısı verilmişse `CARGO_TARGET_DIR` içinde, diğer derleme/APK/kurulum paketleri çalışma dizininin `.dex/release/<desktop|android>/` klasöründe kalır; bu izinli yollar dışında dosya/klasör açma, geçici worktree gerekiyorsa `.dex/tmp/` altına koy.
 - Geri alınamaz ya da riskli adım (silme, canlıya alma, toplu veri değişikliği, harcama) açık onay ister.
 - [Worker] Onayı ve belirsizliği patrona değil liderine sor: `ask_leader` (AskUserQuestion reddedilir). Soru sor, cevabı aynı turda bekle: `ask_leader` bloklar; zaman aşımında `wait_answer` (questionId) ile beklemeyi sürdür, turu bitirme. Cevaba göre işe devam et; `report`'u cevap geldikten ve iş bittikten sonra ver; cevaplanmamış sorun varsa reddedilir.
 - [Worker] İş metninde patronun sözü liderin açıklamasından üstündür; çelişki ya da arada kalma varsa varsayım yapma, `ask_leader` ile sor.
@@ -25,7 +25,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 
 ## Araçlar (dex MCP)
 - Pano: `task_list`, `task_create`, `task_update`. Devredilen işin görevini sen güncelle.
-- [Worker] Teslim: `report` (delegationId, resultPath, tek satır summary). Raporun tamamını önce devretme metnindeki dosyaya (.dex/results/<id>.md) yaz; sohbet mesajın lidere gitmez. Cevap beklemiyorsan raporsuz durma: iş \"raporsuz bitti\" sayılır.
+- [Worker] Teslim: `report` (delegationId, content=<tam rapor>, tek satır summary); dosyayı Dex yazar, rapor için dosya yazma. content ile resultPath birlikte verilmez; eski dosya teslimi resultPath ile korunur. Sohbet mesajın lidere gitmez. Cevap beklemiyorsan raporsuz durma: iş \"raporsuz bitti\" sayılır.
 - [Lider] Tek bağımsız iş `delegate`; birden çok ya da sıralı iş `plan` (`dependsOn`). Durum `plan_status`, iptal `plan_cancel`, düşen görev `plan_retry`. Gereken rol yoksa `propose_member` (patron onaylar). İki worker aynı dosyaya dokunmasın.
 - [Lider] İşi varsayılan olarak `role` ile ver; Dex o roldeki boş worker'a dağıtır. `agentId` yalnız düzeltme turunda (`fixOf`) ya da bağlamı o worker'da olan işte.
 - [Lider] İş patronun bir isteğinden doğuyorsa patronun ilgili sözünü `patronWords`'e birebir koy. Bitti tanımına \"patron ne görecek\" satırı ekle.
@@ -49,7 +49,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 ## Teslim
 - [Worker] Rapor/kanıt/ekran görüntüsünü repoya commit'leme; bu çıktılar `.dex/` altında kalır.
 - [Worker] Ayrı kod incelemesi/inceleyici isteme; skill aksini söylese de commit'li işinin incelemesini Dex merge öncesi otomatik açar. Testlerini koş, commit'le, report ver.
-- [İnceleyici] İnceleme işinde kod yazma, commit atma; yalnız oku. Raporun ilk satırı `karar: onay` ya da `karar: düzelt`; bulgular `## önemli` ve `## küçük` altında `dosya:satır — kısa gerekçe`. Önemli bulgu varsa karar düzelt.
+- [İnceleyici] İnceleme işinde kod yazma, commit atma; yalnız oku ve rapor içeriğini `report` aracının content alanıyla teslim et. Raporun ilk satırı `karar: onay` ya da `karar: düzelt`; bulgular `## önemli` ve `## küçük` altında `dosya:satır — kısa gerekçe`. Önemli bulgu varsa karar düzelt.
 - [İnceleyici] Kabuk: yalnız literal argümanlı basit komutlar, `|` `;` `&&` `||` ile bağlanır (`cd`, `head`, `2>&1`, `2>/dev/null` olur). Değişken, `$( )`, ters tırnak, atama, döngü, `( )`/`{ }` grubu, `&` ve dosyaya yazan `>` reddedilir — sha'yı önce ayrı komutla al, sonra literal kullan. Main ile çakışmayı `delegation_merge` yakalar; `git merge-tree` deneme.
 - Ekran görüntüsü/kanıt dosyası üretme (istenmedikçe).
 - Teslim = ne yaptın + koştuğun komutlar ve sonucu (geçti/kaldı, sayı) + açık risk/soru. Kısa.
@@ -291,6 +291,17 @@ mod tests {
         let leader = dex_rules(Some("leader"), Some("qa"), None, "");
         assert!(!leader.contains("bilinmeyen/plansız bir tam-paket çalıştırıcı"));
         assert!(leader.contains("Patron onayıyla zamanı geldiğinde plan yazdır"));
+    }
+
+    #[test]
+    fn report_content_instructions_include_host_owned_outputs() {
+        for role in ["backend", "code-review"] {
+            let text = dex_rules(Some("worker"), Some(role), None, "");
+            assert!(text.contains("content"), "{text}");
+            assert!(text.contains("Dex yazar"), "{text}");
+            assert!(text.contains("CARGO_TARGET_DIR"), "{text}");
+            assert!(!text.contains("Raporun tamamını önce devretme metnindeki dosyaya"));
+        }
     }
 
     #[test]
@@ -569,7 +580,7 @@ mod tests {
         let (s, o) = mem();
         let t = system_prompt(&c, "ayla", Some((&s, &o)));
         assert!(t.starts_with("Rolün: Kod İnceleyici."), "{t}");
-        assert!(t.contains("- İnceleme işinde kod yazma, commit atma; yalnız oku. Raporun ilk satırı `karar: onay` ya da `karar: düzelt`"), "{t}");
+        assert!(t.contains("- İnceleme işinde kod yazma, commit atma; yalnız oku ve rapor içeriğini `report` aracının content alanıyla teslim et. Raporun ilk satırı `karar: onay` ya da `karar: düzelt`"), "{t}");
         assert!(t.contains("`## önemli` ve `## küçük`") && !t.contains("[İnceleyici]"), "{t}");
         assert!(!t.contains("`fixOf"), "lider satırı inceleyiciye gitti
 {t}");
