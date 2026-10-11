@@ -2732,9 +2732,43 @@ mod tests {
     }
 }
 
+/// Keep terminal replies on the real transport while intercepting paste/Enter in test probes.
+#[cfg(test)]
+pub(crate) fn input_probe_for_test(original: Box<dyn std::io::Write + Send>, probe: impl std::io::Write + Send + 'static) -> Box<dyn std::io::Write + Send> {
+    use std::io::Write;
+    struct InputProbe<P> { original: Box<dyn Write + Send>, probe: P }
+    impl<P: Write> Write for InputProbe<P> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // AgentSink can emit several complete replies in one write. Only those replies
+            // bypass the paste/Enter probe; arbitrary escape sequences remain test input.
+            let replies: &[&[u8]] = &[
+                b"\x1b[1;1R", b"\x1b[?1;2c",
+                b"\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\", b"\x1b]11;rgb:1313/1414/1616\x1b\\",
+            ];
+            let mut remaining = bytes;
+            while let Some(reply) = replies.iter().find(|reply| remaining.starts_with(reply)) {
+                remaining = &remaining[reply.len()..];
+            }
+            if !bytes.is_empty() && remaining.is_empty() {
+                // Complete a partial transport write here so write_all cannot send its suffix
+                // to the user-input probe on the next call.
+                self.original.write_all(bytes)?;
+                Ok(bytes.len())
+            } else {
+                self.probe.write(bytes)
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.original.flush()?;
+            self.probe.flush()
+        }
+    }
+    Box::new(InputProbe { original, probe })
+}
+
+#[cfg(test)]
 /// Shell fixtures still have to service ConPTY's cursor-inheritance query. Discarding it can
 /// block ClosePseudoConsole on windows-2022; use the same terminal replies as agent sessions.
-#[cfg(test)]
 pub(crate) fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
     shell_sink_test_adapter(core, id, sink, None)
 }
@@ -2814,15 +2848,16 @@ mod shell_sink_tests {
     }
 
     struct Input {
-        _original: Box<dyn Write + Send>,
+        original: Box<dyn Write + Send>,
         bytes: Arc<Mutex<Vec<u8>>>,
     }
     impl Write for Input {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.bytes.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
+            let written = self.original.write(bytes)?;
+            self.bytes.lock().unwrap().extend_from_slice(&bytes[..written]);
+            Ok(written)
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
     }
 
     struct Fixture { core: Arc<Core>, root: PathBuf, bytes: Arc<Mutex<Vec<u8>>> }
@@ -2837,7 +2872,9 @@ mod shell_sink_tests {
             }, sink).unwrap();
             wait_ready();
             let bytes = Arc::new(Mutex::new(Vec::new()));
-            core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: bytes.clone() }));
+            core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+                Box::new(Input { original, bytes: bytes.clone() }), std::io::sink(),
+            ));
             Self { core, root, bytes }
         }
     }
@@ -2956,7 +2993,9 @@ mod shell_sink_tests {
         let starts = super::CAPTURE.with(|capture| capture.borrow_mut().take().unwrap());
         started.unwrap();
         assert_eq!(starts.len(), 1);
-        fixture.core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: fixture.bytes.clone() }));
+        fixture.core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+            Box::new(Input { original, bytes: fixture.bytes.clone() }), std::io::sink(),
+        ));
         fixture.bytes.lock().unwrap().clear();
         fixture.core.ptys.note("kaan", "\x1b[6");
         assert!(fixture.bytes.lock().unwrap().is_empty());
@@ -3006,6 +3045,33 @@ mod shell_sink_tests {
     }
 
     #[test]
+    fn late_cursor_reply_reaches_transport_after_ready_and_probe_installation() {
+        let fixture = Fixture::new("late-cursor-transport");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = super::shell_sink_test_adapter(&fixture.core, "kaan", Sink, Some(tx));
+        assert!(sink.data(b"PS C:\\test> "));
+        assert_eq!(rx.try_recv(), Ok(()));
+        fixture.bytes.lock().unwrap().clear();
+        let probe = Arc::new(Mutex::new(Vec::new()));
+        fixture.core.ptys.input_writer_for_test("kaan", |original| super::input_probe_for_test(
+            original, Input { original: Box::new(std::io::sink()), bytes: probe.clone() },
+        ));
+        assert!(sink.data(b"\x1b[6"));
+        assert!(sink.data(b"n"));
+        assert_eq!(*fixture.bytes.lock().unwrap(), b"\x1b[1;1R", "the underlying writer must receive the late reply");
+        assert!(probe.lock().unwrap().is_empty(), "terminal replies must not pollute paste/Enter assertions");
+        assert!(sink.data(b"\x1b[c\x1b]10;?\x1b]11;?"));
+        let replies = fixture.bytes.lock().unwrap().clone();
+        assert_eq!(replies, b"\x1b[1;1R\x1b[?1;2c\x1b]10;rgb:c9c9/cdcd/d2d2\x1b\\\x1b]11;rgb:1313/1414/1616\x1b\\");
+        assert!(probe.lock().unwrap().is_empty());
+        let paste = b"\x1b[200~terminal-looking \x1b[1;1R text\x1b[201~";
+        fixture.core.ptys.write("kaan", paste).unwrap();
+        fixture.core.ptys.write("kaan", b"\r").unwrap();
+        assert_eq!(*probe.lock().unwrap(), [paste.as_slice(), b"\r"].concat());
+        assert_eq!(*fixture.bytes.lock().unwrap(), replies, "paste and Enter must stay off the shell transport");
+    }
+
+    #[test]
     fn shell_sink_ready_follows_successful_cursor_flush_once() {
         use std::sync::{atomic::{AtomicU8, Ordering}, mpsc::{self, TryRecvError}};
         struct CheckedInput {
@@ -3015,12 +3081,16 @@ mod shell_sink_tests {
         }
         impl Write for CheckedInput {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) != 3 {
+                    assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                }
                 if self.fail.load(Ordering::SeqCst) == 1 { return Err(std::io::Error::other("test write failed")); }
                 self.original.write(bytes)
             }
             fn flush(&mut self) -> std::io::Result<()> {
-                assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                if self.fail.load(Ordering::SeqCst) != 3 {
+                    assert_eq!(self.ready.lock().unwrap().try_recv(), Err(TryRecvError::Empty));
+                }
                 if self.fail.load(Ordering::SeqCst) == 2 { return Err(std::io::Error::other("test flush failed")); }
                 self.original.flush()
             }
@@ -3050,8 +3120,8 @@ mod shell_sink_tests {
             assert!(sink.data(&completed));
             assert_eq!(rx.lock().unwrap().try_recv(), Ok(()));
             assert_eq!(rx.lock().unwrap().try_recv(), Err(TryRecvError::Disconnected));
-            // Remove the completed channel's checker before the next iteration.
-            fixture.core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { _original: original, bytes: fixture.bytes.clone() }));
+            // The wrapper remains in the transport chain; stop checking its completed channel.
+            fail.store(3, Ordering::SeqCst);
         }
     }
 }
