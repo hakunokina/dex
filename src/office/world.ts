@@ -2,7 +2,7 @@ import type { Agent, AgentStatus } from "../agents";
 import type { Delegation } from "../delegations";
 import type { Question } from "../questions";
 import { GLYPHS } from "./glyphs";
-import { drawCoreXL, drawCoreFragments, type CorePalette } from "./companion/coreEngine";
+import { drawCoreXL, drawCoreFragments, drawCoreFeet, type CorePalette } from "./companion/coreEngine";
 import { LOOKS, type Step } from "./companion/coreState";
 import { CoreXL, coreBody, XL_PIN, type Body, type Pointer } from "./companion/coreXL";
 import {
@@ -279,7 +279,6 @@ export class World {
 
   /** All fragments precede all chips and text; protected plates also constrain their paths. */
   private drawFragments(ctx: CanvasRenderingContext2D, p: PcbTheme, pal: CorePalette) {
-    if (this.reduced) return;
     const inset = areaInset(this.unit);
     const board = { x: inset, y: inset, w: this.w - 2 * inset, h: this.h - 2 * inset };
     for (const chip of this.chips) {
@@ -289,7 +288,8 @@ export class World {
       // The provider badge is not a block: upper traces leave through it, and pieces drawn first slip under it.
       blocks.push({ x: body.x - (chip.w + 40) / 2, y: body.y + body.s / 2 + XL_PIN, w: chip.w + 40, h: 40 });
       const paths = fragmentPaths(body, this.traces.filter(t => t.leaderId === chip.agent.id).map(t => t.points), blocks, board);
-      drawCoreFragments(ctx, body, core.fragments.sample(paths, body, false), core.fragments.phase, pal, p.chipEdge);
+      drawCoreFragments(ctx, body, core.fragments.sample(paths, body, this.reduced), core.fragments.phase, pal, p.chipEdge);
+      drawCoreFeet(ctx, body, core.sampleFeet(paths, body, this.time * 1000, this.reduced || core.state === "sleep", ctx.canvas), pal, p.chipEdge);
     }
   }
 
@@ -389,6 +389,7 @@ export class World {
       boardBg: p.board,
       edge: p.chipEdge,
       mono: p.mono,
+      weight: core?.weight,
     };
     drawCoreXL(ctx, body.x, body.y, body.s, look, frame, pal);
     ctx.restore();

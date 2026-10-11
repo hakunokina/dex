@@ -4,7 +4,7 @@
 // world.ts feeds it once per step; node:test covers it. Drawing is coreEngine.ts `drawCoreXL`.
 import { XL_BODY, XL_EYE } from "./coreEngine.ts";
 import { DONE_MS, ERROR_MS, pickState, type AgentStatus, type CoreStateId, type Step } from "./coreState.ts";
-import { FragmentMotion } from "../symbiote.ts";
+import { FragmentMotion, bodyWeight, createFootState, plantedFeet, type FragmentPath } from "../symbiote.ts";
 
 export type Vec = { x: number; y: number };
 /** Centre-based layout target (world units). */
@@ -193,6 +193,8 @@ export class CoreTracker {
 
 /** Spec §2: hover ×1.04 in ~150 ms. */
 const HOVER_RATE = 20;
+/** After a suspended card, place contacts afresh; short gaps preserve normal stepping. */
+export const FOOT_RESET_GAP_MS = 500;
 
 export interface CoreStepIn {
   snap: CoreSnapshot;
@@ -214,10 +216,23 @@ export class CoreXL {
   readonly tracker = new CoreTracker();
   readonly pupil: Vec = { x: 0, y: 0 };
   readonly fragments = new FragmentMotion();
+  readonly weight: Vec = { x: 0, y: 0 };
+  private readonly feet = createFootState();
+  private footSurface: object | null = null;
+  private footAt = -Infinity;
+  private footReduced = false;
   hover = 0;
   private blinkAt = -1;
   private blinkStart = -1;
   private lid = 0;
+
+  sampleFeet(paths: readonly FragmentPath[], body: Body, anim: number, reduced: boolean, surface: object, now = Date.now()) {
+    if (surface !== this.footSurface || now - this.footAt > FOOT_RESET_GAP_MS || reduced !== this.footReduced) {
+      for (const foot of this.feet.slots) foot.valid = foot.seen = false;
+    }
+    this.footSurface = surface; this.footAt = now; this.footReduced = reduced;
+    return plantedFeet(paths, body, anim, reduced, this.feet);
+  }
 
   step(i: CoreStepIn) {
     const rand = i.rand ?? Math.random;
@@ -228,6 +243,10 @@ export class CoreXL {
     this.pupil.x = approach(this.pupil.x, g.to.x, i.dt, g.rate);
     this.pupil.y = approach(this.pupil.y, g.to.y, i.dt, g.rate);
     this.fragments.step(id, i.dt, i.reduced);
+    const weight = bodyWeight(i.anim, i.reduced || id === "sleep");
+    const rate = i.reduced ? Infinity : FOLLOW_RATE;
+    this.weight.x = approach(this.weight.x, weight.x, i.dt, rate);
+    this.weight.y = approach(this.weight.y, weight.y, i.dt, rate);
     this.hover = i.reduced ? Number(i.hovered) : approach(this.hover, Number(i.hovered), i.dt, HOVER_RATE);
     if (!blinks(id, i.reduced)) {
       this.blinkStart = -1;

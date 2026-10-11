@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { symbioteParams, bodyContour, tentacleContour, reachAt, DelegationTouches, fragmentPaths, FragmentMotion, fragmentContour, FRAGMENTS, sideways } from "./symbiote.ts";
+import * as symbiote from "./symbiote.ts";
 
 test("Core states distinguish breathing, agitation, spikes and settling", () => {
   const idle = symbioteParams("idle", 1000);
@@ -58,6 +59,161 @@ test("organic silhouette stays inside the body square and freezes under reduced 
 const body = { x: 200, y: 200, s: 120 };
 const bounds = { x: 0, y: 0, w: 400, h: 400 };
 const trace = [{ x: 260, y: 200 }, { x: 290, y: 200 }, { x: 290, y: 300 }];
+
+test("moving body keeps the stance contact fixed in world coordinates", () => {
+  const state = symbiote.createFootState();
+  const paths = fragmentPaths(body, [trace], [], bounds);
+  const first = symbiote.plantedFeet(paths, body, 0, false, state)[0];
+  const contact = { x: first.x, y: first.y };
+  const moved = { ...body, x: 210 };
+  const held = symbiote.plantedFeet(fragmentPaths(moved, [trace], [], bounds), moved, 600, false, state)[0];
+  assert.equal(held.lift, 0);
+  assert.deepEqual({ x: held.x, y: held.y }, contact);
+  const movedPaths = fragmentPaths(moved, [trace], [], bounds);
+  const swing = symbiote.plantedFeet(movedPaths, moved, 960, false, state)[0];
+  assert.ok(swing.lift > 0);
+  const landed = symbiote.plantedFeet(movedPaths, moved, 1200, false, state)[0];
+  assert.equal(landed.lift, 0);
+  assert.ok(Math.abs(landed.x - 290) < 1e-6);
+  assert.ok(Math.abs(landed.y - 223.32) < 1e-6);
+  assert.notDeepEqual({ x: landed.x, y: landed.y }, contact);
+});
+
+test("a changed route starts an early step without jumping the contact", () => {
+  const state = symbiote.createFootState();
+  const first = symbiote.plantedFeet(fragmentPaths(body, [trace], [], bounds), body, 0, false, state)[0];
+  const contact = { x: first.x, y: first.y };
+  const paths = fragmentPaths(body, [[{ x: 200, y: 140 }, { x: 200, y: 70 }]], [], bounds);
+  const start = symbiote.plantedFeet(paths, body, 100, false, state)[0];
+  assert.deepEqual({ x: start.x, y: start.y }, contact);
+  const swing = symbiote.plantedFeet(paths, body, 250, false, state)[0];
+  assert.ok(swing.lift > 0);
+  const landed = symbiote.plantedFeet(paths, body, 400, false, state)[0];
+  assert.equal(landed.lift, 0);
+  assert.equal(landed.x, 200);
+  assert.ok(landed.y < 140);
+});
+
+test("excessive reach regrows from under the body instead of teleporting to a new contact", () => {
+  const state = symbiote.createFootState();
+  symbiote.plantedFeet(fragmentPaths(body, [trace], [], bounds), body, 0, false, state);
+  symbiote.plantedFeet(fragmentPaths(body, [trace], [], bounds), body, 960, false, state);
+  const moved = { ...body, x: 800, y: 500 };
+  const paths = fragmentPaths(moved, [], [], { x: 0, y: 0, w: 1200, h: 900 });
+  const first = symbiote.plantedFeet(paths, moved, 970, false, state)[0];
+  assert.deepEqual({ x: first.x, y: first.y }, { x: moved.x, y: moved.y });
+  for (let t = 980; t <= 1400; t += 10) {
+    for (const foot of symbiote.plantedFeet(paths, moved, t, false, state)) {
+      assert.ok(Math.hypot(foot.x - moved.x, foot.y - moved.y) <= moved.s * 1.05);
+    }
+  }
+  const landed = state.feet[0];
+  assert.equal(landed.lift, 0);
+  assert.ok(Math.hypot(landed.x - moved.x, landed.y - moved.y) > moved.s / 2);
+});
+
+test("a route removed during swing retargets continuously and missing feet release their state", () => {
+  const state = symbiote.createFootState();
+  const paths = fragmentPaths(body, [trace], [], bounds);
+  symbiote.plantedFeet(paths, body, 0, false, state);
+  const swing = symbiote.plantedFeet(paths, body, 960, false, state)[0];
+  const contact = { x: swing.x, y: swing.y };
+  const lift = swing.lift;
+  const changed = fragmentPaths(body, [[{ x: 200, y: 140 }, { x: 200, y: 70 }]], [], bounds);
+  const redirected = symbiote.plantedFeet(changed, body, 970, false, state)[0];
+  assert.deepEqual({ x: redirected.x, y: redirected.y }, contact);
+  assert.equal(redirected.lift, lift);
+  const landed = symbiote.plantedFeet(changed, body, 1270, false, state)[0];
+  assert.equal(landed.x, 200);
+  assert.ok(landed.y < 150);
+  const result = state.feet, slots = [...state.slots];
+  assert.equal(symbiote.plantedFeet([], body, 1300, false, state), result);
+  assert.equal(result.length, 0);
+  symbiote.plantedFeet(changed, body, 1400, false, state);
+  assert.equal(result[0], slots[0]);
+  assert.equal(result[0].x, 200);
+  assert.equal(result[0].y, body.y);
+  assert.equal(result[0].lift, 0);
+  symbiote.plantedFeet(changed, body, 1550, false, state);
+  assert.ok(result[0].lift > 0);
+  symbiote.plantedFeet(changed, body, 1700, false, state);
+  assert.equal(result[0].lift, 0);
+  assert.ok(result[0].y < 150);
+});
+
+test("repeated swing redirects preserve height without accumulating lift", () => {
+  const state = symbiote.createFootState();
+  const paths = fragmentPaths(body, [trace], [], bounds);
+  const up = fragmentPaths(body, [[{ x: 200, y: 140 }, { x: 200, y: 70 }]], [], bounds);
+  symbiote.plantedFeet(paths, body, 0, false, state);
+  symbiote.plantedFeet(paths, body, 960, false, state);
+  let t = 970;
+  for (let i = 0; i < 8; i++) {
+    const route = i % 2 ? paths : up;
+    symbiote.plantedFeet(route, body, t, false, state);
+    const foot = symbiote.plantedFeet(route, body, t + 150, false, state)[0];
+    assert.ok(foot.lift >= 0 && foot.lift <= body.s / 40);
+    t += 160;
+  }
+});
+
+test("feet plant on a circuit corner, hold, lift, then land on the next trace segment", () => {
+  assert.equal(typeof symbiote.plantedFeet, "function");
+  const paths = fragmentPaths(body, [trace], [], bounds);
+  const state = symbiote.createFootState();
+  const feet = (t: number) => symbiote.plantedFeet(paths, body, t, false, state);
+  const first = { ...feet(0)[0] };
+  assert.deepEqual(first, feet(600)[0]);
+  assert.equal(first.lift, 0);
+  const swing = feet(960)[0];
+  assert.ok(swing.lift > 0);
+  const landed = feet(1200)[0];
+  assert.equal(landed.lift, 0);
+  assert.notDeepEqual(landed, first);
+  const loop = symbiote.createFootState();
+  for (let t = 0; t < 5000; t += 17) {
+    for (const foot of symbiote.plantedFeet(paths, body, t, false, loop)) {
+      assert.ok(Number.isFinite(foot.x) && Number.isFinite(foot.y));
+      // Both the planted point and the swing's board projection follow the existing polyline.
+      assert.ok(Math.abs(foot.y - 200) < 1e-6 || Math.abs(foot.x - 290) < 1e-6);
+      assert.ok(Math.hypot(foot.x - body.x, foot.y - body.y) <= paths[0].length);
+    }
+  }
+  assert.deepEqual(symbiote.plantedFeet([], body, 900, false, state), []);
+  const reduced = symbiote.createFootState();
+  const staticFoot = { ...symbiote.plantedFeet(paths, body, 0, true, reduced)[0] };
+  assert.deepEqual(staticFoot, symbiote.plantedFeet(paths, body, 9000, true, reduced)[0]);
+  assert.ok(symbiote.plantedFeet(paths, body, 9000, true, reduced).every(f => f.lift === 0));
+});
+
+test("weight transfer follows the stride with a delay, freezes and stays inside the hover bounds", () => {
+  assert.equal(typeof symbiote.bodyWeight, "function");
+  assert.deepEqual(symbiote.bodyWeight(0, true), { x: 0, y: 0 });
+  assert.deepEqual(symbiote.bodyWeight(9000, true), { x: 0, y: 0 });
+  assert.notDeepEqual(symbiote.bodyWeight(0, false), symbiote.bodyWeight(500, false));
+  for (const state of ["idle", "tool", "error", "sleep"] as const) {
+    for (let t = 0; t < 5000; t += 31) {
+      const weight = symbiote.bodyWeight(t, false);
+      for (const p of bodyContour(state, t, t, false)) {
+        assert.ok(Math.abs(p.x * 1.025 + weight.x) <= 60);
+        assert.ok(Math.abs(p.y * 1.025 + weight.y) <= 60);
+      }
+    }
+  }
+});
+
+test("body lighting has a fixed upper-left light, bounded sphere normals and an illuminated rim", () => {
+  assert.equal(typeof symbiote.bodyLighting, "function");
+  const lit = symbiote.bodyLighting(-0.4, -0.55), dark = symbiote.bodyLighting(0.4, 0.55);
+  assert.ok(lit.diffuse > dark.diffuse);
+  assert.ok(lit.specular > dark.specular);
+  assert.ok(symbiote.bodyLighting(-0.7, -0.7).rim > symbiote.bodyLighting(0, 0).rim);
+  for (const [x, y] of [[0, 0], [-0.4, -0.55], [0.9, 0.9], [3, -4]]) {
+    const light = symbiote.bodyLighting(x, y);
+    for (const v of [light.diffuse, light.specular, light.rim]) assert.ok(Number.isFinite(v) && v >= 0 && v <= 1);
+    assert.ok(Math.abs(Math.hypot(light.normal.x, light.normal.y, light.normal.z) - 1) < 1e-6);
+  }
+});
 
 test("fragment routes follow nearby traces and stop before chips, labels and board edges", () => {
   const blocks = [{ x: 275, y: 245, w: 50, h: 50 }];
