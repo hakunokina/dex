@@ -522,8 +522,15 @@ struct Lexed {
     syntax: bool,
 }
 
-pub(crate) fn command_words(command: &str) -> Vec<Vec<String>> {
-    lex(command, None).segs.into_iter().map(|s| s.words).collect()
+pub(crate) fn command_words(command: &str, d: Option<Dialect>) -> Vec<Vec<String>> {
+    let Some(d) = d else { return Vec::new() };
+    let mut rd = Rd { c: bash_text(command, Some(d)).chars().collect(), i: 0, d, depth: 0, dynamic: false, unknown: false, hidden: Vec::new(), heredocs: Vec::new() };
+    rd.script(None).unwrap_or_default().split(|t| matches!(t, Tok::Op)).map(|toks| {
+        toks.iter().filter_map(|t| match t {
+            Tok::Word(w, _) => Some(w.clone()),
+            _ => None,
+        }).collect()
+    }).collect()
 }
 
 fn lex(command: &str, d: Option<Dialect>) -> Lexed {
@@ -959,7 +966,7 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
     }
-    if let Some(reason) = crate::test_budget::full_suite_denial(command, ctx.cwd.as_deref()).filter(|_| !ctx.qa) {
+    if let Some(reason) = crate::test_budget::full_suite_denial_in_shell(command, ctx.cwd.as_deref(), d).filter(|_| !ctx.qa) {
         verdicts.push(Verdict::Deny(reason.into()));
     }
     // #495: a worker's allow needs `parsed` below, which reads no `$` (but PowerShell's `>$null`),
@@ -1741,7 +1748,7 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
 // around and inside it are still judged, so a hidden denied one stays denied (#484).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Dialect {
+pub(crate) enum Dialect {
     Bash,
     Pwsh,
 }
@@ -2307,7 +2314,7 @@ fn shell_command(tool: &str, input: &Value) -> Option<String> {
 
 /// The shell a tool's command runs in. #495: codex `exec_command` names it (`shell`); without
 /// one, codex runs PowerShell on Windows. None: a shell this reader does not know.
-fn dialect(tool: &str, input: &Value) -> Option<Dialect> {
+pub(crate) fn dialect(tool: &str, input: &Value) -> Option<Dialect> {
     let default = || match tool {
         "Bash" => Dialect::Bash,
         "PowerShell" => Dialect::Pwsh,
