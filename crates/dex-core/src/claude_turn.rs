@@ -31,6 +31,7 @@ struct Turn {
     pending: Option<Rows>,
     reply: Option<String>,
     last_feedback: Option<(u64, Option<String>, String)>,
+    transcript_seq: Option<u64>,
     latest_seq: u64,
     end_seq: u64,
 }
@@ -91,6 +92,7 @@ impl Core {
             pending: None,
             reply: None,
             last_feedback: None,
+            transcript_seq: None,
             latest_seq: seq,
             end_seq: 0,
             interrupted: false,
@@ -116,6 +118,7 @@ impl Core {
                 pending: None,
                 reply: None,
                 last_feedback: None,
+                transcript_seq: None,
                 latest_seq: seq,
                 end_seq: 0,
                 interrupted: false,
@@ -249,21 +252,23 @@ impl Core {
         status: Status,
     ) -> crate::agents::State {
         let turns = self.claude_turns.0.lock().unwrap();
-        if turns
+        if let Some(turn) = turns
             .get(agent)
-            .is_some_and(|t| t.stop.as_ref() == Some(stop) && t.latest_seq == stop.seq
+            .filter(|t| t.stop.as_ref() == Some(stop) && t.latest_seq == stop.seq
                 && !t.ended && !t.continued && !t.interrupted)
-            && self.ptys.generation(agent) == stop.process
         {
-            // Transcript acceptance can advance the status sequence after this request
-            // was accepted. The turn lock and Stop identity, not that ingress stamp,
-            // decide whether this publication still owns the live turn.
-            self.agent_states
-                .hook_seq(agent, Some(status), Some(&stop.session), next_seq())
-        } else {
-            audit(agent, Some(stop.seq), "stale_stop");
-            self.agent_states.get(agent)
+            if self.ptys.generation(agent) == stop.process {
+                // A watcher can overtake ingress, but a newer non-transcript status owns
+                // the agent even before UPS arrives. Test that stamp atomically at publish.
+                if let Some(state) = self.agent_states.hook_if_current(
+                    agent, status, &stop.session, stop.seq, turn.transcript_seq, stop.seq,
+                ) {
+                    return state;
+                }
+            }
         }
+        audit(agent, Some(stop.seq), "stale_stop");
+        self.agent_states.get(agent)
     }
 
     pub(crate) fn claude_transcript_row(&self, agent: &str, row: &Value, process: Option<u64>) {
@@ -333,6 +338,7 @@ impl Core {
             pending: None,
             reply: None,
             last_feedback: None,
+            transcript_seq: None,
             latest_seq: 0,
             end_seq: 0,
             interrupted: false,
@@ -397,8 +403,11 @@ impl Core {
                 return;
             }
             let fence = next_seq();
-            self.agent_states
-                .hook_seq(agent, Some(Status::Working), Some(session), fence);
+            if let Some(state) = self.agent_states.hook_if_current(
+                agent, Status::Working, session, turn.latest_seq, turn.transcript_seq, fence,
+            ) {
+                turn.transcript_seq = Some(state.status_seq);
+            }
             return;
         }
         if !ended || ingress.is_some() {
@@ -414,6 +423,9 @@ impl Core {
         let state = self
             .agent_states
             .hook_seq(agent, Some(Status::Idle), Some(session), fence);
+        if state.status_seq == fence {
+            turn.transcript_seq = Some(fence);
+        }
         drop(turns);
         if was_busy {
             crate::hooks::after_turn_ended(self, agent, "Settled", &state);
@@ -1000,6 +1012,120 @@ pub(crate) mod tests {
         );
         assert_eq!(core.agent_states.get("timur").status, Status::Working);
         finish(&core);
+    }
+
+    #[test]
+    fn prompt_paste_before_ups_fences_old_stop_publication() {
+        let (core, input) = core("paste-before-ups", NullSink);
+        let _finish = Finish(core.clone());
+        let ended_at = core.claude_turns.0.lock().unwrap().get("timur").unwrap().after + 1;
+        observe(&core, row("turn_duration", ended_at));
+        assert_eq!(core.agent_states.get("timur").status, Status::Idle);
+        let stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+            .unwrap();
+
+        assert_eq!(core.chat_send("timur", "new-prompt-canary").unwrap(), "sent");
+        assert!(input.lock().unwrap().ends_with(b"\x1b[200~new-prompt-canary\x1b[201~\r"));
+        assert_eq!(
+            core.claude_stop_status("timur", &stop, Status::Idle).status,
+            Status::Working,
+            "a submitted prompt owns Working before its UPS arrives"
+        );
+        assert_eq!(core.agent_states.get("timur").status, Status::Working);
+    }
+
+    #[test]
+    fn feedback_after_new_status_cannot_authorize_delayed_stop() {
+        let (core, _) = core("feedback-after-new-status", NullSink);
+        let _finish = Finish(core.clone());
+        result(&core);
+        core.delegation_on_hook("timur", "Stop", &json!({}), false).unwrap();
+        let receipt = feedback(&core, "timur");
+        let ingress = next_seq();
+        // The sender's Working stamp can precede the delayed watcher's feedback read.
+        core.agent_states.hook("timur", Some(Status::Working), None);
+        observe(&core, receipt);
+        let stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), ingress)
+            .unwrap();
+        assert_eq!(
+            core.claude_stop_status("timur", &stop, Status::Idle).status,
+            Status::Working,
+            "feedback cannot hide a newer non-transcript status"
+        );
+    }
+
+    #[test]
+    fn stop_preserves_newer_ingress_waiting_to_publish() {
+        let (core, _) = core("newer-ingress-after-stop", NullSink);
+        let _finish = Finish(core.clone());
+        let stop = core
+            .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+            .unwrap();
+        let queued_hook = next_seq();
+        assert_eq!(core.claude_stop_status("timur", &stop, Status::Idle).status, Status::Idle);
+        core.agent_states.hook_seq("timur", Some(Status::Working), Some("session-a"), queued_hook);
+        assert_eq!(core.claude_stop_status("timur", &stop, Status::Idle).status, Status::Working);
+        assert_eq!(core.agent_states.get("timur").status_seq, queued_hook);
+    }
+
+    #[test]
+    fn non_hook_status_writers_fence_old_stop() {
+        for writer in ["working", "waiting", "idle", "offline", "blocked", "chain_wait", "started", "exited"] {
+            let (core, _) = core("non-hook-status-before-stop", NullSink);
+            let _finish = Finish(core.clone());
+            let stop = core
+                .claude_hook_received("timur", "Stop", Some("session-a"), next_seq())
+                .unwrap();
+            let expected = match writer {
+                "working" => core.agent_states.hook("timur", Some(Status::Working), None),
+                "waiting" => core.agent_states.hook("timur", Some(Status::Waiting), None),
+                "idle" => core.agent_states.hook("timur", Some(Status::Idle), None),
+                "offline" => core.agent_states.hook("timur", Some(Status::Offline), None),
+                "blocked" => {
+                    core.agent_states.spawned("timur");
+                    core.agent_states.blocked("timur").unwrap()
+                }
+                "chain_wait" => core.agent_states.chain_wait("timur"),
+                "started" => core.agent_states.started("timur", "claude", true),
+                "exited" => core.agent_states.exited("timur"),
+                _ => unreachable!(),
+            };
+            // Exercise both blocked and final Stop publications, including same-status writes.
+            for status in [Status::Working, Status::Idle] {
+                let actual = core.claude_stop_status("timur", &stop, status);
+                assert_eq!(actual.status, expected.status, "{writer}");
+                assert_eq!(actual.status_seq, expected.status_seq, "{writer}");
+                assert_eq!(actual.chain_wait, expected.chain_wait, "{writer}");
+                assert_eq!(actual.in_turn(), expected.in_turn(), "{writer}");
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_status_publication_keeps_concurrent_newer_hook() {
+        let states = crate::agents::States::default();
+        states.hook("timur", Some(Status::Working), Some("session-a"));
+        let ingress = next_seq();
+        let newer = next_seq();
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let delayed = {
+            let states = states.clone();
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                gate.wait();
+                states.hook_if_current("timur", Status::Idle, "session-a", ingress, None, ingress)
+            })
+        };
+        gate.wait();
+        states.hook_seq("timur", Some(Status::Waiting), Some("session-a"), newer);
+        delayed.join().unwrap();
+        assert_eq!(states.get("timur").status, Status::Waiting);
+        assert_eq!(states.get("timur").status_seq, newer);
+        // Matching feedback sequence cannot authorize a different session.
+        assert!(states.hook_if_current("timur", Status::Idle, "other-session", ingress, Some(newer), ingress).is_none());
+        assert_eq!(states.get("timur").session_id.as_deref(), Some("session-a"));
     }
 
     #[test]
