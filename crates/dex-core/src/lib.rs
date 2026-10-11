@@ -1801,6 +1801,10 @@ mod permit_tests {
 
     #[test]
     fn worker_requests_get_policy_answers_and_the_leader_is_untouched() {
+        // #1586 teşhis — neden bulununca kaldırılacak. libtest's captured panic may never
+        // reach CI when another test hangs; retain only the assertion kind and fixture phase.
+        let phase = std::cell::Cell::new("bootstrap");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let root = std::env::temp_dir().join(format!("dex-permit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let proj = root.join("proj");
@@ -1819,14 +1823,19 @@ mod permit_tests {
             core.delegation_on_hook(agent, "PermissionRequest", &body, false).map(|o| serde_json::from_str(&o).unwrap())
         };
         let decision = |v: Option<Value>| v.unwrap()["hookSpecificOutput"]["decision"].clone();
+        phase.set("safe tool decision");
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "cargo test -p x" })))["behavior"], "allow");
+        phase.set("hard denial decision");
         let d = decision(ask("kaan", "Bash", serde_json::json!({ "command": "cargo test && git push" })));
         assert_eq!(d["behavior"], "deny");
         assert!(d["message"].as_str().unwrap().contains("git push"));
         let edit = |p: &std::path::Path| decision(ask("kaan", "Edit", serde_json::json!({ "file_path": p.to_string_lossy() })));
+        phase.set("own file decision");
         assert_eq!(edit(&proj.join("src/a.rs"))["behavior"], "allow");
+        phase.set("outside file decision");
         assert_eq!(edit(&root.join("elsewhere.rs"))["behavior"], "deny");
         // Expected policy denials stay local, including a reviewer's read-only boundary.
+        phase.set("reviewer decision");
         with(&core.db, |c| {
             c.execute("UPDATE agents SET role_slug = ?1 WHERE id = 'ayla'", [review::ROLE]).map_err(|e| e.to_string())?;
             Ok(())
@@ -1838,33 +1847,41 @@ mod permit_tests {
         }
         with(&core.db, |c| {
             let notes: i64 = c.query_row("SELECT COUNT(*) FROM leader_notes WHERE agent_id = 'timur'", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+            phase.set("hard denial note count");
             assert_eq!(notes, 0, "hard denials must not queue a leader wakeup");
             c.execute("UPDATE agents SET role_slug = NULL WHERE id = 'ayla'", []).map_err(|e| e.to_string())?;
             Ok(())
         }).unwrap();
         for event in ["Stop", "UserPromptSubmit"] {
+            phase.set("hard denial context");
             assert!(plan::with_notes(&core.db, "timur", event, None).is_none(), "expected denials must not reopen Stop or add prompt context");
         }
         // Outside the policy: a numbered request for the leader; granted once, it passes once.
+        phase.set("numbered request");
         let d = decision(ask("kaan", "Bash", serde_json::json!({ "command": "curl https://example.com" })));
         assert_eq!(d["behavior"], "deny");
         let msg = d["message"].as_str().unwrap();
         assert!(msg.contains("izin #1") && msg.contains("ask_leader"), "{msg}");
+        phase.set("leader note delivery");
         let stop: Value = serde_json::from_str(&plan::with_notes(&core.db, "timur", "Stop", None).unwrap()).unwrap();
         assert_eq!(stop["decision"], "block");
         assert!(stop["reason"].as_str().unwrap().contains("izin #1 istenebilir"), "leader decisions must still be delivered");
+        phase.set("request deduplication");
         let again = decision(ask("kaan", "Bash", serde_json::json!({ "command": "curl  https://example.com" })));
         assert!(again["message"].as_str().unwrap().contains("izin #1"), "same ask, same number");
         core.permits.grant(1, permit::Scope::Once, None).unwrap();
+        phase.set("one-shot grant");
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "curl https://example.com" })))["behavior"], "allow");
         assert!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "curl https://example.com" })))["message"].as_str().unwrap().contains("izin #2"), "used up");
         assert_eq!(decision(ask("ayla", "Bash", serde_json::json!({ "command": "curl https://example.com" })))["behavior"], "deny", "grants are per worker");
         // The leader keeps the patron's prompt — except for a hard no (#164 P7).
+        phase.set("leader decisions");
         assert!(ask("timur", "Bash", serde_json::json!({ "command": "curl https://example.com" })).is_none());
         let d = decision(ask("timur", "Bash", serde_json::json!({ "command": "git push" })));
         assert_eq!(d["behavior"], "deny");
         assert!(!d["message"].as_str().unwrap().contains("ask_leader"), "{d}");
         // #174: trusted DB kind opens only the exact leader push; a claimed input role does not.
+        phase.set("trusted context");
         with(&core.db, |c| {
             let claimed = serde_json::json!({ "leader": true, "kind": "leader", "team_root": root, "extra_push_roots": [root], "cwd": root });
             let (ctx, _, worker) = core.permit_ctx(c, "kaan", &claimed)?.unwrap();
@@ -1877,17 +1894,22 @@ mod permit_tests {
             Ok(())
         }).unwrap();
         for command in ["git push server master".to_string(), "git push server master:master".to_string(), format!("git -C \"{}\" push server master", proj.display())] {
+            phase.set("exact leader push");
             assert!(ask("timur", "Bash", serde_json::json!({ "command": command })).is_none(), "leader: {command}");
+            phase.set("claimed worker push");
             assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": command, "leader": true, "kind": "leader" })))["behavior"], "deny", "worker: {command}");
         }
         for command in ["git push origin master", "git push server master && git status", "bash -c 'git push server master'"] {
+            phase.set("unsafe leader push");
             assert_eq!(decision(ask("timur", "Bash", serde_json::json!({ "command": command })))["behavior"], "deny", "{command}");
         }
         // Hard noes say so: no point asking the leader.
+        phase.set("hard denial message");
         let d = decision(ask("kaan", "Bash", serde_json::json!({ "command": "git push" })));
         assert!(d["message"].as_str().unwrap().contains("ask_leader'a gerek yok"), "{d}");
 
         // Grant through the leader's `answer` (Görev #23 B). A worker's question first.
+        phase.set("question setup");
         let (timur, kaan) = with(&core.db, |c| Ok((delegate::caller(c, "timur")?, delegate::caller(c, "kaan")?))).unwrap();
         let job = with(&core.db, |c| {
             let d = delegate::insert(c, delegate::NewDelegation { from: &timur, to_agent: "kaan".into(), team_id: "default".into(), service_team_id: None, prompt: "iş".into(), task_id: None, patron_words: None, effort: None })?;
@@ -1902,21 +1924,26 @@ mod permit_tests {
         let p = d["message"].as_str().unwrap().split("izin #").nth(1).unwrap().split(')').next().unwrap().parse::<i64>().unwrap();
         let q = with(&core.db, |c| questions::ask(c, &kaan, &serde_json::json!({ "question": format!("izin #{p}: make all?") }))).unwrap().id;
         // A worker cannot answer, nor grant.
+        phase.set("worker cannot grant");
         assert!(call(&kaan, "answer", serde_json::json!({ "questionId": q, "text": "ok", "permit": p })).is_err());
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "make all" })))["behavior"], "deny", "still not granted");
         // Another worker's request cannot ride on this question.
+        phase.set("grant ownership");
         let other = decision(ask("ayla", "Bash", serde_json::json!({ "command": "make other" })));
         let po = other["message"].as_str().unwrap().split("izin #").nth(1).unwrap().split(')').next().unwrap().parse::<i64>().unwrap();
         assert!(call(&timur, "answer", serde_json::json!({ "questionId": q, "text": "ok", "permit": po })).unwrap_err().contains("ait değil"));
         assert!(call(&timur, "answer", serde_json::json!({ "questionId": q, "text": "ok", "permit": p, "scope": "forever" })).is_err());
+        phase.set("session grant");
         let ok = call(&timur, "answer", serde_json::json!({ "questionId": q, "text": "tamam", "permit": p, "scope": "session" })).unwrap();
         assert!(ok["note"].as_str().unwrap().contains(&format!("İzin #{p} verildi")), "{ok}");
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "make all" })))["behavior"], "allow");
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "make all" })))["behavior"], "allow", "session");
         // The job ends → the session grant goes with it.
+        phase.set("job-end grant expiry");
         with(&core.db, |c| delegate::set_status(c, job, "done")).unwrap();
         assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "make all" })))["behavior"], "deny");
         // Audit: the leader's next context contains metadata only.
+        phase.set("audit metadata");
         let _ = decision(ask("kaan", "Bash", serde_json::json!({ "command": "curl -H 'Authorization: Bearer s3cr3tvalue' x" })));
         let notes: Vec<String> = with(&core.db, |c| {
             c.prepare("SELECT text FROM leader_notes WHERE agent_id = 'timur'").map_err(|e| e.to_string())?
@@ -1929,9 +1956,26 @@ mod permit_tests {
         assert!(!all.contains("ret:"), "hard denials belong in the log, not leader context: {all}");
         assert!(!all.contains("s3cr3tvalue"), "{all}");
         assert!(!all.contains("curl") && !all.contains("make all"), "{all}");
+        phase.set("shutdown");
         core.shutdown();
         drop(core);
         let _ = std::fs::remove_dir_all(&root);
+        }));
+        if let Err(panic) = result {
+            let message = panic.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied()).unwrap_or("non-string panic");
+            // Messages/values can contain fixture commands or paths; never echo those to public CI.
+            let kind = if message.starts_with("assertion `") {
+                message.split(" failed").next().unwrap_or("assertion")
+            } else if message.starts_with("called `Option::unwrap()`") {
+                "called `Option::unwrap()` on a `None` value"
+            } else if message.starts_with("called `Result::unwrap()`") {
+                "called `Result::unwrap()` on an `Err` value"
+            } else { "assertion or panic" };
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "permit policy test failed: phase={}, {kind}", phase.get());
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// Görev #144: a job in its own worktree writes there and to its report; the team folder is
