@@ -50,7 +50,7 @@ pub struct State {
     hook_at: u64,
     /// #125: [`next_seq`] of the change that set `status` — an older hook applied late loses.
     #[serde(skip)]
-    status_seq: u64,
+    pub(crate) status_seq: u64,
     /// Reconciled team completion is evaluated once until this agent works again.
     #[serde(skip)]
     team_turn_checked: bool,
@@ -163,6 +163,25 @@ impl States {
     /// #125: a hook's status applies only if no newer change (`seq`, see [`next_seq`]) set it already.
     pub fn hook_seq(&self, id: &str, status: Option<Status>, session_id: Option<&str>, seq: u64) -> State {
         self.hook_turn_seq(id, status, session_id, seq, false)
+    }
+
+    /// A delayed Claude hook may cross only the exact status written by its transcript.
+    /// Check and publish under one lock; a paste, exit or wait keeps its newer status.
+    pub(crate) fn hook_if_current(&self, id: &str, status: Status, session: &str, ingress: u64, transcript_seq: Option<u64>, seq: u64) -> Option<State> {
+        let mut states = self.0.lock().unwrap();
+        let state = states.get_mut(id)?;
+        if state.session_id.as_deref() != Some(session)
+            || state.status_seq > ingress && Some(state.status_seq) != transcript_seq
+        {
+            return None;
+        }
+        state.pre_session = false;
+        state.hook_at = now();
+        // Keep the authorized stamp so a newer hook still waiting to publish can win.
+        let publish_seq = seq.max(state.status_seq);
+        state.set_status(status);
+        state.status_seq = publish_seq;
+        Some(state.clone())
     }
 
     pub(crate) fn prompt_seq(&self, id: &str, session_id: Option<&str>, seq: u64) -> State {
