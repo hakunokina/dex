@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Dex">
+  <defs>
+    <radialGradient id="glow" cx="684" cy="512" r="150" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff5c5f" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#e5383b" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#e5383b" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="#0c0d0f"/>
+  <!-- PCB pin motif: faint traces ending in pads along the left and right edges (decor, outside the Android safe zone) -->
+  <g fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M0 300H78L112 334"/><path d="M0 512H130"/><path d="M0 724H78L112 690"/>
+    <path d="M1024 300H946L912 334"/><path d="M1024 512H894"/><path d="M1024 724H946L912 690"/>
+  </g>
+  <g fill="#ffffff" fill-opacity="0.09">
+    <circle cx="124" cy="346" r="13"/><circle cx="144" cy="512" r="13"/><circle cx="124" cy="678" r="13"/>
+    <circle cx="900" cy="346" r="13"/><circle cx="880" cy="512" r="13"/><circle cx="900" cy="678" r="13"/>
+  </g>
+  <!-- the logo's D (App.tsx brand-mark path), stroke thickened for icon scale; 1 unit = 22.5 px -->
+  <path transform="translate(512 512) scale(22.5) translate(-9.875 -14)" fill="none" stroke="#e8eaed" stroke-width="4.6" d="M9 2.25C14.5 2.25 17.5 6 17.5 14C17.5 22 14.5 25.75 9 25.75H2.25V2.25Z"/>
+  <circle cx="684" cy="512" r="150" fill="url(#glow)"/>
+  <circle cx="684" cy="512" r="46" fill="#ff5c5f"/>
+</svg>

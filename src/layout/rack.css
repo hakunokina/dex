@@ -1,0 +1,58 @@
+/* DEX-36 worker rack; #42: one row in the top bar — chips scroll sideways. */
+.rack { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; height: 100%; }
+.rack-scroll {
+  position: relative; /* #285: chips' offsetLeft is measured against the strip (scroll-free) */
+  display: flex; align-items: center; gap: var(--sp-1); min-width: 0; height: 100%; padding: 0 2px;
+  overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+}
+.rack-scroll::-webkit-scrollbar { display: none; }
+.rack-scroll > * { flex: none; }
+/* Edge fade where chips run on past the bar. */
+.rack-scroll.more-right { mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent); }
+.rack-scroll.more-left { mask-image: linear-gradient(to left, #000 calc(100% - 24px), transparent); }
+.rack-scroll.more-left.more-right { mask-image: linear-gradient(to right, transparent, #000 24px, #000 calc(100% - 24px), transparent); }
+.rack-chip {
+  position: relative; display: inline-flex; align-items: center; gap: 6px;
+  height: var(--ctl-h); padding: 0 var(--sp-2);
+  background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--r-md); color: var(--muted);
+  cursor: pointer; white-space: nowrap;
+}
+.rack-chip:hover { color: var(--text); background: var(--surface-2); border-color: var(--line-strong); }
+.rack-chip:focus-visible { outline: none; box-shadow: var(--ring); }
+.rack-chip.focused { box-shadow: inset 0 -2px 0 var(--red); }
+.rack-name { font: var(--fw-medium) var(--fs-sm) var(--font-ui); }
+.rack-provider {
+  padding: 1px 4px; border: 1px solid var(--line-strong); border-radius: var(--r-pill);
+  color: var(--amber); font: var(--fw-semibold) 8px/1.2 var(--font-mono); text-transform: uppercase;
+}
+.rack-chip.idle, .rack-chip.working, .rack-chip.waiting { color: var(--text); }
+.rack-chip.offline { opacity: 0.5; }
+/* Status light is an overlay whose opacity animates, so it never fights the focus shadow.
+   Working: slow soft red breathing. Waiting: hard red blink — the patron is needed. */
+.rack-chip::after {
+  content: ""; position: absolute; inset: -1px; pointer-events: none; opacity: 0;
+  border: 1px solid var(--red-line); border-radius: inherit; box-shadow: inset 0 0 14px var(--red-glow);
+}
+.rack-chip.working::after { animation: rack-glow 2.4s ease-in-out infinite; }
+.rack-chip.waiting::after { background: var(--red-soft); animation: rack-blink 0.9s steps(1) infinite; }
+@keyframes rack-glow { 50% { opacity: 0.75; } }
+@keyframes rack-blink { 50% { opacity: 1; } }
+/* Leaders lead the row: red cap + "L" badge. */
+.rack-chip.leader { box-shadow: inset 0 2px 0 var(--red); }
+.rack-chip.leader.focused { box-shadow: inset 0 2px 0 var(--red), inset 0 -2px 0 var(--red); }
+.rack-badge { font: var(--fw-semibold) 9px var(--font-mono); color: var(--red); line-height: 1; }
+.rack-sep { align-self: stretch; flex: 0 0 1px; margin: 6px 2px; background: var(--line); }
+/* DEX-19: the worker reported and the leader hasn't taken the result in yet (the theme's only green). */
+.rack-chip.done { outline: 1px solid var(--green); outline-offset: 1px; }
+.rack-chip.done.working, .rack-chip.done.waiting { outline: none; }
+
+/* Marks shared by rack chips and agent tabs. */
+.marks { display: inline-flex; align-items: center; gap: 4px; }
+.marks:empty { display: none; }
+.mark-done { color: var(--green); font: var(--fw-semibold) var(--fs-xs)/1 var(--font-mono); }
+.mark-warn, .mark-ask { color: var(--amber); font: var(--fw-semibold) var(--fs-xs)/1 var(--font-mono); }
+.mark-stall { color: var(--amber); flex: none; }
+.mark-deleg {
+  min-width: 14px; height: 14px; padding: 0 3px; border-radius: var(--r-pill);
+  background: var(--red); color: var(--on-accent); font: var(--fw-semibold) 9px/14px var(--font-mono); text-align: center;
+}

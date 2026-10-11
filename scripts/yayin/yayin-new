@@ -1,0 +1,53 @@
+#!/bin/bash
+# yayin-new <proje> <port> [sağlık_yolu] — yeni proje (#221). Tekrar koşmak güvenli (idempotent).
+#   /srv/git/<proje>.git      bare repo; post-receive → yayin-deploy (main|master push)
+#   /srv/apps/<proje>/        port, conf, releases/, current, logs/, status.json
+#   /srv/env/<proje>.env      sunucuya özel ortam (repoya girmez, 0600)
+#   /etc/caddy/sites/<proje>.caddy   <proje>.$DOMAIN → 127.0.0.1:<port>, otomatik TLS
+set -euo pipefail
+. "${YAYIN_CONF:-/etc/yayin.conf}"
+: "${DOMAIN:?yayin.conf: DOMAIN gerekli}"
+if [ "${1:-}" = --dry-run ]; then echo 'yayin-new dry-run: config loaded; filesystem/docker/caddy skipped'; exit 0; fi
+P=${1:-}; PORT=${2:-}; HEALTH=${3:-/}
+[[ $P =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "kullanım: yayin-new <proje: a-z0-9-> <port 1024-65535> [sağlık_yolu]" >&2; exit 2; }
+[[ $PORT =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || { echo "port 1024-65535 olmalı" >&2; exit 2; }
+[[ $HEALTH == /* ]] || { echo "sağlık yolu / ile başlamalı" >&2; exit 2; }
+
+A=/srv/apps/$P
+if [ -e "$A/port" ]; then
+  [ "$(cat "$A/port")" = "$PORT" ] || { echo "$P zaten port $(cat "$A/port") ile kayıtlı" >&2; exit 1; }
+else
+  for f in /srv/apps/*/port; do
+    [ -e "$f" ] && [ "$(cat "$f")" = "$PORT" ] && { echo "port $PORT kullanımda: $(basename "$(dirname "$f")")" >&2; exit 1; }
+  done
+  ss -ltnH "sport = :$PORT" | grep -q . && { echo "port $PORT'u başka bir süreç dinliyor" >&2; exit 1; }
+fi
+
+mkdir -p "$A/releases" "$A/logs"
+echo "$PORT" >"$A/port"
+echo "$HEALTH" >"$A/health"
+[ -e "$A/conf" ] || printf '# %s için yayin.conf ezmeleri (CPUS= MEM= HEALTH_TIMEOUT=)\n' "$P" >"$A/conf"
+[ -e "/srv/env/$P.env" ] || install -m 0600 /dev/null "/srv/env/$P.env"
+
+G=/srv/git/$P.git
+[ -d "$G" ] || git init -q --bare -b main "$G"
+ln -sfn /usr/local/lib/yayin/post-receive "$G/hooks/post-receive"
+
+S=/etc/caddy/sites/$P.caddy
+site=$(printf '# yayin-new (%s)\n%s.%s {\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:%s\n}\n' "$P" "$P" "$DOMAIN" "$PORT")
+if [ "$(sudo cat "$S" 2>/dev/null)" != "$site" ]; then
+  printf '%s\n' "$site" | sudo tee "$S.new" >/dev/null
+  sudo mv -f "$S.new" "$S"
+  if ! sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
+    sudo rm -f "$S"; echo "Caddy doğrulaması başarısız; site dosyası kaldırıldı" >&2; exit 1
+  fi
+  sudo systemctl reload caddy
+fi
+
+cat <<EOF
+$P hazır → https://$P.$DOMAIN (Caddy → 127.0.0.1:$PORT, sağlık: $HEALTH)
+  git remote add yayin ${YAYIN_USER:-$(id -un)}@${YAYIN_HOST:-$(hostname -I | awk '{print $1}')}:$G
+  git push yayin main
+Compose'da yayınlanan port: "127.0.0.1:\${PORT}:<konteyner_portu>"  (PORT=$PORT verilir)
+Gizli ortam: /srv/env/$P.env (her servise env_file olarak eklenir)
+EOF

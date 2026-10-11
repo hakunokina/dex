@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+# dex-core: arayüzsüz çekirdek (tauri YOK). src-tauri: onu process içinde çağıran ince kabuk.
+# dexd: aynı çekirdeği arayüzsüz barındırıp WebSocket'ten sunan servis (S2).
+members = ["crates/dex-core", "crates/dexd", "src-tauri"]
+
+# Profiles only take effect at the workspace root.
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,0 +1,19 @@
+/* DEX-41 notes: a transparent-text textarea over a highlight layer. Both boxes must share every metric
+   (font, padding, wrapping, scrollbar gutter) or the caret drifts from the painted text. */
+.notes { position: relative; height: 100%; background: var(--surface-1); }
+.notes-layer, .notes-editor {
+  position: absolute; inset: 0; margin: 0; border: 0; padding: var(--sp-2) var(--sp-3);
+  font: var(--fw-regular) var(--fs-md)/var(--lh) var(--font-ui); letter-spacing: normal; tab-size: 4;
+  white-space: pre-wrap; overflow-wrap: break-word; scrollbar-gutter: stable;
+}
+.notes-layer { overflow: hidden; color: var(--text); pointer-events: none; }
+.notes-editor {
+  overflow-y: auto; resize: none; outline: none; background: transparent;
+  color: transparent; caret-color: var(--text);
+}
+.notes-editor::placeholder { color: var(--faint); }
+.notes-editor::selection { background: var(--red-soft); }
+.md-h { color: var(--red-hi); }
+.md-mark { color: var(--muted); }
+.md-q { color: var(--muted); }
+.md-code { color: var(--amber); }

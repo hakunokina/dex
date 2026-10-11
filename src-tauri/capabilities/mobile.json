@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mobile",
+  "description": "S5-A: phone shell — no local core, no desktop plugins. Only the host-token bridge commands (registered by the dex-host-tokens plugin setup) plus local notifications for background waiting/done. Referencing opener/dialog here would fail at startup because those plugins are cfg(desktop)-gated out of the mobile build.",
+  "platforms": ["android", "iOS"],
+  "permissions": [
+    "core:default",
+    "notification:default"
+  ]
+}

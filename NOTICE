@@ -1,0 +1,79 @@
+Dex third-party notices
+======================
+
+Dex code is licensed under MIT; see LICENSE. Preserve the following notices
+when redistributing the corresponding material. Dependency packages retain
+their own licenses; this file does not relicense them or grant trademark rights.
+
+Gateway
+-------
+Parts of crates/dex-core/src/gateway/request.rs and stream.rs adapt designs from
+raine/claude-code-proxy v0.1.44, commit
+4b5c058a3c900031d2b2e094a265a5ade7acad3a:
+https://github.com/raine/claude-code-proxy/tree/4b5c058a3c900031d2b2e094a265a5ade7acad3a
+Copyright (c) 2026 Raine Virta — MIT.
+The complete license is retained in
+crates/dex-core/src/gateway/LICENSE-raine; adaptation details are in the
+gateway README.md.
+
+Provider icons
+--------------
+src/usage/icons/ contains icons copied from Token Monitor:
+https://github.com/Javis603/token-monitor
+Copyright (c) 2026 Javis — MIT.
+Its full MIT notice and the LobeHub Icons attribution are retained in
+src/usage/icons/NOTICE.md. Provider logos remain their owners' trademarks.
+
+Embedded workflow skills and mod
+-------------------------------
+crates/dex-core/src/skills.rs embeds the workflow text into the binary.
+systematic-debugging and test-driven-development are modified adaptations of
+the corresponding skills from https://github.com/obra/superpowers:
+https://github.com/obra/superpowers/tree/main/skills/systematic-debugging
+https://github.com/obra/superpowers/tree/main/skills/test-driven-development
+
+MIT License
+
+Copyright (c) 2025 Jesse Vincent
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+The requesting-code-review workflow and dex-leader-colors UI mod are Dex
+material covered by the root MIT license. The mod uses Claude Code's API;
+its reference sources are documented in
+crates/dex-core/mods/dex-leader-colors/README.md.
+
+Generated office artwork
+------------------------
+The office sprites in src/office/assets/ were generated using AI with
+Black Forest Labs FLUX.1 [dev]. Dex does not bundle the model weights.
+The model has a non-commercial license; generated outputs are treated
+separately, and BFL permits commercial output use subject to its terms:
+https://github.com/black-forest-labs/flux/blob/main/model_cards/FLUX.1-dev.md
+https://bfl.ai/legal/non-commercial-license-terms (section 2(d)).
+Check the applicable terms yourself before reuse, since license terms may
+change. The model's non-commercial restriction does not by itself require
+replacing these sprites for commercial use of Dex.
+
+Trademarks
+----------
+Claude, Claude Code and Anthropic are names of Anthropic; Codex and OpenAI
+are names of OpenAI. These names and provider logos are used only to identify
+integrations. Dex is an independent project and does not claim affiliation,
+sponsorship or endorsement by those companies or Black Forest Labs.

@@ -1,0 +1,17 @@
+# master → derle, yedekle, kur, sağlık kontrolü, gerekirse geri al (#215). Tek seferlik; aynı anda
+# ikinci tur yok (oneshot + betikteki flock). Log: /home/dex/deploy/logs, durum: status.json.
+[Unit]
+Description=dexd deploy (master)
+After=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+User=@DEPLOY_USER@
+Group=@DEPLOY_GROUP@
+WorkingDirectory=@USER_HOME@
+Environment=HOME=@USER_HOME@
+Environment=PATH=@USER_HOME@/.local/bin:@USER_HOME@/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=@DEPLOY_HOME@/bin/dexd-deploy
+Nice=10
+TimeoutStartSec=30min

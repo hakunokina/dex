@@ -1,0 +1,16 @@
+#!/bin/bash
+# yayin post-receive (#221) — /srv/git/<proje>.git/hooks/post-receive → buraya symlink (yayin-new).
+# main|master push'unda yayin-deploy'u oturumdan bağımsız (setsid) başlatır ve log'unu push
+# çıktısına akıtır; bağlantı koparsa deploy sürer. Sonuç: yayin-status <proje>.
+P=$(basename "$(cd "${GIT_DIR:-.}" && pwd)" .git)
+Z=0000000000000000000000000000000000000000
+while read -r old new ref; do
+  case $ref in refs/heads/main|refs/heads/master) ;; *) continue ;; esac
+  [ "$new" = "$Z" ] && continue
+  log=/srv/apps/$P/logs/$(date +%Y%m%d-%H%M%S)-${new:0:12}.log
+  YAYIN_LOG=$log YAYIN_PUSH_REF=$ref setsid nohup /usr/local/bin/yayin-deploy "$P" "$new" >"$log" 2>&1 </dev/null &
+  pid=$!
+  tail -n +1 --pid="$pid" -f "$log" 2>/dev/null
+  echo "yayin: sonuç → $(cat "/srv/apps/$P/status.json" 2>/dev/null)"
+done
+exit 0

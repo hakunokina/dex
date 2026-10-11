@@ -1,0 +1,123 @@
+#!/bin/bash
+# yayin-deploy <proje> [sha|ref] — checkout → derle → up → sağlık → başarısızsa önceki sürüme dön (#221).
+# post-receive her main|master push'unda koşturur; elle: yeniden deploy ya da geri alma
+# (`yayin-deploy <proje> <eski-sha>`). Desen: scripts/deploy/dexd-deploy.sh (#215).
+#
+# Kurallar (ihlal → canlıya dokunmadan reddedilir):
+#   - repo kökünde compose.yaml | compose.yml | docker-compose.yaml | docker-compose.yml
+#   - yayınlanan her port 127.0.0.1'e bağlı; biri PORT'a (yayin-new'deki port) yayınlanır
+#   - bind/file secret/config/build/env/watch kaynakları gerçek yoluyla proje kökü altında
+#     (yalnız enjekte edilen ENVF istisna); daemon socket/host yetkisi yok
+# Her servise eklenir (.yayin.override.yaml): CPU/bellek limiti (CPUS/MEM), restart: unless-stopped,
+# env_file: /srv/env/<proje>.env. Compose değişken çözümü: PORT + aynı .env dosyası.
+#
+# Sağlık: http://127.0.0.1:PORT<sağlık_yolu> 2xx/3xx, 3 sn arayla art arda iki kez, HEALTH_TIMEOUT
+# içinde; yeniden başlayan konteyner yok. Durum: /srv/apps/<proje>/status.json
+#   ok | build_failed | invalid | rolled_back | rollback_failed | failed_no_prev  (atlanan push status yazmaz)
+set -uo pipefail
+. "${YAYIN_CONF:-/etc/yayin.conf}" || exit 2
+: "${DOMAIN:?yayin.conf: DOMAIN gerekli}"
+if [ "${1:-}" = --dry-run ]; then echo 'yayin-deploy dry-run: config loaded; git/build/docker/health skipped'; exit 0; fi
+P=${1:?kullanım: yayin-deploy <proje> [sha]}
+A=/srv/apps/$P G=/srv/git/$P.git ENVF=/srv/env/$P.env
+[ -e "$A/port" ] && [ -d "$G" ] || { echo "$P yok (yayin-new $P <port>)" >&2; exit 2; }
+. "$A/conf"
+PORT=$(cat "$A/port") HEALTH=$(cat "$A/health" 2>/dev/null || echo /)
+export PORT
+
+REF=${2:-}
+[ -n "$REF" ] || REF=$(git -C "$G" rev-parse -q --verify refs/heads/main || git -C "$G" rev-parse -q --verify refs/heads/master) ||
+  { echo "$P: main/master dalı yok — önce push" >&2; exit 2; }
+SHA=$(git -C "$G" rev-parse -q --verify "$REF^{commit}") || { echo "$P: '$REF' commit değil" >&2; exit 2; }
+S=${SHA:0:12}
+
+if [ -z "${YAYIN_LOG:-}" ]; then # hook çıktıyı zaten log'a yönlendirir
+  YAYIN_LOG="$A/logs/$(date +%Y%m%d-%H%M%S)-$S.log"
+  exec > >(tee -a "$YAYIN_LOG") 2>&1
+fi
+
+say() { echo "[$(date '+%F %T')] $*"; }
+status() { # result prev
+  printf '{"result":"%s","sha":"%s","prev":"%s","time":"%s","log":"%s"}\n' \
+    "$1" "$S" "$2" "$(date -Is)" "$YAYIN_LOG" >"$A/status.json.tmp" && mv -f "$A/status.json.tmp" "$A/status.json"
+}
+compose_file() { local f; for f in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do [ -e "$1/$f" ] && { echo "$f"; return; }; done; return 1; }
+dc() { # release-dizini compose-argları...
+  local d=$1; shift
+  docker compose -p "$P" --project-directory "$d" -f "$d/$(compose_file "$d")" -f "$d/.yayin.override.yaml" \
+    --env-file "$ENVF" "$@"
+}
+
+validate_compose() {
+  local cfg
+  cfg=$(dc "$1" config --format json --no-env-resolution) || { say "compose config başarısız"; return 1; }
+  python3 -I -X utf8 /usr/local/lib/yayin/compose-validate.py "$A" "$PORT" "$ENVF" <<<"$cfg" ||
+    { say "reddedildi: Compose güvenlik kapısı"; return 1; }
+}
+
+health_once() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$PORT$HEALTH")
+  [[ $code =~ ^[23] ]] || { say "sağlık: 127.0.0.1:$PORT$HEALTH → $code" >&2; return 1; }
+  [ -z "$(dc "$1" ps -q --status restarting)" ] || { say "sağlık: yeniden başlayan konteyner var" >&2; return 1; }
+}
+health() { # release-dizini
+  local deadline=$((SECONDS + HEALTH_TIMEOUT))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if health_once "$1" 2>/dev/null; then
+      sleep 3
+      health_once "$1" && { say "sağlık: tamam (127.0.0.1:$PORT$HEALTH)"; return 0; }
+    fi
+    sleep 2
+  done
+  health_once "$1"
+  return 1
+}
+
+prepare() { # sha12 sha → release dizini hazır + doğrulanmış
+  local s=$1 sha=$2 d="$A/releases/$1" cf svc tmp
+  if [ ! -d "$d" ]; then
+    tmp="$A/releases/.tmp-$s"; rm -rf "$tmp"; mkdir -p "$tmp"
+    git -C "$G" archive "$sha" | tar -x -C "$tmp" && mv "$tmp" "$d" || { rm -rf "$tmp"; say "checkout başarısız"; return 1; }
+  fi
+  cf=$(compose_file "$d") || { say "compose dosyası yok (compose.yaml)"; return 1; }
+  { echo "services:"
+    for svc in $(docker compose -p "$P" --project-directory "$d" -f "$d/$cf" --env-file "$ENVF" config --services --no-env-resolution); do
+      printf '  %s:\n    restart: unless-stopped\n    env_file: ["%s"]\n    deploy:\n      resources:\n        limits: {cpus: "%s", memory: "%s"}\n' \
+        "$svc" "$ENVF" "$CPUS" "$MEM"
+    done
+  } >"$d/.yayin.override.yaml"
+  validate_compose "$d"
+}
+
+exec 9>"$A/lock"
+flock -w 900 9 || { say "kilit alınamadı (başka deploy 15 dk'dır sürüyor)"; exit 1; }
+if [ -n "${YAYIN_PUSH_REF:-}" ] && [ "$(git -C "$G" rev-parse -q --verify "$YAYIN_PUSH_REF")" != "$SHA" ]; then
+  say "$S: daha yeni bir push geldi, atlandı (o push kendi deploy'unu yapar)"; exit 0
+fi
+
+prev=$(basename "$(readlink "$A/current" 2>/dev/null)" 2>/dev/null); [ "$prev" = . ] && prev=""
+say "deploy: $P $S (önceki: ${prev:-yok}) → $YAYIN_LOG"
+if ! prepare "$S" "$SHA"; then status invalid "$prev"; say "canlıya dokunulmadı"; exit 1; fi
+D="$A/releases/$S"
+say "derleme: docker compose build"
+if ! dc "$D" build; then status build_failed "$prev"; say "derleme başarısız; canlıya dokunulmadı"; exit 1; fi
+say "başlat: docker compose up -d"
+if dc "$D" up -d --quiet-pull --remove-orphans && health "$D"; then
+  ln -sfn "releases/$S" "$A/current.tmp" && mv -fT "$A/current.tmp" "$A/current"
+  status ok "$prev"
+  ls -1t "$A/releases" | grep -vx -e "$S" -e "$prev" | tail -n +"$((KEEP_RELEASES - 1))" |
+    while read -r r; do rm -rf "${A:?}/releases/$r"; done
+  say "deploy tamam: $P $S → https://$P.$DOMAIN"; exit 0
+fi
+
+if [ -z "$prev" ] || [ "$prev" = "$S" ]; then
+  say "önceki sürüm yok; yeni sürüm durduruldu"
+  dc "$D" down --remove-orphans
+  status failed_no_prev ""; exit 1
+fi
+say "GERİ ALMA: $prev"
+if validate_compose "$A/releases/$prev" && dc "$A/releases/$prev" up -d --build --quiet-pull --remove-orphans && health "$A/releases/$prev"; then
+  status rolled_back "$prev"; say "geri alındı: $prev (canlı = önceki sürüm)"; exit 1
+fi
+status rollback_failed "$prev"; say "GERİ ALMA BAŞARISIZ — elle müdahale: docs/yayin.md"; exit 2

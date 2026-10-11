@@ -1,0 +1,420 @@
+/* S5-A: the phone shell — dark, DEX-37 tokens only (imported via App.css). Layout: fixed top bar,
+   scrolling body, bottom tab bar with the gesture inset; the agent screen covers everything.
+   Z Flip8: inner screen is a tall portrait (~412dp); the cover screen (~320dp) tightens under
+   max-width: 360px — icon-only tabs, compact agent rows, shorter key bar. Folding/unfolding is a
+   resize the views already follow (ResizeObserver / visualViewport). */
+
+.m-app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+}
+
+/* ---- top bar ---- */
+.m-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  padding-top: calc(var(--sp-2) + env(safe-area-inset-top));
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--line);
+}
+.m-brand {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--red);
+}
+.m-brand img { width: 18px; height: 18px; }
+.m-teams { position: relative; flex: 1; min-width: 0; }
+.m-team-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font: inherit;
+}
+.m-chev { transform: rotate(-90deg); }
+.m-chev.up { transform: rotate(90deg); }
+.m-team-list {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: var(--z-m-pop);
+  margin: 0;
+  padding: var(--sp-1);
+  list-style: none;
+  background: var(--surface-pop);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+}
+.m-team-list button {
+  width: 100%;
+  padding: 10px var(--sp-2);
+  background: none;
+  border: 0;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+.m-team-list button.on { background: var(--red-soft); color: var(--red-hi); }
+.m-host-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-2);
+  font-size: 13px;
+  flex: none; /* the team picker must never push the servers button off-screen */
+}
+.m-host-btn svg { width: 16px; height: 16px; }
+.m-add-title { margin: var(--sp-3) 0 var(--sp-1); font-size: 14px; font-weight: 600; color: var(--text-2); }
+.m-host-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.m-host-dot.connected { background: var(--green); }
+.m-host-dot.connecting, .m-host-dot.reconnecting { background: var(--amber); }
+.m-host-dot.unauthorized, .m-host-dot.no-token { background: var(--red); }
+
+/* ---- body ---- */
+/* position: the office canvas is absolutely positioned (office.css) — without a positioned box here
+   it covered the whole viewport, hiding the top bar and the bottom tabs. */
+.m-body { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; overflow: hidden; }
+.m-body > * { flex: 1; min-height: 0; }
+.m-hint { padding: var(--sp-4); color: var(--text-2); font-size: 14px; line-height: 1.5; }
+.m-board { display: flex; flex-direction: column; overflow: auto; }
+
+/* The shared desktop PCB measures this whole slot and uses its portrait layout.
+   Top/bottom insets already belong to the bars; only side cutouts remain here. */
+.m-card {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  margin-left: env(safe-area-inset-left);
+  margin-right: env(safe-area-inset-right);
+  overflow: hidden;
+}
+
+/* ---- bottom tabs ---- */
+.m-tabs {
+  display: flex;
+  background: var(--surface-1);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.m-tab {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 0 6px;
+  background: none;
+  border: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+.m-tab svg { width: 20px; height: 20px; }
+.m-tab.on { color: var(--red-hi); }
+
+/* ---- agents ---- */
+.m-agents { overflow: auto; padding: var(--sp-2) var(--sp-3) var(--sp-6); }
+.m-agents h3 {
+  margin: var(--sp-3) 0 var(--sp-1);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+.m-agent {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 12px var(--sp-3);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+}
+.m-agent + .m-agent { margin-top: var(--sp-2); }
+.m-agent.leader { border-color: var(--red-line); }
+.m-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--idle); }
+.m-dot.working { background: var(--red); box-shadow: 0 0 8px var(--red-glow); }
+.m-dot.waiting { background: var(--amber); }
+.m-dot.idle { background: var(--green); }
+.m-agent-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.m-agent-main b { font-size: 15px; }
+.m-agent-sub { font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-agent-preview { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-agent-preview.unread { color: var(--text); }
+.m-agent { min-height: 56px; }
+.m-marks { display: flex; gap: 4px; }
+.m-marks .mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--r-xs);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 700;
+}
+.m-marks .mark.done { color: var(--green); border: 1px solid var(--green); }
+.m-marks .mark.ask { color: var(--amber); border: 1px solid var(--amber-line); }
+.m-marks .mark.warn { color: var(--red-hi); border: 1px solid var(--red-line); }
+.m-agent-side { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.m-engine { font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 1px 6px; }
+.m-status-text { font-size: 11px; color: var(--text-2); }
+.m-chev-agent { color: var(--faint); }
+
+/* ---- agent screen (over everything) ---- */
+.m-agent-screen {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-m-screen);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.m-agent-top {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  padding-top: calc(var(--sp-2) + env(safe-area-inset-top));
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--line);
+}
+.m-back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 6px;
+  background: none;
+  border: 0;
+  color: var(--text);
+}
+.m-agent-title { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.m-agent-title b { font-size: 15px; }
+.m-agent-title span { font-size: 12px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.m-agent-state { display: flex; align-items: center; gap: 6px; }
+.m-agent-state .mark.ask { font-style: normal; color: var(--amber); border: 1px solid var(--amber-line); border-radius: var(--r-pill); padding: 0 6px; font-size: 11px; }
+.m-view-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text-2);
+}
+.m-chat-slot { display: flex; flex: 1; min-height: 0; }
+.m-chat-slot > .chat { flex: 1; min-width: 0; }
+.m-chat-slot > [role="alert"] { flex: 1; min-width: 0; overflow: auto; }
+.m-chat-slot .settings-err { color: var(--red-hi); overflow-wrap: anywhere; }
+.m-chat-slot [role="alert"] button { min-height: 44px; }
+
+/* ---- terminal + extra keys ---- */
+.m-term { flex: 1; min-height: 0; display: flex; flex-direction: column; position: relative; }
+.m-term-view { flex: 1; min-height: 0; display: flex; position: relative; }
+.m-term-host { flex: 1; min-width: 0; padding: var(--sp-1); touch-action: none; }
+.m-term .xterm { height: 100%; }
+.m-term-bottom {
+  position: absolute;
+  right: var(--sp-3);
+  bottom: var(--sp-3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  background: var(--surface-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  color: var(--text);
+}
+.m-line {
+  display: flex;
+  gap: 6px;
+  padding: 6px var(--sp-2) 0;
+  background: var(--surface-1);
+  border-top: 1px solid var(--line);
+}
+.m-line input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px; /* under 16px mobile browsers zoom on focus */
+}
+.m-line input:focus { outline: none; border-color: var(--red-line); }
+.m-line button {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  background: var(--red);
+  border: 0;
+  border-radius: var(--r-md);
+  color: var(--on-accent);
+}
+.m-line :disabled { opacity: 0.5; }
+.m-term-bottom:focus-visible, .m-line button:focus-visible { outline: 2px solid var(--red-hi); outline-offset: 2px; }
+.m-launch {
+  position: absolute;
+  left: 50%;
+  top: 40%;
+  transform: translate(-50%, -50%);
+  padding: 12px 28px;
+  background: var(--red);
+  color: var(--on-accent);
+  border: 0;
+  border-radius: var(--r-pill);
+  font: inherit;
+  font-weight: 600;
+}
+.m-keys {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px var(--sp-2) calc(6px + env(safe-area-inset-bottom));
+  background: var(--surface-1);
+  border-top: 1px solid var(--line);
+}
+.m-keys button {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 40px;
+  height: 40px;
+  padding: 0 10px;
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 13px;
+}
+.m-keys button.on { background: var(--red-soft); border-color: var(--red-line); color: var(--red-hi); }
+
+/* ---- pairing / servers sheet ---- */
+.m-add { overflow: auto; padding: var(--sp-4) var(--sp-4) var(--sp-6); display: block; }
+.m-add-hero { text-align: center; margin-bottom: var(--sp-5); }
+.m-add-hero img { width: 56px; height: 56px; }
+.m-add-hero h1 { color: var(--red); letter-spacing: 0.1em; margin: var(--sp-2) 0; }
+.m-add-hero p, .m-add h2 { color: var(--text-2); }
+.m-add-hero p { font-size: 13px; line-height: 1.5; }
+.m-add label { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--sp-3); font-size: 13px; color: var(--text-2); }
+.m-add input {
+  padding: 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font-size: 15px;
+}
+.m-add input:focus { outline: none; border-color: var(--red-line); }
+code { color: var(--text-2); }
+.m-primary {
+  width: 100%;
+  padding: 13px;
+  margin-top: var(--sp-2);
+  background: var(--red);
+  color: var(--on-accent);
+  border: 0;
+  border-radius: var(--r-md);
+  font: inherit;
+  font-weight: 600;
+}
+.m-primary:disabled { background: var(--red-dim); }
+.m-err { color: var(--red-hi); font-size: 13px; margin-top: var(--sp-2); }
+.m-hosts { list-style: none; margin: 0 0 var(--sp-4); padding: 0; display: flex; flex-direction: column; gap: var(--sp-2); }
+.m-host {
+  display: flex;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+}
+.m-host-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.m-host-main code { font-size: 11px; }
+.m-host-status { font-size: 12px; color: var(--text-2); }
+.m-repair { display: flex; gap: 6px; margin-top: 6px; }
+.m-repair input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 13px;
+}
+.m-repair button, .m-danger {
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: 12px;
+}
+.m-danger { align-self: flex-start; color: var(--red-hi); border-color: var(--red-line); }
+
+/* Notes editor already sizes itself (layout/notes.css). */
+.m-body .notes { flex: 1; min-height: 0; }
+
+/* ---- cover screen (Z Flip8, ~320dp) ---- */
+@media (max-width: 360px) {
+  .m-tab span { display: none; }
+  .m-tab { padding: 10px 0 8px; }
+  .m-agent { padding: 10px var(--sp-2); }
+  .m-agent-main b { font-size: 14px; }
+  .m-agent-sub { display: none; }
+  .m-engine { display: none; }
+  .m-status-text { display: none; }
+  .m-host-label { display: none; }
+  .m-keys { gap: 4px; }
+  .m-keys button { min-width: 36px; height: 38px; padding: 0 8px; }
+}

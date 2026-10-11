@@ -1,0 +1,238 @@
+// The desktop shell against a real dexd (e2e/fixtures.ts). What the patron sees first: the app
+// connects, a team is made from the UI, its crew and the task board show up.
+import { test, expect, calls, openTeam, teamAgents, newTeam } from "./fixtures";
+import { existsSync } from "node:fs";
+import { dirname, basename } from "node:path";
+
+test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi görünür", async ({ app, dexd }) => {
+  const errors: string[] = [];
+  app.on("pageerror", (e) => errors.push(e.message));
+  // #47: no team yet → no Kart (its "Yeni takım" button); the empty stage offers the create action.
+  const create = app.getByRole("status").getByRole("button", { name: "Takım oluştur…" });
+  await expect(create).toBeVisible();
+
+  const name = `Açılış ${test.info().workerIndex}`;
+  const folder = `Açılış${test.info().workerIndex}`;
+  await create.click();
+  await app.getByRole("textbox", { name: "Ad" }).fill(name);
+  await expect(app.locator(".team-folder-preview")).toContainText(`${folder}Main`);
+  await expect(app.getByRole("button", { name: "Oluştur", exact: true })).toBeEnabled();
+  await app.getByRole("button", { name: "Oluştur", exact: true }).click();
+
+  await expect(app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name, exact: true })).toBeVisible();
+  const team = (await dexd.call<{ id: string; name: string; cwd: string }[]>("team_list")).find((t) => t.name === name);
+  expect(team, "takım çekirdekte").toBeTruthy();
+  expect(basename(team!.cwd)).toBe(`${folder}Main`);
+  expect(basename(dirname(team!.cwd))).toBe(folder);
+  expect(existsSync(team!.cwd)).toBe(true);
+  expect(existsSync(dirname(team!.cwd))).toBe(true);
+  const projects = await dexd.call<{ name: string; rootPath: string }[]>("project_list", { teamId: team!.id });
+  expect(projects).toMatchObject([{ name: `${folder}Main`, rootPath: team!.cwd }]);
+  const crew = await teamAgents(dexd, team!.id);
+  expect(crew.map((a) => a.kind).sort()).toEqual(["leader", "worker", "worker", "worker", "worker"]);
+  for (const a of crew) await expect(app.getByRole("region", { name: a.name, exact: true })).toBeVisible();
+  // #47: the team's Kart carries the status count (no "bekliyor") and the team/app buttons.
+  const kart = app.getByRole("group", { name: "Kart araçları" });
+  await expect(kart).toContainText("çalışıyor");
+  await expect(kart).toContainText("boşta");
+  await expect(kart).not.toContainText("bekliyor");
+  for (const b of ["Görevler", "Yeni takım", "Takım ayarları ve üyeler", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  // #70/#73: the top bar holds only team tabs | DEX logo | crew chips, plus the window controls.
+  const bar = app.locator("header.topbar");
+  // Only the leader and the red (working/waiting or job-carrying) workers get a chip; a new team's workers are quiet.
+  await expect(bar.locator(".rack-chip")).toHaveCount(crew.filter((a) => a.kind === "leader").length);
+  const stray = () => bar.evaluate((h) => [...h.querySelectorAll("button")].filter((b) => !b.closest(".team-tabs, .rack, .win-ctl")).length);
+  expect(await stray()).toBe(0);
+  await expect(bar.locator(":scope > *")).toHaveCount(3);
+  await expect(bar.locator(":scope > .brand")).toHaveText("DEX");
+  // The logo sits at the window's centre whatever the tab/chip count; each side scrolls inside itself, the bar never spills.
+  const layout = () => app.evaluate(() => {
+    const bar = document.querySelector(".topbar")!, logo = document.querySelector(".topbar > .brand svg")!.getBoundingClientRect();
+    const brand = document.querySelector(".topbar > .brand")!.getBoundingClientRect();
+    return {
+      centred: Math.abs((brand.left + brand.right) / 2 - window.innerWidth / 2) <= 2,
+      logo: logo.width > 0,
+      width: bar.getBoundingClientRect().width <= window.innerWidth,
+      bar: bar.scrollWidth <= bar.clientWidth,
+      ctl: document.querySelector(".win-ctl")!.getBoundingClientRect().right <= window.innerWidth,
+    };
+  });
+  const ok = { centred: true, logo: true, width: true, bar: true, ctl: true };
+  expect(await layout()).toEqual(ok);
+  // Narrowest desktop window (tauri.conf minWidth), with more tabs than fit on the left.
+  await app.setViewportSize({ width: 1100, height: 720 });
+  for (let i = 0; i < 4; i++) await newTeam(dexd, `Uzun takım adı ${test.info().workerIndex}-${i}`);
+  await expect(app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: /^Uzun takım adı/ })).toHaveCount(4);
+  expect(await layout()).toEqual(ok);
+  expect(errors).toEqual([]);
+});
+
+test("eski host (project_list yok): ana takım klasör seçilmeden oluşturulamaz", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Eski Kurulum ${test.info().workerIndex}`);
+  await app.addInitScript(() => { window.__dexOld = { hide: ["project_list"] }; });
+  await app.reload();
+  await openTeam(app, team.name);
+  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
+  await app.getByRole("textbox", { name: "Ad" }).fill("Klasörsüz olmaz");
+  await expect(app.getByText("klasör seçilmedi", { exact: true })).toBeVisible();
+  const create = app.getByRole("button", { name: "Oluştur", exact: true });
+  await expect(create).toBeDisabled();
+  await app.getByRole("button", { name: "Klasör seç…" }).click();
+  await expect(create).toBeEnabled();
+  await app.getByRole("button", { name: "Vazgeç", exact: true }).click();
+});
+
+test("görev panosu: görev oluşturulur, listede ve çekirdekte görünür", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Pano ${test.info().workerIndex}`);
+  await app.reload();
+  await openTeam(app, team.name);
+
+  // #70: the board button sits in the Kart; ` still toggles the board.
+  const boardBtn = app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Görevler" });
+  await boardBtn.click();
+  await expect(boardBtn).toHaveAttribute("aria-pressed", "true");
+  const board = app.getByRole("complementary");
+  const input = board.getByRole("textbox", { name: "Yeni görev… (Enter)" });
+  await expect(input).toBeVisible();
+  const title = `e2e görev ${Date.now()}`;
+  await input.fill(title);
+  await input.press("Enter");
+
+  await expect(board.getByText(title)).toBeVisible();
+  await expect(input).toHaveValue("");
+  const tasks = await dexd.call<{ title: string; teamId: string | null; status: string }[]>("task_list", { teamId: team.id });
+  expect(tasks.find((t) => t.title === title)).toMatchObject({ teamId: team.id, status: "todo" });
+  await app.keyboard.press("Control+Backquote");
+  await expect(input).toBeHidden();
+  await expect(boardBtn).toHaveAttribute("aria-pressed", "false");
+});
+
+test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh klasör/proje/hafıza", async ({ app, dexd }) => {
+  const source = await newTeam(dexd, "Kaynak");
+  await dexd.call("agent_create", { agent: { teamId: source.id, name: "Özel Üye", kind: "worker", model: "claude-sonnet-5-5", roleSlug: "frontend" } });
+  const original = await teamAgents(dexd, source.id);
+  const template = await dexd.call<{ kind: string; members: { name: string; kind: string; model: string; engine: string; roleSlug: string }[] }>("team_clone_template", { teamId: source.id });
+  await app.addInitScript(() => { window.__dexFake = { codex_models: [{ id: "gpt-5.4", label: "GPT 5.4" }] }; });
+  await app.reload();
+  await openTeam(app, source.name);
+  await app.setViewportSize({ width: 390, height: 780 });
+  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
+  const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+  await expect(form.getByRole("textbox", { name: "Ad", exact: true })).toHaveValue("");
+  await expect(form.locator(".team-clone-member")).toHaveCount(original.length);
+  for (const [i, member] of template.members.entries()) {
+    await expect(form.getByRole("textbox", { name: `Üye ${i + 1} adı`, exact: true })).toHaveValue(member.name);
+    await expect(form.getByRole("combobox", { name: `Üye ${i + 1} modeli`, exact: true })).toHaveValue(member.model);
+  }
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Kopya");
+  await form.getByRole("textbox", { name: "Üye 2 adı", exact: true }).fill("Yeni Üye");
+  await form.getByRole("combobox", { name: "Üye 2 rolü", exact: true }).selectOption("backend");
+  await form.getByRole("combobox", { name: "Üye 2 motoru", exact: true }).selectOption("codex");
+  await expect(form.getByRole("combobox", { name: "Üye 2 modeli", exact: true })).toHaveValue("gpt-5.4");
+  expect((await form.boundingBox())!.width).toBeLessThanOrEqual(390);
+  await form.getByRole("button", { name: "Oluştur", exact: true }).focus();
+  await app.keyboard.press("Tab");
+  await expect(form.getByRole("textbox", { name: "Ad", exact: true })).toBeFocused();
+  await app.keyboard.press("Shift+Tab");
+  await expect(form.getByRole("button", { name: "Oluştur", exact: true })).toBeFocused();
+  await app.keyboard.press("Enter");
+  await expect(form).toHaveCount(0);
+  const teams = await dexd.call<{ id: string; name: string; cwd: string; memoryDir: string; workspaceRoot: string }[]>("team_list");
+  const copy = teams.find(t => t.name === "Kopya")!;
+  expect(copy).toBeTruthy();
+  expect(copy.id).not.toBe(source.id);
+  expect(basename(copy.cwd)).toBe("KopyaMain");
+  expect(basename(copy.workspaceRoot)).toBe("Kopya");
+  expect(copy.memoryDir).not.toBe(teams.find(t => t.id === source.id)!.memoryDir);
+  const crew = await dexd.call<{ id: string; teamId: string; name: string; engine: string; roleSlug: string; model: string }[]>("agent_list");
+  const copied = crew.filter(a => a.teamId === copy.id);
+  expect(copied).toHaveLength(original.length);
+  expect(copied.every(a => !original.some(o => o.id === a.id))).toBe(true);
+  expect(copied.find(a => a.name === "Yeni Üye")).toMatchObject({ engine: "codex", roleSlug: "backend", model: "gpt-5.4" });
+  expect(await dexd.call("project_list", { teamId: copy.id })).toMatchObject([{ name: "KopyaMain", rootPath: copy.cwd }]);
+  expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args).toMatchObject({ team: { name: "Kopya", cwd: null, members: expect.any(Array) } });
+  const tab = app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: /^Kaynak( \d+)?$/ });
+  await tab.focus();
+  await app.keyboard.press("Shift+F10");
+  const menu = app.getByRole("menu", { name: "Takım işlemleri" });
+  await expect(menu.getByRole("menuitem", { name: "Takımı kopyala" })).toBeFocused();
+  await app.keyboard.press("Enter");
+  await expect(form.locator(".team-clone-member")).toHaveCount(original.length);
+  await app.keyboard.press("Escape");
+  await expect(form).toHaveCount(0);
+  await expect(tab).toBeFocused();
+});
+
+for (const provider of ["anthropic", "local"]) {
+  test(`takımı kopyala: ${provider} üyesi canlı local modellerini seçer`, async ({ app, dexd }) => {
+    const source = await dexd.call<{ id: string; name: string }>("team_create", { team: {
+      name: `Local Kaynak ${provider}`, kind: "main", members: [
+        { name: "Lead", kind: "leader", engine: "claude", provider, model: provider === "local" ? "qwen-a" : "claude-sonnet-5-5" },
+      ],
+    } });
+    await app.addInitScript(() => {
+      window.__dexFake = {
+        provider_list: [
+          { id: "anthropic", label: "Anthropic", baseUrl: null, hasToken: false, tokenMask: null, models: [{ id: "claude-sonnet-5-5", label: "Sonnet" }] },
+          { id: "local", label: "Local", baseUrl: "http://127.0.0.1:4000", hasToken: true, tokenMask: null, models: [] },
+        ],
+        codex_models: [],
+        provider_local_status: { baseUrl: "http://127.0.0.1:4000", registry: false, models: [
+          { id: "qwen-a", backend: null, removable: false }, { id: "qwen-b", backend: null, removable: false },
+        ] },
+      };
+    });
+    await app.reload();
+    await openTeam(app, source.name);
+    await app.setViewportSize({ width: 390, height: 780 });
+    const tab = app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: new RegExp(`^${source.name}`) });
+    await tab.focus();
+    await app.keyboard.press("Shift+F10");
+    await app.keyboard.press("Enter");
+    const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+    await form.getByRole("textbox", { name: "Ad", exact: true }).fill(`Local Kopya ${provider}`);
+    const picker = form.getByRole("combobox", { name: "Üye 1 sağlayıcısı", exact: true });
+    await expect(picker.locator('option[value="local"]')).toHaveCount(1);
+    if (provider !== "local") await picker.selectOption("local");
+    const models = form.getByRole("combobox", { name: "Üye 1 modeli", exact: true });
+    await expect(models.locator("option")).toHaveText(["qwen-a", "qwen-b"]);
+    await expect(models).toHaveValue("qwen-a");
+    const create = form.getByRole("button", { name: "Oluştur", exact: true });
+    await expect(create).toBeEnabled();
+    await models.focus();
+    await app.keyboard.press("ArrowDown");
+    await app.keyboard.press("Enter");
+    await expect(models).toHaveValue("qwen-b");
+    await expect(create).toBeEnabled();
+    expect((await form.boundingBox())!.width).toBeLessThanOrEqual(390);
+    await create.focus();
+    await app.keyboard.press("Enter");
+    await expect(form).toHaveCount(0);
+    expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args).toMatchObject({ team: {
+      members: [{ provider: "local", model: "qwen-b" }],
+    } });
+  });
+}
+
+test("kopya şablonu hatası görünür ve yeniden denenebilir", async ({ app, dexd }) => {
+  const source = await newTeam(dexd, "Kopya Hata");
+  await app.addInitScript(() => {
+    window.__dexOld = { unknown: ["team_clone_template"] };
+    window.__dexFake = { codex_models: [] };
+  });
+  await app.reload();
+  await openTeam(app, source.name);
+  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
+  const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+  await expect(form.getByRole("alert")).toContainText("team_clone_template");
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Hatalı Kopya");
+  await expect(form.getByRole("button", { name: "Oluştur", exact: true })).toBeDisabled();
+  await app.evaluate(() => { window.__dexOld = {}; });
+  await form.getByRole("button", { name: "Yeniden dene", exact: true }).click();
+  await expect(form.locator(".team-clone-member")).toHaveCount((await teamAgents(dexd, source.id)).length);
+  await expect(form.getByRole("button", { name: "Oluştur", exact: true })).toBeEnabled();
+  await app.keyboard.press("Escape");
+  await expect(form).toHaveCount(0);
+});

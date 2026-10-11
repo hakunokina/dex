@@ -1,0 +1,2 @@
+# yayin (#221) — her proje /etc/caddy/sites/<proje>.caddy (yayin-new yazar). Sertifika otomatik.
+import /etc/caddy/sites/*.caddy

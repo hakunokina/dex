@@ -1,0 +1,57 @@
+{
+  "name": "dex",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@10.17.0",
+  "engines": {
+    "node": "24.x"
+  },
+  "pnpm": {
+    "overrides": {
+      "source-map-js": "^1.2.2"
+    }
+  },
+  "scripts": {
+    "hooks:install": "node scripts/install-hooks.mjs",
+    "publish:public": "node scripts/publish-public.mjs",
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "tauri": "tauri",
+    "release": "node scripts/dexd-sidecar.mjs && tauri build --config src-tauri/tauri.release.conf.json",
+    "release:apk": "node scripts/release-apk.mjs",
+    "release:all": "pnpm release && pnpm release:apk",
+    "deploy:install": "node scripts/deploy-install.mjs",
+    "deploy:status": "node scripts/deploy-status.mjs",
+    "test:e2e": "playwright test",
+    "gate": "node scripts/gate.mjs",
+    "dexd:dev": "node scripts/dexd-dev.mjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-notification": "^2.4.0",
+    "@tauri-apps/plugin-opener": "^2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "d3-force": "^3.0.0",
+    "dockview-react": "^8.3.1",
+    "lucide-react": "^1.48.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tauri-apps/cli": "^2",
+    "@types/d3-force": "^3.0.10",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  }
+}

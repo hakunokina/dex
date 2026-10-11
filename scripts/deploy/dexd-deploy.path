@@ -1,0 +1,11 @@
+# post-receive tetik dosyasını yazınca dexd-deploy.service'i başlatır (#215).
+# Kapat: sudo systemctl disable --now dexd-deploy.path
+[Unit]
+Description=dexd otomatik deploy tetiği
+
+[Path]
+PathChanged=@DEPLOY_HOME@/trigger
+Unit=dexd-deploy.service
+
+[Install]
+WantedBy=multi-user.target

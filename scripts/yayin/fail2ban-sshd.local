@@ -1,0 +1,10 @@
+# Generic Ubuntu ssh.service jail; no server-specific exceptions.
+[sshd]
+enabled = true
+backend = systemd
+filter = sshd[mode=normal, journalmatch="_SYSTEMD_UNIT=ssh.service"]
+port = ssh
+usedns = no
+maxretry = 5
+findtime = 10m
+bantime = 1h

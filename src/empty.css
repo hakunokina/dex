@@ -1,0 +1,19 @@
+/* Modern §6: Core's empty states (EmptyState.tsx). */
+.empty-state {
+  --empty-dash: #4a4e55; --empty-line: #3a3e44; /* the mock's art greys (decorative strokes, not text) */
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3) var(--sp-4); padding: var(--sp-4); /* a narrow panel wraps the text under the art */
+  background: var(--surface-2); border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+  font-size: var(--fs-sm); user-select: text;
+}
+.empty-state svg { flex: none; }
+.empty-text { flex: 1 1 180px; min-width: 0; }
+.empty-text b { font-weight: var(--fw-semibold); }
+.empty-text p { margin: 2px 0 0; color: var(--text-2); }
+.empty-acts { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
+.empty-acts button {
+  min-height: var(--ctl-h); padding: 0 var(--sp-3); cursor: pointer; font-size: var(--fs-sm); font-weight: var(--fw-medium);
+  color: var(--text); background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.empty-acts button:hover { border-color: var(--line-strong); background: var(--press); }
+.empty-acts button.primary { background: var(--red); border-color: transparent; color: var(--on-accent); }
+.empty-acts button.primary:hover { background: var(--red-hi); }

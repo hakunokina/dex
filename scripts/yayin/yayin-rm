@@ -1,0 +1,19 @@
+#!/bin/bash
+# yayin-rm <proje> — yayından kaldırır (#221). Silmez: repo, sürümler ve .env
+# /srv/archive/<proje>-<ts>/'e taşınır; konteynerler ve ağ kaldırılır (imajlar kalır).
+# Geri getirmek: dizinleri yerine taşı, yayin-new <proje> <port>, yayin-deploy <proje>.
+set -euo pipefail
+. "${YAYIN_CONF:-/etc/yayin.conf}"
+: "${DOMAIN:?yayin.conf: DOMAIN gerekli}"
+if [ "${1:-}" = --dry-run ]; then echo 'yayin-rm dry-run: config loaded; docker/remove/archive skipped'; exit 0; fi
+P=${1:?kullanım: yayin-rm <proje>}
+[[ $P =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { echo "geçersiz ad" >&2; exit 2; }
+[ -e "/srv/apps/$P/port" ] || { echo "$P yok" >&2; exit 2; }
+docker compose -p "$P" down --remove-orphans
+if [ -e "/etc/caddy/sites/$P.caddy" ]; then sudo rm -f "/etc/caddy/sites/$P.caddy"; sudo systemctl reload caddy; fi
+X=/srv/archive/$P-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$X"
+mv "/srv/apps/$P" "$X/app"
+[ -d "/srv/git/$P.git" ] && mv "/srv/git/$P.git" "$X/git"
+[ -e "/srv/env/$P.env" ] && mv "/srv/env/$P.env" "$X/env" && chmod 600 "$X/env"
+echo "$P kaldırıldı → $X"

@@ -1,0 +1,427 @@
+//! Açılışta sağlayıcıların sunduğu modeller sorulur; Dex kataloğunda olmayan model
+//! için YALNIZ haber verilir (katalog değişmez). Kapatılan haber `settings.models_seen`'e yazılır,
+//! aynı model bir daha çıkmaz. Ağ yoksa / sağlayıcı cevap vermezse o sağlayıcı sessizce atlanır.
+//!
+//! Yöntem: GLM ve Muse, Dex kasasındaki (`dex-provider`) jetonla
+//! `GET {base}/v1/models` + `Authorization: Bearer` (Muse `x-api-key`'i 401 ile reddeder).
+//! GLM Anthropic biçimi döner (`data[].id/display_name/created_at`), Muse OpenAI biçimi (`data[].id`).
+//! Claude: CLI'da liste alt komutu yok; Claude Code'un abonelik OAuth jetonu YALNIZ
+//! `GET api.anthropic.com/v1/models` için kullanılır. Jeton yalnız bellekte; süresi
+//! geçmişse yenilenmez (dosyaya yazmayız), Claude o açılışta atlanır. Codex: seçici `codex debug
+//! models`'tan canlı, ama sunucu kataloğu istemcinin `client_version`'ına göre süzer (gpt-6.1-sol
+//! 0.154'e dönmez, 0.160'a döner). Haber = codex'in kendi bildiği son sürümün (`version.json`
+//! `latest_version`) kataloğunda olup kurulu CLI'ın listesinde olmayan model; `auth.json`'daki
+//! ChatGPT jetonuyla (YALNIZ models GET'i, bellekte, yenilenmez)
+//! `GET chatgpt.com/backend-api/codex/models?client_version=<son>`. Etiket `codex update`'i söyler.
+//!
+//! Sıklık: sağlayıcı başına 24 saatte en çok bir kez. Son BAŞARILI kontrol
+//! `settings.models_checked`'te (sağlayıcı → ms); cevapsız sağlayıcı zamanı güncellemez, sonraki
+//! açılışta yeniden denenir.
+
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::providers::{self, KEYRING_SERVICE};
+
+const SEEN: &str = "models_seen";
+const CHECKED: &str = "models_checked";
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Sağlayıcı → sorulacak uç + yalnız sohbet modellerini bırakan önek (Muse ses/görsel de listeler).
+const SOURCES: &[(&str, &str)] = &[("anthropic", "claude-"), ("glm", "glm-"), ("muse", "muse-spark-"), (CODEX, "")];
+
+/// Codex providers.rs'te bir sağlayıcı değil (ayrı motor); haber anahtarı yine `codex:<id>`.
+const CODEX: &str = "codex";
+const CODEX_MODELS: &str = "https://chatgpt.com/backend-api/codex/models";
+
+const ANTHROPIC_MODELS: &str = "https://api.anthropic.com/v1/models?limit=1000";
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NewModel {
+    pub provider: String,
+    pub provider_label: String,
+    pub id: String,
+    pub label: String,
+}
+
+impl NewModel {
+    /// `settings.models_seen` anahtarı.
+    pub fn key(&self) -> String {
+        format!("{}:{}", self.provider, self.id.to_ascii_lowercase())
+    }
+}
+
+/// Sağlayıcının `/v1/models` cevabından `(id, görünen ad)`.
+fn parse_models(v: &serde_json::Value) -> Vec<(String, String)> {
+    v.get("data")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?.to_string();
+            let label = r.get("display_name").and_then(|x| x.as_str()).unwrap_or(&id).to_string();
+            Some((id, label))
+        })
+        .collect()
+}
+
+/// Claude Code'un OAuth erişim jetonu: `<CLAUDE_CONFIG_DIR|~/.claude>/.credentials.json`, yoksa
+/// işletim sistemi kasasındaki `Claude Code-credentials` girdisi (aynı JSON). Yalnız okunur.
+pub(crate) fn claude_token() -> Option<String> {
+    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        Some(std::path::PathBuf::from(home).join(".claude"))
+    });
+    let from_file = dir.and_then(|d| std::fs::read_to_string(d.join(".credentials.json")).ok());
+    let raw = from_file.or_else(|| {
+        let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok()?;
+        crate::secrets::get("Claude Code-credentials", &user).ok().flatten()
+    })?;
+    oauth_access(&serde_json::from_str(&raw).ok()?, now_ms())
+}
+
+fn oauth_access(v: &serde_json::Value, now: i64) -> Option<String> {
+    let o = v.get("claudeAiOauth")?;
+    let expired = o.get("expiresAt").and_then(|e| e.as_i64()).is_some_and(|e| e <= now);
+    let token = o.get("accessToken")?.as_str()?;
+    (!expired && !token.is_empty()).then(|| token.to_string())
+}
+
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// Codex'in kendi güncelleme denetiminin bildiği son sürüm (`$CODEX_HOME/version.json`).
+fn codex_latest(home: &std::path::Path) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("version.json")).ok()?).ok()?;
+    let latest = v.get("latest_version")?.as_str()?;
+    latest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')).then(|| latest.to_string())
+}
+
+/// `auth.json` ChatGPT girişi: (erişim jetonu, hesap kimliği). API anahtarlı girişte yok → atlanır.
+fn codex_auth(home: &std::path::Path) -> Option<(String, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).ok()?).ok()?;
+    let t = v.get("tokens")?;
+    let token = t.get("access_token")?.as_str().filter(|s| !s.is_empty())?.to_string();
+    Some((token, t.get("account_id").and_then(|a| a.as_str()).map(String::from)))
+}
+
+/// Son sürümün kataloğunda olup kurulu CLI'ın listesinde olmayanlar; etiket güncellemeyi söyler.
+fn codex_missing(latest: Vec<crate::codex::ModelInfo>, installed: &[crate::codex::ModelInfo], version: &str) -> Vec<(String, String)> {
+    latest
+        .into_iter()
+        .filter(|m| !installed.iter().any(|i| i.id == m.id))
+        .map(|m| (m.id, format!("{} — codex-cli {version} gerekir (`codex update`)", m.label)))
+        .collect()
+}
+
+fn fetch_codex(agent: &ureq::Agent) -> Option<Vec<(String, String)>> {
+    let home = crate::codex::home();
+    let installed = crate::codex::models().ok()?;
+    let version = codex_latest(&home)?;
+    let (token, account) = codex_auth(&home)?;
+    let mut req = agent
+        .get(CODEX_MODELS)
+        .query("client_version", &version)
+        .set("Authorization", &format!("Bearer {token}"));
+    if let Some(a) = &account {
+        req = req.set("ChatGPT-Account-Id", a);
+    }
+    let body = req.call().ok()?.into_string().ok()?;
+    Some(codex_missing(crate::codex::parse_models(&body).ok()?, &installed, &version))
+}
+
+fn fetch_one(provider: &str) -> Option<Vec<(String, String)>> {
+    if provider == CODEX {
+        return fetch_codex(&http());
+    }
+    let (url, token, oauth) = if provider == "anthropic" {
+        (ANTHROPIC_MODELS.to_string(), claude_token()?, true)
+    } else {
+        let base = providers::get(provider)?.base_url?;
+        let token = crate::secrets::get(KEYRING_SERVICE, provider).ok().flatten().filter(|t| !t.is_empty())?;
+        (format!("{base}/v1/models"), token, false)
+    };
+    let mut req = http()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("anthropic-version", "2023-06-01");
+    if oauth {
+        req = req.set("anthropic-beta", "oauth-2025-04-20");
+    }
+    let v: serde_json::Value = req
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    Some(parse_models(&v))
+}
+
+fn http() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+}
+
+/// Ağ çağrısı (sağlayıcı başına en çok ~13 sn); UI iş parçacığında koşturma. Cevapsız sağlayıcı yok sayılır.
+pub fn fetch(only: &[&'static str]) -> Vec<(String, Vec<(String, String)>)> {
+    let handles: Vec<_> = only
+        .iter()
+        .map(|&p| (p.to_string(), std::thread::spawn(move || fetch_one(p))))
+        .collect();
+    handles.into_iter().filter_map(|(p, h)| Some((p, h.join().ok()??))).collect()
+}
+
+/// `glm-5.3-flash` → (`glm-flash`, (5, 3)); tarih gibi uzun sayılar (20251001) sürüm sayılmaz.
+fn family_version(id: &str) -> (String, Option<(u32, u32)>) {
+    let mut family = Vec::new();
+    let mut nums = Vec::new();
+    for part in id.to_ascii_lowercase().split(['-', '.', '_']) {
+        match part.parse::<u32>() {
+            Ok(n) if part.len() <= 3 => nums.push(n),
+            Ok(_) => {}
+            Err(_) => family.push(part.to_string()),
+        }
+    }
+    let version = nums.first().map(|&a| (a, nums.get(1).copied().unwrap_or(0)));
+    (family.join("-"), version)
+}
+
+/// Katalogda olmayan, eski sürüm olmayan ve daha önce kapatılmamış modeller.
+/// Eski sürüm: aynı ailede (yoksa sağlayıcıda) katalogda daha yeni sürüm varsa — ilk açılışta
+/// GLM-4.x / Muse 1.1 gibi bilerek listelenmeyen modeller uyarı yağdırmasın.
+pub fn news(offered: &[(String, Vec<(String, String)>)], seen: &BTreeSet<String>) -> Vec<NewModel> {
+    let mut out = Vec::new();
+    for (provider, models) in offered {
+        if provider == CODEX {
+            // fetch_codex zaten kurulu listeyle süzdü; Codex sürümleri Dex kataloğunda değil.
+            out.extend(
+                models
+                    .iter()
+                    .map(|(id, label)| NewModel { provider: CODEX.into(), provider_label: "Codex".into(), id: id.clone(), label: label.clone() })
+                    .filter(|m| !seen.contains(&m.key())),
+            );
+            continue;
+        }
+        let (Some(def), Some((_, prefix))) = (providers::get(provider), SOURCES.iter().find(|(p, _)| p == provider)) else {
+            continue;
+        };
+        let known: Vec<_> = def
+            .models
+            .iter()
+            .map(|m| {
+                let (f, v) = family_version(m.id);
+                (m.id.to_ascii_lowercase(), f, v)
+            })
+            .collect();
+        let top = known.iter().filter_map(|k| k.2).max();
+        for (id, label) in models {
+            let lower = id.to_ascii_lowercase();
+            if !lower.starts_with(prefix) || known.iter().any(|k| k.0 == lower) {
+                continue;
+            }
+            let (family, version) = family_version(id);
+            let newest = known.iter().filter(|k| k.1 == family).filter_map(|k| k.2).max().or(top);
+            if matches!((version, newest), (Some(v), Some(n)) if v < n) {
+                continue;
+            }
+            let item = NewModel {
+                provider: provider.clone(),
+                provider_label: def.label.to_string(),
+                id: id.clone(),
+                label: label.clone(),
+            };
+            if !seen.contains(&item.key()) {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn load<T: serde::de::DeserializeOwned + Default>(conn: &Connection, key: &str) -> T {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str(&v).ok())
+        .unwrap_or_default()
+}
+
+fn store<T: Serialize>(conn: &Connection, key: &str, value: &T) -> Result<(), String> {
+    let v = serde_json::to_string(value).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, v],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Son başarılı kontrolü 24 saatten eski (ya da hiç olmamış) sağlayıcılar.
+pub fn due(conn: &Connection, now: i64) -> Vec<&'static str> {
+    let checked: BTreeMap<String, i64> = load(conn, CHECKED);
+    SOURCES
+        .iter()
+        .map(|(p, _)| *p)
+        .filter(|p| checked.get(*p).is_none_or(|&t| now - t >= DAY_MS || t > now))
+        .collect()
+}
+
+/// Cevap veren sağlayıcıların kontrol zamanı; cevapsızlar listede yoktur, zamanları değişmez.
+pub fn mark_checked(conn: &Connection, answered: &[String], now: i64) -> Result<(), String> {
+    if answered.is_empty() {
+        return Ok(());
+    }
+    let mut checked: BTreeMap<String, i64> = load(conn, CHECKED);
+    for p in answered {
+        checked.insert(p.clone(), now);
+    }
+    store(conn, CHECKED, &checked)
+}
+
+pub fn seen(conn: &Connection) -> BTreeSet<String> {
+    load(conn, SEEN)
+}
+
+/// Kapatılan haberler bir daha gösterilmez. Anahtar `NewModel::key` biçiminde olmalı.
+pub fn mark_seen(conn: &Connection, keys: &[String]) -> Result<(), String> {
+    let mut all = seen(conn);
+    for k in keys {
+        let k = k.trim().to_ascii_lowercase();
+        if k.split_once(':').is_some_and(|(p, id)| (p == CODEX || providers::get(p).is_some()) && !id.is_empty()) {
+            all.insert(k);
+        }
+    }
+    store(conn, SEEN, &all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offered(p: &str, ids: &[&str]) -> (String, Vec<(String, String)>) {
+        (p.into(), ids.iter().map(|i| (i.to_string(), i.to_uppercase())).collect())
+    }
+
+    /// Örnek model listeleri: yalnız yeni, legacy olmayan model (FlashX) haber olur.
+    #[test]
+    fn only_new_non_legacy_models() {
+        let glm = offered("glm", &[
+            "glm-4.5", "glm-4.5-air", "glm-4.6", "glm-4.7", "glm-5", "glm-5-turbo", "glm-5.1", "glm-5.2",
+            "glm-5.3", "glm-5.3-flash", "glm-5.3-flashx",
+        ]);
+        let muse = offered("muse", &[
+            "sam-3.1", "muse-spark-1.3-contributor", "muse-voice-transcribe-1.0", "muse-spark-1.3", "muse-image-1.0",
+            "muse-spark-1.2-contributor", "muse-spark-1.2", "muse-spark-1.1",
+        ]);
+        let n = news(&[glm, muse], &BTreeSet::new());
+        let ids: Vec<&str> = n.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["glm-5.3-flashx"]);
+        assert_eq!((n[0].provider_label.as_str(), n[0].label.as_str(), n[0].key().as_str()), ("GLM", "GLM-5.3-FLASHX", "glm:glm-5.3-flashx"));
+    }
+
+    #[test]
+    fn claude_old_generations_are_not_news() {
+        let claude = offered("anthropic", &[
+            "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001",
+            "claude-opus-4-1-20250805", "claude-sonnet-4-5-20250929", "claude-3-5-haiku-20241022", "claude-opus-6-0",
+        ]);
+        let ids: Vec<String> = news(&[claude], &BTreeSet::new()).into_iter().map(|m| m.key()).collect();
+        assert_eq!(ids, ["anthropic:claude-opus-6-0"]);
+    }
+
+    #[test]
+    fn oauth_token_only_while_valid() {
+        let v = serde_json::json!({"claudeAiOauth": {"accessToken": "tok", "expiresAt": 2000}});
+        assert_eq!(oauth_access(&v, 1000).as_deref(), Some("tok"));
+        assert_eq!(oauth_access(&v, 2000), None, "süresi geçmiş jeton kullanılmaz");
+        assert_eq!(oauth_access(&serde_json::json!({}), 0), None);
+    }
+
+    #[test]
+    fn newer_versions_and_new_families_are_news() {
+        let n = news(&[offered("muse", &["muse-spark-1.4", "muse-spark-2.0-pro"]), offered("glm", &["glm-6"])], &BTreeSet::new());
+        assert_eq!(n.len(), 3);
+    }
+
+    #[test]
+    fn dismissed_stays_dismissed() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        let list = [offered("glm", &["glm-5.3-flashx"])];
+        let first = news(&list, &seen(&c));
+        assert_eq!(first.len(), 1);
+        mark_seen(&c, &[first[0].key(), "bogus:x".into(), "glm:".into()]).unwrap();
+        mark_seen(&c, &[first[0].key()]).unwrap();
+        assert_eq!(seen(&c).into_iter().collect::<Vec<_>>(), ["glm:glm-5.3-flashx"]);
+        assert!(news(&list, &seen(&c)).is_empty());
+    }
+
+    #[test]
+    fn checks_at_most_once_a_day_and_retries_failures() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        let t0 = 1_000_000_000_000;
+        assert_eq!(due(&c, t0), ["anthropic", "glm", "muse", "codex"], "hiç kontrol yok → hepsi");
+        // Yalnız GLM cevap verdi: Claude ve Muse bir sonraki açılışta yeniden denenir.
+        mark_checked(&c, &["glm".into()], t0).unwrap();
+        assert_eq!(due(&c, t0 + 1000), ["anthropic", "muse", "codex"]);
+        // Hiçbiri cevap vermedi (ağ yok): zaman değişmez.
+        mark_checked(&c, &[], t0 + 2000).unwrap();
+        assert_eq!(due(&c, t0 + DAY_MS - 1), ["anthropic", "muse", "codex"], "24 saat dolmadan GLM atlanır");
+        assert_eq!(due(&c, t0 + DAY_MS), ["anthropic", "glm", "muse", "codex"], "24 saat dolunca yeniden");
+        // Saat geri alındıysa (kayıt gelecekte) kontrol kilitlenmesin.
+        assert_eq!(due(&c, t0 - 1), ["anthropic", "glm", "muse", "codex"]);
+    }
+
+    #[test]
+    fn codex_news_is_latest_catalog_minus_installed() {
+        let m = |id: &str| crate::codex::ModelInfo { id: id.into(), label: id.to_uppercase(), upgrade: None };
+        let missing = codex_missing(vec![m("gpt-6.1-sol"), m("gpt-6-astra")], &[m("gpt-6-astra")], "0.160.0");
+        assert_eq!(missing, [("gpt-6.1-sol".to_string(), "GPT-6.1-SOL — codex-cli 0.160.0 gerekir (`codex update`)".to_string())]);
+        let n = news(&[(CODEX.into(), missing)], &BTreeSet::new());
+        assert_eq!(n.iter().map(NewModel::key).collect::<Vec<_>>(), ["codex:gpt-6.1-sol"]);
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        mark_seen(&c, &[n[0].key()]).unwrap();
+        assert!(news(&[(CODEX.into(), vec![("gpt-6.1-sol".into(), "x".into())])], &seen(&c)).is_empty());
+
+        let home = std::env::temp_dir().join(format!("dex-news-codex-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("version.json"), r#"{"latest_version":"0.160.0","last_checked_at":"x"}"#).unwrap();
+        std::fs::write(home.join("auth.json"), r#"{"tokens":{"access_token":"t","account_id":"a"}}"#).unwrap();
+        assert_eq!(codex_latest(&home).as_deref(), Some("0.160.0"));
+        assert_eq!(codex_auth(&home), Some(("t".into(), Some("a".into()))));
+        std::fs::write(home.join("version.json"), r#"{"latest_version":"1&x=y"}"#).unwrap();
+        assert_eq!(codex_latest(&home), None, "sorgu dizesine giden değer süzülür");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn family_and_version() {
+        assert_eq!(family_version("claude-haiku-4-5-20251001"), ("claude-haiku".into(), Some((4, 5))));
+        assert_eq!(family_version("GLM-5.3-Flash"), ("glm-flash".into(), Some((5, 3))));
+        assert_eq!(family_version("glm-5"), ("glm".into(), Some((5, 0))));
+        assert_eq!(family_version("sonnet"), ("sonnet".into(), None));
+    }
+
+    /// Canlı: kasadaki jetonlarla gerçek uçlar (`cargo test -p dex-core --lib live_fetch -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn live_fetch() {
+        let got = fetch(&SOURCES.iter().map(|s| s.0).collect::<Vec<_>>());
+        for (p, models) in &got {
+            println!("{p}: {}", models.iter().map(|m| m.0.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        println!("news: {:?}", news(&got, &BTreeSet::new()).iter().map(NewModel::key).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parses_both_shapes() {
+        let a = serde_json::json!({"data":[{"id":"glm-5.3","display_name":"GLM-5.3"}]});
+        let o = serde_json::json!({"object":"list","data":[{"id":"muse-spark-1.3","object":"model"}]});
+        assert_eq!(parse_models(&a), [("glm-5.3".to_string(), "GLM-5.3".to_string())]);
+        assert_eq!(parse_models(&o), [("muse-spark-1.3".to_string(), "muse-spark-1.3".to_string())]);
+    }
+}

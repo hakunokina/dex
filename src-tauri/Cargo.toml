@@ -1,0 +1,68 @@
+[package]
+name = "dex"
+version = "0.1.0"
+description = "Dex"
+authors = ["hakunokina"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "dex_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# #151: tray-icon — the core's tray (src/tray.rs); tauri pulls the tray crate on desktop targets only.
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# S5-A: notifications are wanted on every platform (background "waiting"/"done" on Android).
+tauri-plugin-notification = "2"
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
+
+# #150 (B): the core runs in its own process (`dexd --local`, crates/dexd/src/local.rs); the shell
+# finds or starts it (src/core_proc.rs) and no longer links it. `inproc-core` = the previous build
+# (core inside the app, A0's loopback endpoint behind DEX_LOCAL_WS) — the way back, for one release.
+[features]
+inproc-core = ["dep:dex-core", "dep:dexd"]
+
+# S5-A: desktop-only. The core (PTY/job/keyring, none of it builds for Android) and the desktop
+# plugins (folder dialog, opener) stay out of the mobile build entirely.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+dex-core = { path = "../crates/dex-core", optional = true }
+dexd = { path = "../crates/dexd", optional = true }
+# #150: the shell checks the local core is up (`auth.hello`) and asks it to stop (dexd's versions).
+tokio-tungstenite = "0.30"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+dirs = "6"
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+# #34: ekran alıntısı PNG'si (tauri'nin ağacında zaten var, yeni indirme yok).
+png = "0.17"
+# #34: ekran alıntısı tetiği (global kısayol; ~2.3: 2.4 tauri 2.12 ister, tüm ağacı yükseltir).
+tauri-plugin-global-shortcut = "~2.3"
+# #41: ikinci masaüstü örneği çıkar, var olan pencere öne gelir (~2.4: 2.5 tauri 2.12 ister).
+tauri-plugin-single-instance = "~2.4"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+# #34: ekran alıntısı — GDI yakalama + panoya metin (dex-core'un kullandığı sürüm).
+[target.'cfg(windows)'.dependencies]
+# #150: the shell's own secrets (host device tokens, TM hub) — the entries dex-core used (src/secrets.rs).
+keyring = { version = "3", features = ["windows-native"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
+# [profile.release] lives in the workspace root Cargo.toml (members' profiles are ignored).
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }

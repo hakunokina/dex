@@ -1,0 +1,101 @@
+/* DEX-36: dockview bound to the design tokens of src/App.css (DEX-37 owns the values; only names here). */
+.dockview-theme-dex {
+  /* FIX-5: floating groups (Settings, Team…) below the topbar pop-ups, patron cards, palette. */
+  --dv-overlay-z-index: var(--z-float);
+  --dv-group-view-background-color: var(--bg);
+  --dv-tabs-and-actions-container-background-color: var(--dock-header-bg);
+  --dv-tabs-and-actions-container-height: var(--tab-h);
+  --dv-tabs-and-actions-container-font-size: var(--tab-fs);
+  --dv-tab-font-size: var(--tab-fs);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--tab-bg-active);
+  --dv-activegroup-hiddenpanel-tab-background-color: var(--tab-bg);
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--tab-bg-active);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: var(--tab-bg);
+  --dv-activegroup-visiblepanel-tab-color: var(--tab-fg-active);
+  --dv-activegroup-hiddenpanel-tab-color: var(--tab-fg);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--tab-fg-active);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--tab-fg);
+  --dv-tab-divider-color: transparent;
+  --dv-tab-border-radius: var(--tab-radius);
+  --dv-tab-margin-block: var(--tab-my);
+  --dv-tab-margin-inline: 2px;
+  --dv-border-radius: var(--dock-group-radius);
+  --dv-dropdown-border-radius: var(--r-sm);
+  --dv-sash-border-radius: var(--r-xs);
+  --dv-spacing-padding: 0px;
+  --dv-separator-border: var(--dock-group-border);
+  --dv-paneview-header-border-color: var(--dock-group-border);
+  --dv-sash-color: var(--sash);
+  --dv-active-sash-color: var(--sash-hover);
+  --dv-drag-over-background-color: var(--drop-overlay);
+  --dv-drag-over-border-color: var(--drop-outline);
+  --dv-drag-over-border: 1px solid var(--drop-outline);
+  --dv-icon-hover-background-color: var(--tab-bg-hover);
+  --dv-tabs-container-scrollbar-color: var(--line-strong);
+  --dv-scrollbar-background-color: var(--line-strong);
+  --dv-floating-box-shadow: var(--shadow-pop);
+  --dv-floating-border: 1px solid var(--dock-group-border);
+  --dv-floating-group-border: 1px solid var(--dock-group-border);
+  --dv-floating-titlebar-background-color: var(--dock-header-bg);
+  --dv-floating-titlebar-border-bottom: 1px solid var(--dock-group-border);
+  --dv-transition-duration: var(--dur);
+  font-family: var(--font-ui);
+}
+.dockview-theme-dex .dv-groupview { border: 1px solid var(--dock-group-border); }
+/* Modern §5: panel floors carry the texture (gradient + noise); the tab strip is the floor's top edge. */
+.dockview-theme-dex .dv-groupview .dv-content-container { background: var(--tex), var(--dock-group-bg); }
+.dockview-theme-dex .dv-tabs-and-actions-container { background: var(--tex), var(--dock-header-bg); }
+.dockview-theme-dex .dv-tab { padding: 0 var(--tab-px); }
+.dockview-theme-dex .dv-tab:hover { background-color: var(--tab-bg-hover); }
+.dockview-theme-dex .dv-groupview.dv-active-group .dv-tab.dv-active-tab { box-shadow: inset 0 -2px 0 var(--tab-accent); }
+
+/* Agent tab: status dot + name + marks + close. */
+.dex-tab { display: flex; align-items: center; gap: 5px; height: 100%; min-width: 0; max-width: 100%; }
+.dex-tab-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dex-tab-icon { width: 13px; height: 13px; flex: none; }
+.dex-tab .dex-heartbeat { animation: none; }
+.dex-heartbeat-age { flex: none; white-space: nowrap; color: var(--text-2); font: var(--fs-xs)/1 var(--font-mono); font-variant-numeric: tabular-nums; }
+.dex-heartbeat-age.quiet { color: var(--amber); }
+.dex-tab-close, .dex-tab-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 16px; height: 16px; padding: 0; border: 0; border-radius: var(--r-xs); flex: none;
+  background: none; color: inherit; opacity: 0.55; cursor: pointer;
+}
+.dex-tab-close { margin-right: -4px; }
+.dex-tab-action svg,
+.dex-tab-close svg { width: 12px; height: 12px; }
+/* Favoride sabit Kart: kapatma düğmesi yok, tıklanmayan kilit simgesi. */
+.dex-tab-lock { display: inline-flex; align-items: center; margin-right: -4px; opacity: 0.55; flex: none; }
+.dex-tab-lock svg { width: 12px; height: 12px; }
+.dex-tab-action:hover,
+.dex-tab-close:hover { opacity: 1; background: var(--tab-bg-hover); }
+/* #46: a shell group's header action ("Yeni terminal"). */
+.dex-group-actions { display: flex; align-items: center; height: 100%; padding: 0 var(--sp-1); }
+.dex-group-action {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: var(--r-xs);
+  background: none; color: var(--tab-fg); cursor: pointer;
+}
+.dex-group-action svg { width: 14px; height: 14px; }
+.dex-group-action:hover { color: var(--tab-fg-active); background: var(--tab-bg-hover); }
+.dex-group-action:focus-visible { outline: none; box-shadow: var(--ring); }
+
+/* #49: a float never outgrows the dock, also when the window shrinks under it (16 px margin);
+   dockview then clamps its position inside. */
+.dv-floating-overlay-host > .dv-resize-container { max-width: calc(100% - 32px); max-height: calc(100% - 32px); }
+
+/* Panel bodies */
+.workspace { height: 100%; }
+.panel-fill { position: relative; width: 100%; height: 100%; }
+.board-docked { display: flex; flex-direction: column; height: 100%; background: var(--surface-1); }
+.slot-box { position: relative; width: 100%; height: 100%; }
+.slot-box > .slot { position: absolute; inset: 0; display: flex; flex-direction: column; }
+.slot > .pane { flex: 1; }
+/* Parked slots (panel closed): off-screen but laid out, so their xterm keeps a size and keeps streaming. */
+.slot-parking { position: fixed; left: -20000px; top: 0; visibility: hidden; pointer-events: none; }
+.slot-parking > .slot { width: 900px; height: 560px; display: flex; flex-direction: column; }
+
+/* Pane header marks (were in the removed dock stylesheet). */
+.pane-name { font: var(--fw-semibold) var(--fs-sm) var(--font-ui); }
+.pane-deleg { color: var(--red); font: var(--fw-semibold) var(--fs-xs) var(--font-mono); }
+.pane-ask { color: var(--amber); font: var(--fw-semibold) var(--fs-xs)/1 var(--font-mono); }

@@ -1,0 +1,8 @@
+# Copy to yayin.conf (gitignored), edit for your own VM. No credentials here.
+YAYIN_USER=admin
+YAYIN_HOST=vm.example.com
+DOMAIN=example.com
+CPUS=2
+MEM=1g
+KEEP_RELEASES=5
+HEALTH_TIMEOUT=60

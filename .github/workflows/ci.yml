@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned gitleaks (verified SHA-256)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = "gitleaks_$($env:GITLEAKS_VERSION)_windows_x64.zip"
+          $url = "https://github.com/gitleaks/gitleaks/releases/download/v$($env:GITLEAKS_VERSION)/$archive"
+          $zip = Join-Path $env:RUNNER_TEMP $archive
+          Invoke-WebRequest $url -OutFile $zip
+          # SHA-256 from the official v8.30.0 release checksums file.
+          $expected = '54fe94f644b832dd08e8c3a5915efb3bfa862386d59fb27ca0792cb687a83573'
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Gitleaks checksum mismatch'
+          }
+          $bin = Join-Path $env:RUNNER_TEMP 'gitleaks'
+          Expand-Archive $zip -DestinationPath $bin -Force
+          $bin >> $env:GITHUB_PATH
+      - name: Select trusted gitleaks policy
+        shell: pwsh
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Join-Path $env:RUNNER_TEMP 'trusted.gitleaks.toml'
+          if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+            if ([string]::IsNullOrWhiteSpace($env:BASE_REF)) { throw 'PR base branch missing' }
+            git fetch --no-tags origin "+refs/heads/$($env:BASE_REF):refs/remotes/origin/$($env:BASE_REF)"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $baseConfig = "refs/remotes/origin/$($env:BASE_REF):.gitleaks.toml"
+            $present = git ls-tree --name-only "refs/remotes/origin/$($env:BASE_REF)" -- .gitleaks.toml
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($present -eq '.gitleaks.toml') {
+              $policy = git show $baseConfig
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              [IO.File]::WriteAllText($config, ($policy -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+            } else {
+              # Bootstrap only: the base branch has no policy on the first policy PR.
+              Copy-Item -LiteralPath .gitleaks.toml -Destination $config
+            }
+          } else {
+            Copy-Item -LiteralPath .gitleaks.toml -Destination $config
+          }
+          $ignore = Join-Path $env:RUNNER_TEMP 'empty.gitleaksignore'
+          [IO.File]::WriteAllText($ignore, '')
+          "DEX_GITLEAKS_CONFIG=$config" >> $env:GITHUB_ENV
+          "DEX_GITLEAKS_IGNORE=$ignore" >> $env:GITHUB_ENV
+      - name: Scan HEAD tree
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'head-tree.zip'
+          $tree = Join-Path $env:RUNNER_TEMP 'head-tree'
+          git archive --format=zip "--output=$zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive $zip -DestinationPath $tree -Force
+          gitleaks dir $tree --config $env:DEX_GITLEAKS_CONFIG --gitleaks-ignore-path $env:DEX_GITLEAKS_IGNORE --redact --no-banner --ignore-gitleaks-allow
+          exit $LASTEXITCODE
+      - name: Scan full history (including removed secrets)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          gitleaks git "--log-opts=--all --full-history -m" --config $env:DEX_GITLEAKS_CONFIG --gitleaks-ignore-path $env:DEX_GITLEAKS_IGNORE --redact --no-banner --ignore-gitleaks-allow
+          exit $LASTEXITCODE
+
+  build-and-test:
+    name: build-and-test
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.17.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install pinned gitleaks and Git hooks
+        run: npm run hooks:install
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Rust check
+        run: cargo check --locked
+      - name: Rust core unit tests
+        timeout-minutes: 10
+        run: cargo test --locked -p dex-core --lib
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Frontend unit tests
+        run: npm test
+      - name: Public publication gate tests
+        run: node --test scripts/public-gates.test.mjs
+      - name: Frontend build
+        run: npm run build
+      # E2E is owned by QA; add it only after a separate CI scope decision.
+      # Clippy is not a gate here; existing warnings must not weaken unit tests.
+
+  macos-build-and-test:
+    name: macos-build-and-test
+    runs-on: macos-latest # arm64
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.17.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Install pinned gitleaks and Git hooks
+        run: npm run hooks:install
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.96.0 --profile minimal
+      - name: Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Rust check
+        run: cargo check --locked
+      - name: Rust core unit tests
+        timeout-minutes: 10
+        run: cargo test --locked -p dex-core --lib
+      - name: TypeScript check
+        run: npx tsc --noEmit
+      - name: Frontend unit tests
+        run: npm test
+      - name: Frontend build
+        run: npm run build
+      # E2E is owned by QA; add it only after a separate CI scope decision.
+      # Clippy is not a gate here; existing warnings must not weaken unit tests.
+
+# After creating the public repo, require all three job checks in a branch ruleset
+# and prohibit direct pushes/bypasses. Actions cannot reject an already received push.

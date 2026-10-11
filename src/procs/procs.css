@@ -1,0 +1,73 @@
+/* Dockview owns placement and panel chrome. */
+.procs {
+  width: 100%; height: 100%; min-width: 0; min-height: 0;
+  container-type: inline-size;
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--surface-1);
+}
+.procs-head {
+  display: flex; align-items: center; gap: var(--sp-2); flex: none;
+  height: 36px; padding: 0 var(--sp-1) 0 var(--sp-3);
+  border-bottom: 1px solid var(--line); background: var(--surface-2);
+}
+.procs-head > svg { width: 14px; height: 14px; color: var(--muted); flex: none; }
+.procs-title { font: var(--fw-semibold) var(--fs-xs) var(--font-ui); letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-2); }
+.procs-host { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: var(--fs-xs); }
+.procs-close { width: var(--ctl-h); height: var(--ctl-h); }
+
+.procs-sum { flex: none; margin: 0; padding: 6px var(--sp-3); border-bottom: 1px solid var(--line); color: var(--muted); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.procs-sum b { color: var(--text); font-weight: var(--fw-semibold); }
+.procs-heavy { color: var(--amber); }
+.procs-err { flex: none; margin: 0; padding: 6px var(--sp-3); border-bottom: 1px solid var(--line); color: var(--red-hi); font-size: var(--fs-sm); }
+
+.procs-body { flex: 1; min-height: 0; overflow-y: auto; padding: var(--sp-2); }
+.procs-note { margin: var(--sp-2); color: var(--muted); font-size: var(--fs-sm); }
+.procs-note p { margin: 0 0 var(--sp-2); color: var(--red-hi); }
+.procs-skel { height: 34px; margin-bottom: 6px; border-radius: var(--r-md); }
+
+.procs-agents, .procs-list { list-style: none; margin: 0; padding: 0; }
+.procs-agent { margin-bottom: 6px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; }
+.procs-agent-head {
+  display: flex; align-items: center; gap: var(--sp-2); width: 100%; min-height: 34px; padding: 0 var(--sp-2);
+  background: none; border: 0; color: var(--text); font: inherit; text-align: left; cursor: pointer;
+}
+.procs-agent-head:hover { background: var(--hover); }
+.procs-chev { width: 14px; height: 14px; flex: none; color: var(--muted); transition: transform var(--dur-fast) var(--ease); }
+.procs-chev.open { transform: rotate(90deg); }
+.procs-agent-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: var(--fw-semibold); }
+.procs-team { margin-left: var(--sp-2); color: var(--muted); font-size: var(--fs-xs); font-weight: var(--fw-regular); }
+.procs-count { flex: none; color: var(--muted); font-size: var(--fs-xs); }
+.procs-num { flex: none; min-width: 52px; text-align: right; font-size: var(--fs-sm); font-variant-numeric: tabular-nums; color: var(--text-2); }
+
+.procs-list { border-top: 1px solid var(--line); }
+.procs-proc { display: flex; align-items: center; gap: var(--sp-2); min-height: 40px; padding: var(--sp-1) var(--sp-2) var(--sp-1) 30px; }
+.procs-proc + .procs-proc { border-top: 1px solid var(--line); }
+.procs-proc-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.procs-proc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.procs-pid { color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.procs-cmd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: var(--fs-xs) var(--font-mono); }
+
+.procs-badge {
+  flex: none; padding: 1px 6px; border-radius: var(--r-pill); font-size: var(--fs-xs); white-space: nowrap;
+  color: var(--text-2); background: var(--surface-3); box-shadow: inset 0 0 0 1px var(--line);
+}
+.procs-badge.kind-browser { color: var(--amber); background: var(--amber-soft); box-shadow: inset 0 0 0 1px var(--amber-line); }
+.procs-root { flex: none; min-width: 76px; text-align: center; color: var(--muted); font-size: var(--fs-xs); }
+.procs-kill {
+  flex: none; min-width: 76px; height: var(--ctl-h); padding: 0 var(--sp-2);
+  background: none; border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  color: var(--text-2); font-size: var(--fs-xs); cursor: pointer;
+}
+.procs-kill:hover:not([aria-disabled="true"]) { color: var(--red-hi); border-color: var(--red-line); background: var(--red-soft); }
+/* aria-disabled, not disabled: a disabled button drops the keyboard focus to <body>. */
+.procs-kill[aria-disabled="true"] { opacity: .5; cursor: default; }
+
+/* Narrow: the count and the per-process command line give way first. */
+@container (max-width: 480px) {
+  .procs-agent-head { flex-wrap: wrap; padding-block: var(--sp-1); }
+  .procs-agent-name { flex-basis: calc(100% - 30px); }
+  .procs-count { display: none; }
+  .procs-num { min-width: 44px; }
+  .procs-proc { padding-left: var(--sp-2); flex-wrap: wrap; }
+  .procs-proc-main { flex-basis: 100%; order: -1; }
+}

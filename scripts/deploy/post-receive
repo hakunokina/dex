@@ -1,0 +1,17 @@
+#!/bin/bash
+# dexd-deploy tetiği (#215): master güncellendiyse sha'yı tetik dosyasına yazar ve hemen çıkar —
+# push'u bekletmez. Asıl işi dexd-deploy.path → dexd-deploy.service yapar. Kurulum: install.sh.
+DEPLOY_CONF=${DEPLOY_CONF:-@DEPLOY_HOME@/deploy.conf}
+. "@DEPLOY_HOME@/bin/config.sh"
+load_deploy_config || exit 2
+TRIGGER=$DEPLOY_HOME/trigger
+while read -r old new ref; do
+  [ "$ref" = refs/heads/master ] || continue
+  [ "$new" = 0000000000000000000000000000000000000000 ] && continue
+  if printf '%s\n' "$new" >"$TRIGGER" 2>/dev/null; then
+    echo "dexd-deploy: $(echo "$new" | cut -c1-10) kuyrukta — durum: pnpm deploy:status"
+  else
+    echo "dexd-deploy: tetik yazılamadı ($TRIGGER); otomatik deploy yok" >&2
+  fi
+done
+exit 0

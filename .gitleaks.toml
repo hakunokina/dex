@@ -1,0 +1,261 @@
+title = "Dex public repository leak gates"
+minVersion = "v8.30.0"
+
+[extend]
+useDefault = true
+
+# F08 / audit #1267: public, synthetic JWT signing fixture, used only by tests.
+# Bind the exception to the fixture path and the entire public fixture value.
+[[allowlists]]
+description = "Synthetic gateway JWT private key (never a production credential)"
+targetRules = ["private-key", "dex-json-pkcs8"]
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]gateway[\\/]test-key\.json$''']
+regexes = ['''^MIIEwAIBADANBgkqhkiG9w0BAQEFAASCBKowggSmAgEAAoIBAQDDndc7x1C8l4HZuPnJtMkfITtG3OGp2o2R/xJJ9vhLONg1/4TLMaf4SSzDP8PGrR2TMt/fzv66pIWM6hWDz/mZNB7jJXQtttJ8ND10zmdiORg/jcbqt\+IcZI06J9t0199UA3\+SDupcokvB1iA8MiKBP5W2uOQPvnV\+Q\+JXu8PBnPqOvhcsu89/9yq\+o\+chq3Di7pK1vt6rvnHk8SsxLHcomOtbG\+XYjP6qGeJZ/T77bc4Z4Dk\+5lOVikl3EYloQ9OBy90ta28GruaNziH8qT2bno18IquS7WS1EpNr\+eIyjm0gPgGv/XF1zfzcjaLqnRldTnScj2hVITOOuBMggolJAgMBAAECggEBAIzfMo0eMIpgIWcFyvzzcJM2f1W849ZKSgGFy0nwzUZ\+nVXluWALVod7Sv0hAoAlU1MaJBctHkyTBopAWVYfhARMgKHb6xqwukwv4sInklQuAcRi\+Yk2\+2KvFvV2lphCjdYW3tv0Wdp0FlJ1PamcATVK8SoxZCviYQKZKHs\+AO\+ANpcvlkahrPR7KAz5LbyLZPMllYu5uULJ32WUPKbLJT5YSZcWQW7M4RhseucpG7cEgVETxteISdnrIsqRPsIbQ1ohuCTNGn01SnynLG8XrZZ3aWG7rcK7otgWm2soAiySTrglh8hno0YzWCOMmZsecWn2X8k3W9oBpOllaSn3YTECgYEA5V2Q9hijHGtA8v23joe5KIbQZI0Cnrh7zNMK9z480MzTTqdXxGWSIgo9Dli19HoaIyU7QA0dgElQjptjfKAuH6kx80E9o1CA9y9eqCxDaO7BNPpLDXF1GEOR19AqLzAflqVu3zazi4YKvvANNcAzVsbaEMVGB5ydVMb5aHaQjt8CgYEA2lUB7EzKVUYuBj2sQslpq/pAdRm0FiNHqqYiKSCm/LmlPax/oZWd\+oP5Rre59ugrEkRaNPN54pT9tnzi9gwBoAeGhrYak4a1R/I5iCSwZhjSf4iP/9yNrtyA3Z6dAif3Ojpj3cV4F6JE9D9mpPij\+DhKuQZO4gw2jILo\+67S9NcCgYEA3MNVLnmCLW1SI09vKGGcJtSzqcRLfEem6PtMd7LQyEwNKoxJHsCAigD\+yVs7LueDVsaUI8870Ok//zKy7BYkrtakPDVURWfL6Z8PZaDM9SewkPRD3tmQUd1fd7Blmeugy9fJQlEdOTK4DxVwMYcgIurcov2trM/iYuHs1s4fz1MCgYEAhJdLa63W0qKkILYjfwvCWObJblQFwcv7Ie9yn3ds8d3sM\+AmQoMSRakQIZpCHWgxgA5ymeWjB69jxQdi7fmsovru/7Bnw1/zh5Xayos9dUNt0nWkvcW7ZY4T1IMW5tBOm9YKAAyEOhYZuhsmwtkc\+wl0l5j1HuI73mlCBFbPVlECgYEAs1N/HcWHuv4D269nUToUp2179ANUtvGyBMi7D7UsNMWSes55R04Cg\+E0YuATh7bwIUp0WaHMxzxDra6JR9xuMkaxD3XlvDCty1N3JUetaIsQcLQkw9kI8EIq6b\+d3HV3zcbJpSzSmO\+fI8Bpixr12FGaipFc9/oH3FuNNp8Yko4=$''']
+
+# The gateway fixture stores base64 DER, without a PEM header; default PEM rules miss it.
+[[rules]]
+id = "dex-json-pkcs8"
+description = "Base64 PKCS8 private key in JSON"
+regex = '''(?i)["']pkcs8["']\s*:\s*["']([A-Za-z0-9+/]{64,}={0,2})["']'''
+secretGroup = 1
+
+# Z.ai / GLM API keys (32 hex + "." + 16 alphanumerics); not covered by default rules or GitHub push protection.
+[[rules]]
+id = "dex-zai-api-key"
+description = "Z.ai / GLM API key"
+regex = '''\b[0-9a-fA-F]{32}\.[A-Za-z0-9]{16}\b'''
+keywords = ["."]
+
+[[rules]]
+id = "dex-windows-user-path"
+description = "Personal Windows user directory (plain, escaped or forward-slash path)"
+regex = '''(?i)\b([A-Z]:[\\/]+Users[\\/]+[^\s\\/"'<>\x60]+)'''
+secretGroup = 1
+
+# Ada is a fictional redaction-test persona (example.com), not a real local account.
+[[rules.allowlists]]
+description = "Synthetic handoff-summary redaction persona"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]chat\.rs$''']
+regexes = ['''(?i)^[A-Z]:[\\/]+Users[\\/]+Ada$''']
+
+[[rules.allowlists]]
+description = "Synthetic process classification username"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]proc\.rs$''']
+regexes = ['''^C:[\\/]+Users[\\/]+u$''']
+
+[[rules.allowlists]]
+description = "Synthetic screenshot and core-start error username"
+condition = "AND"
+paths = ['''(?:^|[\\/])src-tauri[\\/]src[\\/]snip\.rs$''', '''(?:^|[\\/])e2e[\\/]core-band\.spec\.ts$''']
+regexes = ['''^C:[\\/]+Users[\\/]+x$''']
+
+[[rules]]
+id = "dex-private-ipv4"
+description = "Private IPv4 address (RFC1918)"
+regex = '''(?:^|[^0-9.])((?:10\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})|172\.(?:1[6-9]|2[0-9]|3[01])|192\.168)\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2}))\b'''
+secretGroup = 1
+
+# These exact GPU display-test endpoints are synthetic. No production IP exception.
+[[rules.allowlists]]
+description = "Synthetic GPU view unit-test endpoints"
+condition = "AND"
+paths = ['''(?:^|[\\/])src[\\/]gpu[\\/]view\.test\.ts$''']
+regexes = ['''^10\.0\.0\.[12]$''']
+
+# Stored-provider tests inject this exact mock backend URL through an in-memory vault.
+[[rules.allowlists]]
+description = "Synthetic provider vault endpoint"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]providers\.rs$''']
+regexes = ['''^10\.0\.0\.5$''']
+
+# This exact address exercises LAN rejection in listener tests, not a configured host.
+[[rules.allowlists]]
+description = "Synthetic LAN rejection cases"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dexd[\\/]src[\\/](?:tailnet|server)\.rs$''']
+regexes = ['''^192\.168\.1\.5$''']
+
+# Exact synthetic LAN rejection fixtures in the frontend connection/token flows.
+[[rules.allowlists]]
+description = "Synthetic frontend LAN rejection endpoints"
+condition = "AND"
+paths = ['''(?:^|[\\/])src[\\/]api[\\/](?:connectionPolicy|webTokens)\.test\.ts$''', '''(?:^|[\\/])e2e[\\/]hosts-security\.spec\.ts$''']
+regexes = ['''^(?:192\.168\.1\.2|10\.0\.0\.2)$''']
+
+[[rules]]
+id = "dex-tailnet-ipv4"
+description = "Tailnet / CGNAT IPv4 address (100.64.0.0/10)"
+regex = '''(?:^|[^0-9.])(100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2}))(?:/10|\b)'''
+secretGroup = 1
+
+# Network range in a firewall template, not a machine address; only this file and CIDR.
+[[rules.allowlists]]
+description = "Tailnet firewall CIDR template"
+condition = "AND"
+regexTarget = "match"
+paths = ['''(?:^|[\\/])crates[\\/]dexd[\\/]src[\\/]tailnet\.rs$''']
+regexes = ['''100\.64\.0\.0/10$''']
+
+# Exact synthetic endpoint used by tailnet-range and local-listener rejection tests.
+# Keep the exception bound to these files and this address, not other tailnet hosts.
+[[rules.allowlists]]
+description = "Synthetic tailnet range and listener test endpoint"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dexd[\\/]src[\\/](?:tailnet|server)\.rs$''']
+regexes = ['''^100\.64\.0\.1$''']
+
+# One shared synthetic tailnet endpoint, bound to the three regression-test files.
+[[rules.allowlists]]
+description = "Synthetic frontend tailnet acceptance endpoint"
+condition = "AND"
+paths = ['''(?:^|[\\/])src[\\/]api[\\/](?:connectionPolicy|webTokens)\.test\.ts$''', '''(?:^|[\\/])e2e[\\/]hosts-security\.spec\.ts$''']
+regexes = ['''^100\.64\.0\.1$''']
+
+# The documented network CIDR is a policy range, not a machine address.
+[[rules.allowlists]]
+description = "Protocol documentation tailnet CIDR"
+condition = "AND"
+regexTarget = "match"
+paths = ['''(?:^|[\\/])docs[\\/]protocol\.md$''']
+regexes = ['''100\.64\.0\.0/10$''']
+
+[[rules]]
+id = "dex-tailnet-hostname"
+description = "Tailscale private DNS hostname"
+regex = '''(?i)\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+ts\.net\b'''
+
+[[rules.allowlists]]
+description = "Synthetic frontend MagicDNS fixture"
+condition = "AND"
+paths = ['''(?:^|[\\/])src[\\/]api[\\/](?:connectionPolicy|webTokens)\.test\.ts$''']
+regexes = ['''(?i)^fixture\.ts\.net$''']
+
+[[rules]]
+id = "dex-tailscale-key"
+description = "Tailscale key prefix (auth, API, client and future key kinds)"
+regex = '''\btskey-[a-z]+-[A-Za-z0-9_-]{10,}\b'''
+
+[[rules]]
+id = "dex-tailscale-approval-url"
+description = "Tailscale machine registration / approval URL"
+regex = '''https://(?:login|controlplane)\.tailscale\.com/(?:a|admin/machines)/[A-Za-z0-9_/?=&%.-]+'''
+
+# Exact parser/redaction test strings; do not exempt these files from other rules.
+[[allowlists]]
+description = "Synthetic privacy-argument token fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]step\.rs$''']
+regexes = ['''^sk-ABCDEF0123456789$''']
+
+[[allowlists]]
+description = "Synthetic provider configuration parser token"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]providers\.rs$''']
+regexes = ['''^abc\.def123456789$''']
+
+# RFC6455 handshake nonce (base64 of dexdeployhealth), not an authentication key.
+[[allowlists]]
+description = "Fixed WebSocket health-check nonce"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(?:^|[\\/])scripts[\\/]deploy[\\/]dexd-deploy\.sh$''']
+regexes = ['''^ZGV4ZGRlcGxveWhlYWx0aA==$''']
+
+[[allowlists]]
+description = "Synthetic core audit redaction bearer fixture"
+targetRules = ["curl-auth-header"]
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]lib\.rs$''']
+regexes = ['''^(?:Authorization: Bearer )?s3cr3tvalue$''']
+
+[[rules]]
+id = "dex-personal-email"
+description = "Personal email address"
+regex = '''(?i)\b([a-z0-9][a-z0-9._%+-]*@[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,})\b'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Documentation and public noreply addresses"
+regexes = ['''(?i)^[^@]+@(?:(?:[a-z0-9-]+\.)*example\.com|(?:[a-z0-9-]+\.)*invalid|(?:users\.)?noreply\.github\.com)$''', '''(?i)^noreply@[^@]+$''']
+
+[[rules.allowlists]]
+description = "Exact synthetic credential redaction examples"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]proc\.rs$''']
+regexes = ['''^(?:pw@host\.com|ghp_abcdefghijklmnop@github\.com)$''']
+
+[[rules.allowlists]]
+description = "Tauri icon scale filename, not an email address"
+condition = "AND"
+paths = ['''(?:^|[\\/])src-tauri[\\/]tauri\.conf\.json$''']
+regexes = ['''^128x128@2x\.png$''']
+
+[[rules.allowlists]]
+description = "Exact public Git endpoint in permit parser tests"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]permit\.rs$''']
+regexes = ['''^git@github\.com$''']
+
+[[rules]]
+id = "dex-local-hostname"
+description = "Local virtual-machine hostname"
+regex = '''(?i)\b[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-vm\b'''
+
+[[rules]]
+id = "dex-public-ipv4"
+description = "Public IPv4 endpoint"
+regex = '''\b((?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2}))\b'''
+secretGroup = 1
+
+[[rules.allowlists]]
+description = "Non-public ranges and RFC5737 documentation networks; private and CGNAT have separate rules"
+regexes = ['''^(?:0\.[0-9.]+|10\.[0-9.]+|127\.[0-9.]+|169\.254\.[0-9.]+|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9.]+|192\.168\.[0-9.]+|100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9.]+|192\.0\.2\.[0-9]+|198\.51\.100\.[0-9]+|203\.0\.113\.[0-9]+|(?:22[4-9]|23[0-9]|24[0-9]|25[0-5])\.[0-9.]+)$''']
+
+[[rules.allowlists]]
+description = "Exact synthetic network-error endpoint"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]chain\.rs$''']
+regexes = ['''^1\.2\.3\.4$''']
+
+[[rules.allowlists]]
+description = "Exact boundary endpoint outside the CGNAT range in the parser test"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dexd[\\/]src[\\/]tailnet\.rs$''']
+regexes = ['''^100\.128\.0\.1$''']
+
+[[rules]]
+id = "dex-ssh-target"
+description = "SSH username and host endpoint"
+regex = '''(?i)\b(?:ssh://[a-z0-9._-]+@[a-z0-9.-]+(?::[0-9]+)?(?:/[^\s"'<>\x60),]*)?|[a-z0-9._-]+@[a-z0-9.-]+:[^\s"'<>\x60),]*|ssh[ \t]+[a-z0-9._-]+@[a-z0-9.-]+)'''
+keywords = ["@"]
+
+[[rules.allowlists]]
+description = "Documentation SSH domains"
+regexes = ['''(?i)^(?:ssh://|ssh[ \t]+)?[^@]+@(?:(?:[a-z0-9-]+\.)*example\.com|(?:[a-z0-9-]+\.)*invalid)(?::[^\s]*)?(?:/[^\s]*)?$''']
+
+# Exact public/synthetic endpoints used by permit parser tests (audit #1379 N3).
+[[rules.allowlists]]
+description = "Exact synthetic permit SSH endpoints"
+condition = "AND"
+paths = ['''(?:^|[\\/])crates[\\/]dex-core[\\/]src[\\/]permit\.rs$''']
+regexes = [
+  '''^deploy@192\.0\.2\.10:/srv/git/dex\.git$''',
+  '''^ssh://deploy@192\.0\.2\.10/srv/git/dex\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/git/\*\.git$''',
+  '''^ssh://deploy@192\.0\.2\.10/srv/git/\*\.git$''',
+  '''^git@github\.com:x/y\.git$''',
+  '''^deploy@192\.0\.2\.11:/srv/git/dex\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/other/dex\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/git/sub/dex\.git$''',
+  '''^ssh://deploy@192\.0\.2\.10/srv/git/sub/dex\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/git/\.\./etc/x\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/git/a/b\.git$''',
+  '''^deploy@192\.0\.2\.10:/srv/git/\.git$''',
+  '''^user@host:/srv/$''',
+]

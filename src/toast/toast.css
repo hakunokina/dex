@@ -1,0 +1,32 @@
+/* Modern §6: the toast stack — the last block of the bottom-right .patron-cards column (team/team.css). */
+.toasts { display: flex; flex-direction: column; gap: var(--sp-2); }
+.toasts:empty { margin-top: calc(-1 * var(--sp-2)); } /* no extra column gap under the cards */
+.toast {
+  padding: var(--sp-2) var(--sp-3); background: var(--surface-pop); border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--muted); border-radius: var(--r-md); box-shadow: var(--shadow-pop);
+  font-size: var(--fs-sm); user-select: text;
+  animation: card-pop var(--dur-pop) var(--spring);
+  transition: opacity var(--dur-slow) var(--ease);
+}
+.toast.ok { border-left-color: var(--green); }
+.toast.err { border-left-color: var(--red); }
+.toast.leaving { opacity: 0; }
+.toast-head { display: flex; align-items: flex-start; gap: var(--sp-2); }
+.toast-title { flex: 1; min-width: 0; font-weight: var(--fw-semibold); overflow-wrap: anywhere; }
+.toast-body { margin-top: 2px; color: var(--text-2); overflow-wrap: anywhere; }
+/* 24px targets (WCAG 2.5.8). */
+.toast-close {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; margin: -4px -6px 0 0; padding: 0; cursor: pointer;
+  background: none; border: 0; border-radius: var(--r-sm); color: var(--muted);
+}
+.toast-close:hover { color: var(--text); background: var(--press); }
+.toast-acts { display: flex; flex-wrap: wrap; gap: var(--sp-2); margin-top: var(--sp-2); }
+.toast-acts button {
+  min-height: 24px; padding: 0 var(--sp-2); cursor: pointer; font-size: var(--fs-xs); color: var(--text);
+  background: var(--surface-3); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+}
+.toast-acts button:hover { background: var(--press); }
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; transition: none; }
+}

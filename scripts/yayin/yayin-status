@@ -1,0 +1,18 @@
+#!/bin/bash
+# yayin-status [proje] — son deploy sonucu + canlı sağlık (#221). Proje verilirse log kuyruğu da.
+set -uo pipefail
+. "${YAYIN_CONF:-/etc/yayin.conf}" || exit 2
+: "${DOMAIN:?yayin.conf: DOMAIN gerekli}"
+if [ "${1:-}" = --dry-run ]; then echo 'yayin-status dry-run: config loaded; curl/docker/log skipped'; exit 0; fi
+for A in /srv/apps/${1:-*}/; do
+  [ -e "$A/port" ] || continue
+  p=$(basename "$A") port=$(cat "$A/port") h=$(cat "$A/health" 2>/dev/null || echo /)
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$port$h")
+  printf '%-20s port=%-5s canlı=%s current=%s son=%s\n' "$p" "$port" "$code" \
+    "$(basename "$(readlink "$A/current" 2>/dev/null)" 2>/dev/null)" "$(cat "$A/status.json" 2>/dev/null || echo -)"
+done
+if [ -n "${1:-}" ]; then
+  docker compose -p "$1" ps
+  l=$(ls -1t "/srv/apps/$1/logs/"*.log 2>/dev/null | head -n1)
+  [ -n "$l" ] && { echo "--- $l"; tail -n 20 "$l"; }
+fi

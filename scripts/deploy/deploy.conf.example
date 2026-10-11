@@ -1,0 +1,16 @@
+# Copy to deploy.conf (gitignored). Simple KEY=value only; no shell expressions.
+DEX_DEPLOY_HOST=admin@vm.example.com
+DEPLOY_USER=dex
+DEPLOY_GROUP=dex
+USER_HOME=/home/dex
+DEPLOY_HOME=/home/dex/deploy
+REPO=/home/dex/dex.git
+SRC=/home/dex/src/dex
+BIN=/home/dex/bin/dexd
+DATA=/home/dex/.local/share/dexd
+SERVICE=dexd.service
+PORT=7717
+HEALTH_TIMEOUT=60
+KEEP_LOGS=30
+# APK release only: expected signing certificate SHA-256 (64 hex characters), or DEX_APK_CERT env.
+DEX_APK_CERT=

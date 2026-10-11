@@ -1,0 +1,67 @@
+/* Task board drawer — overlays the stage from the right, never reflows it. */
+.board {
+  position: fixed; top: calc(var(--bar-h) + var(--sp-1)); right: var(--sp-1); bottom: var(--sp-1); z-index: var(--z-board);
+  width: min(820px, 62vw);
+  display: flex; flex-direction: column; overflow: hidden;
+  background: var(--surface-1); border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop);
+  transform: translateX(calc(100% + var(--sp-2))); visibility: hidden;
+  transition: transform var(--dur) var(--ease), visibility 0s linear var(--dur);
+}
+.board.open { transform: none; visibility: visible; transition: transform var(--dur) var(--ease); }
+
+.board-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  height: 36px; padding: 0 var(--sp-1) 0 var(--sp-3);
+  border-bottom: 1px solid var(--line); background: var(--surface-2);
+}
+.board-title { font: var(--fw-semibold) var(--fs-xs) var(--font-ui); letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-2); }
+.board-add, .board-card-title-input, .board-card-desc, .board-agent {
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--r-sm); font: inherit; outline: none;
+}
+.board-add { flex: 1; height: var(--ctl-h); padding: 0 var(--sp-2); }
+.board-add:hover, .board-card-title-input:hover, .board-card-desc:hover { border-color: var(--line-strong); }
+.board-error { padding: 6px var(--sp-3); color: var(--red); font-size: var(--fs-sm); border-bottom: 1px solid var(--line); }
+
+.board-cols { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--sp-2); padding: var(--sp-2); }
+.board-col { display: flex; flex-direction: column; min-height: 0; background: var(--bg); border: 1px solid transparent; border-radius: var(--r-md); transition: border-color var(--dur-fast) var(--ease); }
+.board-col.over { border-color: var(--red-line); }
+.board-col > header {
+  padding: 6px 10px; font-size: var(--fs-xs); font-weight: var(--fw-medium); color: var(--muted);
+  text-transform: uppercase; letter-spacing: var(--tracking-caps);
+}
+.board-col > header b { color: var(--text-2); margin-left: var(--sp-1); font-variant-numeric: tabular-nums; }
+.board-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 6px 6px; display: flex; flex-direction: column; gap: 6px; }
+
+.board-card {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 6px var(--sp-2) var(--sp-1); cursor: grab; touch-action: none;
+  transition: border-color var(--dur-fast) var(--ease), background-color var(--dur-fast) var(--ease);
+}
+.board-card:hover { border-color: var(--line-strong); background: var(--surface-3); }
+.board-card.editing { border-color: var(--line-strong); cursor: default; }
+.board-card.dragging { opacity: 0.35; }
+/* Modern §2/§6: loading placeholders take a real card's box; the empty board shows Core instead of the columns. */
+.board-card.skel-card, .board-card.skel-card:hover { cursor: default; background: var(--surface-2); border-color: var(--line); padding-bottom: 6px; }
+.board-empty { flex: 1; min-height: 0; overflow-y: auto; padding: var(--sp-2); }
+.board-card.ghost {
+  position: fixed; z-index: var(--z-drag); pointer-events: none; cursor: grabbing;
+  box-shadow: var(--shadow-pop); transform: rotate(1.5deg);
+}
+.board-card-title { font-weight: var(--fw-semibold); word-break: break-word; }
+.board-card-title-input { width: 100%; height: var(--ctl-h-sm); padding: 0 5px; font-weight: var(--fw-semibold); }
+.board-card-desc { width: 100%; margin-top: 5px; padding: var(--sp-1) 5px; resize: vertical; user-select: text; }
+.board-card-desc-view {
+  margin-top: 2px; color: var(--muted); font-size: var(--fs-sm); white-space: pre-wrap;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.board-card-foot { display: flex; flex-wrap: wrap; align-items: center; margin-top: var(--sp-1); }
+.board-role-chip { min-width: 0; max-width: 100%; margin-left: var(--sp-1); color: var(--text-2); }
+/* #209: işin token + $'ı (API eşdeğeri), atama ile sil arasında. */
+.board-cost {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: var(--sp-2);
+  color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; border-radius: var(--r-sm);
+}
+.board-agent { height: var(--ctl-h-sm); font-size: var(--fs-xs); padding: 0 var(--sp-1); border-left: 3px solid var(--line-strong); }
+.board-agent option { background: var(--surface-pop); }

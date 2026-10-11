@@ -1,0 +1,430 @@
+/* DEX-37: design tokens — dark only. Components use these, never raw values. */
+:root {
+  /* Surfaces: floor → panel → raised → hover → popover (anthracite steps). */
+  --bg: #0c0d0f;
+  --surface-1: #121316;
+  --surface-2: #17191c;
+  --surface-3: #1e2024;
+  --surface-pop: #1a1c20;
+  --scrim: rgba(4, 5, 6, 0.55);
+  /* Legacy aliases (pre-DEX-37 names still read by some rules). */
+  --panel: var(--surface-1);
+  --panel-2: var(--surface-2);
+
+  /* Soft lines: low contrast, translucent so they sit on any surface. */
+  --line: rgba(255, 255, 255, 0.06);
+  --line-strong: rgba(255, 255, 255, 0.11);
+  --border: var(--line);
+  --hover: rgba(255, 255, 255, 0.045);
+  --press: rgba(255, 255, 255, 0.07);
+
+  /* Text */
+  --text: #d5d8dd;
+  --text-2: #a1a6ae;
+  --muted: #6c717a;
+  --faint: #4a4e55;
+  --on-accent: #fff;
+
+  /* Accent + status. Red = status/emphasis only; focus is calm grey. */
+  --red: #e5383b;
+  --red-hi: #ff5c5f;
+  --red-soft: rgba(229, 56, 59, 0.14);
+  --red-line: rgba(229, 56, 59, 0.5);
+  --red-glow: rgba(229, 56, 59, 0.35);
+  --red-dim: #5a1c1f;
+  --green: #4f9e76; /* DEX-19: "worker finished" outline — the theme's only green, muted to sit beside the red */
+  --amber: #f5c35b;
+  --amber-soft: rgba(245, 195, 91, 0.12);
+  --amber-line: rgba(245, 195, 91, 0.35);
+  --orange: #f2893a; /* #212: context ≥500k — between amber and red */
+  --idle: #3a3e44;
+  --ring: 0 0 0 2px rgba(170, 180, 195, 0.28);
+
+  /* PCB scene (DEX-39): canvas resolves these once per mount through src/theme.ts. */
+  --pcb-outside: var(--bg);
+  --pcb-board: #15191a;
+  --pcb-board-edge: rgba(184, 194, 194, 0.18);
+  --pcb-grid: rgba(184, 194, 194, 0.025);
+  --pcb-trace: rgba(150, 160, 160, 0.28);
+  --pcb-trace-hot: var(--team-line);
+  --pcb-chip: #1d2124;
+  --pcb-chip-off: #131618;
+  --pcb-chip-edge: rgba(205, 211, 214, 0.2);
+  --pcb-pin: #71777b;
+  --pcb-via: rgba(173, 182, 183, 0.22);
+  --pcb-provider: #94a7bd;
+  --pcb-shadow: rgba(0, 0, 0, 0.45);
+  --pcb-radius: 12px;
+  --pcb-chip-radius: 6px;
+
+  /* Radii */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* Shadows — 3 depths, raised things only: resting card · lifted/floating · popover.
+     Modern §5: each carries the 1px top light line (--edge-hi), so every raised surface catches it. */
+  --edge-hi: inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  --shadow-1: var(--edge-hi), 0 1px 2px rgba(0, 0, 0, 0.25);
+  --shadow-2: var(--edge-hi), 0 4px 14px rgba(0, 0, 0, 0.3);
+  --shadow-pop: var(--edge-hi), 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--line);
+
+  /* Modern §5 texture for panel floors: 5% SVG noise over a faint top-down sheen. Static layers only —
+     use as `background: var(--tex), <surface>`. No blur here: backdrop-filter is for fixed layers alone
+     (src/blur.test.ts holds the list). */
+  --noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .05 0'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+  --tex: var(--noise), linear-gradient(180deg, rgba(255, 255, 255, 0.022), rgba(255, 255, 255, 0) 160px);
+
+  /* Spacing (4 multiples) */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+
+  /* Type */
+  /* Bundled OFL faces (@fontsource-variable, src/main.tsx) first; Geist if installed; then the system. */
+  --font-ui: "Inter Variable", "Geist", "Segoe UI Variable", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "Geist Mono", "Cascadia Mono", Consolas, monospace;
+  --sans: var(--font-ui);
+  --mono: var(--font-mono);
+  --fs-2xs: 10px; /* key caps and in-chip tags only — never running text */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 20px;
+  --fs-2xl: 28px;
+  --brand-fs: 38px; /* #83: DEX logo, 2.5x #75's --fs-lg */
+  --lh-tight: 1.25;
+  --lh: 1.45;
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --tracking-caps: 0.06em;
+
+  /* Terminal (xterm reads these via src/theme.ts) */
+  --term-font: var(--font-mono);
+  --term-size: 13px;
+  --term-size-sm: 11px;
+  --term-line: 1.15;
+  --term-bg: var(--surface-1);
+  /* ANSI 16 (xterm) — color is state, not decoration: green ok, red-hi error, amber warn, blue path/link, muted echo. */
+  --term-black: var(--surface-3);
+  --term-red: var(--red);
+  --term-green: var(--green);
+  --term-yellow: var(--amber);
+  --term-blue: #4f8ff9;
+  --term-magenta: #b48ef0;
+  --term-cyan: #5fb4b4;
+  --term-white: var(--text-2);
+  --term-bright-black: var(--muted);
+  --term-bright-red: var(--red-hi);
+  --term-bright-green: #7cc79c;
+  --term-bright-yellow: #ffd98a;
+  --term-bright-blue: #8ab6ff;
+  --term-bright-magenta: #d2b6ff;
+  --term-bright-cyan: #8fd6d6;
+  --term-bright-white: #f2f4f7;
+  --term-selection: rgba(229, 56, 59, 0.27);
+
+  /* Compact control sizes */
+  --bar-h: 60px; /* #83: carries the 2.5x logo */
+  --row-h: 26px;
+  --ctl-h: 26px;
+  --ctl-h-sm: 22px;
+  --head-h: 28px;
+  --icon: 14px;
+  --icon-stroke: 1.75;
+  --pane-tab-h: 24px; /* Terminal/Sohbet row buttons */
+  --pane-tab-pad: 2px; /* that row's inner gap */
+  --term-pad-top: 6px; /* gap above the xterm grid */
+
+  /* Motion */
+  --dur-fast: 110ms;
+  --dur: 180ms;
+  --dur-slow: 320ms;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --spring: cubic-bezier(0.34, 1.4, 0.44, 1); /* openings only (palette, cards) — a small overshoot */
+  --dur-pop: 180ms;
+
+  /* dockview tokens (DEX-36 binds --dv-* to these; names shared with tom). */
+  --dock-gap: 6px;
+  --dock-group-bg: var(--surface-1);
+  --dock-group-border: var(--line);
+  --dock-group-radius: var(--r-md);
+  --dock-header-bg: var(--surface-1);
+  --tab-h: 28px;
+  --tab-px: 10px;
+  --tab-my: var(--sp-1);
+  --tab-radius: var(--r-sm);
+  --tab-fs: var(--fs-sm);
+  --tab-bg: transparent;
+  --tab-bg-hover: var(--hover);
+  --tab-bg-active: var(--surface-2);
+  --tab-fg: var(--muted);
+  --tab-fg-active: var(--text);
+  --tab-accent: var(--team);
+  --sash: transparent;
+  --sash-hover: var(--line-strong);
+  --drop-overlay: var(--team-soft);
+  --drop-outline: var(--team-line);
+
+  /* Z layers (FIX-5): one place. Floating dockview groups sit at the bottom of the
+     overlay stack (--dv-overlay-z-index is bound below); the topbar pop-ups, patron
+     cards and the palette always stay above them. In-panel marks stay below all. */
+  --z-pane-note: 4;
+  --z-flash: 5;
+  --z-banner: 5;
+  --z-float: 90;
+  --z-board: 200;
+  --z-drag: 210;
+  --z-team-pop: 300;
+  --z-patron: 400;
+  --z-palette: 500;
+  /* Mobile shell (src/mobile/mobile.css) shares the same token block. */
+  --z-m-pop: 30;
+  --z-m-screen: 40;
+
+  /* Modern §7: team accent — tab underline, Core ring, office traces, team badge. One family, swapped
+     per team by [data-accent] (src/team/accent.ts). Red stays the brand: logo, errors, waiting questions. */
+  --team: var(--red);
+  --team-hi: var(--red-hi);
+  --team-soft: var(--red-soft);
+  --team-line: var(--red-line);
+  --team-glow: var(--red-glow);
+
+  color-scheme: dark;
+}
+[data-accent="blue"] { --team: #4f8ff9; --team-hi: #8ab6ff; --team-soft: rgba(79, 143, 249, 0.14); --team-line: rgba(79, 143, 249, 0.5); --team-glow: rgba(79, 143, 249, 0.35); }
+[data-accent="green"] { --team: #4f9e76; --team-hi: #7cc79c; --team-soft: rgba(79, 158, 118, 0.14); --team-line: rgba(79, 158, 118, 0.5); --team-glow: rgba(79, 158, 118, 0.35); }
+[data-accent="violet"] { --team: #b48ef0; --team-hi: #d2b6ff; --team-soft: rgba(180, 142, 240, 0.14); --team-line: rgba(180, 142, 240, 0.5); --team-glow: rgba(180, 142, 240, 0.35); }
+[data-accent="cyan"] { --team: #5fb4b4; --team-hi: #8fd6d6; --team-soft: rgba(95, 180, 180, 0.14); --team-line: rgba(95, 180, 180, 0.5); --team-glow: rgba(95, 180, 180, 0.35); }
+/* Tokens built on --team resolve where they are declared: re-declare them inside a team's scope. */
+[data-accent] {
+  --tab-accent: var(--team);
+  --drop-overlay: var(--team-soft);
+  --drop-outline: var(--team-line);
+  --pcb-trace-hot: var(--team-line);
+}
+
+/* #33: compact density (Settings → Görünüm; src/density.ts sets the attribute, default compact).
+   Only sizes change. Floors: text ≥ 11px; controls ≥ 24px tall, except the wide Terminal/Sohbet
+   buttons (22px) whose 24px target circle still clears every neighbour (WCAG 2.5.8 spacing). */
+:root[data-density="compact"] {
+  --sp-3: 10px;
+  --sp-4: 12px;
+  --sp-5: 16px;
+  --sp-6: 20px;
+  --fs-md: 12px;
+  --fs-lg: 14px;
+  --brand-fs: 35px;
+  --lh: 1.4;
+  --term-size: 12px;
+  --term-line: 1;
+  --bar-h: 56px;
+  --row-h: 24px;
+  --ctl-h: 24px;
+  --head-h: 24px;
+  --icon: 13px;
+  --pane-tab-h: 22px;
+  --pane-tab-pad: 1px;
+  --term-pad-top: 2px;
+  --dock-gap: 3px;
+  --tab-h: 24px;
+  --tab-px: 8px;
+  --tab-my: 2px;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: var(--fw-regular) var(--fs-md) / var(--lh) var(--font-ui);
+  font-feature-settings: "cv11", "ss03"; /* Inter: single-storey a, rounder glyphs */
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button, input, select, textarea { transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease); }
+:focus { outline: none; }
+:focus-visible { outline: none; box-shadow: var(--ring); }
+code, kbd, pre { font-family: var(--font-mono); }
+/* One icon set (lucide), one size. */
+svg.lucide { width: var(--icon); height: var(--icon); stroke-width: var(--icon-stroke); flex: none; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: var(--r-pill); border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+.app { display: flex; flex-direction: column; height: 100%; }
+
+/* #73: equal side columns keep the logo at the window's centre whatever the tab/chip count; each side scrolls inside itself. */
+.topbar {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: var(--sp-3);
+  height: var(--bar-h); padding: 0 var(--sp-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--tex), var(--surface-1);
+}
+/* #75/#83: the logo is the bar's largest text (2.5x #75; its "X" stands taller than a chip); tab and chip names stay at --fs-sm. */
+.brand { font: var(--fw-semibold) var(--brand-fs) / 1 var(--font-mono); display: flex; align-items: center; user-select: none; }
+/* #85: the letters' size and spacing of #83's text (cap height 0.737em, 0.28em tracking); the dot is the Kart's trace packet. */
+.brand-mark { width: 2.37em; height: 0.737em; pointer-events: none; } /* clicks land on .brand, the drag region */
+.brand-mark path { fill: none; stroke: var(--text); stroke-width: 4.2; }
+/* #87: a notch brighter — the glow leans to --red-hi and reaches a little further. */
+.brand-dot { fill: var(--red-hi); filter: drop-shadow(0 0 1.8px var(--red-hi)) drop-shadow(0 0 5px var(--red-glow)); }
+/* #87: the run shows only while the team works; idle, it fades out where it stopped and the crossing's dot fades in. */
+.brand-run, .brand-dot.still { transition: opacity 0.6s ease; }
+.brand-mark:not(.live) .brand-run, .brand-mark.live .brand-dot.still { opacity: 0; }
+@media (prefers-reduced-motion: reduce) {
+  .brand-run { display: none; }
+  .brand-mark.live .brand-dot.still { opacity: 1; }
+}
+.topbar-right { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; height: 100%; }
+.topbar-rack { flex: 1; min-width: 0; height: 100%; }
+.win-ctl { display: flex; align-self: stretch; flex: none; margin-right: calc(-1 * var(--sp-3)); }
+.win-ctl button {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; height: 100%; padding: 0; border: 0; background: none; color: var(--muted); cursor: pointer;
+}
+.win-ctl button svg { width: 14px; height: 14px; stroke-width: 1.5; }
+.win-ctl button:hover { color: var(--text); background: var(--hover); }
+.win-ctl button.close:hover { color: var(--text); background: var(--red); }
+.stat { color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.stat b { color: var(--text-2); font-weight: var(--fw-semibold); }
+.stat b.red { color: var(--red); }
+
+.app-body { flex: 1; min-height: 0; display: flex; } /* #54: stage | usage strip */
+.stage { flex: 1; min-width: 0; min-height: 0; position: relative; } /* each .team-stage (team/team.css) holds one dockview (layout/Workspace.tsx) */
+.office { position: absolute; inset: 0; width: 100%; height: 100%; display: block; image-rendering: auto; cursor: pointer; }
+
+.pane {
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+  background: var(--surface-1); border: 1px solid var(--line); border-radius: var(--r-md);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease);
+}
+.pane.focused { border-color: var(--line-strong); box-shadow: inset 0 2px 0 var(--team); }
+/* Rack/palette reveal: two quick red pulses over the pane (DEX-10b). */
+.pane { position: relative; }
+.pane-flash {
+  position: absolute; inset: 0; z-index: var(--z-flash); pointer-events: none; opacity: 0;
+  border: 2px solid var(--red); border-radius: inherit; box-shadow: inset 0 0 28px var(--red-glow);
+  animation: pane-flash 0.9s ease-out;
+}
+@keyframes pane-flash { 15%, 55% { opacity: 1; } 35% { opacity: 0.25; } }
+.pane-status { color: var(--muted); font-size: var(--fs-xs); }
+.spacer { flex: 1; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--idle); flex: none; }
+.dot.idle { background: var(--text-2); }
+.dot.working { background: var(--red); box-shadow: 0 0 6px var(--red); animation: pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.45; } }
+.dot.waiting { background: var(--red); box-shadow: 0 0 0 2px var(--red-glow); animation: blink 0.5s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Modern §2 motion. Pane/tab switches fade only (no transform: xterm's geometry and drawing stay put);
+   openings (cards, balloons, toasts) pop with the spring. Reduced motion turns all of it off. */
+@keyframes fade-in { from { opacity: 0; } }
+@keyframes card-pop { from { opacity: 0; transform: translateY(6px) scale(0.96); } }
+/* Team tab: a stage that drops .hidden fades in. */
+.team-stage:not(.hidden) { animation: fade-in var(--dur) var(--ease); }
+/* Dock tab: with defaultRenderer "always", dockview hides a background panel with inline visibility:hidden. */
+.dockview-theme-dex .dv-render-overlay:not([style*="visibility: hidden"]) { animation: fade-in var(--dur) var(--ease); }
+/* Loading placeholder: the same box the content will take, so nothing shifts when it lands. */
+.skel {
+  border-radius: var(--r-sm);
+  background: linear-gradient(90deg, var(--surface-3) 25%, var(--line-strong) 50%, var(--surface-3) 75%) 0 0 / 200% 100%;
+  animation: skel 1.2s linear infinite;
+}
+@keyframes skel { to { background-position: -200% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .team-stage:not(.hidden), .dockview-theme-dex .dv-render-overlay, .skel { animation: none; }
+}
+
+.icon-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  background: none; border: 0; border-radius: var(--r-sm); width: var(--ctl-h-sm); height: var(--ctl-h-sm); padding: 0;
+  color: var(--muted); cursor: pointer; flex: none;
+}
+.icon-btn:hover:not(:disabled) { color: var(--text); background: var(--hover); }
+.icon-btn:active:not(:disabled) { background: var(--press); }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
+/* S5-B: Terminal ↔ Sohbet switch at the top of the agent pane. */
+.pane-view-toggle {
+  display: flex; gap: 2px; padding: var(--pane-tab-pad); flex: none;
+  background: var(--surface-1); border-bottom: 1px solid var(--line);
+}
+.pane-view-toggle button {
+  display: flex; align-items: center; gap: 4px; height: var(--pane-tab-h); padding: 0 10px;
+  background: none; border: 0; border-radius: var(--r-sm);
+  color: var(--muted); font-size: var(--fs-xs); cursor: pointer;
+}
+.pane-view-toggle button svg { width: 13px; height: 13px; }
+.pane-view-toggle button.on { background: var(--surface-3); color: var(--text); }
+/* #22: worker pane watch-only ↔ write switch, at the row's right end; write mode is marked red. */
+.pane-view-toggle .pane-write, .pane-view-toggle .pane-reset { margin-left: auto; }
+.pane-view-toggle .pane-reset:disabled { opacity: .5; cursor: default; }
+.pane-view-toggle .pane-write.on svg { color: var(--red); }
+/* #212: context fill — absolute token thresholds (contextFormat.ts); the row's right end, before reset/write. */
+.pane-view-toggle .ctx-meter {
+  display: flex; align-items: center; gap: 6px; min-width: 0; margin-left: auto; padding: 0 6px;
+  border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.pane-view-toggle .ctx-meter + .pane-reset, .pane-view-toggle .ctx-meter + .pane-write { margin-left: 0; }
+.ctx-meter .ctx-text { overflow: hidden; text-overflow: ellipsis; }
+.ctx-meter .ctx-bar { flex: none; width: 48px; height: 4px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
+.ctx-meter .ctx-bar > span { display: block; height: 100%; background: var(--muted); }
+.ctx-meter.ctx-warn { color: var(--amber); }
+.ctx-meter.ctx-warn .ctx-bar > span { background: var(--amber); }
+.ctx-meter.ctx-high { color: var(--orange); }
+.ctx-meter.ctx-high .ctx-bar > span { background: var(--orange); }
+.ctx-meter.ctx-critical { color: var(--red-hi); font-weight: var(--fw-semibold); }
+.ctx-meter.ctx-critical .ctx-bar > span { background: var(--red); }
+.pane-view-toggle .pane-reset.urgent { color: var(--red-hi); background: var(--red-soft); box-shadow: inset 0 0 0 1px var(--red-line); }
+/* S5-B: the chat fills the pane body (the terminal stays mounted, CSS-hidden). */
+.chat-host { position: absolute; inset: 0; display: flex; min-height: 0; }
+.chat-host > .chat { flex: 1; min-width: 0; }
+
+.pane-body { position: relative; flex: 1; min-height: 0; background: var(--term-bg); }
+.pane-note {
+  position: absolute; top: var(--sp-1); right: var(--sp-2); z-index: var(--z-pane-note);
+  padding: 2px 6px; border-radius: var(--r-sm); background: var(--surface-pop); color: var(--muted);
+  font-size: var(--fs-xs); box-shadow: var(--shadow-1); pointer-events: none;
+}
+/* DEX-13: provider failure strip (StopFailure → plain Turkish). */
+.pane-alert {
+  display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-1) var(--sp-1) var(--sp-2);
+  background: var(--amber-soft); border-bottom: 1px solid var(--amber-line); color: var(--amber); font-size: var(--fs-sm);
+}
+.pane-alert span { flex: 1; min-width: 0; }
+/* FIX-3: late first reply — same strip, two actions. */
+.pane-act {
+  flex: none; height: var(--ctl-h-sm); padding: 0 var(--sp-2); border-radius: var(--r-sm); cursor: pointer;
+  background: transparent; border: 1px solid var(--amber-line); color: var(--amber); font-size: var(--fs-xs);
+}
+.pane-act:hover:not(:disabled) { background: var(--amber-soft); }
+.pane-act:disabled { opacity: 0.5; cursor: default; }
+.term-host { position: absolute; inset: var(--term-pad-top) 0 0 var(--sp-2); }
+.launch {
+  position: absolute; inset: 0; margin: auto;
+  width: max-content; height: 30px; padding: 0 var(--sp-3);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md);
+  cursor: pointer; display: flex; align-items: center; gap: var(--sp-2);
+}
+.launch span { color: var(--red); display: inline-flex; }
+.launch:hover { background: var(--surface-3); border-color: var(--line-strong); }
+
+.xterm-viewport::-webkit-scrollbar { width: 8px; }
+.xterm-viewport::-webkit-scrollbar-thumb { background: var(--line-strong); }
+
+/* DEX-37 × DEX-36: inside a dockview group the group draws the frame — the pane drops its own (no double line). */
+.dockview-theme-dex .dv-groupview { border-radius: var(--dock-group-radius); overflow: hidden; transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease); }
+/* Modern §5: the active group glows faintly in the team's colour (calm grey focus ring stays for controls). */
+.dockview-theme-dex .dv-groupview.dv-active-group { border-color: var(--line-strong); box-shadow: 0 0 10px -3px var(--team-glow); }
+.dockview-theme-dex .dv-tab { font-weight: var(--fw-medium); --dv-tab-close-icon-size: 10px; }
+.dockview-theme-dex .dv-content-container .pane { border: 0; border-radius: 0; }
+.dockview-theme-dex .dv-content-container .pane.focused { box-shadow: none; }

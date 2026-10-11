@@ -1,0 +1,604 @@
+//! DEX-33 — test bütçesi: the whole Playwright suite is QA's job. A shell command that runs
+//! `playwright test` with no spec (positional filter) and no `--grep` is denied at PreToolUse
+//! for every role but `qa`. Covers npx / pnpm exec / yarn / bunx / node_modules/.bin, env
+//! prefixes (`CI=1 …`, `cross-env …`) and package.json scripts (`npm run e2e`, `pnpm e2e`,
+//! `npm test`) resolved from the hook's `cwd` (plus a leading `cd <dir> &&`), extra args
+//! included. Not detected on purpose (false positives cost more than a miss): `npm --prefix`,
+//! `pnpm -C/--filter`, workspaces, `bash script.sh`, `$(…)`, config-file `testMatch` tricks.
+//! Godot GUT is also denied when a literal broad test directory and recursive discovery
+//! are given without a file/test selector. Unknown wrappers and directory expressions pass.
+
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
+
+pub const DENY: &str = "Tüm e2e paketini koşma; ilgili spec'i ver ya da QA'ya bırak (Dex test bütçesi). \
+    Örn. `npx playwright test tests/x.spec.ts --workers=1` ya da `--grep \"<test adı>\"`.";
+
+const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
+    Örn. `godot --headless -s addons/gut/gut_cmdln.gd -gtest=res://tests/e2e/test_x.gd -gexit`.";
+
+struct Enforcer {
+    recognises: fn(&[String]) -> bool,
+    deny: &'static str,
+}
+
+struct Runner {
+    name: &'static str,
+    markers: fn(&crate::stack::TestMarkers) -> bool,
+    enforcer: Option<Enforcer>,
+}
+
+const RUNNERS: &[Runner] = &[
+    Runner { name: "Playwright", markers: playwright_markers, enforcer: Some(Enforcer { recognises: unfiltered_playwright, deny: DENY }) },
+    Runner { name: "Godot GUT", markers: |m| m.file("project.godot") && m.dir("addons/gut"), enforcer: Some(Enforcer { recognises: unfiltered_gut, deny: DENY_GUT }) },
+    Runner { name: "Android (Gradle)", markers: android_markers, enforcer: None },
+    Runner { name: "Maestro", markers: |m| m.dir(".maestro"), enforcer: None },
+    Runner { name: "WebdriverIO (Electron)", markers: |m| m.root_config("wdio.conf."), enforcer: None },
+    Runner { name: "Jest/Vitest e2e", markers: |m| m.root_file_matching(|n|
+        (n.starts_with("jest.") || n.starts_with("vitest.")) && n.contains("config.") && (n.contains("e2e") || n.contains("integration"))), enforcer: None },
+    Runner { name: "Cypress", markers: |m| m.root_config("cypress.config."), enforcer: None },
+    Runner { name: "Flutter integration_test", markers: |m| m.dir("integration_test"), enforcer: None },
+    Runner { name: "Unity Test Framework", markers: |m| m.dir("Assets") && m.text("Packages/manifest.json")
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|p| p.get("dependencies").and_then(|v| v.get("com.unity.test-framework")).is_some()), enforcer: None },
+];
+
+fn android_markers(m: &crate::stack::TestMarkers) -> bool {
+    ["build.gradle", "build.gradle.kts"].iter().any(|path| m.file(path) &&
+        (m.dir_named("androidTest") || m.text(path).is_some_and(|s| s.contains("connectedAndroidTest"))))
+}
+
+fn playwright_markers(m: &crate::stack::TestMarkers) -> bool {
+    m.root_config("playwright.config.") || m.text("package.json")
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .is_some_and(|p| ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"].iter()
+            .any(|key| p.get(key).and_then(|v| v.get("@playwright/test")).is_some()))
+}
+
+/// Advisory only; new enforcement requires a patron-approved plan. Called at prompt build.
+pub(crate) fn unplanned_runners(root: &Path) -> Vec<&'static str> {
+    let markers = crate::stack::TestMarkers::scan(root);
+    RUNNERS.iter().filter(|r| r.enforcer.is_none() && (r.markers)(&markers)).map(|r| r.name).collect()
+}
+
+/// Hook side: Some(deny answer) when a non-QA agent's shell command would run the whole suite.
+pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<String> {
+    let tool = body.get("tool_name").and_then(Value::as_str).unwrap_or("");
+    if !matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell") {
+        return None;
+    }
+    let input = body.get("tool_input")?;
+    // claude: a string; codex's shell tools may pass argv.
+    let command = match input.get("command").or_else(|| input.get("cmd"))? {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
+        _ => return None,
+    };
+    let cwd = body.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+    let reason = check(&command, cwd, 0)?;
+    let role: Option<String> = conn
+        .query_row("SELECT role_slug FROM agents WHERE id = ?1", [agent], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+        .flatten();
+    if role.as_deref() == Some("qa") {
+        return None;
+    }
+    Some(
+        json!({ "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason
+        }})
+        .to_string(),
+    )
+}
+
+/// Whether `command` (run in `cwd`) starts a full Playwright or Godot GUT suite.
+pub fn runs_full_suite(command: &str, cwd: Option<&Path>) -> bool {
+    check(command, cwd.map(Path::to_path_buf), 0).is_some()
+}
+
+fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8) -> Option<&'static str> {
+    for seg in segments(command) {
+        let words = strip_env(&seg);
+        if words.first().map(String::as_str) == Some("cd") {
+            // Only a relative/absolute literal dir; anything fancy drops the cwd (→ no script lookup).
+            cwd = match (words.get(1), &cwd) {
+                (Some(d), _) if Path::new(d).is_absolute() => Some(PathBuf::from(d)),
+                (Some(d), Some(c)) if !d.starts_with(['$', '~', '-']) => Some(c.join(d)),
+                _ => None,
+            };
+            continue;
+        }
+        for enforcer in RUNNERS.iter().filter_map(|r| r.enforcer.as_ref()) {
+            if (enforcer.recognises)(&words) {
+                return Some(enforcer.deny);
+            }
+        }
+        if depth < 3 {
+            if let Some((script, extra)) = script_call(&words) {
+                if let Some(body) = cwd.as_deref().and_then(|c| package_script(c, &script)) {
+                    // npm/pnpm/yarn append the extra args to the script's command line.
+                    let line = if extra.is_empty() { body } else { format!("{body} {}", extra.join(" ")) };
+                    if let Some(reason) = check(&line, cwd.clone(), depth + 1) {
+                        return Some(reason);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn unfiltered_gut(words: &[String]) -> bool {
+    let mut words = strip_env(words);
+    // Only literal `timeout <duration>` wrappers; unfamiliar options remain allowed.
+    while words.first().is_some_and(|w| w == "timeout") {
+        let Some(duration) = words.get(1) else { return false };
+        let number = duration.trim_end_matches(['s', 'm', 'h', 'd']);
+        if number.parse::<f64>().is_err() {
+            return false;
+        }
+        words = strip_env(&words[2..]);
+    }
+    let Some(exe) = words.first() else { return false };
+    let base = exe.rsplit(['/', '\\']).next().unwrap_or(exe).to_ascii_lowercase();
+    if !(matches!(base.as_str(), "godot" | "godot.exe" | "godot_console" | "godot_console.exe")
+        || base.starts_with("godot_v") && base.ends_with(".exe"))
+    {
+        return false;
+    }
+    let mut runner = false;
+    let mut broad_dir = false;
+    let mut recursive = false;
+    let mut engine_args = true;
+    let mut doctool = false;
+    let mut gdscript_docs = false;
+    let mut args = words[1..].iter();
+    while let Some(arg) = args.next() {
+        if matches!(arg.as_str(), "--" | "++") {
+            engine_args = false;
+        }
+        // Only an engine flag stops execution; script user arguments do not.
+        if engine_args && arg == "--check-only" {
+            return false;
+        }
+        if engine_args {
+            doctool |= arg == "--doctool";
+            gdscript_docs |= arg == "--gdscript-docs";
+        }
+        let (flag, value) = arg.split_once('=').unwrap_or((arg, ""));
+        match flag {
+            "-gtest" | "-gselect" | "-gunit_test_name" | "-h" | "--help" => return false,
+            "-s" | "--script" => {
+                let path = if value.is_empty() { args.next().map(String::as_str).unwrap_or("") } else { value };
+                let path = path.replace('\\', "/");
+                runner = matches!(path.as_str(), "addons/gut/gut_cmdln.gd" | "./addons/gut/gut_cmdln.gd" | "res://addons/gut/gut_cmdln.gd");
+                if !runner {
+                    return false;
+                }
+            }
+            "-gdir" => {
+                let dir = if value.is_empty() { args.next().map(String::as_str).unwrap_or("") } else { value };
+                if !matches!(dir.trim_end_matches('/'), "res://tests" | "res://tests/e2e") {
+                    return false;
+                }
+                broad_dir = true;
+            }
+            "-ginclude_subdirs" => recursive = value.is_empty() || value == "true",
+            _ => {}
+        }
+    }
+    // GDScript docs bypass the engine-doc early exit and can instantiate the script.
+    runner && broad_dir && recursive && (!doctool || gdscript_docs)
+}
+
+/// Shell-ish split into command segments (`&&`, `||`, `;`, `|`, `&`, newline), words unquoted.
+fn segments(command: &str) -> Vec<Vec<String>> {
+    let mut out = vec![Vec::new()];
+    let mut word = String::new();
+    let mut has_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = command.chars().peekable();
+    let flush = |out: &mut Vec<Vec<String>>, word: &mut String, has: &mut bool| {
+        if *has {
+            out.last_mut().unwrap().push(std::mem::take(word));
+            *has = false;
+        }
+    };
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                has_word = true;
+            }
+            // Escape only before a shell-special char; otherwise literal (Windows paths, PowerShell).
+            (None, '\\') => match chars.peek() {
+                Some('\n') => {
+                    chars.next();
+                }
+                Some(&n) if n.is_whitespace() || "\"'\\&|;()$`".contains(n) => {
+                    word.push(n);
+                    chars.next();
+                    has_word = true;
+                }
+                _ => {
+                    word.push('\\');
+                    has_word = true;
+                }
+            },
+            (None, c) if c.is_whitespace() && c != '\n' => flush(&mut out, &mut word, &mut has_word),
+            (None, '&' | '|' | ';' | '\n' | '(' | ')') => {
+                flush(&mut out, &mut word, &mut has_word);
+                if !out.last().unwrap().is_empty() {
+                    out.push(Vec::new());
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                has_word = true;
+            }
+        }
+    }
+    flush(&mut out, &mut word, &mut has_word);
+    out.retain(|s| !s.is_empty());
+    out
+}
+
+/// Drops leading `VAR=value` assignments and `env` / `cross-env` wrappers.
+fn strip_env(words: &[String]) -> Vec<String> {
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        let assign = w.split_once('=').is_some_and(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        if assign || w == "env" || w == "cross-env" {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    words[i..].to_vec()
+}
+
+fn is_playwright(word: &str) -> bool {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word).to_ascii_lowercase();
+    matches!(base.as_str(), "playwright" | "playwright.cmd" | "playwright.exe" | "playwright.ps1" | "cli.js")
+        // `node node_modules/playwright/cli.js` or `…/@playwright/test/cli.js`
+        && (base != "cli.js" || word.replace('\\', "/").contains("playwright/"))
+}
+
+/// Flags of `playwright test` that take a separate value (`--workers 1`), so that value is not
+/// mistaken for a spec filter.
+const VALUE_FLAGS: &[&str] = &[
+    "-c", "--config", "-j", "--workers", "--project", "--reporter", "--retries", "--timeout",
+    "--repeat-each", "--max-failures", "--output", "--shard", "--trace", "--grep-invert", "--global-timeout",
+    "--browser", "--update-snapshots", "--tsconfig", "--ignore-snapshots-dir",
+];
+
+/// `… playwright test …` in the segment with neither a positional filter nor a grep.
+fn unfiltered_playwright(words: &[String]) -> bool {
+    let Some(at) = words.windows(2).position(|w| is_playwright(&w[0]) && w[1] == "test") else {
+        return false;
+    };
+    let mut args = words[at + 2..].iter();
+    while let Some(a) = args.next() {
+        let a = a.as_str();
+        if a == "--" {
+            continue;
+        }
+        if matches!(a, "-g" | "--grep") || a.starts_with("--grep=") || a.starts_with("-g=") {
+            return false;
+        }
+        // Narrowed by something other than a spec: fine.
+        if matches!(a, "--last-failed" | "--only-changed" | "--list" | "-h" | "--help") || a.starts_with("--only-changed=") {
+            return false;
+        }
+        if VALUE_FLAGS.contains(&a) {
+            args.next();
+            continue;
+        }
+        if !a.starts_with('-') {
+            return false; // spec file / path filter
+        }
+    }
+    true
+}
+
+/// `npm run x …`, `npm test`, `pnpm [run] x …`, `yarn [run] x …`, `bun run x …` → (script, extra args).
+fn script_call(words: &[String]) -> Option<(String, Vec<String>)> {
+    let pm = words.first()?.rsplit(['/', '\\']).next()?.to_ascii_lowercase();
+    let pm = pm.trim_end_matches(".cmd").trim_end_matches(".exe");
+    let rest = &words[1..];
+    let (script, extra) = match (pm, rest.first().map(String::as_str)) {
+        ("npm", Some("run" | "run-script" | "rum" | "urn")) | ("pnpm" | "yarn" | "bun", Some("run")) => (rest.get(1)?.as_str(), &rest[2..]),
+        ("npm", Some("test" | "t" | "tst")) => ("test", &rest[1..]),
+        // Bare `pnpm e2e` / `yarn e2e`: a script name unless it is a flag; unknown builtins just
+        // find no such script in package.json.
+        ("pnpm" | "yarn", Some(s)) if !s.starts_with('-') => (s, &rest[1..]),
+        _ => return None,
+    };
+    if script.starts_with('-') {
+        return None;
+    }
+    let extra = extra.iter().skip_while(|a| *a == "--").cloned().collect();
+    Some((script.to_string(), extra))
+}
+
+fn package_script(dir: &Path, name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("package.json")).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("scripts")?.get(name)?.as_str().map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker_fixture(files: &[(&str, &str)], dirs: &[&str]) -> crate::projects::tests::Fixture {
+        let f = crate::projects::tests::Fixture::new();
+        for (path, body) in files {
+            let path = f.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        for path in dirs {
+            std::fs::create_dir_all(f.0.join(path)).unwrap();
+        }
+        f
+    }
+
+    #[test]
+    fn unplanned_runners_require_known_file_markers() {
+        for (files, dirs, name) in [
+            (vec![("build.gradle", "")], vec!["app/src/androidTest"], "Android (Gradle)"),
+            (vec![("build.gradle.kts", "tasks.named(\"connectedAndroidTest\")")], vec![], "Android (Gradle)"),
+            (vec![], vec![".maestro"], "Maestro"),
+            (vec![("wdio.conf.ts", "")], vec![], "WebdriverIO (Electron)"),
+            (vec![("jest.e2e.config.js", "")], vec![], "Jest/Vitest e2e"),
+            (vec![("vitest.config.integration.ts", "")], vec![], "Jest/Vitest e2e"),
+            (vec![("cypress.config.ts", "")], vec![], "Cypress"),
+            (vec![], vec!["integration_test"], "Flutter integration_test"),
+            (vec![("Packages/manifest.json", r#"{"dependencies":{"com.unity.test-framework":"1.0"}}"#)], vec!["Assets"], "Unity Test Framework"),
+        ] {
+            let f = marker_fixture(&files, &dirs);
+            assert_eq!(unplanned_runners(&f.0), vec![name], "{name}");
+        }
+        for (files, dirs) in [
+            (vec![("build.gradle", "")], vec![]),
+            (vec![], vec!["app/src/androidTest"]),
+            (vec![("jest.config.js", ""), ("vitest.config.ts", ""), ("e2e.txt", "cypress wdio Flutter")], vec![]),
+            (vec![("Packages/manifest.json", "{}")], vec!["Assets"]),
+            (vec![("Packages/manifest.json", r#"{"dependencies":{"com.unity.test-framework":"1"}}"#)], vec![]),
+        ] {
+            let f = marker_fixture(&files, &dirs);
+            assert!(unplanned_runners(&f.0).is_empty());
+        }
+    }
+
+    #[test]
+    fn registered_runner_markers_do_not_hide_unplanned_tools() {
+        for (files, dirs, name) in [
+            (vec![("playwright.config.ts", "")], vec![], "Playwright"),
+            (vec![("package.json", r#"{"devDependencies":{"@playwright/test":"1"}}"#)], vec![], "Playwright"),
+            (vec![("project.godot", "")], vec!["addons/gut"], "Godot GUT"),
+        ] {
+            let f = marker_fixture(&files, &dirs);
+            let runner = RUNNERS.iter().find(|r| r.name == name).unwrap();
+            assert!(runner.enforcer.is_some());
+            assert!((runner.markers)(&crate::stack::TestMarkers::scan(&f.0)), "{name}");
+            assert!(unplanned_runners(&f.0).is_empty());
+            std::fs::write(f.0.join("cypress.config.js"), "").unwrap();
+            assert_eq!(unplanned_runners(&f.0), vec!["Cypress"]);
+        }
+        for (files, dirs, name) in [
+            (vec![("package.json", r#"{"scripts":{"test":"playwright test"}}"#)], vec![], "Playwright"),
+            (vec![("project.godot", "")], vec![], "Godot GUT"),
+            (vec![], vec!["addons/gut"], "Godot GUT"),
+        ] {
+            let f = marker_fixture(&files, &dirs);
+            let runner = RUNNERS.iter().find(|r| r.name == name).unwrap();
+            assert!(!(runner.markers)(&crate::stack::TestMarkers::scan(&f.0)));
+        }
+        for (i, runner) in RUNNERS.iter().enumerate() {
+            assert!(!RUNNERS[..i].iter().any(|r| r.name == runner.name));
+        }
+    }
+
+    #[test]
+    fn marker_scan_ignores_nested_configs_heavy_dirs_and_deep_android_tests() {
+        let f = marker_fixture(&[("build.gradle", ""), ("nested/cypress.config.ts", "")], &["a/b/c/androidTest"]);
+        for dir in [".git", ".dex", "node_modules", "target", "build", "dist", ".gradle", ".godot", "Library", "Temp", "Pods", ".dart_tool"] {
+            std::fs::create_dir_all(f.0.join(dir).join("src/androidTest")).unwrap();
+        }
+        assert!(unplanned_runners(&f.0).is_empty());
+        std::fs::create_dir_all(f.0.join("app/src/androidTest")).unwrap();
+        assert_eq!(unplanned_runners(&f.0), vec!["Android (Gradle)"]);
+    }
+
+    fn full(cmd: &str) -> bool {
+        runs_full_suite(cmd, None)
+    }
+
+    #[test]
+    fn gut_full_suite() {
+        for exe in ["godot", "godot_console", "godot.exe", "godot_console.exe", "Godot_v4.5-stable_win64_console.exe", r"C:\Godot\godot_console.exe"] {
+            for prefix in ["", "timeout 1200 ", "CI=1 ", "env CI=1 timeout 1200 ", "timeout 20m env CI=1 ", "cross-env CI=1 "] {
+                for dir in ["res://tests", "res://tests/e2e/"] {
+                    let cmd = format!("{prefix}{exe} --headless --path . -s addons/gut/gut_cmdln.gd -gdir={dir} -ginclude_subdirs -gexit");
+                    assert!(full(&cmd), "{cmd}");
+                }
+            }
+        }
+        assert!(full(r#"& "C:\Program Files\Godot\Godot_v4.5.exe" --headless --script res://addons/gut/gut_cmdln.gd -gdir res://tests/e2e -ginclude_subdirs=true"#));
+    }
+
+    #[test]
+    fn gut_check_only_is_allowed() {
+        let cmd = "godot --headless --check-only -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
+        assert!(!full(cmd));
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let body = json!({ "tool_name": "exec_command", "tool_input": { "cmd": cmd } });
+        assert!(on_pre_tool(&c, "kaan", &body).is_none());
+        let broad = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
+        assert!(!full(&format!("timeout 1200 env CI=1 {broad} --check-only")));
+        assert!(full(&format!("{cmd} && {broad}")), "the next suite still runs");
+        for suffix in ["--check-only=false", "-- --check-only", "++ --check-only"] {
+            assert!(full(&format!("{broad} {suffix}")), "{suffix}");
+        }
+    }
+
+    #[test]
+    fn gut_doctool_is_allowed() {
+        let broad = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
+        for cmd in [format!("{broad} --doctool ."), format!("{broad} --doctool")] {
+            assert!(!full(&cmd), "{cmd}");
+        }
+        assert!(full(&format!("{broad} -- --doctool .")));
+        assert!(full(&format!("{broad} --doctool . --gdscript-docs res://")));
+        assert!(full(&format!("{broad} --export-release Linux .dex/tmp/game")));
+    }
+
+    #[test]
+    fn gut_selected_or_uncertain_runs_are_allowed() {
+        let broad = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
+        for selector in ["-gtest=res://tests/e2e/test_x.gd", "-gselect=test_x", "-gunit_test_name=test_jump", "-gtest res://tests/e2e/test_x.gd", "-gselect test_x", "-gunit_test_name test_jump", "-gtest=", "--help"] {
+            assert!(!full(&format!("{broad} {selector}")), "{selector}");
+        }
+        for cmd in [
+            "godot -s addons/gut/gut_cmdln.gd -gtest=res://tests/e2e/test_x.gd -gexit",
+            "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e",
+            "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs=false",
+            "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e/login -ginclude_subdirs",
+            "godot -s addons/gut/gut_cmdln.gd -gdir=$TEST_DIR -ginclude_subdirs",
+            "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests,res://other -ginclude_subdirs",
+            "godot -s addons/gut/gut_cmdln.gd -ginclude_subdirs",
+            "godot -s other.gd -gdir=res://tests -ginclude_subdirs",
+            "godot --headless -gdir=res://tests -ginclude_subdirs",
+            "other.exe -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs",
+            "timeout --signal=TERM 1200 godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs",
+            "echo godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs",
+        ] {
+            assert!(!full(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn gut_hook_denies_everyone_but_qa_with_file_example() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let cmd = "timeout 1200 godot_console.exe --headless --path . -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs -gexit";
+        for tool in ["Bash", "PowerShell", "shell", "exec_command", "local_shell"] {
+            let body = json!({ "tool_name": tool, "tool_input": { "cmd": cmd } });
+            for agent in ["kaan", "ayla", "timur", "unknown"] {
+                let out: Value = serde_json::from_str(&on_pre_tool(&c, agent, &body).expect(agent)).unwrap();
+                assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+                assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], DENY_GUT);
+            }
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "qa runs GUT");
+            let selected = json!({ "tool_name": tool, "tool_input": { "cmd": format!("{cmd} -gtest=res://tests/e2e/test_x.gd") } });
+            assert!(on_pre_tool(&c, "kaan", &selected).is_none());
+        }
+        let argv = json!({ "tool_name": "shell", "tool_input": { "command": ["godot", "-s", "addons/gut/gut_cmdln.gd", "-gdir=res://tests", "-ginclude_subdirs"] } });
+        assert!(on_pre_tool(&c, "kaan", &argv).is_some());
+    }
+
+    #[test]
+    fn direct_invocations() {
+        for c in [
+            "npx playwright test",
+            "npx playwright test --workers=2",
+            "npx playwright test --workers 1 --project chromium",
+            "pnpm exec playwright test --reporter=list",
+            "yarn playwright test",
+            "bunx playwright test -j 4",
+            "CI=1 npx playwright test",
+            "npx cross-env CI=1 playwright test",
+            "cd app && npx playwright test",
+            "npm run build && npx playwright test --trace on",
+            "./node_modules/.bin/playwright test",
+            r"node_modules\.bin\playwright.cmd test",
+            "node node_modules/@playwright/test/cli.js test",
+            "npx playwright test -- --workers=1",
+        ] {
+            assert!(full(c), "{c}");
+        }
+        for c in [
+            "npx playwright test tests/login.spec.ts",
+            "npx playwright test login --workers=1",
+            "npx playwright test --grep \"giriş akışı\"",
+            "npx playwright test -g login",
+            "npx playwright test --grep=@smoke",
+            "npx playwright test --workers 1 e2e/dock.spec.ts",
+            "npx playwright test --last-failed",
+            "npx playwright test --list",
+            "npx playwright show-report",
+            "npx playwright install chromium",
+            "echo 'npx playwright test'",
+            "grep -r \"playwright test\" docs",
+            "cargo test --workspace",
+            "npx vitest run",
+        ] {
+            assert!(!full(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn package_scripts() {
+        let dir = std::env::temp_dir().join(format!("dex-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("web")).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{ "scripts": {
+                "e2e": "playwright test --workers=2",
+                "test:e2e": "npm run build && npx playwright test",
+                "test": "npm run e2e",
+                "e2e:smoke": "playwright test --grep @smoke",
+                "unit": "vitest run"
+            } }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("web/package.json"), r#"{ "scripts": { "e2e": "playwright test" } }"#).unwrap();
+        let full = |c: &str| runs_full_suite(c, Some(&dir));
+        for c in ["npm run e2e", "pnpm e2e", "pnpm run test:e2e", "yarn e2e", "bun run e2e", "npm test", "npm t", "cd web && npm run e2e", "npm run e2e -- --project=chromium"] {
+            assert!(full(c), "{c}");
+        }
+        for c in [
+            "npm run e2e -- tests/x.spec.ts",
+            "pnpm e2e tests/x.spec.ts",
+            "npm run e2e -- --grep login",
+            "pnpm run test:e2e -- -g login",
+            "npm run e2e:smoke",
+            "npm run unit",
+            "pnpm install",
+            "npm run nope",
+        ] {
+            assert!(!full(c), "{c}");
+        }
+        // No cwd → scripts can't be resolved: allowed (documented miss, not a false positive).
+        assert!(!runs_full_suite("npm run e2e", None));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_denies_everyone_but_qa() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let body = json!({ "tool_name": "Bash", "tool_input": { "command": "npx playwright test" } });
+        for agent in ["kaan", "ayla", "timur"] {
+            let out: Value = serde_json::from_str(&on_pre_tool(&c, agent, &body).expect(agent)).unwrap();
+            assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("QA'ya bırak"));
+        }
+        assert!(on_pre_tool(&c, "bora", &body).is_none(), "qa runs the suite");
+        let spec = json!({ "tool_name": "Bash", "tool_input": { "command": "npx playwright test a.spec.ts" } });
+        assert!(on_pre_tool(&c, "kaan", &spec).is_none());
+        let other = json!({ "tool_name": "Write", "tool_input": { "command": "npx playwright test" } });
+        assert!(on_pre_tool(&c, "kaan", &other).is_none());
+        let argv = json!({ "tool_name": "shell", "tool_input": { "command": ["npx", "playwright", "test"] } });
+        assert!(on_pre_tool(&c, "kaan", &argv).is_some());
+    }
+}

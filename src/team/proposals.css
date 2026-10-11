@@ -1,0 +1,33 @@
+/* DEX-22: patron approval cards for leaders' member proposals (bottom-right, above the stage). */
+.proposals {
+  position: fixed; right: var(--sp-4); bottom: var(--sp-4); z-index: var(--z-patron);
+  display: flex; flex-direction: column; gap: var(--sp-2); width: 320px; max-width: calc(100vw - 32px);
+}
+.proposal {
+  padding: 10px var(--sp-3); display: flex; flex-direction: column; gap: 6px;
+  background: var(--surface-pop); border-radius: var(--r-lg);
+  box-shadow: var(--shadow-pop), inset 3px 0 0 var(--red);
+  font-size: var(--fs-sm); user-select: text;
+  animation: card-pop var(--dur-pop) var(--spring); /* Modern §2 (App.css) */
+}
+@media (prefers-reduced-motion: reduce) { .proposal { animation: none; } }
+.proposal h4 { margin: 0; font-size: var(--fs-sm); font-weight: var(--fw-semibold); display: flex; align-items: center; gap: var(--sp-2); }
+.proposal-team { color: var(--muted); font-weight: var(--fw-regular); margin-left: auto; }
+.proposal-who, .proposal-reason { margin: 0; }
+.proposal-model { margin-left: 6px; color: var(--muted); font-family: var(--font-mono); font-size: var(--fs-xs); }
+.proposal-reason { color: var(--text-2); white-space: pre-wrap; border-left: 2px solid var(--line-strong); padding-left: var(--sp-2); }
+.proposal label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: var(--fs-xs); }
+.proposal input {
+  font-size: var(--fs-sm); color: var(--text); height: var(--ctl-h);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 0 var(--sp-2);
+}
+.proposal input:hover { border-color: var(--line-strong); }
+.proposal-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.proposal-actions button {
+  height: var(--ctl-h); font-size: var(--fs-sm); font-weight: var(--fw-medium); padding: 0 var(--sp-3); cursor: pointer; color: var(--text);
+  background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.proposal-actions button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--press); }
+.proposal-actions button.primary { background: var(--red); border-color: transparent; color: var(--on-accent); }
+.proposal-actions button.primary:hover:not(:disabled) { background: var(--red-hi); }
+.proposal-actions button:disabled { opacity: 0.45; cursor: default; }

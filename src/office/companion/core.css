@@ -1,0 +1,66 @@
+/* #243: Core strip on the leader pane (design #236 §4): 40px row above the view toggle; compact 24px. */
+.core-strip {
+  display: flex; align-items: center; gap: var(--sp-2); flex: none; height: 40px; min-width: 0;
+  padding: 0 var(--sp-2) 0 var(--sp-1); background: var(--surface-2); border-bottom: 1px solid var(--line);
+}
+.core-strip.compact { height: 24px; gap: var(--sp-1); }
+.core-face { flex: none; display: block; }
+.core-say {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-2); font-size: var(--fs-sm);
+}
+.core-say b { color: var(--text); font-weight: var(--fw-semibold); }
+.core-strip[data-state="error"] .core-say { color: var(--red-hi); }
+.core-strip .sr-only, .core-balloon .sr-only {
+  position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+/* 24×24 minimum targets (WCAG 2.2 AA 2.5.8). */
+.core-btn {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 24px; padding: 0; border: 0; border-radius: var(--r-sm);
+  background: none; color: var(--muted); cursor: pointer;
+}
+.core-btn svg { width: 13px; height: 13px; }
+.core-btn:hover:not(:disabled) { color: var(--text); background: var(--hover); }
+.core-btn:disabled { opacity: 0.4; cursor: default; }
+.core-ask {
+  flex: none; height: 24px; min-width: 24px; padding: 0 var(--sp-2); cursor: pointer;
+  border: 1px solid var(--amber-line); border-radius: var(--r-pill); background: var(--amber-soft);
+  color: var(--amber); font: var(--fw-semibold) var(--fs-xs) / 1 var(--font-mono);
+}
+.core-ask:hover { border-color: var(--amber); }
+.core-strip button:focus-visible, .core-balloon button:focus-visible, .core-balloon input:focus-visible {
+  outline: 2px solid var(--pcb-provider); outline-offset: 1px;
+}
+
+/* Balloon: in the flow under the strip (pushes the pane body, never covers the terminal); max 220px. */
+.core-balloon { position: relative; flex: none; margin: 8px var(--sp-2) var(--sp-2); }
+/* Modern §2: opens with the spring from its tail (card-pop in App.css). */
+.core-balloon { animation: card-pop var(--dur-pop) var(--spring); transform-origin: 19px 0; }
+@media (prefers-reduced-motion: reduce) { .core-balloon { animation: none; } }
+/* Tail up towards Core (the strip's left end). */
+.core-balloon::before {
+  content: ""; position: absolute; z-index: 1; top: -5px; left: 14px; width: 10px; height: 10px; transform: rotate(45deg);
+  background: var(--surface-pop); border-left: 1px solid var(--line-strong); border-top: 1px solid var(--line-strong);
+}
+.core-balloon-body {
+  display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow: auto;
+  background: var(--surface-pop); border: 1px solid var(--line-strong); border-radius: var(--r-md);
+}
+.core-pager {
+  display: flex; align-items: center; justify-content: flex-end; gap: 2px; padding: 2px var(--sp-1) 0;
+  color: var(--muted); font: var(--fs-xs) var(--font-mono); margin-bottom: -4px;
+}
+/* The card is the corner card's (proposals.css), flattened into the balloon. */
+.core-card .proposal { box-shadow: inset 3px 0 0 var(--amber); background: none; border-radius: 0; }
+.core-card .ask-options { flex-direction: column; align-items: stretch; }
+.core-card .ask-options button { text-align: left; }
+.core-card [data-key]:not([data-key="Enter"])::before {
+  content: attr(data-key); margin-right: 6px; padding: 0 4px; border: 1px solid var(--line-strong); border-bottom-width: 2px;
+  border-radius: var(--r-xs); font: var(--fs-xs) var(--font-mono); color: var(--text-2); text-transform: uppercase;
+}
+.core-keys { margin: 0; padding: 0 var(--sp-3) var(--sp-2); color: var(--muted); font-size: var(--fs-xs); }
+.core-keys kbd {
+  font: var(--fs-xs) var(--font-mono); padding: 0 4px; color: var(--text-2);
+  border: 1px solid var(--line-strong); border-bottom-width: 2px; border-radius: var(--r-xs);
+}
