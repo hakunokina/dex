@@ -1824,7 +1824,7 @@ mod permit_tests {
         };
         let decision = |v: Option<Value>| v.unwrap()["hookSpecificOutput"]["decision"].clone();
         phase.set("safe tool decision");
-        assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "cargo test -p x" })))["behavior"], "allow");
+        assert_eq!(decision(ask("kaan", "Bash", serde_json::json!({ "command": "cargo test -p x permit" })))["behavior"], "allow");
         phase.set("hard denial decision");
         let d = decision(ask("kaan", "Bash", serde_json::json!({ "command": "cargo test && git push" })));
         assert_eq!(d["behavior"], "deny");

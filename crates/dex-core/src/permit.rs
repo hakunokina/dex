@@ -522,6 +522,10 @@ struct Lexed {
     syntax: bool,
 }
 
+pub(crate) fn command_words(command: &str) -> Vec<Vec<String>> {
+    lex(command, None).segs.into_iter().map(|s| s.words).collect()
+}
+
 fn lex(command: &str, d: Option<Dialect>) -> Lexed {
     let mut segs = vec![Seg::default()];
     let mut dynamic = false;
@@ -955,8 +959,8 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
     }
-    if !ctx.qa && crate::test_budget::runs_full_suite(command, ctx.cwd.as_deref()) {
-        verdicts.push(Verdict::Deny(crate::test_budget::DENY.into()));
+    if let Some(reason) = crate::test_budget::full_suite_denial(command, ctx.cwd.as_deref()).filter(|_| !ctx.qa) {
+        verdicts.push(Verdict::Deny(reason.into()));
     }
     // #495: a worker's allow needs `parsed` below, which reads no `$` (but PowerShell's `>$null`),
     // backtick, substitution or here-document — what `lex` calls dynamic is its to judge.
@@ -2981,10 +2985,10 @@ mod tests {
         assert!(matches!(run("Bash", "echo x > /tmp/out.txt"), Verdict::Deny(_)));
         // Everyday work.
         for (tool, cmd) in [
-            ("Bash", "cargo test -p dex-core --lib"),
+            ("Bash", "cargo test -p dex-core --lib permit"),
             ("Bash", "cargo check"),
             ("Bash", "cargo clippy -p dex-core -- -D warnings"),
-            ("Bash", "cd crates/dex-core && cargo test 2>&1 | tail -20"),
+            ("Bash", "cd crates/dex-core && cargo test permit 2>&1 | tail -20"),
             ("Bash", "npm test"),
             ("Bash", "npm run build"),
             ("Bash", "npx tsc --noEmit && npm test"),
@@ -2999,7 +3003,7 @@ mod tests {
             ("Bash", "rg -n 'fn main' crates | head -5"),
             ("Bash", "cat Cargo.toml | grep version"),
             ("Bash", "ls -la src"),
-            ("PowerShell", "cargo test -p dex-core --lib 2>&1 | Select-Object -Last 20"),
+            ("PowerShell", "cargo test -p dex-core --lib permit 2>&1 | Select-Object -Last 20"),
             ("PowerShell", "npm run build"),
             ("PowerShell", "npx tsc --noEmit; npm test"),
             ("PowerShell", "git add -A; git commit -m \"fix: x — y\""),
@@ -3007,7 +3011,7 @@ mod tests {
             ("PowerShell", "Get-Content src/a.rs | Select-Object -First 5"),
             ("PowerShell", "Get-ChildItem src"),
             ("PowerShell", "cargo build *> build.log"),
-            ("PowerShell", "& cargo test"),
+            ("PowerShell", "& cargo test permit"),
         ] {
             assert_eq!(run(tool, cmd), Verdict::Allow, "{tool}: {cmd}");
         }
@@ -3055,7 +3059,7 @@ mod tests {
     #[test]
     fn safe_commands_are_allowed() {
         for c in [
-            "cargo test -p dex-core --lib",
+            "cargo test -p dex-core --lib permit",
             "cargo clippy -p dex-core -- -D warnings",
             "cargo +nightly fmt",
             "git status --short",
@@ -3067,7 +3071,7 @@ mod tests {
             "ls -la src | grep ts",
             "rg -n 'fn main' crates",
             "cat Cargo.toml",
-            "cd crates/dex-core && cargo test 2>&1 | tail -20",
+            "cd crates/dex-core && cargo test permit 2>&1 | tail -20",
             "cargo build > build.log",
             "echo hi > /dev/null",
             "npx playwright test tests/x.spec.ts --workers=1",
@@ -3368,7 +3372,7 @@ mod tests {
         let v = bash("cat > /c/w/proj/src/Snip.tsx <<'EOF'\nx\nEOF");
         assert!(matches!(&v, Verdict::Leader(_)), "{v:?}");
         for c in [
-            "cd /c/w/proj && cargo test",
+            "cd /c/w/proj && cargo test permit",
             "cd /c/w/proj/crates; git status",
             "echo x > /c/w/proj/out.txt",
             "echo x > /C/w/proj/out.txt",
@@ -3504,7 +3508,7 @@ mod tests {
         for c in ["echo x >&../out.txt", "echo x >& ../out.txt", "echo x 1<>../out.txt", "cat <> ../out", "ls 2>&1 >&../o"] {
             deny(c);
         }
-        for c in ["cargo test 2>&1 | tail -20", "echo x >&2", "echo x 1>&2", "ls >&-", "echo x >&out.txt", "cat <>out.txt", "ls 2>&1>out.txt"] {
+        for c in ["cargo test permit 2>&1 | tail -20", "echo x >&2", "echo x 1>&2", "ls >&-", "echo x >&out.txt", "cat <>out.txt", "ls 2>&1>out.txt"] {
             allow(c);
         }
     }
@@ -3521,7 +3525,7 @@ mod tests {
             "GIT_EXTERNAL_DIFF=./x.sh git diff",
             "NODE_OPTIONS='--require ./x.js' pnpm test",
             "RUSTC_WRAPPER=./w cargo build",
-            "env cargo test",
+            "env cargo test permit",
             "CDPATH=/c cd x",
             "PATH=.",
             "PATH=. ; ls",
@@ -3624,7 +3628,7 @@ mod tests {
         assert_eq!(decide("ToolSearch", &json!({ "query": "select:mcp__dex__report" }), &reviewer), Verdict::Allow);
         // What the policy allows a worker but changes the repo or the disk: a hard no for the reviewer.
         for c in ["git commit -m x", "git add src/a.rs", "git branch topic", "echo x > f", "echo x >> f", "cat a.rs > b.rs",
-            "cargo test -p dex-core", "pnpm test", "npx tsc --noEmit", "npx playwright test e2e/a.spec.ts",
+            "cargo test -p dex-core permit", "pnpm test", "npx tsc --noEmit", "npx playwright test e2e/a.spec.ts",
             "(git commit -m x)", "(echo x > f)", "git diff && git commit -am x", "git push https://example.com/r.git HEAD:dev"] {
             assert!(matches!(run(c, &reviewer), Verdict::Deny(_)), "{c}: {:?}", run(c, &reviewer));
             assert!(!matches!(run(c, &worker), Verdict::Deny(_)) || c.starts_with("git push"), "{c}: {:?}", run(c, &worker));
