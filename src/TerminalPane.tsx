@@ -146,7 +146,10 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
             setLost(true);
           } else if (!freshRef.current) term!.write("\r\n\x1b[90m— oturum kapandı —\x1b[0m\r\n");
         },
-        onReattach: () => resumed(term!, size),
+        onReattach: () => {
+          runningRef.current = true;
+          resumed(term!, size);
+        },
       };
       sinkRef.current = sink;
       // Unmount only detaches the view; after a full reload the backend snapshot paints first.

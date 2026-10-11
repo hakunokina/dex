@@ -18,6 +18,8 @@ export interface DexEvent<T> {
 export type Unlisten = () => void;
 
 export interface PtyHandlers {
+  /** Identity of the attached process, before its snapshot or any queued output. */
+  onGeneration?: (generation?: number) => void;
   onData: (bytes: Uint8Array) => void;
   /** The process ended (or, remote, can no longer be reached). #206 `lost`: the socket came back
    *  and the core no longer has it — it went with the core (a restart), nothing on screen is live. */
@@ -36,6 +38,7 @@ export interface PtyInfo {
   rows: number;
   alive: boolean;
   startedAt: number;
+  generation?: number;
 }
 
 interface PtySnapshot {
@@ -50,6 +53,7 @@ interface PtySnapshot {
 interface PtyAttachment {
   subscriber: number;
   snapshot: PtySnapshot;
+  generation?: number;
 }
 
 export type DetachPty = () => Promise<void>;
@@ -112,6 +116,7 @@ export class TauriTransport implements Transport {
     const onExit = new Channel<null>();
     onExit.onmessage = () => queue.deliver(() => h.onExit());
     const attachment = await invoke<PtyAttachment>("pty_attach", { id, onData, onExit });
+    h.onGeneration?.(attachment.generation);
     queue.flush(() => paintSnapshot(attachment.snapshot, h));
     return async () => void (await invoke("pty_detach", { id, subscriber: attachment.subscriber }));
   }
@@ -333,6 +338,7 @@ export class WsTransport implements Transport {
       c.queue = new PtySnapshotQueue();
       await this.request<PtyAttachment>("pty.attach", { id: c.id, channel })
         .then((attachment) => {
+          c.h.onGeneration?.(attachment.generation);
           c.queue.flush(() => {
             c.h.onData(RESET);
             paintSnapshot(attachment.snapshot, c.h);
@@ -395,6 +401,7 @@ export class WsTransport implements Transport {
     this.byId.set(id, channel);
     try {
       const attachment = await this.call<PtyAttachment>("pty.attach", { id, channel });
+      h.onGeneration?.(attachment.generation);
       c.queue.flush(() => paintSnapshot(attachment.snapshot, h));
     } catch (e) {
       this.chans.delete(channel);

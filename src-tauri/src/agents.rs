@@ -12,7 +12,7 @@ pub fn agent_start(
 }
 
 #[tauri::command]
-pub fn agent_status_list(core: State<CoreState>) -> Vec<dex_core::agents::State> {
+pub fn agent_status_list(core: State<CoreState>) -> Vec<dex_core::agents::PtyState> {
     core.agent_status_list()
 }
 

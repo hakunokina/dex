@@ -15,6 +15,10 @@ use crate::Core;
 pub struct PtyInput(Arc<Mutex<Box<dyn Write + Send>>>);
 
 impl PtyInput {
+    pub(crate) fn same_transport(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(crate) fn write(&self, data: &[u8]) -> Result<(), String> {
         let mut writer = self.0.lock().map_err(|_| "PTY input kilidi zehirli")?;
         writer.write_all(data).map_err(|e| e.to_string())?;
@@ -90,6 +94,8 @@ pub struct PtyInfo {
     pub rows: u16,
     pub alive: bool,
     pub started_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +103,8 @@ pub struct PtyInfo {
 pub struct Attachment {
     pub subscriber: SubscriberId,
     pub snapshot: Snapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 /// Live sessions by PTY id (= agent id). Clones share the map.
@@ -104,7 +112,7 @@ pub struct Attachment {
 pub struct Ptys {
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     /// At most one finished stream per registered agent, replaced on spawn and cleared on deletion.
-    finished: Arc<Mutex<HashMap<String, Arc<PtyStream>>>>,
+    finished: Arc<Mutex<HashMap<String, (u64, Arc<PtyStream>)>>>,
     /// Retired jobs remain visible here until resource release, including deadline overruns.
     teardowns: Arc<Teardowns>,
     owner: std::sync::Weak<Core>,
@@ -571,7 +579,7 @@ impl Ptys {
         }
         let session = map.remove(id)?;
         if session.replay {
-            self.finished.lock().unwrap().insert(id.to_string(), session.stream.clone());
+            self.finished.lock().unwrap().insert(id.to_string(), (session.gen, session.stream.clone()));
         }
         Some(session)
     }
@@ -752,6 +760,7 @@ impl Ptys {
                 rows: s.rows,
                 alive: true,
                 started_at: s.started_at,
+                generation: Some(s.gen),
             })
             .collect();
         result.sort_by(|a, b| a.id.cmp(&b.id));
@@ -759,24 +768,24 @@ impl Ptys {
     }
 
     pub fn attach(&self, id: &str, sink: impl PtySink) -> Result<Attachment, String> {
-        let (stream, finished) = {
+        let (gen, stream, finished) = {
             let map = self.sessions.lock().unwrap();
-            map.get(id).map(|s| (s.stream.clone(), false))
-                .or_else(|| self.finished.lock().unwrap().get(id).cloned().map(|s| (s, true)))
+            map.get(id).map(|s| (s.gen, s.stream.clone(), false))
+                .or_else(|| self.finished.lock().unwrap().get(id).cloned().map(|(gen, s)| (gen, s, true)))
                 .ok_or("no session")?
         };
         if finished {
             stream.limit_scrollback(FINISHED_SCROLLBACK_LINES);
         }
         let (subscriber, snapshot) = stream.attach(sink)?;
-        Ok(Attachment { subscriber, snapshot })
+        Ok(Attachment { subscriber, snapshot, generation: Some(gen) })
     }
 
     pub fn detach(&self, id: &str, subscriber: SubscriberId) -> bool {
         let stream = {
             let map = self.sessions.lock().unwrap();
             map.get(id).map(|s| s.stream.clone())
-                .or_else(|| self.finished.lock().unwrap().get(id).cloned())
+                .or_else(|| self.finished.lock().unwrap().get(id).map(|(_, s)| s.clone()))
         };
         stream.is_some_and(|stream| stream.detach(subscriber))
     }
@@ -1063,6 +1072,54 @@ mod tests {
     }
 
     #[test]
+    fn early_teardown_replacement_attachment_identifies_new_generation() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::early_teardown_replacement_attachment_identifies_new_generation") { return; }
+        #[derive(Clone, Default)]
+        struct Output(Arc<Mutex<Vec<u8>>>, Exited);
+        impl PtySink for Output {
+            fn data(&mut self, bytes: &[u8]) -> bool { self.0.lock().unwrap().extend_from_slice(bytes); true }
+            fn exit(&mut self) { self.1.exit(); }
+        }
+        let ptys = Ptys::default();
+        let old = Arc::new(PtyStream::default());
+        let (release_tx, release_rx) = mpsc::channel();
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let mut session = replay_session(0, old.clone());
+        session.reader_done = Some(drained_rx);
+        ptys.insert("kaan".into(), session);
+        let old_output = Output::default();
+        ptys.attach("kaan", old_output.clone()).unwrap();
+        let reader = {
+            let old = old.clone();
+            std::thread::spawn(move || {
+                release_rx.recv_timeout(Duration::from_secs(6)).unwrap();
+                old.publish(b"LATE_OLD_OUTPUT");
+                old.close();
+                drained_tx.send(()).unwrap();
+            })
+        };
+        assert!(ptys.kill("kaan"));
+        let new = Arc::new(PtyStream::default());
+        ptys.insert("kaan".into(), replay_session(1, new.clone()));
+        let output = Output::default();
+        let attachment = ptys.attach("kaan", output.clone()).unwrap();
+        new.publish(b"NEW_OUTPUT");
+        assert_eq!(*output.0.lock().unwrap(), b"NEW_OUTPUT");
+        assert!(!old_output.1.0.load(Ordering::SeqCst), "old reader is still held");
+        release_tx.send(()).unwrap();
+        reader.join().unwrap();
+        wait_teardowns(&ptys, HashMap::is_empty);
+        assert!(old_output.1.0.load(Ordering::SeqCst));
+        assert!(!output.1.0.load(Ordering::SeqCst), "old exit cannot end the replacement stream");
+        assert_eq!(serde_json::to_value(&attachment).unwrap()["generation"], 1);
+        assert_eq!(serde_json::to_value(&ptys.list()[0]).unwrap()["generation"], 1);
+        new.close();
+        ptys.kill("kaan");
+        wait_teardowns(&ptys, HashMap::is_empty);
+    }
+
+    #[test]
     fn early_teardown_never_answers_into_a_replacement() {
         use std::sync::mpsc;
         if isolated_lock_test("pty::tests::early_teardown_never_answers_into_a_replacement") { return; }
@@ -1078,16 +1135,24 @@ mod tests {
         let mut session = replay_session(1, old.clone());
         session.writer = Arc::new(Mutex::new(Box::new(Reply(old_tx))));
         core.ptys.insert("kaan".into(), session);
+        let _old_watch = crate::agents::watch_resume_for_test(&core, "kaan", "saved-old");
         old.subscribe(crate::agents::shell_sink_for_test(&core, "kaan", Exited::default())).unwrap();
+        let mut old_tail = crate::agents::shell_sink_for_test(&core, "kaan", Exited::default());
+        old_tail.data(b"No conversation");
         old.publish(b"\x1b[");
         assert!(core.ptys.kill("kaan"));
         let new = Arc::new(PtyStream::default());
         let mut session = replay_session(2, new.clone());
         session.writer = Arc::new(Mutex::new(Box::new(Reply(new_tx))));
         core.ptys.insert("kaan".into(), session);
+        let new_watch = crate::agents::watch_resume_for_test(&core, "kaan", "saved-new");
         old.publish(b"6n");
         assert_eq!(old_rx.recv_timeout(Duration::from_secs(2)).unwrap(), b"\x1b[1;1R");
         assert_eq!(new_rx.try_recv(), Err(mpsc::TryRecvError::Empty), "late reply must not enter the replacement input");
+        old_tail.data(b" found");
+        new_watch();
+        old.publish(b"No saved session found");
+        new_watch();
         assert!(core.ptys.retire("kaan", Some(1)).is_none(), "old waiter cannot claim a second exit or the replacement");
         assert_eq!(core.ptys.generation("kaan"), Some(2));
         core.ptys.write("kaan", b"USER_INPUT").unwrap();
@@ -1302,6 +1367,32 @@ mod tests {
         assert!(String::from_utf8_lossy(&attachment.snapshot.bytes()).contains("RX:FAST_FINAL_OUTPUT"));
         assert!(exited.0.load(Ordering::SeqCst));
         assert!(ptys.write("kaan", b"input").is_err());
+    }
+
+    #[test]
+    fn finished_attach_is_capped_while_reader_is_draining() {
+        use std::sync::mpsc;
+        if isolated_lock_test("pty::tests::finished_attach_is_capped_while_reader_is_draining") { return; }
+        let ptys = Ptys::default();
+        let stream = Arc::new(PtyStream::new(2, 40, 10_000));
+        let output: String = (0..3_005).map(|i| format!("line-{i:04}\r\n")).collect();
+        stream.publish(output.as_bytes());
+        stream.publish(b"\x1b[31");
+        let (drained_tx, drained_rx) = mpsc::channel();
+        let mut session = replay_session(0, stream.clone());
+        session.reader_done = Some(drained_rx);
+        ptys.insert("kaan".into(), session);
+        assert!(ptys.kill("kaan"));
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        let history = String::from_utf8(snapshot.scrollback).unwrap();
+        assert_eq!(history.lines().filter(|line| line.starts_with("line-")).count(), 2_000, "retired replay is capped before EOF too");
+        assert!(!history.contains("line-0000"));
+        stream.publish(b"mTAIL");
+        stream.close();
+        drained_tx.send(()).unwrap();
+        wait_teardowns(&ptys, HashMap::is_empty);
+        let snapshot = ptys.attach("kaan", Exited::default()).unwrap().snapshot;
+        assert!(String::from_utf8_lossy(&snapshot.ansi).contains("\x1b[31mTAIL"), "capping the snapshot preserves the unfinished parser sequence");
     }
 
     #[test]
