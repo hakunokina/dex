@@ -23,7 +23,7 @@ test.after(() => { globalThis.OffscreenCanvas = originalOffscreenCanvas; });
 const palette: CorePalette = { tokens: { "--red-hi": "#ff0000" }, chip: "#111111", chipTop: "#222222", pin: "#777777", via: "#555555", badgeBg: "#080808", mouth: "#eeeeee", z: "#666666" };
 const frame: CoreXLFrame = { t: 0, age: 5000, from: null, pupil: { x: 4, y: 0 }, lid: 0, hover: 0, reduced: false, provider: null, boot: 0, boardBg: "#111111", edge: "#333333", mono: "monospace" };
 
-function record(id: keyof typeof LOOKS, overrides: Partial<CoreXLFrame> = {}, palettes = [palette]) {
+function record(id: keyof typeof LOOKS, overrides: Partial<CoreXLFrame> = {}, palettes = [palette], texture: ImageBitmap | null = null, size = 120) {
   type Op = { name: string; args: number[] };
   const fills: { color: unknown; path: Op[] }[] = [], strokes: { color: unknown; path: Op[] }[] = [];
   const rects: number[][] = [];
@@ -55,9 +55,22 @@ function record(id: keyof typeof LOOKS, overrides: Partial<CoreXLFrame> = {}, pa
     fill() { fills.push({ color: this.fillStyle, path: [...path] }); },
     stroke() { strokes.push({ color: this.strokeStyle, path: [...path] }); },
   };
-  for (const pal of palettes) drawCoreXL(ctx as unknown as CanvasRenderingContext2D, 100, 100, 120, LOOKS[id], { ...frame, ...overrides }, pal);
+  for (const pal of palettes) drawCoreXL(ctx as unknown as CanvasRenderingContext2D, 100, 100, size, LOOKS[id], { ...frame, ...overrides }, pal, texture);
   return { ctx: ctx as unknown as CanvasRenderingContext2D, fills, strokes, rects, scales, gradients, images };
 }
+
+test("XL texture is clipped below unchanged eyes/marks and stays with reduced motion; tiny bodies fall back", () => {
+  const texture = { width: 128, height: 128 } as ImageBitmap;
+  for (const reduced of [false, true]) {
+    const drawn = record("idle", { reduced }, [palette], texture);
+    assert.equal(drawn.images.filter(image => image.surface === texture).length, 1);
+    assert.equal(drawn.images[1].beforeFills, 0);
+    assert.ok(drawn.fills.some(fill => fill.color === "#ff0000"));
+    assert.ok(drawn.strokes.some(stroke => stroke.color === palette.mouth));
+  }
+  assert.equal(record("idle", {}, [palette], texture, 39).images.length, 1);
+  assert.ok(record("idle").fills.some(fill => typeof fill.color === "object"));
+});
 
 test("all eight XL expressions draw one centred red eye and preserve the mouth", () => {
   for (const id of Object.keys(LOOKS) as (keyof typeof LOOKS)[]) {
