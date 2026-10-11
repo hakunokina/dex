@@ -2679,6 +2679,22 @@ mod tests {
     }
 }
 
+/// Shell fixtures still have to service ConPTY's cursor-inheritance query. Discarding it can
+/// block ClosePseudoConsole on windows-2022; use the same terminal replies as agent sessions.
+#[cfg(test)]
+fn shell_sink_for_test(core: &crate::Core, id: &str, sink: impl crate::PtySink) -> impl crate::PtySink {
+    struct ShellSink<S> { terminal: AgentSink, inner: S }
+    impl<S: crate::PtySink> crate::PtySink for ShellSink<S> {
+        fn data(&mut self, bytes: &[u8]) -> bool {
+            self.terminal.data(bytes);
+            self.inner.data(bytes)
+        }
+        fn exit(&mut self) { self.inner.exit(); }
+        fn resized(&mut self, cols: u16, rows: u16) { self.inner.resized(cols, rows); }
+    }
+    ShellSink { terminal: AgentSink { core: core.weak_self.clone(), id: id.into(), tail: String::new() }, inner: sink }
+}
+
 /// #18: a job queued while the patron had a draft goes once the draft ends — event-driven, once.
 #[cfg(test)]
 mod draft_tests {
@@ -2692,6 +2708,39 @@ mod draft_tests {
     }
 
     #[test]
+    fn shell_fixture_answers_conpty_cursor_query() {
+        use std::{io::Write, sync::{Arc, Mutex}};
+        struct Input {
+            original: Box<dyn Write + Send>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let written = self.original.write(bytes)?;
+                self.bytes.lock().unwrap().extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+            fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("dex-cursor-{}", std::process::id()));
+        let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
+        let mut sink = super::shell_sink_for_test(&core, "kaan", Sink);
+        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", Sink)).unwrap();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        core.ptys.input_writer_for_test("kaan", |original| Box::new(Input { original, bytes: bytes.clone() }));
+        // portable-pty requests cursor inheritance even when the child is just a shell.
+        // Older Windows ConPTY waits for this reply when ClosePseudoConsole is called.
+        assert!(sink.data(b"\x1b[6n"));
+        let reply = bytes.lock().unwrap().clone();
+        core.ptys.kill("kaan");
+        core.shutdown();
+        drop(core);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(reply.ends_with(b"\x1b[1;1R"), "the shell fixture must service cursor inheritance: {reply:?}");
+    }
+
+    #[test]
     fn emptied_draft_delivers_the_queued_job_after_the_quiet_window_once() {
         let root = std::env::temp_dir().join(format!("dex-draft-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2699,7 +2748,7 @@ mod draft_tests {
             .unwrap();
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
-        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink)
+        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", Sink))
             .unwrap();
         // The patron's session (Görev #20: a Dex session would be replaced, not pasted into).
         core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({ "prompt": "patron" }), false);
@@ -2765,7 +2814,8 @@ mod draft_tests {
         for id in ["kaan", "ayla", "timur"] {
             let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
             let spawn = pty::Spawn { id: id.into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() };
-            if id == "kaan" { core.pty_spawn(spawn, Rec(out.clone())) } else { core.pty_spawn(spawn, Sink) }.unwrap();
+            if id == "kaan" { core.pty_spawn(spawn, super::shell_sink_for_test(&core, id, Rec(out.clone()))) }
+            else { core.pty_spawn(spawn, super::shell_sink_for_test(&core, id, Sink)) }.unwrap();
         }
         let idle = |id: &str| {
             core.agent_states.hook(id, Some(super::Status::Idle), None);
@@ -2836,7 +2886,7 @@ mod draft_tests {
             .unwrap();
         std::fs::create_dir_all(root.join("cwd")).unwrap();
         let cwd = Some(root.join("cwd").to_string_lossy().into_owned());
-        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, Sink)
+        core.pty_spawn(pty::Spawn { id: "kaan".into(), cmd: shell::SHELL_CMD.into(), cwd, cols: 80, rows: 24, ..Default::default() }, super::shell_sink_for_test(&core, "kaan", Sink))
             .unwrap();
         // The patron's session: the job is pasted, no real claude is started (core-tests-no-real-claude).
         core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({ "prompt": "patron" }), false);
@@ -2966,7 +3016,7 @@ mod quota_tests {
         })
         .unwrap();
         for id in ["timur", "kaan", "ayla", "bora"] {
-            core.pty_spawn(crate::pty::Spawn { id: id.into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, ShellSink).unwrap();
+            core.pty_spawn(crate::pty::Spawn { id: id.into(), cmd: crate::shell::SHELL_CMD.into(), cols: 80, rows: 24, ..Default::default() }, shell_sink_for_test(core, id, ShellSink)).unwrap();
         }
     }
 
