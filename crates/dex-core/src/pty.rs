@@ -1522,7 +1522,7 @@ mod tests {
     #[test]
     fn team_deletion_clears_only_its_members_finished_replay() {
         let core = replay_core();
-        let team = core.team_create(crate::teams::NewTeam { name: "Replay".into(), kind: "service".into(),
+        let team = core.team_create(crate::teams::NewTeam { profile: None, name: "Replay".into(), kind: "service".into(),
             cwd: None, worker_roles: None, members: None }).unwrap();
         let ids: Vec<_> = core.agent_list().unwrap().into_iter().filter(|a| a.team_id == team.id).map(|a| a.id).collect();
         for id in ids.iter().map(String::as_str).chain(["kaan"]) {

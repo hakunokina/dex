@@ -69,8 +69,13 @@ pub fn list(conn: &Connection) -> Result<Vec<Role>, String> {
 /// `slug — ad, slug — ad, …` in catalog order, built from the table (never a fixed list): the leader's
 /// rules and the unknown-role errors show the same text.
 pub fn catalog_text(conn: &Connection) -> String {
-    conn.prepare("SELECT slug || ' — ' || name FROM roles ORDER BY sort, slug")
-        .and_then(|mut st| st.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>())
+    catalog_text_for_profile(conn, "dev")
+}
+
+/// Education and development leaders see only their own profile's roles.
+pub fn catalog_text_for_profile(conn: &Connection, profile: &str) -> String {
+    conn.prepare("SELECT slug || ' — ' || name FROM roles WHERE (category='education') = ?1 ORDER BY sort, slug")
+        .and_then(|mut st| st.query_map([profile == "edu"], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default()
         .join(", ")
 }
@@ -136,13 +141,26 @@ mod tests {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         seed(&c).unwrap();
         let roles = list(&c).unwrap();
-        assert_eq!(roles.len(), 20);
+        assert_eq!(roles.len(), 22);
         for s in ["lead", "frontend", "backend", "qa", "explorer", "game-designer", "technical-artist", "gameplay-programmer"] {
             assert!(roles.iter().any(|r| r.slug == s), "{s}");
         }
         assert_eq!(name_of(&c, "lead").unwrap(), "Lead");
         assert!(prompt_for_agent(&c, "timur").unwrap().starts_with("Rolün: Takım Lideri"));
         assert!(prompt_for_agent(&c, "yok").is_none());
+    }
+
+    #[test]
+    fn catalogs_filter_education_in_both_directions_and_keep_order() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let roles = list(&c).unwrap();
+        for profile in ["dev", "edu"] {
+            let expected = roles.iter().filter(|r| (r.category == "education") == (profile == "edu"))
+                .map(|r| format!("{} — {}", r.slug, r.name)).collect::<Vec<_>>().join(", ");
+            assert_eq!(catalog_text_for_profile(&c, profile), expected);
+        }
+        assert_eq!(catalog_text_for_profile(&c, "edu"), "teacher — Teacher, visual-explainer — Visual Explainer");
+        assert_eq!(catalog_text(&c), catalog_text_for_profile(&c, "dev"));
     }
 
     #[test]

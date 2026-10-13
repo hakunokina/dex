@@ -1681,7 +1681,7 @@ mod security_tests {
         )
         .unwrap();
         let team = core
-            .team_create(teams::NewTeam {
+            .team_create(teams::NewTeam { profile: None,
                 name: "Security test".into(), kind: "service".into(), cwd: None, worker_roles: None,
                 members: None,
             })
@@ -1720,7 +1720,7 @@ mod security_tests {
         )
         .unwrap();
         let team = core
-            .team_create(teams::NewTeam { name: "Stop test".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None })
+            .team_create(teams::NewTeam { profile: None, name: "Stop test".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None })
             .unwrap();
         let agent = core.agent_list().unwrap().into_iter().find(|a| a.team_id == team.id).unwrap();
         // Jobs from the default team's leader (rows outlive the deleted team) + a plan of the team.
@@ -3039,7 +3039,7 @@ mod project_bind_tests {
         assert!(read(&c, &p2.join("src").join("a.rs")) && !read(&c, &p1.join("src").join("a.rs")));
 
         // A service worker: its workspace and its one research file; the requester's P read-only.
-        let svc = e.core.team_create(teams::NewTeam { name: "Araştırma".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let svc = e.core.team_create(teams::NewTeam { profile: None, name: "Araştırma".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let worker = e.core.agent_list().unwrap().into_iter().find(|a| a.team_id == svc.id && a.kind == "worker").unwrap().id;
         let report = p1.join("docs").join("research").join("4-konu.md");
         sql(&e, "INSERT INTO delegations(id,from_agent,to_agent,team_id,service_team_id,prompt,status,project_id,project_root,result_path,created_at,updated_at)

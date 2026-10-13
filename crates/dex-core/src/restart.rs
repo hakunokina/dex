@@ -868,7 +868,7 @@ mod lifecycle_tests {
     #[test]
     fn an_outbound_service_job_keeps_its_requesting_leader_open() {
         let c = core(); open(&c, "timur"); expire(&c);
-        let service = c.team_create(teams::NewTeam { name:"servis".into(),kind:"service".into(),cwd:None,worker_roles:None,members:None }).unwrap();
+        let service = c.team_create(teams::NewTeam { profile: None, name:"servis".into(),kind:"service".into(),cwd:None,worker_roles:None,members:None }).unwrap();
         let worker = c.agent_list().unwrap().into_iter().find(|a|a.team_id==service.id && a.kind=="worker").unwrap();
         with(&c.db, |db| {
             let from = delegate::caller(db, "timur")?;
