@@ -140,15 +140,17 @@ fn build_system_prompt(
     cwd: Option<&Path>,
     ctx: Option<&crate::project_context::ProjectContext>,
 ) -> String {
-    let (kind, role, test_level): (Option<String>, Option<String>, String) = conn
-        .query_row("SELECT a.kind, a.role_slug, t.test_level FROM agents a JOIN teams t ON t.id=a.team_id WHERE a.id = ?1", [agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    let (kind, role, test_level, team_profile): (Option<String>, Option<String>, String, String) = conn
+        .query_row("SELECT a.kind, a.role_slug, t.test_level, t.profile FROM agents a JOIN teams t ON t.id=a.team_id WHERE a.id = ?1", [agent], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .optional()
         .ok()
         .flatten()
-        .unwrap_or((None, None, "full".into()));
-    let roles = if kind.as_deref() == Some("leader") { crate::roles::catalog_text(conn) } else { String::new() };
+        .unwrap_or((None, None, "full".into(), "dev".into()));
+    let education = team_profile == "edu";
+    let roles = if kind.as_deref() == Some("leader") { crate::roles::catalog_text_for_profile(conn, &team_profile) } else { String::new() };
     let mut rules = dex_rules(kind.as_deref(), role.as_deref(), memory, &roles);
-    if test_level == "light" {
+    if education { rules = education_rules(&rules); }
+    if !education && test_level == "light" {
         if let (Some(start), Some(end)) = (rules.find("## Test bütçesi"), rules.find("## Teslim")) {
             let leader_note = if kind.as_deref() == Some("leader") { "\n- Hafif test düzeyinde QA tam turu planlama." } else { "" };
             rules.replace_range(start..end, &format!("## Test bütçesi\n- Test düzeyi: hafif — yalnız derleme + tip kontrolü (ör. cargo check, tsc --noEmit); birim, tarayıcı/uçtan uca ve QA tam paket yok; patron uygulamada test eder.{leader_note}\n\n"));
@@ -187,8 +189,8 @@ fn build_system_prompt(
     }
     // #322: the repo's stack profile sits between the role and the rules; the leader alone hears
     // that it is missing (with what the repo looks like) or was cut.
-    let profile = cwd.and_then(crate::stack::read);
-    if kind.as_deref() == Some("leader") {
+    let profile = cwd.filter(|_| !education).and_then(crate::stack::read);
+    if !education && kind.as_deref() == Some("leader") {
         if let Some(note) = cwd.and_then(|c| crate::stack::leader_note(c, profile.as_ref())) {
             rules = format!("{rules}\n\n{note}");
         }
@@ -211,6 +213,30 @@ fn build_system_prompt(
         Some(role) => format!("{role}\n\n{rules}"),
         None => rules,
     }
+}
+
+/// Reuse the tagged mechanics and memory text verbatim; the dev source/rendering stays unchanged.
+/// Prefixes refer to whole, controlled rule lines, never role text or user-provided content.
+fn education_rules(rules: &str) -> String {
+    let mut in_test_budget = false;
+    let mut out = Vec::new();
+    for line in rules.lines() {
+        if line.starts_with("## ") { in_test_budget = line == "## Test bütçesi"; }
+        if in_test_budget { continue; }
+        if [
+            "- Yazmadan önce", "- En küçük doğru", "- Durum mesajlarında",
+            "- Worker işi kendi git", "- İnceleme `düzelt`", "- Rapor/kanıt/ekran",
+            "- Ayrı kod incelemesi", "- Koşmadığın komutu",
+        ].iter().any(|prefix| line.starts_with(prefix)) { continue; }
+        out.push(if line.starts_with("- Çıktı sözleşmesi:") {
+            "- Çıktı sözleşmesi: ders dosyaları takım klasöründe `lessons/` altında kalır; rapor içeriğini `report` ile ver, dosyayı kayıtlı proje kökünde Dex yazar; geçici iş takım klasörünün `.dex/tmp/` klasöründe veya oturum scratchpad'inde kalır."
+        } else if line.starts_with("- İşi varsayılan olarak `role`") {
+            "- İşi varsayılan olarak `role` ile ver; Dex o roldeki boş worker'a dağıtır. `agentId` yalnız bağlamı o worker'da olan işte."
+        } else if line.starts_with("- Teslim =") {
+            "- Teslim = ders dosyasının yolu + ne gösterdiği + açık risk/soru. Kısa."
+        } else { line });
+    }
+    out.join("\n")
 }
 
 fn bound_projects(conn: &Connection, team: &str) -> usize {
@@ -277,6 +303,44 @@ pub fn project_list_block(conn: &Connection, team: &str, limit: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn education_prompts_keep_roles_memory_and_mechanics_without_dev_rules() {
+        let c = db();
+        c.execute("UPDATE teams SET profile='edu' WHERE id='default'", []).unwrap();
+        c.execute("UPDATE agents SET role_slug='teacher' WHERE id='timur'", []).unwrap();
+        c.execute("UPDATE agents SET role_slug='visual-explainer' WHERE id='ayla'", []).unwrap();
+        let (s, o) = mem();
+        let root = project("edu", &[(crate::stack::FILE, "DEV STACK"), ("package.json", "{\"scripts\":{\"e2e\":\"playwright test\"}}")]);
+        for (agent, role) in [("timur", "Öğretmen"), ("ayla", "Görsel Anlatıcı")] {
+            let t = build_system_prompt(&c, agent, Some((&s, &o)), Some(&root), None);
+            assert!(t.starts_with(&format!("Rolün: {role}")) && t.contains("## Hafıza"), "{t}");
+            for excluded in ["Test bütçesi", "delegation_merge", "Proje yığını", "DEV STACK", "worktree", "fixOf", "kod incelemesi", "Senden beklenen:", "Yazmadan önce", "En küçük doğru", "koştuğun komutlar"] {
+                assert!(!t.contains(excluded), "edu contains {excluded}: {t}");
+            }
+            assert!(t.contains("Sırrı koda/log'a yazma") && t.contains("riskli adım") && t.contains("`memory_search`"));
+            let dev_memory = dex_rules(Some(if agent == "timur" { "leader" } else { "worker" }), None, Some((&s, &o)), "");
+            assert_eq!(t.split("## Hafıza").nth(1), dev_memory.split("## Hafıza").nth(1));
+            if agent == "timur" {
+                assert!(t.contains("teacher — Teacher, visual-explainer — Visual Explainer") && !t.contains("backend —"));
+                for tool in ["`delegate`", "`note`", "`answer`", "`escalate`", "`effort`", "`model`", "`patronWords`"] { assert!(t.contains(tool), "{tool}"); }
+            } else {
+                assert!(t.contains("`lessons/`") && t.contains("content=<tam rapor>") && t.contains("`ask_leader`") && t.contains("`wait_answer`"));
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dev_prompt_bytes_match_pre_education_baseline() {
+        use sha2::{Digest, Sha256};
+        let c = db();
+        let (s, o) = mem();
+        for (agent, expected) in [("timur", "a83b5668a70fa745e0f9736904ee7268e919a4f3d2b9edf7b28f803a89852d52"), ("ayla", "ffcfeaacfc3db1de3c35e91f3a9b0bcf824d04169fe3de7d125692f74d33adb1")] {
+            let t = system_prompt(&c, agent, Some((&s, &o)));
+            assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
+        }
+    }
 
     #[test]
     fn full_test_budget_is_general_and_qa_escalates_missing_plans() {
@@ -404,7 +468,7 @@ mod tests {
         let service = crate::teams::create_team(
             &c,
             &f.0,
-            crate::teams::NewTeam { name: "Service".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None },
+            crate::teams::NewTeam { profile: None, name: "Service".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None },
         )
         .unwrap();
         let worker = crate::teams::list_agents(&c).unwrap().into_iter().find(|a| a.team_id == service.id && a.kind == "worker").unwrap();
@@ -538,7 +602,7 @@ mod tests {
         let t = system_prompt(&c, "timur", Some((&s, &o)));
         let all = crate::roles::list(&c).unwrap();
         assert!(all.len() > 10);
-        for r in &all {
+        for r in all.iter().filter(|r| r.category != "education") {
             assert!(t.contains(&format!("{} — {}", r.slug, r.name)), "{} yok\n{t}", r.slug);
         }
         assert!(t.contains("mobile — Mobile Engineer"), "{t}");

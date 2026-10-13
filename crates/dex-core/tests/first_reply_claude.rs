@@ -116,7 +116,7 @@ fn retry_resends_and_cancel_stops_with_real_claude() {
     let rec = Arc::new(Rec::default());
     let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(Sink(rec.clone()))).unwrap();
     core.first_reply_set("anthropic", 10).unwrap();
-    let team = core.team_create(teams::NewTeam { name: "FR live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+    let team = core.team_create(teams::NewTeam { profile: None, name: "FR live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
     let id = core.agent_list().unwrap().into_iter().find(|a| a.team_id == team.id).unwrap().id;
 
     let prompts = |rec: &Rec| rec.count(|e, p| e == "dex-hook" && p["agentId"] == id.as_str() && p["event"] == "UserPromptSubmit");

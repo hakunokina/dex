@@ -156,7 +156,7 @@ fn trust_refusal_leaves_no_session_and_a_lost_resume_starts_fresh() {
     std::env::set_var("CLAUDE_CONFIG_DIR", &config);
     let rec = Arc::new(Rec::default());
     let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(Sink(rec.clone()))).unwrap();
-    let team = core.team_create(teams::NewTeam { name: "FIX4 live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+    let team = core.team_create(teams::NewTeam { profile: None, name: "FIX4 live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
     let id = core.agent_list().unwrap().into_iter().find(|a| a.team_id == team.id).unwrap().id;
     let saved = || db::with(&core.db, |c| resumable_session(c, &id, "claude")).unwrap();
     let waiting = || core.agent_states.pre_session(&id) && core.agent_states.get(&id).status == Status::Waiting;

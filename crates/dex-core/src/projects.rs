@@ -1365,7 +1365,7 @@ pub(crate) mod tests {
         let legacy = crate::teams::create_team(
             &c,
             &f.0,
-            crate::teams::NewTeam {
+            crate::teams::NewTeam { profile: None,
                 name: "Legacy checkout".into(),
                 kind: "main".into(),
                 cwd: Some(wt.to_string_lossy().into()),

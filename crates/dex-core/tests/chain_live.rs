@@ -67,7 +67,7 @@ fn glm_quota_fails_over_with_resume() {
 
     let rec = Arc::new(Rec::default());
     let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(Sink(rec.clone()))).unwrap();
-    let team = core.team_create(teams::NewTeam { name: "DEX-17 live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+    let team = core.team_create(teams::NewTeam { profile: None, name: "DEX-17 live".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
     let members: Vec<_> = core.agent_list().unwrap().into_iter().filter(|a| a.team_id == team.id).collect();
     let leader = members.iter().find(|a| a.kind == "leader").unwrap().id.clone();
     let id = members.iter().find(|a| a.kind == "worker").unwrap().id.clone();

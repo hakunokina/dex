@@ -407,6 +407,10 @@ const MIGRATIONS: &[&str] = &[
     // 34 (#1514): additive, idempotent leader instructions. Before commit: ROLLBACK.
     // After commit: retain the table and pending notes; revert only the application.
     crate::worker_notes::SCHEMA,
+    // 35 (#1657): team purpose is independent of main/service. Versioned transaction
+    // makes reopening idempotent; existing teams keep dev behavior. Before commit: ROLLBACK.
+    // After commit: retain column/education roles, revert only application (no data deletion).
+    "ALTER TABLE teams ADD COLUMN profile TEXT NOT NULL DEFAULT 'dev' CHECK(profile IN ('dev','edu'));",
 ];
 
 const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_project_snapshot
@@ -418,6 +422,39 @@ const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_proje
 #[cfg(test)]
 mod job_model_migration_tests {
     use super::*;
+
+    #[test]
+    fn education_profile_migration_twice_preserves_existing_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(34).enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        let counts = |c: &Connection| -> (i64, i64) {
+            (c.query_row("SELECT COUNT(*) FROM teams", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0)).unwrap())
+        };
+        let before = counts(&c);
+        for _ in 0..2 {
+            migrate(&mut c).unwrap();
+            crate::roles::seed(&c).unwrap();
+            assert_eq!(counts(&c), before);
+            assert_eq!(c.query_row("SELECT profile FROM teams WHERE id='default'", [], |r| r.get::<_, String>(0)).unwrap(), "dev");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM roles WHERE category='education'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 {
+            migrate(&mut clean).unwrap();
+            crate::roles::seed(&clean).unwrap();
+            assert_eq!(clean.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get::<_, i64>(0)).unwrap(), 22);
+            assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        }
+        assert_eq!(counts(&clean), (0, 0));
+        assert!(clean.execute("INSERT INTO teams(id,name,kind,created_at,profile) VALUES('bad','Bad','main',0,'unknown')", []).is_err());
+        println!("education migration: before/after={before:?}; existing + clean DB 2 runs; FK=0");
+    }
 
     #[test]
     fn worker_notes_migration_twice_preserves_rows_and_clean_db() {
@@ -1315,7 +1352,7 @@ pub mod tasks {
             let before: Vec<String> = c
                 .prepare("SELECT slug||name||category||description||system_prompt||sort FROM roles ORDER BY sort, slug")
                 .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-            assert_eq!(before.len(), 20);
+            assert_eq!(before.len(), 22);
 
             super::super::migrate(&mut c).unwrap();
 
@@ -1331,7 +1368,7 @@ pub mod tasks {
             assert_eq!(after, before, "role rows survive the column drop");
             // Fresh seed still upserts into the narrower table.
             crate::roles::seed(&c).unwrap();
-            assert_eq!(crate::roles::list(&c).unwrap().len(), 20);
+            assert_eq!(crate::roles::list(&c).unwrap().len(), 22);
         }
     }
 }

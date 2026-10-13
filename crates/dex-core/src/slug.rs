@@ -269,7 +269,7 @@ mod tests {
         let t = crate::teams::create_team(
             &c,
             &f.0,
-            crate::teams::NewTeam { name: "Category".into(), kind: "main".into(), cwd: None, worker_roles: None, members: None },
+            crate::teams::NewTeam { profile: None, name: "Category".into(), kind: "main".into(), cwd: None, worker_roles: None, members: None },
         )
         .unwrap();
         let a = crate::teams::list_agents(&c).unwrap().into_iter().find(|a| a.team_id == t.id && a.kind == "worker").unwrap();

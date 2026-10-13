@@ -489,7 +489,7 @@ mod tests {
         let service = crate::teams::create_team(
             &c,
             &f.0,
-            crate::teams::NewTeam {
+            crate::teams::NewTeam { profile: None,
                 name: "Research".into(),
                 kind: "service".into(),
                 cwd: None,
@@ -650,7 +650,7 @@ mod tests {
         let t = crate::teams::create_team(
             &c,
             &f.0,
-            crate::teams::NewTeam {
+            crate::teams::NewTeam { profile: None,
                 name: "Bound".into(),
                 kind: "main".into(),
                 cwd: Some(root.to_string_lossy().into()),

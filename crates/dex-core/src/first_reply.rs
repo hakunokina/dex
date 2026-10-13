@@ -286,7 +286,7 @@ mod tests {
         .unwrap();
         core.first_reply.set_unit(Duration::from_millis(5)); // "90 sn" = 450 ms
         let team = core
-            .team_create(teams::NewTeam { name: "FR".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None })
+            .team_create(teams::NewTeam { profile: None, name: "FR".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None })
             .unwrap();
         let agent = core.agent_list().unwrap().into_iter().find(|a| a.team_id == team.id).unwrap();
         let id = agent.id.clone();

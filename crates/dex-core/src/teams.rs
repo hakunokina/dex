@@ -8,6 +8,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 pub const TEAM_KINDS: &[&str] = &["main", "service"];
+pub const TEAM_PROFILES: &[&str] = &["dev", "edu"];
 pub const AGENT_KINDS: &[&str] = &["leader", "worker"];
 
 #[derive(Serialize, Debug)]
@@ -16,6 +17,7 @@ pub struct Team {
     pub id: String,
     pub name: String,
     pub kind: String,
+    pub profile: String,
     /// The project folder (main teams only).
     pub cwd: Option<String>,
     pub created_at: i64,
@@ -91,8 +93,11 @@ pub struct WorkersOutcome {
 pub struct NewTeam {
     pub name: String,
     pub kind: String,
+    /// Absent in older clients; defaults to the development profile.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub cwd: Option<String>,
-    /// Roles of the 4 template workers; absent → `DEFAULT_WORKER_ROLES`.
+    /// Template workers: dev defaults to `DEFAULT_WORKER_ROLES`, edu to one visual-explainer.
     pub worker_roles: Option<Vec<String>>,
     /// When present, replaces the default crew, atomically with the team.
     #[serde(default)]
@@ -124,6 +129,7 @@ pub struct TeamMemberTemplate {
 #[serde(rename_all = "camelCase")]
 pub struct TeamCloneTemplate {
     pub kind: String,
+    pub profile: String,
     pub members: Vec<TeamMemberTemplate>,
 }
 
@@ -166,8 +172,8 @@ fn folder_preview(db: &crate::db::Db, name: &str, home: Option<&Path>) -> Result
 }
 
 pub fn clone_template(conn: &Connection, team_id: &str) -> Result<TeamCloneTemplate, String> {
-    let kind = conn
-        .query_row("SELECT kind FROM teams WHERE id=?1", [team_id], |r| r.get(0))
+    let (kind, profile) = conn
+        .query_row("SELECT kind,profile FROM teams WHERE id=?1", [team_id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()
         .map_err(|e| e.to_string())?
         .ok_or("team_not_found")?;
@@ -189,7 +195,7 @@ pub fn clone_template(conn: &Connection, team_id: &str) -> Result<TeamCloneTempl
         .map_err(|e| e.to_string())?
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
-    Ok(TeamCloneTemplate { kind, members })
+    Ok(TeamCloneTemplate { kind, profile, members })
 }
 
 impl crate::Core {
@@ -503,7 +509,7 @@ const TEAM_COLS: &str = "id, name, kind, cwd, created_at, worktrees,
             (SELECT value FROM settings WHERE key = 'worktree_orphans:' || teams.cwd), '[]'))
         ORDER BY path
     )), default_project_id, workspace_root, team_memory_root, agent_memory_root,
-    (SELECT root_path FROM projects WHERE id=teams.default_project_id AND team_id=teams.id), test_level";
+    (SELECT root_path FROM projects WHERE id=teams.default_project_id AND team_id=teams.id), test_level, profile";
 const AGENT_COLS: &str =
     "a.id, a.team_id, a.name, a.kind, a.title, a.model, a.shirt, a.hair, a.skin, a.sort, a.provider, a.role_slug, r.name, a.engine,
      a.pending_engine, a.pending_provider, a.pending_model, a.chain_off, a.active_provider, a.active_model, a.active_engine,
@@ -524,6 +530,7 @@ const ROLE_NAMES: &[(&str, &str)] = &[
     ("code-review", "Lens"), ("pm", "Compass"), ("marketing", "Signal"), ("seo", "Rank"), ("support", "Relay"),
     ("code-automation", "Bot"), ("n8n-automation", "Bot"), ("mobile", "Droid"),
     ("game-designer", "Dice"), ("technical-artist", "Prism"), ("gameplay-programmer", "Loop"),
+    ("teacher", "Sage"), ("visual-explainer", "Chalk"),
 ];
 const FALLBACK_NAME: &str = "Agent";
 
@@ -571,7 +578,7 @@ fn team_row(data_dir: &Path) -> impl Fn(&Row) -> rusqlite::Result<Team> + '_ {
         let worktree_cleanup = serde_json::from_str(&cleanup)
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?;
         Ok(Team { id, name: r.get(1)?, kind, cwd, created_at: r.get(4)?, workdir: s(workdir), memory_dir, worktrees: r.get(5)?, worktree_cleanup,
-            default_project_id:r.get(7)?,workspace_root,suggested_workspace_root,team_memory_root,agent_memory_root,test_level:r.get(12)? })
+            default_project_id:r.get(7)?,workspace_root,suggested_workspace_root,team_memory_root,agent_memory_root,test_level:r.get(12)?,profile:r.get(13)? })
     }
 }
 
@@ -636,7 +643,12 @@ pub fn get_team(conn: &Connection, data_dir: &Path, id: &str) -> Result<Team, St
         let has_test_level: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('teams') WHERE name='test_level')", [], |r| r.get(0),
         )?;
-        if has_test_level { Err(error) } else { conn.prepare(&sql.replace(", test_level FROM", ", 'full' FROM")) }
+        let has_profile: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('teams') WHERE name='profile')", [], |r| r.get(0),
+        )?;
+        if has_test_level && has_profile { return Err(error); }
+        let sql = if has_test_level { sql.clone() } else { sql.replace(", test_level,", ", 'full',") };
+        conn.prepare(&if has_profile { sql } else { sql.replace(", profile FROM", ", 'dev' FROM") })
     }).map_err(|e| e.to_string())?;
     st.query_row([id], team_row(data_dir))
         .optional()
@@ -664,26 +676,39 @@ pub fn create_team(conn: &Connection, data_dir: &Path, t: NewTeam) -> Result<Tea
 pub(crate) fn create_team_with_folders(conn: &Connection, data_dir: &Path, t: NewTeam, folders: Option<&TeamFolders>) -> Result<Team, String> {
     let name = check_name(&t.name)?;
     one_of(&t.kind, TEAM_KINDS, "takım türü")?;
+    let profile = t.profile.as_deref().unwrap_or("dev");
+    one_of(profile, TEAM_PROFILES, "takım profili")?;
+    let education = profile == "edu";
+    if education {
+        if let Some(members) = &t.members {
+            if members.len() != 2
+                || members.iter().filter(|m| m.kind == "leader" && m.role_slug.as_deref() == Some("teacher")).count() != 1
+                || members.iter().filter(|m| m.kind == "worker" && m.role_slug.as_deref() == Some("visual-explainer")).count() != 1
+            { return Err("eğitim takımı bir teacher lider ve bir visual-explainer worker ister".into()); }
+        }
+    }
     let cwd = match (t.kind.as_str(), t.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty())) {
         ("main", Some(raw)) => Some(claim_dir(conn, raw, "")?),
         ("main", None) => folders.map(|f| f.project_root.to_string_lossy().into_owned()),
         (_, Some(_)) => return Err("alt takımın proje klasörü olmaz".into()),
         (_, None) => None,
     };
+    let default_roles: &[&str] = if education { &["visual-explainer"] } else { &DEFAULT_WORKER_ROLES };
     let worker_roles = match t.worker_roles.filter(|_| t.members.is_none()) {
-        Some(r) if r.len() != DEFAULT_WORKER_ROLES.len() => {
-            return Err(format!("takım {} worker ister", DEFAULT_WORKER_ROLES.len()))
+        Some(r) if r.len() != default_roles.len() => {
+            return Err(format!("takım {} worker ister", default_roles.len()))
         }
+        Some(r) if education && r[0] != "visual-explainer" => return Err("eğitim worker rolü visual-explainer olmalı".into()),
         Some(r) => r,
-        None => DEFAULT_WORKER_ROLES.iter().map(|s| s.to_string()).collect(),
+        None => default_roles.iter().map(|s| s.to_string()).collect(),
     };
     // Team and crew land together or not at all.
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     if let Some(f) = folders { check_workspace_claim(&tx, &f.workspace_root, "")?; }
     let id = insert_with_new_id(&name, "teams", &mut os_rng, |id| {
         tx.execute(
-            "INSERT INTO teams (id, name, kind, cwd, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, name, t.kind, cwd, now()],
+            "INSERT INTO teams (id, name, kind, cwd, created_at, profile, worktrees) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, name, t.kind, cwd, now(), profile, !education],
         )
         .map(|_| ())
     })?;
@@ -691,7 +716,7 @@ pub(crate) fn create_team_with_folders(conn: &Connection, data_dir: &Path, t: Ne
         if let Some(root)=cwd.as_deref() {
             crate::projects::reserve_root(&tx,root).map_err(|e|e.to_string())?;
         }
-        crate::projects::backfill_team(&tx,data_dir,&id,cwd.as_deref(),true,now(),None)
+        crate::projects::backfill_team(&tx,data_dir,&id,cwd.as_deref(),!education,now(),None)
             .map_err(|e|e.to_string())?;
         if let Some(f) = folders {
             tx.execute("UPDATE teams SET workspace_root=?2 WHERE id=?1", params![id,f.workspace_root.to_string_lossy()]).map_err(|e|e.to_string())?;
@@ -711,7 +736,7 @@ pub(crate) fn create_team_with_folders(conn: &Connection, data_dir: &Path, t: Ne
             tx.execute("UPDATE agents SET chain_off=?2 WHERE id=?1", params![a.id,member.chain_off]).map_err(|e|e.to_string())?;
         }
     } else {
-        let crew = std::iter::once(("leader", crate::providers::CLAUDE_STRONG, "lead".to_string()))
+        let crew = std::iter::once(("leader", crate::providers::CLAUDE_STRONG, if education { "teacher" } else { "lead" }.to_string()))
             .chain(worker_roles.into_iter().map(|r| ("worker", crate::providers::CLAUDE_MID, r)));
         for (kind, model, role) in crew {
             create_agent(&tx, data_dir, NewAgent {
@@ -1107,6 +1132,106 @@ mod tests {
     use super::*;
 
     #[test]
+    fn education_team_has_teacher_and_one_visual_worker_without_worktrees() {
+        let f = crate::projects::tests::Fixture::new();
+        let root = f.0.join("lessons-team");
+        std::fs::create_dir(&root).unwrap();
+        let c = mem();
+        let input: NewTeam = serde_json::from_value(serde_json::json!({"name":"Education","kind":"main","profile":"edu","cwd":root})).unwrap();
+        let t = create_team(&c, &f.0, input).unwrap();
+        assert_eq!(serde_json::to_value(&t).unwrap()["profile"], "edu");
+        assert!(!t.worktrees);
+        let crew = crew_of(&c, &t.id);
+        let shape: Vec<_> = crew.iter().map(|a| (a.kind.as_str(), a.role_slug.as_deref().unwrap(), a.name.as_str())).collect();
+        assert_eq!(shape, [("leader", "teacher", "Sage"), ("worker", "visual-explainer", "Chalk-1")]);
+        assert!(crate::roles::browser_for_agent(&c, &crew[1].id));
+        assert!(crate::skills::skills_for_agent(&c, &crew[0].id).unwrap().is_empty());
+        assert!(crate::skills::skills_for_agent(&c, &crew[1].id).unwrap().is_empty());
+        let ctx = crate::project_context::resolve(&c, &f.0, crate::project_context::ResolveRequest {
+            team_id: &t.id, agent_id: Some(&crew[1].id), delegation_id: None, project_id: None,
+            mode: crate::project_context::ContextMode::Selection,
+        }).unwrap();
+        assert!(!ctx.worktrees);
+        assert!(crate::project_context::validate(&ctx).is_ok(), "plain folder must work");
+        assert!(!root.join(".git").exists());
+        assert_eq!(serde_json::to_value(clone_template(&c, &t.id).unwrap()).unwrap()["profile"], "edu");
+    }
+
+    #[test]
+    fn education_team_memory_search_and_index_are_isolated_from_default() {
+        let f = crate::projects::tests::Fixture::new();
+        let root = f.0.join("education");
+        std::fs::create_dir(&root).unwrap();
+        let c = mem();
+        let legacy_memory = f.0.join("default-memory");
+        c.execute("UPDATE teams SET team_memory_root=?1,agent_memory_root=?1 WHERE id='default'", [legacy_memory.to_str().unwrap()]).unwrap();
+        let input: NewTeam = serde_json::from_value(serde_json::json!({"name":"Education","kind":"main","profile":"edu","cwd":root})).unwrap();
+        let t = create_team(&c, &f.0, input).unwrap();
+        let default = get_team(&c, &f.0, "default").unwrap();
+        assert_ne!(t.team_memory_root, default.team_memory_root);
+        let resolve = |team, agent| crate::project_context::resolve(&c, &f.0, crate::project_context::ResolveRequest {
+            team_id: team, agent_id: Some(agent), delegation_id: None, project_id: None,
+            mode: crate::project_context::ContextMode::Selection,
+        }).unwrap();
+        let crew = crew_of(&c, &t.id);
+        let dev_ctx = resolve("default", "timur");
+        let edu_ctx = resolve(&t.id, &crew[0].id);
+        for (ctx, name) in [(&dev_ctx, "dev-only"), (&edu_ctx, "edu-only")] {
+            let scope = crate::memory::SearchScope::for_context(&c, ctx).unwrap();
+            for dir in [ctx.team_memory_root.join("shared"), scope.own] {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(format!("{name}.md")), format!("---\nname: {name}\ndescription: isolationneedle\nmetadata:\n  type: reference\n---\nisolationneedle\n")).unwrap();
+            }
+        }
+        for (ctx, own, other) in [(&dev_ctx, "dev-only", "edu-only"), (&edu_ctx, "edu-only", "dev-only")] {
+            let hits = crate::memory::search(&crate::memory::SearchScope::for_context(&c, ctx).unwrap(), "isolationneedle", 8);
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|h| h.slug == own));
+            let index = crate::hooks::memory_index_for_context(&c, ctx, 8192).unwrap();
+            assert!(index.contains(own) && !index.contains(other), "{index}");
+        }
+        for a in &crew {
+            let ctx = resolve(&t.id, &a.id);
+            if a.kind == "worker" {
+                let hits = crate::memory::search(&crate::memory::SearchScope::for_context(&c, &ctx).unwrap(), "isolationneedle", 8);
+                assert_eq!(hits.len(), 1, "worker sees its team share, not the teacher's private memory");
+                assert_eq!(hits[0].slug, "edu-only");
+                let index = crate::hooks::memory_index_for_context(&c, &ctx, 8192).unwrap();
+                assert!(index.contains("edu-only") && !index.contains("dev-only"));
+            }
+            let prompt = crate::rules::system_prompt_for_context(&c, &a.id, &ctx);
+            assert!(prompt.contains("## İş/proje bağlamı") && prompt.contains(&t.id));
+            println!("EDU_PROMPT_BEGIN:{}\n{prompt}\nEDU_PROMPT_END", a.kind);
+        }
+    }
+
+    #[test]
+    fn education_profile_validates_crew_atomically_and_keeps_kind_independent() {
+        let c = mem();
+        let before = list_teams(&c, Path::new("/data")).unwrap().len();
+        for body in [
+            serde_json::json!({"profile":"unknown"}),
+            serde_json::json!({"profile":"edu","workerRoles":["qa"]}),
+            serde_json::json!({"profile":"edu","workerRoles":["visual-explainer","visual-explainer"]}),
+            serde_json::json!({"profile":"edu","members":[]}),
+            serde_json::json!({"profile":"edu","members":[{"name":"Sage","kind":"leader","model":"opus","roleSlug":"teacher"}]}),
+        ] {
+            let mut body = body;
+            body["name"] = "Invalid".into();
+            body["kind"] = "service".into();
+            assert!(create_team(&c, Path::new("/data"), serde_json::from_value(body).unwrap()).is_err());
+            assert_eq!(list_teams(&c, Path::new("/data")).unwrap().len(), before);
+        }
+        let edu = create_team(&c, Path::new("/data"), serde_json::from_value(serde_json::json!({"name":"Edu service","kind":"service","profile":"edu"})).unwrap()).unwrap();
+        assert_eq!((edu.kind.as_str(), edu.profile.as_str(), edu.worktrees), ("service", "edu", false));
+        assert_eq!(crew_of(&c, &edu.id).len(), 2);
+        let template = serde_json::to_value(clone_template(&c, &edu.id).unwrap()).unwrap();
+        let copy = create_team(&c, Path::new("/data"), serde_json::from_value(serde_json::json!({"name":"Copy","kind":template["kind"],"profile":template["profile"],"members":template["members"]})).unwrap()).unwrap();
+        assert_eq!(copy.profile, "edu");
+        assert_eq!(crew_of(&c, &copy.id).len(), 2);
+    }
+
+    #[test]
     fn legacy_main_layout_suggests_parent_without_writing() {
         let f = crate::projects::tests::Fixture::new();
         let root = f.0.join("StudioII/StudioIIMain");
@@ -1132,8 +1257,9 @@ mod tests {
         c.execute("UPDATE agents SET chain_off=1 WHERE id='kaan'", []).unwrap();
         let before = c.total_changes();
         let template = serde_json::to_value(clone_template(&c, "default").unwrap()).unwrap();
-        assert_eq!(template.as_object().unwrap().len(), 2);
+        assert_eq!(template.as_object().unwrap().len(), 3);
         assert_eq!(template["kind"], "main");
+        assert_eq!(template["profile"], "dev");
         assert_eq!(template["members"].as_array().unwrap().len(), list_agents(&c).unwrap().into_iter().filter(|a| a.team_id=="default").count());
         let name = get_agent(&c,"kaan").unwrap().name;
         let kaan = template["members"].as_array().unwrap().iter().find(|a| a["name"]==name).unwrap();
@@ -1369,7 +1495,7 @@ mod tests {
         let f=crate::projects::tests::Fixture::new();
         let c=crate::db::open(&f.0.join("dex.db")).unwrap();
         let root=f.dir("new-root");
-        let t=create_team(&c,&f.0,NewTeam{name:"New".into(),kind:"main".into(),cwd:Some(root.to_string_lossy().into()),worker_roles:None, members: None }).unwrap();
+        let t=create_team(&c,&f.0,NewTeam{ profile: None,name:"New".into(),kind:"main".into(),cwd:Some(root.to_string_lossy().into()),worker_roles:None, members: None }).unwrap();
         let p=crate::projects::get(&c,&t.id,t.default_project_id.as_deref().unwrap()).unwrap();
         assert_eq!(p.root_path,t.cwd);
         assert_eq!(t.team_memory_root,Some(service_dir(&f.0,&t.id).join("memory").to_string_lossy().into()));
@@ -1387,7 +1513,7 @@ mod tests {
         assert_eq!(cleared.memory_dir.as_deref(),Some(anchor.as_str()),"slug migration keeps the legacy anchor after selecting team context");
         let before=list_teams(&c,&f.0).unwrap().len();
         let bad=f.dir("bad-root");
-        assert!(create_team(&c,&f.0,NewTeam{name:"Bad".into(),kind:"main".into(),cwd:Some(bad.to_string_lossy().into()),worker_roles:Some(vec!["not-a-role".into();4]), members: None }).is_err());
+        assert!(create_team(&c,&f.0,NewTeam{ profile: None,name:"Bad".into(),kind:"main".into(),cwd:Some(bad.to_string_lossy().into()),worker_roles:Some(vec!["not-a-role".into();4]), members: None }).is_err());
         assert_eq!(list_teams(&c,&f.0).unwrap().len(),before);
     }
 
@@ -1395,7 +1521,7 @@ mod tests {
     fn project_legacy_team_update_routes_root_and_rejects_busy_or_ambiguous() {
         let f=crate::projects::tests::Fixture::new();
         let c=crate::db::open(&f.0.join("dex.db")).unwrap();
-        let t=create_team(&c,&f.0,NewTeam{name:"Category".into(),kind:"main".into(),cwd:None,worker_roles:None, members: None }).unwrap();
+        let t=create_team(&c,&f.0,NewTeam{ profile: None,name:"Category".into(),kind:"main".into(),cwd:None,worker_roles:None, members: None }).unwrap();
         let pid=t.default_project_id.unwrap();
         let root=f.dir("root");
         let changed=update_team(&c,&f.0,&t.id,TeamPatch{cwd:Some(Some(root.to_string_lossy().into())),..Default::default()}).unwrap();
@@ -1452,7 +1578,7 @@ mod tests {
     #[test]
     fn same_name_many_agents_never_collide() {
         let c = mem();
-        let t = create_team(&c, Path::new("/data"), NewTeam { name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let t = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let mut ids = std::collections::HashSet::new();
         for _ in 0..2000 {
             let a = create_agent(&c, Path::new("/data"), NewAgent {
@@ -1521,41 +1647,41 @@ mod tests {
         let c = mem();
         let d = tmp("unique");
         let data = Path::new("/data");
-        let a = create_team(&c, data, NewTeam { name: "A".into(), kind: "main".into(), cwd: Some(d.to_string_lossy().into()), worker_roles: None, members: None }).unwrap();
+        let a = create_team(&c, data, NewTeam { profile: None, name: "A".into(), kind: "main".into(), cwd: Some(d.to_string_lossy().into()), worker_roles: None, members: None }).unwrap();
         assert_eq!(a.workdir, a.cwd);
         assert!(a.memory_dir.as_deref().unwrap().ends_with(&format!(".dex{}memory", std::path::MAIN_SEPARATOR)));
         // Same folder spelled differently still collides.
         let alias = format!("{}{}.", d.to_string_lossy(), std::path::MAIN_SEPARATOR);
-        let err = create_team(&c, data, NewTeam { name: "B".into(), kind: "main".into(), cwd: Some(alias), worker_roles: None, members: None }).unwrap_err();
+        let err = create_team(&c, data, NewTeam { profile: None, name: "B".into(), kind: "main".into(), cwd: Some(alias), worker_roles: None, members: None }).unwrap_err();
         assert!(err.contains("\"A\""), "{err}");
         // Raw SQL can't bypass it either.
         assert!(c.execute("INSERT INTO teams VALUES ('x','X','main',?1,0)", [&a.cwd]).is_err());
         // Re-claiming its own folder is fine.
         update_team(&c, data, &a.id, TeamPatch { cwd: Some(a.cwd.clone()), ..Default::default() }).unwrap();
-        let category=create_team(&c, data, NewTeam { name: "C".into(), kind: "main".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let category=create_team(&c, data, NewTeam { profile: None, name: "C".into(), kind: "main".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         assert!(category.cwd.is_none());
         assert!(category.default_project_id.is_some());
-        assert!(create_team(&c, data, NewTeam { name: "C".into(), kind: "main".into(), cwd: Some("Z:/yok/böyle".into()), worker_roles: None, members: None }).is_err());
+        assert!(create_team(&c, data, NewTeam { profile: None, name: "C".into(), kind: "main".into(), cwd: Some("Z:/yok/böyle".into()), worker_roles: None, members: None }).is_err());
     }
 
     #[test]
     fn service_team_lives_in_app_data() {
         let c = mem();
         let data = Path::new("/data");
-        let s = create_team(&c, data, NewTeam { name: "Araştırma".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, data, NewTeam { profile: None, name: "Araştırma".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         assert!(s.id.starts_with("arastirma-"), "{}", s.id);
         assert_eq!(s.cwd, None);
         assert_eq!(s.workdir.as_deref().map(PathBuf::from), Some(data.join("teams").join(&s.id).join("workspace")));
         assert_eq!(s.memory_dir.as_deref().map(PathBuf::from), Some(data.join("teams").join(&s.id).join("memory")));
-        assert!(create_team(&c, data, NewTeam { name: "X".into(), kind: "service".into(), cwd: Some(".".into()), worker_roles: None, members: None }).is_err());
+        assert!(create_team(&c, data, NewTeam { profile: None, name: "X".into(), kind: "service".into(), cwd: Some(".".into()), worker_roles: None, members: None }).is_err());
         assert!(update_team(&c, data, &s.id, TeamPatch { cwd: Some(Some(".".into())), ..Default::default() }).is_err());
-        assert!(create_team(&c, data, NewTeam { name: "X".into(), kind: "other".into(), cwd: None, worker_roles: None, members: None }).is_err());
+        assert!(create_team(&c, data, NewTeam { profile: None, name: "X".into(), kind: "other".into(), cwd: None, worker_roles: None, members: None }).is_err());
     }
 
     #[test]
     fn auto_name_takes_the_first_free_number() {
         let c = mem();
-        let t = create_team(&c, Path::new("/data"), NewTeam { name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let t = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let add = |name: &str, role: Option<&str>| {
             create_agent(&c, Path::new("/data"), NewAgent {
                 team_id: t.id.clone(), name: name.into(), kind: "worker".into(), title: String::new(), model: "sonnet".into(),
@@ -1577,7 +1703,7 @@ mod tests {
         // A second leader: Core is taken.
         assert_eq!(auto_name(&c, &t.id, "leader", Some("lead")).unwrap(), "Core-2");
         // Numbering is per team: U has its own Kernel-1, but no Canvas.
-        let u = create_team(&c, Path::new("/data"), NewTeam { name: "U".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let u = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "U".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         assert_eq!(auto_name(&c, &u.id, "worker", Some("backend")).unwrap(), "Kernel-2");
         assert_eq!(auto_name(&c, &u.id, "worker", Some("design")).unwrap(), "Canvas-1");
     }
@@ -1586,7 +1712,7 @@ mod tests {
     fn new_team_gets_lead_and_four_workers() {
         let c = mem();
         let data = Path::new("/data");
-        let t = create_team(&c, data, NewTeam { name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let t = create_team(&c, data, NewTeam { profile: None, name: "T".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let crew: Vec<Agent> = list_agents(&c).unwrap().into_iter().filter(|a| a.team_id == t.id).collect();
         let shape: Vec<_> = crew.iter().map(|a| (a.kind.as_str(), a.role_slug.as_deref().unwrap(), a.model.as_str())).collect();
         assert_eq!(shape, [
@@ -1598,20 +1724,20 @@ mod tests {
         assert_eq!(names, ["Core", "Pixel-1", "Kernel-1", "Probe-1", "Scout-1"]);
 
         let roles = Some(vec!["design".into(), "devops".into(), "security".into(), "pm".into()]);
-        let u = create_team(&c, data, NewTeam { name: "U".into(), kind: "service".into(), cwd: None, worker_roles: roles, members: None }).unwrap();
+        let u = create_team(&c, data, NewTeam { profile: None, name: "U".into(), kind: "service".into(), cwd: None, worker_roles: roles, members: None }).unwrap();
         let slugs: Vec<_> = list_agents(&c).unwrap().into_iter().filter(|a| a.team_id == u.id).filter_map(|a| a.role_slug).collect();
         assert_eq!(slugs, ["lead", "design", "devops", "security", "pm"]);
 
         let qa = Some(vec!["qa".into(), "qa".into(), "seo".into(), "qa".into()]);
-        let q = create_team(&c, data, NewTeam { name: "Q".into(), kind: "service".into(), cwd: None, worker_roles: qa, members: None }).unwrap();
+        let q = create_team(&c, data, NewTeam { profile: None, name: "Q".into(), kind: "service".into(), cwd: None, worker_roles: qa, members: None }).unwrap();
         let names: Vec<_> = list_agents(&c).unwrap().into_iter().filter(|a| a.team_id == q.id).map(|a| a.name).collect();
         assert_eq!(names, ["Core", "Probe-1", "Probe-2", "Rank-1", "Probe-3"]);
 
         // Wrong count / unknown role: nothing is left behind.
         let before = list_teams(&c, data).unwrap().len();
-        assert!(create_team(&c, data, NewTeam { name: "V".into(), kind: "service".into(), cwd: None, worker_roles: Some(vec!["qa".into()]), members: None }).is_err());
+        assert!(create_team(&c, data, NewTeam { profile: None, name: "V".into(), kind: "service".into(), cwd: None, worker_roles: Some(vec!["qa".into()]), members: None }).is_err());
         let bad = Some(vec!["qa".into(), "qa".into(), "qa".into(), "yok".into()]);
-        assert!(create_team(&c, data, NewTeam { name: "W".into(), kind: "service".into(), cwd: None, worker_roles: bad, members: None }).is_err());
+        assert!(create_team(&c, data, NewTeam { profile: None, name: "W".into(), kind: "service".into(), cwd: None, worker_roles: bad, members: None }).is_err());
         assert_eq!(list_teams(&c, data).unwrap().len(), before);
 
         // Role change retitles unless a title is given; null clears.
@@ -1629,7 +1755,7 @@ mod tests {
     fn agents_crud_and_cascade() {
         let c = mem();
         let data = Path::new("/data");
-        let s = create_team(&c, data, NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, data, NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let mk = |name: &str, kind: &str, model: &str| {
             create_agent(&c, Path::new("/data"), NewAgent { team_id: s.id.clone(), name: name.into(), kind: kind.into(), title: " Araştırmacı ".into(), model: model.into(), provider: None, role_slug: None, engine: None })
         };
@@ -1661,7 +1787,7 @@ mod tests {
     #[test]
     fn providers_validate_model_and_persist() {
         let c = mem();
-        let s = create_team(&c, Path::new("/data"), NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let mk = |name: &str, provider: Option<&str>, model: &str| {
             create_agent(&c, Path::new("/data"), NewAgent {
                 team_id: s.id.clone(), name: name.into(), kind: "worker".into(), title: String::new(),
@@ -1694,7 +1820,7 @@ mod tests {
     fn engine_switch_validates_model() {
         let c = mem();
         assert!(list_agents(&c).unwrap().iter().all(|a| a.engine == "claude"), "existing rows stay claude");
-        let s = create_team(&c, Path::new("/data"), NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let mk = |engine: Option<&str>, model: &str| {
             create_agent(&c, Path::new("/data"), NewAgent {
                 team_id: s.id.clone(), name: "Cx".into(), kind: "worker".into(), title: String::new(),
@@ -1725,7 +1851,7 @@ mod tests {
     #[test]
     fn workers_bulk_change_spares_leader() {
         let c = mem();
-        let s = create_team(&c, Path::new("/data"), NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let other = crew_of(&c, "default");
         let out = set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).unwrap();
         let crew = crew_of(&c, &s.id);
@@ -1749,7 +1875,7 @@ mod tests {
     #[test]
     fn workers_bulk_change_rejects_invalid_combos() {
         let c = mem();
-        let s = create_team(&c, Path::new("/data"), NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let before: Vec<_> = crew_of(&c, &s.id).into_iter().map(|a| (a.engine, a.provider, a.model)).collect();
         let err = set_workers_model(&c, &s.id, &target("codex", Some("glm"), "gpt-5.5"), |_| false).unwrap_err();
         assert!(err.contains("Codex"), "{err}");
@@ -1765,7 +1891,7 @@ mod tests {
     #[test]
     fn running_workers_get_pending_change() {
         let c = mem();
-        let s = create_team(&c, Path::new("/data"), NewTeam { name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let crew = crew_of(&c, &s.id);
         let (lead, busy, idle) = (&crew[0], &crew[1], &crew[2]);
         let live = |id: &str| id == busy.id || id == lead.id;
