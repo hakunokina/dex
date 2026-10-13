@@ -1436,7 +1436,7 @@ mod tests {
         let pre = |id: &str, tool: &str, input: Value| json!({ "hook_event_name": "PreToolUse", "tool_use_id": id, "tool_name": tool, "tool_input": input, "cwd": proj.to_string_lossy(), "permission_mode": "auto" });
 
         // Allowed (worker): the reply is the policy's allow, byte for byte; a start goes out.
-        let safe = pre("t1", "Bash", json!({ "command": "cargo test -p dex-core --lib" }));
+        let safe = pre("t1", "Bash", json!({ "command": "cargo test -p dex-core --lib chat" }));
         let direct = core.delegation_on_hook("kaan", "PreToolUse", &safe, false).unwrap();
         let (status, reply) = post("kaan", &safe);
         assert!(status.contains("200"), "{status}");
