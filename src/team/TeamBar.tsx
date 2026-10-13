@@ -12,9 +12,9 @@ import { useTeamProjects } from "../project/store";
 import { getStatus } from "../agents";
 import {
   DEFAULT_WORKER_ROLES, ENGINES, importProviders, listCodexModels, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
-  setProviderToken, teamDeleteInfo, teamCloneTemplate,
+  setProviderToken, teamDeleteInfo, teamCloneTemplate, supportsEducation,
   type AgentKind, type LocalStatus, type PendingModel, type ProviderImportRow, type ProviderInfo, type ProviderModel, type Role,
-  type TeamKind, type TeamCloneTemplate,
+  type TeamKind, type TeamProfile, type TeamCloneTemplate,
 } from "./api";
 import {
   addAgent, chainBack, createTeam, isRunning, membersOf, patchAgent, patchTeam, removeAgent, removeTeam, restartPending, selectTeam,
@@ -64,20 +64,22 @@ function HostBadge({ host }: { host: string }) {
 const CATEGORY_TEXT: Record<string, string> = {
   leadership: "Liderlik", eng: "Mühendislik", qa: "Kalite", research: "Araştırma", design: "Tasarım",
   product: "Ürün", ops: "Operasyon", security: "Güvenlik", automation: "Otomasyon", marketing: "Pazarlama",
-  support: "Destek", game: "Oyun",
+  support: "Destek", game: "Oyun", education: "Eğitim",
 };
 
 /** Roles kept in the catalog but demoted from the new-team form (DEX-21). */
 export const DEMOTED_ROLES = ["support", "marketing", "seo", "n8n-automation"];
 
 /** Role picker grouped by category (catalog order). With `other`, those slugs move to a trailing "Diğer" group. */
-function RoleSelect({ value, onChange, disabled, label, other }: {
+function RoleSelect({ value, onChange, disabled, label, other, profile = "dev" }: {
   value: string; onChange: (slug: string) => void; disabled?: boolean; label?: string; other?: string[];
+  profile?: TeamProfile;
 }) {
   const { roles } = useTeams();
+  const available = roles.filter(r => (r.category === "education") === (profile === "edu"));
   const groups = new Map<string, Role[]>();
   const rest: Role[] = [];
-  for (const r of roles) {
+  for (const r of available) {
     if (other?.includes(r.slug)) rest.push(r);
     else groups.set(r.category, [...(groups.get(r.category) ?? []), r]);
   }
@@ -229,6 +231,8 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   const [host, setHost] = useState(initialHost ?? LOCAL);
   const [name, setName] = useState("");
   const [kind, setKind] = useState<TeamKind>("main");
+  const [profile, setProfile] = useState<TeamProfile>("dev");
+  const [education, setEducation] = useState<{ host: string; supported: boolean } | null>(null);
   const [cwd, setCwd] = useState<string | null>(null);
   const [workerRoles, setWorkerRoles] = useState<string[]>(DEFAULT_WORKER_ROLES);
   const [error, setError] = useState<string | null>(null);
@@ -274,13 +278,26 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   }, [host, sourceId, catalogRetry]);
   // Modern hosts create the team/Main folders when cwd is omitted; old hosts still need a picker.
   const projects = hostSupports(host, "project_list");
+  const educationSupport = education?.host === host ? education.supported : null;
+  const educationSelected = (template?.profile ?? profile) === "edu";
+  useEffect(() => {
+    let live = true;
+    setEducation(null);
+    void supportsEducation(host).then(supported => { if (live) setEducation({ host, supported }); });
+    return () => { live = false; };
+  }, [host]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (busy || loading || (sourceId && !template)) return;
+    if (busy || loading || (sourceId && !template) || (educationSelected && educationSupport !== true)) return;
     setBusy(true); setError(null);
     try {
-      await createTeam(host, { name: name.trim(), kind, cwd: kind === "main" ? cwd : null, ...(template ? { members: template.members } : { workerRoles }) });
+      if (educationSelected && !await supportsEducation(host)) {
+        setEducation({ host, supported: false });
+        return;
+      }
+      await createTeam(host, { name: name.trim(), kind, profile: template?.profile ?? profile, cwd: kind === "main" ? cwd : null,
+        ...(template ? { members: template.members } : profile === "dev" ? { workerRoles } : {}) });
       onDone();
     } catch (err) {
       setError(String(err));
@@ -325,6 +342,13 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
           <option value="service">Alt takım (hizmet)</option>
         </select>
       </label>
+      {!sourceId && <label>
+        Profil
+        <select value={profile} onChange={e => setProfile(e.target.value as TeamProfile)}>
+          <option value="dev">Geliştirici</option>
+          <option value="edu">Eğitim</option>
+        </select>
+      </label>}
       {kind === "main" ? (
         <div className="team-dir">
           <span title={cwd ?? ""}>{cwd ?? (projects ? "Varsayılan klasör düzeni" : "klasör seçilmedi")}</span>
@@ -342,7 +366,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
           return <fieldset key={i} className="team-clone-member">
             <legend>Üye {i + 1} · {m.kind === "leader" ? "lider" : "worker"}</legend>
             <label>Ad<input aria-label={`Üye ${i + 1} adı`} value={m.name} onChange={e => update({ name: e.target.value })} /></label>
-            <label>Rol<RoleSelect label={`Üye ${i + 1} rolü`} value={m.roleSlug ?? ""} onChange={roleSlug => update({ roleSlug, title: "" })} /></label>
+            <label>Rol<RoleSelect profile={template.profile} label={`Üye ${i + 1} rolü`} value={m.roleSlug ?? ""} onChange={roleSlug => update({ roleSlug, title: "" })} /></label>
             <label>Motor<select aria-label={`Üye ${i + 1} motoru`} value={m.engine ?? "claude"} onChange={e => {
               const engine = e.target.value as "claude" | "codex";
               update({ engine, model: engineModels(codexModels, providers, engine, m.provider)[0]?.id ?? "" });
@@ -357,7 +381,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
             </select></label>
           </fieldset>;
         })}
-      </fieldset> : !sourceId && <fieldset className="team-crew">
+      </fieldset> : !sourceId && (profile === "edu" ? <p className="team-note">Öğretmen (lider) + Görsel Anlatıcı</p> : <fieldset className="team-crew">
         <legend>Ekip: 1 lider (Lead) + 4 worker</legend>
         {workerRoles.map((slug, i) => (
           <RoleSelect
@@ -368,7 +392,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
             onChange={(v) => setWorkerRoles(workerRoles.map((r, j) => (j === i ? v : r)))}
           />
         ))}
-      </fieldset>}
+      </fieldset>)}
       </fieldset>
       {catalogLoading && <p className="team-note" role="status">Model kataloğu yükleniyor…</p>}
       {catalogError && <div className="team-form-fields">
@@ -380,10 +404,13 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
       {sourceId && !loading && !template && <button type="button" onClick={() => setRetry(r => r + 1)}>Yeniden dene</button>}
       {template && !template.members.length && <p className="team-note">Kaynak takımda üye yok; yeni takım boş başlayacak.</p>}
       {sourceId && <p className="team-note">Hafıza, oturumlar ve projeler yeni takımda sıfırdan başlar.</p>}
+      {educationSelected && (educationSupport === null
+        ? <p className="team-note" role="status">Eğitim desteği kontrol ediliyor…</p>
+        : !educationSupport && <p className="team-err" role="alert">Eğitim için bu hostun çekirdeğini güncelleyin.</p>)}
       {error && <p className="team-err" role="alert">{error}</p>}
       <div className="team-actions">
         <button type="button" disabled={busy} onClick={onDone}>Vazgeç</button>
-        <button type="submit" className="primary" disabled={busy || loading || !name.trim() || (!!sourceId && !template) || template?.members.some(m => !m.name.trim() || !m.model) || (kind === "main" && !cwd && !projects)}>{busy ? "Oluşturuluyor…" : "Oluştur"}</button>
+        <button type="submit" className="primary" disabled={busy || loading || (educationSelected && educationSupport !== true) || !name.trim() || (!!sourceId && !template) || template?.members.some(m => !m.name.trim() || !m.model) || (kind === "main" && !cwd && !projects)}>{busy ? "Oluşturuluyor…" : "Oluştur"}</button>
       </div>
     </form>
     </>
@@ -398,7 +425,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
   const [error, setError] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [kind, setKind] = useState<AgentKind>("worker");
-  const [role, setRole] = useState("frontend");
+  const [role, setRole] = useState(team?.profile === "edu" ? "visual-explainer" : "frontend");
   const [model, setModel] = useState<string>("claude-sonnet-5-5");
   const [provider, setProvider] = useState("anthropic");
   const [engine, setEngine] = useState("claude");
@@ -516,7 +543,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
               <tr key={a.id} className={a.kind === "leader" ? "is-leader" : undefined}>
                 <td data-label="Ad"><i className="swatch" style={{ background: a.shirt }} />{a.name}</td>
                 <td data-label="Rol" title={a.title}>
-                  <RoleSelect value={a.roleSlug ?? ""} disabled={busy} label={`${a.name} rolü`}
+                  <RoleSelect profile={team.profile} value={a.roleSlug ?? ""} disabled={busy} label={`${a.name} rolü`}
                     onChange={(v) => run(() => patchAgent(a.id, { roleSlug: v }))} />
                 </td>
                 <td data-label="Motor">
@@ -588,12 +615,13 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
         <select value={kind} onChange={(e) => {
           const k = e.target.value as AgentKind;
           setKind(k);
-          if (k === "leader") setRole("lead");
+          if (team.profile === "edu") setRole(k === "leader" ? "teacher" : "visual-explainer");
+          else if (k === "leader") setRole("lead");
         }}>
           <option value="leader">lider</option>
           <option value="worker">worker</option>
         </select>
-        <RoleSelect value={role} onChange={setRole} label="Yeni üyenin rolü" />
+        <RoleSelect profile={team.profile} value={role} onChange={setRole} label="Yeni üyenin rolü" />
         <select value={engine} aria-label="Yeni üyenin motoru"
           onChange={(e) => {
             setEngine(e.target.value);

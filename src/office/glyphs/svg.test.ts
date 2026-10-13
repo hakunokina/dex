@@ -20,7 +20,9 @@ test("parseGlyph: path, circle, ellipse and rounded rect become path data; fill 
 test("every catalog glyph parses to drawable parts", () => {
   const dir = new URL(".", import.meta.url);
   const files = readdirSync(dir).filter((f) => f.endsWith(".svg"));
-  assert.equal(files.length, 20);
+  assert.equal(files.length, 22);
+  assert.ok(files.includes("teacher.svg"));
+  assert.ok(files.includes("visual-explainer.svg"));
   for (const file of files) {
     const parts = parseGlyph(readFileSync(new URL(file, dir), "utf8"));
     assert.ok(parts.length > 0 && parts.every((p) => p.d.startsWith("M")), file);

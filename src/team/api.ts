@@ -1,10 +1,11 @@
 // S4: every call names its host — a bare host id for lists/creates, a qualified team/agent id
 // (src/api/hosts.ts) otherwise. Records come back with qualified ids and their `host`.
-import { callHost, LOCAL, onEvent, qid, qOpt, splitId } from "../api/hosts";
+import { callHost, hostSupports, LOCAL, onEvent, qid, qOpt, splitId } from "../api/hosts";
 import type { Unlisten } from "../api/transport";
 import { chainView } from "./chainView";
 
 export type TeamKind = "main" | "service";
+export type TeamProfile = "dev" | "edu";
 export type TestLevel = "full" | "light";
 export type AgentKind = "leader" | "worker";
 /** Görev #120: Claude'un sürümlü kimlikleri; eski takma adlar (opus/sonnet/haiku) DB'de geçerli kalır. */
@@ -19,6 +20,7 @@ export interface TeamRec {
   host: string;
   name: string;
   kind: TeamKind;
+  profile: TeamProfile;
   /** Project folder (main teams only; unique across teams). */
   cwd: string | null;
   createdAt: number;
@@ -146,14 +148,15 @@ export interface Role {
   description: string;
 }
 
-/** A new team is always 1 `lead` + 4 workers; these are the workers' default roles. */
+/** Developer teams default to 1 `lead` + 4 workers with these roles. */
 export const DEFAULT_WORKER_ROLES = ["frontend", "backend", "qa", "explorer"];
 
 export interface NewTeam {
   name: string;
   kind: TeamKind;
+  profile?: TeamProfile;
   cwd?: string | null;
-  /** Exactly 4; omitted → DEFAULT_WORKER_ROLES. */
+  /** Developer profile: exactly 4; omitted → DEFAULT_WORKER_ROLES. Edu omits this. */
   workerRoles?: string[];
   members?: TeamMemberTemplate[];
 }
@@ -169,7 +172,7 @@ export interface TeamMemberTemplate {
   chainOff?: boolean;
   effort?: null;
 }
-export interface TeamCloneTemplate { kind: TeamKind; members: TeamMemberTemplate[] }
+export interface TeamCloneTemplate { kind: TeamKind; profile: TeamProfile; members: TeamMemberTemplate[] }
 export interface TeamFolderPreview {
   folderName: string;
   workspaceRoot: string;
@@ -204,6 +207,19 @@ const team = (host: string, t: TeamRec): TeamRec => ({ ...t, host, id: qid(host,
 const agent = (host: string, a: AgentRec): AgentRec => ({ ...a, host, id: qid(host, a.id), teamId: qid(host, a.teamId) });
 
 export const listTeams = (host: string) => callHost<TeamRec[]>(host, "team_list").then((r) => r.map((t) => team(host, t)));
+/** Probe this host's wire records, never the local catalog or cached teams. */
+export async function supportsEducation(host: string): Promise<boolean> {
+  if (!hostSupports(host, "team_list") || !hostSupports(host, "role_list")) return false;
+  try {
+    const [teams, roles] = await Promise.all([
+      callHost<TeamRec[]>(host, "team_list"), callHost<Role[]>(host, "role_list"),
+    ]);
+    if (!Array.isArray(teams) || !Array.isArray(roles)) return false;
+    // A populated downgraded core can expose new DB roles while ignoring profile.
+    if (teams.length) return teams.every(t => t?.profile === "dev" || t?.profile === "edu");
+    return ["teacher", "visual-explainer"].every(slug => roles.some(r => r?.slug === slug));
+  } catch { return false; }
+}
 export const createTeam = (host: string, t: NewTeam) => callHost<TeamRec>(host, "team_create", { team: t }).then((r) => team(host, r));
 export function updateTeam(id: string, patch: TeamPatch) {
   const [host, raw] = splitId(id);
