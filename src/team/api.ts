@@ -1,6 +1,6 @@
 // S4: every call names its host — a bare host id for lists/creates, a qualified team/agent id
 // (src/api/hosts.ts) otherwise. Records come back with qualified ids and their `host`.
-import { callHost, LOCAL, onEvent, qid, qOpt, splitId } from "../api/hosts";
+import { callHost, hostSupports, LOCAL, onEvent, qid, qOpt, splitId } from "../api/hosts";
 import type { Unlisten } from "../api/transport";
 import { chainView } from "./chainView";
 
@@ -207,6 +207,19 @@ const team = (host: string, t: TeamRec): TeamRec => ({ ...t, host, id: qid(host,
 const agent = (host: string, a: AgentRec): AgentRec => ({ ...a, host, id: qid(host, a.id), teamId: qid(host, a.teamId) });
 
 export const listTeams = (host: string) => callHost<TeamRec[]>(host, "team_list").then((r) => r.map((t) => team(host, t)));
+/** Probe this host's wire records, never the local catalog or cached teams. */
+export async function supportsEducation(host: string): Promise<boolean> {
+  if (!hostSupports(host, "team_list") || !hostSupports(host, "role_list")) return false;
+  try {
+    const [teams, roles] = await Promise.all([
+      callHost<TeamRec[]>(host, "team_list"), callHost<Role[]>(host, "role_list"),
+    ]);
+    if (!Array.isArray(teams) || !Array.isArray(roles)) return false;
+    // A populated downgraded core can expose new DB roles while ignoring profile.
+    if (teams.length) return teams.every(t => t?.profile === "dev" || t?.profile === "edu");
+    return ["teacher", "visual-explainer"].every(slug => roles.some(r => r?.slug === slug));
+  } catch { return false; }
+}
 export const createTeam = (host: string, t: NewTeam) => callHost<TeamRec>(host, "team_create", { team: t }).then((r) => team(host, r));
 export function updateTeam(id: string, patch: TeamPatch) {
   const [host, raw] = splitId(id);

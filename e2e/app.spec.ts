@@ -43,6 +43,18 @@ isolatedTest("eğitim profili: klavyeyle takım kurulur, yalnız eğitim rolleri
     await expect(picker.locator("optgroup")).toHaveAttribute("label", "Eğitim");
     await expect(picker.locator("option")).toHaveCount(2);
   }
+  await settings.getByRole("button", { name: "Takımı kopyala", exact: true }).click();
+  const copyForm = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+  await copyForm.getByRole("textbox", { name: "Ad", exact: true }).fill("Ders Kopya");
+  const copyCreate = copyForm.getByRole("button", { name: "Oluştur", exact: true });
+  await expect(copyCreate).toBeEnabled();
+  await copyCreate.focus();
+  await app.keyboard.press("Enter");
+  await expect(copyForm).toHaveCount(0);
+  expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args?.team).toMatchObject({ profile: "edu" });
+  const copy = (await dexd.call<{ id: string; name: string; profile: string }[]>("team_list")).find(t => t.name === "Ders Kopya")!;
+  expect(copy.profile).toBe("edu");
+  expect((await teamAgents(dexd, copy.id)).map(a => a.name).sort()).toEqual(["Chalk-1", "Sage"]);
 });
 
 test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi görünür", async ({ app, dexd }) => {
@@ -122,6 +134,69 @@ test("eski host (project_list yok): ana takım klasör seçilmeden oluşturulama
   await expect(create).toBeEnabled();
   await app.getByRole("button", { name: "Vazgeç", exact: true }).click();
 });
+
+test("eski host (profile yok): Eğitim engellenir, geliştirici oluşturma korunur", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, "Eski Profil");
+  const teams = await dexd.call<Record<string, unknown>[]>("team_list");
+  const oldTeams = teams.map(({ profile: _profile, ...t }) => t);
+  await app.addInitScript(({ oldTeams, url, token }) => {
+    // The old core accepts team_create but ignores profile, returning a development team.
+    window.__dexFake = { team_list: oldTeams, team_create: oldTeams[0] };
+    localStorage.setItem("dex.hosts", JSON.stringify([{ id: "old-profile", name: "Eski uzak host", url, device: "test" }]));
+    localStorage.setItem("dex.e2e.token.old-profile", token);
+  }, { oldTeams, url: dexd.url, token: dexd.token });
+  await app.reload();
+  await app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: new RegExp(`^${team.name}`) }).first().click();
+  await app.setViewportSize({ width: 390, height: 780 });
+  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).focus();
+  await app.keyboard.press("Enter");
+  const form = app.getByRole("dialog", { name: "Yeni takım", exact: true });
+  const host = form.getByRole("combobox", { name: "Takımın host'u", exact: true });
+  await expect(host.locator('option[value="old-profile"]')).toBeEnabled();
+  await host.selectOption("old-profile");
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Eski Ders");
+  const profile = form.getByRole("combobox", { name: "Profil", exact: true });
+  await profile.focus();
+  await app.keyboard.press("ArrowDown");
+  await app.keyboard.press("Enter");
+  await expect(profile).toHaveValue("edu");
+  await expect(form.getByRole("alert")).toContainText("Eğitim için bu hostun çekirdeğini güncelleyin.");
+  const create = form.getByRole("button", { name: "Oluştur", exact: true });
+  await expect(create).toBeDisabled();
+  // Even implicit/programmatic submission must stop before the mutating request.
+  await form.evaluate(el => (el as HTMLFormElement).requestSubmit());
+  await expect(form.getByRole("alert")).toBeVisible();
+  expect((await calls(app)).filter(c => c.cmd === "team_create")).toHaveLength(0);
+  expect(await form.evaluate(el => el.scrollWidth <= el.clientWidth && el.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+  await profile.selectOption("dev");
+  await expect(form.getByRole("alert")).toHaveCount(0);
+  await expect(create).toBeEnabled();
+  await create.focus();
+  await app.keyboard.press("Enter");
+  await expect(form).toHaveCount(0);
+  expect((await calls(app)).filter(c => c.cmd === "team_create")).toHaveLength(1);
+});
+
+for (const failure of ["team_list", "role_list", "eksik eğitim rolleri"]) {
+  isolatedTest(`eğitim desteği belirsiz (${failure}): takım oluşturulmaz`, async ({ app }) => {
+    await expect(app.getByRole("button", { name: "Takım oluştur…" })).toBeVisible();
+    await app.evaluate(failure => {
+      window.__dexFake = { team_list: [], ...(failure === "eksik eğitim rolleri" ? { role_list: [] } : {}) };
+      if (failure !== "eksik eğitim rolleri") {
+        delete window.__dexFake[failure];
+        window.__dexOld = { unknown: [failure] };
+      }
+    }, failure);
+    await app.getByRole("button", { name: "Takım oluştur…" }).click();
+    const form = app.getByRole("dialog", { name: "Yeni takım", exact: true });
+    await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Belirsiz Ders");
+    await form.getByRole("combobox", { name: "Profil", exact: true }).selectOption("edu");
+    await expect(form.getByRole("alert")).toContainText("çekirdeğini güncelleyin");
+    await expect(form.getByRole("button", { name: "Oluştur", exact: true })).toBeDisabled();
+    await form.evaluate(el => (el as HTMLFormElement).requestSubmit());
+    expect((await calls(app)).filter(c => c.cmd === "team_create")).toHaveLength(0);
+  });
+}
 
 test("görev panosu: görev oluşturulur, listede ve çekirdekte görünür", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Pano ${test.info().workerIndex}`);

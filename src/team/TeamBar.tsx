@@ -12,7 +12,7 @@ import { useTeamProjects } from "../project/store";
 import { getStatus } from "../agents";
 import {
   DEFAULT_WORKER_ROLES, ENGINES, importProviders, listCodexModels, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
-  setProviderToken, teamDeleteInfo, teamCloneTemplate,
+  setProviderToken, teamDeleteInfo, teamCloneTemplate, supportsEducation,
   type AgentKind, type LocalStatus, type PendingModel, type ProviderImportRow, type ProviderInfo, type ProviderModel, type Role,
   type TeamKind, type TeamProfile, type TeamCloneTemplate,
 } from "./api";
@@ -232,6 +232,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   const [name, setName] = useState("");
   const [kind, setKind] = useState<TeamKind>("main");
   const [profile, setProfile] = useState<TeamProfile>("dev");
+  const [education, setEducation] = useState<{ host: string; supported: boolean } | null>(null);
   const [cwd, setCwd] = useState<string | null>(null);
   const [workerRoles, setWorkerRoles] = useState<string[]>(DEFAULT_WORKER_ROLES);
   const [error, setError] = useState<string | null>(null);
@@ -277,12 +278,24 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   }, [host, sourceId, catalogRetry]);
   // Modern hosts create the team/Main folders when cwd is omitted; old hosts still need a picker.
   const projects = hostSupports(host, "project_list");
+  const educationSupport = education?.host === host ? education.supported : null;
+  const educationSelected = (template?.profile ?? profile) === "edu";
+  useEffect(() => {
+    let live = true;
+    setEducation(null);
+    void supportsEducation(host).then(supported => { if (live) setEducation({ host, supported }); });
+    return () => { live = false; };
+  }, [host]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
-    if (busy || loading || (sourceId && !template)) return;
+    if (busy || loading || (sourceId && !template) || (educationSelected && educationSupport !== true)) return;
     setBusy(true); setError(null);
     try {
+      if (educationSelected && !await supportsEducation(host)) {
+        setEducation({ host, supported: false });
+        return;
+      }
       await createTeam(host, { name: name.trim(), kind, profile: template?.profile ?? profile, cwd: kind === "main" ? cwd : null,
         ...(template ? { members: template.members } : profile === "dev" ? { workerRoles } : {}) });
       onDone();
@@ -391,10 +404,13 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
       {sourceId && !loading && !template && <button type="button" onClick={() => setRetry(r => r + 1)}>Yeniden dene</button>}
       {template && !template.members.length && <p className="team-note">Kaynak takımda üye yok; yeni takım boş başlayacak.</p>}
       {sourceId && <p className="team-note">Hafıza, oturumlar ve projeler yeni takımda sıfırdan başlar.</p>}
+      {educationSelected && (educationSupport === null
+        ? <p className="team-note" role="status">Eğitim desteği kontrol ediliyor…</p>
+        : !educationSupport && <p className="team-err" role="alert">Eğitim için bu hostun çekirdeğini güncelleyin.</p>)}
       {error && <p className="team-err" role="alert">{error}</p>}
       <div className="team-actions">
         <button type="button" disabled={busy} onClick={onDone}>Vazgeç</button>
-        <button type="submit" className="primary" disabled={busy || loading || !name.trim() || (!!sourceId && !template) || template?.members.some(m => !m.name.trim() || !m.model) || (kind === "main" && !cwd && !projects)}>{busy ? "Oluşturuluyor…" : "Oluştur"}</button>
+        <button type="submit" className="primary" disabled={busy || loading || (educationSelected && educationSupport !== true) || !name.trim() || (!!sourceId && !template) || template?.members.some(m => !m.name.trim() || !m.model) || (kind === "main" && !cwd && !projects)}>{busy ? "Oluşturuluyor…" : "Oluştur"}</button>
       </div>
     </form>
     </>
