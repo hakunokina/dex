@@ -5,6 +5,7 @@ import type { Unlisten } from "../api/transport";
 import { chainView } from "./chainView";
 
 export type TeamKind = "main" | "service";
+export type TeamProfile = "dev" | "edu";
 export type TestLevel = "full" | "light";
 export type AgentKind = "leader" | "worker";
 /** Görev #120: Claude'un sürümlü kimlikleri; eski takma adlar (opus/sonnet/haiku) DB'de geçerli kalır. */
@@ -19,6 +20,7 @@ export interface TeamRec {
   host: string;
   name: string;
   kind: TeamKind;
+  profile: TeamProfile;
   /** Project folder (main teams only; unique across teams). */
   cwd: string | null;
   createdAt: number;
@@ -146,14 +148,15 @@ export interface Role {
   description: string;
 }
 
-/** A new team is always 1 `lead` + 4 workers; these are the workers' default roles. */
+/** Developer teams default to 1 `lead` + 4 workers with these roles. */
 export const DEFAULT_WORKER_ROLES = ["frontend", "backend", "qa", "explorer"];
 
 export interface NewTeam {
   name: string;
   kind: TeamKind;
+  profile?: TeamProfile;
   cwd?: string | null;
-  /** Exactly 4; omitted → DEFAULT_WORKER_ROLES. */
+  /** Developer profile: exactly 4; omitted → DEFAULT_WORKER_ROLES. Edu omits this. */
   workerRoles?: string[];
   members?: TeamMemberTemplate[];
 }
@@ -169,7 +172,7 @@ export interface TeamMemberTemplate {
   chainOff?: boolean;
   effort?: null;
 }
-export interface TeamCloneTemplate { kind: TeamKind; members: TeamMemberTemplate[] }
+export interface TeamCloneTemplate { kind: TeamKind; profile: TeamProfile; members: TeamMemberTemplate[] }
 export interface TeamFolderPreview {
   folderName: string;
   workspaceRoot: string;

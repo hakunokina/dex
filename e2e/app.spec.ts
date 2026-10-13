@@ -1,8 +1,49 @@
 // The desktop shell against a real dexd (e2e/fixtures.ts). What the patron sees first: the app
 // connects, a team is made from the UI, its crew and the task board show up.
-import { test, expect, calls, openTeam, teamAgents, newTeam } from "./fixtures";
+import { test, isolatedTest, expect, calls, openTeam, teamAgents, newTeam } from "./fixtures";
 import { existsSync } from "node:fs";
 import { dirname, basename } from "node:path";
+
+isolatedTest("eğitim profili: klavyeyle takım kurulur, yalnız eğitim rolleri ve iki üye görünür", async ({ app, dexd }) => {
+  await app.setViewportSize({ width: 390, height: 780 });
+  await app.getByRole("button", { name: "Takım oluştur…" }).click();
+  const form = app.getByRole("dialog", { name: "Yeni takım", exact: true });
+  await expect(form.getByRole("textbox", { name: "Ad", exact: true })).toBeFocused();
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Ders");
+  const profile = form.getByRole("combobox", { name: "Profil", exact: true });
+  await expect(profile).toHaveValue("dev");
+  await expect(form.getByRole("combobox", { name: /^Worker \d rolü$/ })).toHaveCount(4);
+  await expect(form.locator('optgroup[label="Eğitim"]')).toHaveCount(0);
+  await profile.focus();
+  await app.keyboard.press("ArrowDown");
+  await app.keyboard.press("Enter");
+  await expect(profile).toHaveValue("edu");
+  await expect(form.getByRole("combobox", { name: /^Worker \d rolü$/ })).toHaveCount(0);
+  await expect(form.getByText("Öğretmen (lider) + Görsel Anlatıcı", { exact: true })).toBeVisible();
+  expect(await form.evaluate(el => el.scrollWidth <= el.clientWidth && el.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+  const create = form.getByRole("button", { name: "Oluştur", exact: true });
+  await expect(create).toBeEnabled();
+  await create.focus();
+  await app.keyboard.press("Tab");
+  await expect(form.getByRole("textbox", { name: "Ad", exact: true })).toBeFocused();
+  await create.focus();
+  await app.keyboard.press("Enter");
+  await expect(form).toHaveCount(0);
+  const request = (await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args?.team;
+  expect(request).toMatchObject({ name: "Ders", profile: "edu" });
+  expect(request).not.toHaveProperty("workerRoles");
+  expect(request).not.toHaveProperty("members");
+  const team = (await dexd.call<{ id: string; name: string; profile: string }[]>("team_list")).find(t => t.name === "Ders")!;
+  expect(team.profile).toBe("edu");
+  expect((await teamAgents(dexd, team.id)).map(a => a.name).sort()).toEqual(["Chalk-1", "Sage"]);
+  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  const settings = app.locator(".team-settings");
+  for (const label of ["Sage rolü", "Chalk-1 rolü", "Yeni üyenin rolü"]) {
+    const picker = settings.getByRole("combobox", { name: label, exact: true });
+    await expect(picker.locator("optgroup")).toHaveAttribute("label", "Eğitim");
+    await expect(picker.locator("option")).toHaveCount(2);
+  }
+});
 
 test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi görünür", async ({ app, dexd }) => {
   const errors: string[] = [];
