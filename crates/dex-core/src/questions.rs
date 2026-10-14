@@ -13,6 +13,7 @@ use crate::db::{with, Db};
 use crate::delegate::Caller;
 use crate::events::Events;
 use crate::Core;
+use std::collections::HashSet;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,12 +25,75 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(45);
 pub(crate) struct Answers {
     gate: Mutex<()>,
     changed: Condvar,
+    /// İptal anahtarları: (worker, questionId). `notifications/cancelled` ya da oturum
+    /// bitişi bekleyen her çağrıyı bu anahtarla kaydeder; `wait` anahtarı görünce hemen kapanır.
+    cancelled: Mutex<HashSet<(String, i64)>>,
 }
 
 impl Answers {
     pub(crate) fn notify(&self) {
         let _guard = self.gate.lock().unwrap();
         self.changed.notify_all();
+    }
+
+    /// Bekleyen soruyu iptal eder: satır `cancelled` olur, lidere `[Dex-Soru] … iptal` notu
+    /// gider, bloklanan çağrı Err ile uyanır. `answer_delivered_at` de yazılır — teslim bekleyen
+    /// kalmadığı için `on_exit`/`waiting` işi raporsuz kapatır (asılı iş kalmaz). Geç cevap
+    /// (`answer`/`patron_answer`) "iptal edilmişti" ile reddedilir.
+    /// Dönen bool: false = iptal edilecek açık soru yoktu (zaten cevaplı/iptal ya da başkasının).
+    pub(crate) fn cancel_question(&self, db: &Db, ev: &Events, worker: &str, id: i64) -> Result<bool, String> {
+        let cancelled = with(db, |conn| {
+            let q = get(conn, id)?;
+            if q.worker != worker || q.status == "answered" || q.status == "cancelled" {
+                return Ok(None);
+            }
+            let ts = now();
+            conn.execute(
+                "UPDATE questions SET status = 'cancelled', answer_delivered_at = ?2, updated_at = ?2 WHERE id = ?1",
+                params![id, ts],
+            )
+            .map_err(e)?;
+            crate::plan::note(
+                conn,
+                &q.leader,
+                &format!(
+                    "[{}] {} #{} · soru #{} iptal edildi (çağrı iptal/oturum bitti): {}",
+                    crate::dexmsg::SORU,
+                    q.worker_name,
+                    q.delegation_id,
+                    q.id,
+                    q.question
+                ),
+            )?;
+            crate::diagnostics::event("question", json!({"id": id, "status": "cancelled"}));
+            Ok(Some(()))
+        })?;
+        if cancelled.is_none() {
+            return Ok(false);
+        }
+        self.cancelled.lock().map_err(|_| "cevap kilidi zehirli")?.insert((worker.to_string(), id));
+        self.notify();
+        let _ = ev.emit("questions-changed", &());
+        Ok(true)
+    }
+
+    /// Worker'ın tüm açık sorularını iptal eder (oturum bitişi / `notifications/cancelled`).
+    pub(crate) fn cancel_agent(&self, db: &Db, ev: &Events, worker: &str) -> Result<usize, String> {
+        let ids: Vec<i64> = with(db, |conn| {
+            conn.prepare("SELECT id FROM questions WHERE worker = ?1 AND status IN ('open','escalated') ORDER BY id")
+                .map_err(e)?
+                .query_map([worker], |r| r.get(0))
+                .map_err(e)?
+                .collect::<Result<_, _>>()
+                .map_err(e)
+        })?;
+        let mut n = 0;
+        for id in ids {
+            if self.cancel_question(db, ev, worker, id)? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn wait(&self, db: &Db, worker: &Caller, id: i64, timeout: Duration) -> Result<Value, String> {
@@ -47,6 +111,11 @@ impl Answers {
                 }
                 Ok(q)
             })?;
+            if q.status == "cancelled"
+                || self.cancelled.lock().map_err(|_| "cevap kilidi zehirli")?.remove(&(worker.id.clone(), id))
+            {
+                return Err(format!("soru #{id} iptal edildi (çağrı iptal/oturum bitti); turu bitir, gerekiyorsa yeni soruyla devam et"));
+            }
             if q.status == "answered" {
                 return Ok(if q.answer_delivered_at.is_some() {
                     json!({"questionId": id, "status": "delivered", "note": "Cevap bu oturuma zaten teslim edildi; cevaba göre devam et."})
@@ -206,6 +275,9 @@ fn own(conn: &Connection, c: &Caller, id: i64) -> Result<Question, String> {
     if !c.is_leader() || q.leader != c.id {
         return Err(format!("soru #{id} sana sorulmadı (lider: {})", q.leader_name));
     }
+    if q.status == "cancelled" {
+        return Err(format!("soru #{id} iptal edilmişti; cevap işlenmedi"));
+    }
     if q.status == "answered" {
         return Err(format!("soru #{id} zaten cevaplandı ({})", q.answered_by.as_deref().unwrap_or("?")));
     }
@@ -247,6 +319,9 @@ pub fn escalate(conn: &Connection, c: &Caller, id: i64, note: Option<&str>) -> R
 /// The patron's answer (UI card). The leader hears it as a note (woken if idle: `Core::question_answer`).
 pub fn patron_answer(conn: &Connection, id: i64, text: &str) -> Result<Question, String> {
     let q = get(conn, id)?;
+    if q.status == "cancelled" {
+        return Err(format!("soru #{id} iptal edilmişti; cevap işlenmedi"));
+    }
     if q.status == "answered" {
         return Err(format!("soru #{id} zaten cevaplandı"));
     }
@@ -664,6 +739,56 @@ mod tests {
     }
 
     #[test]
+    fn cancel_closes_blocking_call_and_late_answer_is_rejected() {
+        let (db, ev, d) = setup();
+        let (worker, leader) = with(&db, |c| Ok((caller(c, "kaan")?, caller(c, "timur")?))).unwrap();
+        let answers = std::sync::Arc::new(Answers::default());
+        let thread_answers = answers.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_db = db.clone();
+        let thread_ev = ev.clone();
+        let waiter = std::thread::spawn(move || {
+            let worker = with(&thread_db, |c| caller(c, "kaan")).unwrap();
+            tx.send(mcp_call(&thread_db, &thread_ev, &crate::permit::Permits::default(), &thread_answers, &worker,
+                "ask_leader", &json!({"question": "Karar?"})).unwrap()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "ask_leader must wait for its answer");
+        let id = with(&db, |c| list_recent(c)?.pop().map(|q| q.id).ok_or("soru yok".to_string())).unwrap();
+        assert!(answers.cancel_question(&db, &ev, "kaan", id).unwrap());
+        assert!(!answers.cancel_question(&db, &ev, "kaan", id).unwrap(), "second cancel is a no-op");
+        assert!(!answers.cancel_question(&db, &ev, "ayla", id).unwrap(), "foreign worker cannot cancel");
+        let err = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap_err();
+        assert!(err.contains("iptal"), "{err}");
+        waiter.join().unwrap();
+        let q = with(&db, |c| get(c, id)).unwrap();
+        assert_eq!(q.status, "cancelled");
+        assert!(q.answer_delivered_at.is_some(), "settled: the job can close instead of hanging");
+        let note = with(&db, |c| crate::plan::take_notes(c, "timur")).unwrap().unwrap();
+        assert!(note.contains("iptal") && note.contains("Karar?"), "{note}");
+        let err = with(&db, |c| answer(c, &leader, id, "geç")).unwrap_err();
+        assert!(err.contains("iptal edilmişti"), "{err}");
+        let err = with(&db, |c| patron_answer(c, id, "geç")).unwrap_err();
+        assert!(err.contains("iptal edilmişti"), "{err}");
+        with(&db, |c| crate::delegate::report(c, &worker, d, "bitti: tamam", None)).unwrap();
+        assert_eq!(status(&db, d), "done");
+    }
+
+    #[test]
+    fn session_exit_after_cancel_closes_the_job_without_hanging() {
+        let (db, ev, d) = setup();
+        let answers = Answers::default();
+        let worker = with(&db, |c| caller(c, "kaan")).unwrap();
+        let q = with(&db, |c| ask(c, &worker, &json!({"question": "Karar?"}))).unwrap();
+        assert_eq!(answers.cancel_agent(&db, &ev, "kaan").unwrap(), 1);
+        assert_eq!(answers.cancel_agent(&db, &ev, "kaan").unwrap(), 0);
+        crate::delegate::session_exited(&db, &ev, "kaan").unwrap();
+        assert_eq!(status(&db, d), "done_no_report");
+        assert!(hook(&db, &ev, "kaan", "Stop", json!({})).is_none());
+        let recent = with(&db, list_recent).unwrap();
+        assert!(recent.iter().any(|x| x.id == q.id && x.status == "cancelled"), "cancelled stays visible, not hanging");
+    }
+
+    #[test]
     fn wait_checks_ownership_and_preserves_hook_fallback() {
         let (db, ev, _) = setup();
         let answers = Answers::default();
@@ -957,6 +1082,44 @@ mod wake_tests {
         assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap()["result"]["structuredContent"]["answer"], "devam");
         waiter.join().unwrap();
         assert!(with(&core.db, |c| super::take_answers(c, "kaan")).unwrap().is_empty());
+        done(core, root);
+    }
+
+    #[test]
+    fn cancelled_notification_closes_blocking_call_and_marks_question() {
+        let (core, root, _) = core("cancelled-notify");
+        let q = with(&core.db, |c| super::ask(c, &caller(c, "kaan")?, &json!({"question": "Karar?"}))).unwrap();
+        let qid = q.id;
+        let key = core.mcp.key_for("kaan");
+        let worker_core = core.clone();
+        let worker_key = key.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let reply: Value = ureq::post(&format!("http://127.0.0.1:{}/mcp", worker_core.hooks.port))
+                .timeout(std::time::Duration::from_secs(10))
+                .set("Authorization", &format!("Bearer {}", worker_core.hooks.token))
+                .set("X-Dex-Agent", "kaan")
+                .set("X-Dex-Key", &worker_key)
+                .send_json(json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "wait_answer", "arguments": {"questionId": qid}}}))
+                .unwrap().into_json().unwrap();
+            tx.send(reply).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(150)).is_err(), "wait_answer must block");
+        // Esc: the CLI cancels the request — a notification carries no id.
+        let cancelled = ureq::post(&format!("http://127.0.0.1:{}/mcp", core.hooks.port))
+            .timeout(std::time::Duration::from_secs(5))
+            .set("Authorization", &format!("Bearer {}", core.hooks.token))
+            .set("X-Dex-Agent", "kaan")
+            .set("X-Dex-Key", &key)
+            .send_json(json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 7}})).unwrap();
+        assert_eq!(cancelled.status(), 202);
+        let reply = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        assert!(reply["result"].to_string().contains("iptal"), "{reply}");
+        waiter.join().unwrap();
+        assert_eq!(with(&core.db, |c| super::get(c, qid)).unwrap().status, "cancelled");
         done(core, root);
     }
 
