@@ -23,6 +23,12 @@ fn project<T: Serialize>(r: Result<T, String>) -> Result<Value, Error> {
     serde_json::to_value(v).map_err(|e| Error::failed(e.to_string()))
 }
 
+/// Inbox-layer calls keep their stable `{code, message}` (inbox_submit's contract).
+fn inbox<T: Serialize>(r: Result<T, dex_core::inbox::Error>) -> Result<Value, Error> {
+    let v = r.map_err(|e| Error::new(e.code, e.message))?;
+    serde_json::to_value(v).map_err(|e| Error::failed(e.to_string()))
+}
+
 type Handler = fn(&Core, &Value) -> Result<Value, Error>;
 
 /// Blocking (DB, file and — for providers — network calls): run it off the async runtime.
@@ -54,6 +60,11 @@ handlers! {
             let reply = core.inbox_submit(input).map_err(|e| Error::new(e.code, e.message))?;
             serde_json::to_value(reply).map_err(|e| Error::failed(e.to_string()))
         },
+        // #1718: share replies and FCM device tokens — host connections only, never the agent MCP.
+        "inbox_replies" => |core,p| inbox(core.inbox_replies(&arg::<String>(p,"teamId")?,arg(p,"limit")?)),
+        "inbox_reply_get" => |core,p| inbox(core.inbox_reply_get(arg(p,"id")?)),
+        "push_register" => |core,p| inbox(core.push_register(&arg::<String>(p,"token")?,&arg::<String>(p,"platform")?)),
+        "push_unregister" => |core,p| inbox(core.push_unregister(&arg::<String>(p,"token")?)),
         "agent_context" => |core,p| ok(core.agent_context(&arg::<String>(p,"agentId")?)),
         "team_context" => |core,p| ok(core.team_context(&arg::<String>(p,"teamId")?)),
         "usage_summary" => |core,p| ok(core.usage_summary(&arg::<String>(p,"teamId")?,arg(p,"since")?)),
@@ -279,6 +290,29 @@ mod tests {
         for (params,code) in [(serde_json::json!({}),"bad_request"),(serde_json::json!({"teamId":"default"}),"inbox_empty"),(serde_json::json!({"teamId":"default","text":"x"}),"inbox_no_assistant"),(serde_json::json!({"teamId":"default","text":"x","path":"evil"}),"bad_request")] {
             assert_eq!(call(&core,"inbox_submit",&params).unwrap_err().code,code);
         }
+        core.shutdown();
+    }
+
+    #[test]
+    fn inbox_reply_and_push_rpcs_are_advertised_with_stable_errors() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/inbox-reply-rpc-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let core=Core::start(Paths{data_dir:root.join("data"),config_dir:root.join("config")},Events::new(NullSink)).unwrap();
+        for m in ["inbox_replies","inbox_reply_get","push_register","push_unregister"] { assert!(METHODS.contains(&m), "{m}"); }
+        assert_eq!(call(&core,"inbox_replies",&serde_json::json!({"teamId":"default","limit":10})).unwrap(),serde_json::json!([]));
+        for (method,params,code) in [
+            ("inbox_replies",serde_json::json!({}),"bad_request"),
+            ("inbox_replies",serde_json::json!({"teamId":""}),"inbox_team"),
+            ("inbox_reply_get",serde_json::json!({"id":"x"}),"bad_request"),
+            ("inbox_reply_get",serde_json::json!({"id":1}),"inbox_reply_not_found"),
+            ("push_register",serde_json::json!({"token":"t","platform":"ios"}),"push_platform"),
+            ("push_register",serde_json::json!({"token":"","platform":"android"}),"push_token"),
+            ("push_unregister",serde_json::json!({}),"bad_request"),
+        ] {
+            assert_eq!(call(&core,method,&params).unwrap_err().code,code,"{method} {params}");
+        }
+        let reply=call(&core,"push_register",&serde_json::json!({"token":"fcm-device-1","platform":"android"})).unwrap();
+        assert_eq!(reply,serde_json::json!({"ok":true,"pushConfigured":false}));
+        assert_eq!(call(&core,"push_unregister",&serde_json::json!({"token":"fcm-device-1"})).unwrap(),serde_json::json!({"ok":true}));
         core.shutdown();
     }
 

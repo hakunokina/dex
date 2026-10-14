@@ -859,6 +859,7 @@ dependencies = [
  "log",
  "notify",
  "portable-pty",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
