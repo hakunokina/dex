@@ -71,8 +71,10 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
   await dexd.call("pty_kill", { id: echo.id });
   await app.locator('.team-stage:not(.hidden) .dv-tab').filter({ hasText: /^Takım$/ }).click();
   const row = settings.locator("tr").filter({ hasText: "Echo-1" });
-  await expect(row.getByRole("button", { name: "Üyeyi sil" })).toBeEnabled();
-  await row.getByRole("button", { name: "Üyeyi sil" }).click();
+  await expect(row.getByRole("button", { name: "Echo-1 işlemleri" })).toBeEnabled();
+  await row.getByRole("button", { name: "Echo-1 işlemleri" }).click();
+  await row.getByRole("menuitem", { name: "Üyeyi sil" }).click();
+  await app.getByRole("alertdialog").getByRole("button", { name: "Üyeyi sil" }).click();
   await expect(region("Echo-1")).toHaveCount(0);
   const after = (await region(leader.name).boundingBox())!;
   expect(Math.abs(after.width - before!.width)).toBeLessThan(2);
