@@ -120,6 +120,12 @@ impl crate::Core {
             reply.queued = false;
             with(&self.db, |c| c.execute("UPDATE inbox_receipts SET reply=?1 WHERE id=?2", params![serde_json::to_string(&reply).unwrap(),id]).map(|_| ()).map_err(|e| e.to_string()))
                 .map_err(|_| error("inbox_unavailable", "gelen kutusu yanıtı kaydedilemedi"))?;
+        } else {
+            // A transient not-ready at submit (busy, draining, typing, spawn) must not
+            // strand the row when no further hook ever comes: re-arm the existing
+            // typing-window timer as the one retry. Persistent blocks (drain, draft,
+            // pre-session dialog) still end on their own event, which wakes again.
+            self.inbox_wake(&reply.agent_id);
         }
         Ok(reply)
     }
@@ -471,6 +477,57 @@ mod tests {
         assert_eq!(with(&core.db, |c| c.query_row("SELECT COUNT(*) FROM inbox_messages", [], |r| r.get::<_,i64>(0)).map_err(|e| e.to_string())).unwrap(), 0);
     }
     fn input() -> Submit { Submit { team_id: "default".into(), client_id: None, text: Some("bir\niki\u{1b}[201~\u{0}".into()), image: None } }
+    #[test]
+    fn idle_submit_delivers_immediately_without_waiting_for_another_hook() {
+        use crate::agents::Status;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-idle-now-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        // Open, idle, and quiet: readiness ignores hook age (silent_for drives
+        // reset/idle-close, never the inbox gate), so no further hook may come.
+        core.agent_states.hook("ayla", Some(Status::Idle), Some("quiet-session"));
+        let reply = core.inbox_submit(input()).unwrap();
+        assert!(!reply.queued, "an idle session takes the share at once");
+        let pasted = with(&core.db, |c| c.query_row("SELECT pasted FROM inbox_messages", [], |r| r.get::<_,bool>(0)).map_err(|e| e.to_string())).unwrap();
+        assert!(pasted, "immediate delivery marks the row pasted");
+        core.inbox_prompt_received("ayla", "Patron paylaştı:\nbir\niki[201~");
+        core.ptys.kill("ayla");
+        core.shutdown();
+    }
+
+    #[test]
+    fn missed_submit_retries_without_another_event() {
+        use crate::agents::Status;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-retry-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        core.agent_states.hook("ayla", Some(Status::Idle), Some("retry-session"));
+        // Busy at submit: the share queues…
+        core.agent_states.hook("ayla", Some(Status::Working), None);
+        let mut share = input(); share.client_id = Some("retry-share".into());
+        assert!(core.inbox_submit(share).unwrap().queued);
+        // …and the turn ends with its Stop hook lost: a bare state change wakes nothing.
+        core.agent_states.hook("ayla", Some(Status::Idle), None);
+        // No further event may come; the submit-time wake must deliver on its timer.
+        let pasted = || with(&core.db, |c| c.query_row("SELECT pasted FROM inbox_messages", [], |r| r.get::<_,bool>(0)).map_err(|e| e.to_string())).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pasted() && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let delivered = pasted();
+        if delivered {
+            core.inbox_prompt_received("ayla", "Patron paylaştı:\nbir\niki[201~");
+        }
+        core.ptys.kill("ayla");
+        core.shutdown();
+        assert!(delivered, "a queued share must deliver without another event");
+    }
     #[test]
     fn validates_size_mime_base64_and_cleans_controls_without_accepting_paths() {
         assert_eq!(validate(&input()).unwrap().0, "bir\niki[201~");
