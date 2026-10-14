@@ -63,9 +63,6 @@ impl Core {
         submission_rows: Option<SubmissionRows>,
         submit: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.agent_states.get(agent).engine.as_deref() == Some("codex") {
-            return submit();
-        }
         let mut turns = self.claude_turns.0.lock().unwrap();
         let seq = next_seq();
         let after = crate::diagnostics::now_ms();
@@ -108,12 +105,6 @@ impl Core {
         session: Option<&str>,
         seq: u64,
     ) -> Option<Stop> {
-        if self.agent_states.get(agent).engine.as_deref() == Some("codex") {
-            if event == "UserPromptSubmit" {
-                self.agent_states.prompt_seq(agent, session, seq);
-            }
-            return None;
-        }
         if matches!(
             event,
             "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "Stop" | "StopFailure"
@@ -858,21 +849,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn team_turn_done_codex_stop_once_and_rearms_on_prompt() {
-        let events = Arc::new(DoneEvents::default());
-        let (core, _) = core("team-codex-hook", events.clone());
-        let _finish = Finish(core.clone());
-        core.agent_states.started("timur", "codex", false);
-        core.agent_states.hook("timur", Some(Status::Working), Some("session-a"));
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        assert_eq!(events.0.lock().unwrap().len(), 1);
-        post(&core, "UserPromptSubmit", "next turn", Duration::from_secs(3)).unwrap();
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        assert_eq!(events.0.lock().unwrap().len(), 2);
-    }
-
-    #[test]
     fn team_turn_done_is_team_scoped_and_waits_for_incoming_service_work() {
         let events = Arc::new(DoneEvents::default());
         let (core, _) = core("team-scope", events.clone());
@@ -928,41 +904,6 @@ pub(crate) mod tests {
         post(&core, "UserPromptSubmit", "next turn", Duration::from_secs(3)).unwrap();
         post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
         observe(&core, row("turn_duration", crate::diagnostics::now_ms() + 1));
-        assert_eq!(events.0.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn team_turn_done_codex_interrupt_blocks_late_stop_until_new_prompt() {
-        let events = Arc::new(DoneEvents::default());
-        let (core, _) = core("team-codex-interrupt", events.clone());
-        let _finish = Finish(core.clone());
-        core.agent_states.started("timur", "codex", false);
-        core.agent_states.hook("timur", Some(Status::Working), Some("session-a"));
-        crate::hooks::on_interrupt(&core, "timur");
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        assert!(events.0.lock().unwrap().is_empty(), "late Codex Stop cannot complete interrupted work");
-        post(&core, "PreToolUse", "", Duration::from_secs(3)).unwrap();
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        assert!(events.0.lock().unwrap().is_empty(), "tool hooks cannot rearm completion");
-        post(&core, "UserPromptSubmit", "next turn", Duration::from_secs(3)).unwrap();
-        post(&core, "Stop", "", Duration::from_secs(3)).unwrap();
-        assert_eq!(events.0.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn team_turn_done_codex_interrupt_rearms_on_new_rollout_turn() {
-        let events = Arc::new(DoneEvents::default());
-        let (core, _) = core("team-codex-interrupt-rollout", events.clone());
-        let _finish = Finish(core.clone());
-        core.agent_states.started("timur", "codex", false);
-        let process = core.ptys.generation("timur").unwrap();
-        core.agent_states.codex_observed("timur", process, Some("A"), Some(crate::diagnostics::now_ms())).unwrap();
-        crate::hooks::on_interrupt(&core, "timur");
-        assert!(core.agent_states.codex_completed("timur", process, "A", Some(crate::diagnostics::now_ms() + 1)).is_none());
-        assert!(events.0.lock().unwrap().is_empty());
-        core.agent_states.codex_observed("timur", process, Some("B"), Some(crate::diagnostics::now_ms() + 1)).unwrap();
-        let end = core.agent_states.codex_completed("timur", process, "B", Some(crate::diagnostics::now_ms() + 2)).unwrap();
-        crate::hooks::after_turn_ended(&core, "timur", "Settled", &end);
         assert_eq!(events.0.lock().unwrap().len(), 1);
     }
 
@@ -1832,22 +1773,6 @@ pub(crate) mod tests {
             Status::Working,
             "reconciling acceptance cannot discard the new UPS boundary"
         );
-        finish(&core);
-    }
-
-    #[test]
-    fn codex_stop_keeps_its_existing_hook_delivery_contract() {
-        let (core, _) = core("codex-contract", NullSink);
-        core.agent_states.started("timur", "codex", false);
-        core.agent_states
-            .hook("timur", Some(Status::Working), Some("session-a"));
-        let id = result(&core);
-        core.delegation_on_hook("timur", "Stop", &json!({}), false)
-            .unwrap();
-        assert!(with(&core.db, |c| delegate::get(c, id))
-            .unwrap()
-            .delivered_at
-            .is_some());
         finish(&core);
     }
 

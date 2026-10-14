@@ -362,7 +362,7 @@ mod tests {
         // Geçici zincir değeri (active_*) ayarlananı ezer.
         crate::db::with(&core.db, |conn| {
             conn.execute(
-                "UPDATE agents SET active_engine = 'codex', active_model = 'gpt-5' WHERE id = 'kaan'",
+                "UPDATE agents SET active_provider = 'glm', active_model = 'GLM-5.3' WHERE id = 'kaan'",
                 [],
             )
             .map_err(|e| e.to_string())?;
@@ -372,8 +372,8 @@ mod tests {
         let reply = crate::mcp::call_for_test(&core, "timur", "dex_status");
         let rows = reply["structuredContent"]["agents"].as_array().unwrap();
         let kaan = rows.iter().find(|a| a["agentId"] == "kaan").unwrap();
-        assert_eq!(kaan["engine"], "codex");
-        assert_eq!(kaan["model"], "gpt-5");
+        assert_eq!(kaan["provider"], "glm");
+        assert_eq!(kaan["model"], "GLM-5.3");
         assert_eq!(kaan["name"], "Kaan");
         // Sır sızıntısı yok: rol system_prompt'u ve delegation/question içeriği çıkmaz.
         let secret: String = crate::db::with(&core.db, |conn| {

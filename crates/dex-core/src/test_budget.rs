@@ -72,18 +72,12 @@ pub(crate) fn unplanned_runners(root: &Path) -> Vec<&'static str> {
 /// Hook side: Some(deny answer) when a non-QA agent's shell command would run the whole suite.
 pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<String> {
     let tool = body.get("tool_name").and_then(Value::as_str).unwrap_or("");
-    if !matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell") {
+    if !matches!(tool, "Bash" | "PowerShell") {
         return None;
     }
-    let input = body.get("tool_input")?;
-    // claude: a string; codex's shell tools may pass argv.
-    let command = match input.get("command").or_else(|| input.get("cmd"))? {
-        Value::String(s) => s.clone(),
-        Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "),
-        _ => return None,
-    };
+    let command = body.get("tool_input")?.get("command")?.as_str()?;
     let cwd = body.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-    let reason = check(&command, cwd, 0, crate::permit::dialect(tool, input))?;
+    let reason = check(command, cwd, 0, crate::permit::dialect(tool))?;
     let role: Option<String> = conn
         .query_row("SELECT role_slug FROM agents WHERE id = ?1", [agent], |r| r.get(0))
         .optional()
@@ -109,7 +103,7 @@ pub fn runs_full_suite(command: &str, cwd: Option<&Path>) -> bool {
 }
 
 pub(crate) fn full_suite_denial(command: &str, cwd: Option<&Path>) -> Option<&'static str> {
-    full_suite_denial_in_shell(command, cwd, crate::permit::dialect("", &Value::Null))
+    full_suite_denial_in_shell(command, cwd, crate::permit::dialect(""))
 }
 
 pub(crate) fn full_suite_denial_in_shell(command: &str, cwd: Option<&Path>, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
@@ -535,7 +529,7 @@ mod tests {
 
     fn e2e_shell_budget(tool: &str, cmd: &str, cwd: Option<&Path>, reason: Option<&str>) {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
-        let input = json!({ "cmd": cmd });
+        let input = json!({ "command": cmd });
         let body = json!({ "tool_name": tool, "tool_input": input, "cwd": cwd });
         for agent in ["kaan", "ayla", "timur", "unknown"] {
             let out = on_pre_tool(&c, agent, &body);
@@ -646,9 +640,9 @@ mod tests {
             ("Bash", "(cargo test -p dex-core --lib chat)"),
             ("PowerShell", "& { cargo test -p dex-core --lib chat }"),
         ] {
-            let input = json!({ "cmd": cmd });
+            let input = json!({ "command": cmd });
             let body = json!({ "tool_name": tool, "tool_input": input });
-            assert_eq!(full_suite_denial_in_shell(cmd, None, crate::permit::dialect(tool, &input)), None, "{tool}: {cmd}");
+            assert_eq!(full_suite_denial_in_shell(cmd, None, crate::permit::dialect(tool)), None, "{tool}: {cmd}");
             assert!(on_pre_tool(&c, "kaan", &body).is_none(), "{tool}: {cmd}");
             assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {tool}: {cmd}");
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -753,17 +747,11 @@ mod tests {
                 assert_eq!(full_suite_denial_in_shell(&cmd, None, d), None, "{d:?}: {cmd}");
             }
         }
-        for (cmd, reason) in [("npx playwright test".into(), Some(DENY)), (gut.into(), Some(DENY_GUT)), ("npx playwright test # kontrol".into(), None), (format!("{gut} # -gtest=x"), None)] {
-            let c = crate::db::open(Path::new(":memory:")).unwrap();
-            let body = json!({ "tool_name": "exec_command", "tool_input": { "cmd": cmd, "shell": "unknown-shell" } });
-            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), reason.is_some(), "unknown-shell: {cmd}");
-            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
-        }
     }
 
     fn rust_shell_budget(tool: &str, cmd: &str, denied: bool) {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
-        let input = json!({ "cmd": cmd });
+        let input = json!({ "command": cmd });
         let body = json!({ "tool_name": tool, "tool_input": input });
         for agent in ["kaan", "ayla", "timur", "unknown"] {
             let out = on_pre_tool(&c, agent, &body);
@@ -818,29 +806,25 @@ mod tests {
     }
 
     #[test]
-    fn rust_shell_explicit_dialects_and_unknown_shell() {
+    fn rust_shell_explicit_dialects() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
-        for (shell, cmd, denied) in [
-            ("bash", "cargo test -p dex-core --lib # kontrol", true),
-            ("pwsh", "cargo test -p dex-core --lib # kontrol", true),
-            ("powershell.exe", "cargo test -p dex-core --lib *> .dex/tmp/rust.log", true),
-            ("bash", "cargo test -p dex-core --lib '*' > log.txt", false),
-            ("pwsh", "cargo test -p dex-core --lib chat *> log.txt", false),
-            ("unknown-shell", "cargo test -p dex-core --lib", false),
-            ("unknown-shell", "cargo test -p dex-core --lib # kontrol", false),
-            ("unknown-shell", "cargo test -p dex-core --lib *> log.txt", false),
-            ("unknown-shell", "cargo test -p dex-core --lib '*'", false),
+        for (tool, cmd, denied) in [
+            ("Bash", "cargo test -p dex-core --lib # kontrol", true),
+            ("PowerShell", "cargo test -p dex-core --lib # kontrol", true),
+            ("PowerShell", "cargo test -p dex-core --lib *> .dex/tmp/rust.log", true),
+            ("Bash", "cargo test -p dex-core --lib '*' > log.txt", false),
+            ("PowerShell", "cargo test -p dex-core --lib chat *> log.txt", false),
         ] {
-            let input = json!({ "cmd": cmd, "shell": shell });
-            let body = json!({ "tool_name": "exec_command", "tool_input": input });
-            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied, "{shell}: {cmd}");
-            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {shell}: {cmd}");
+            let input = json!({ "command": cmd });
+            let body = json!({ "tool_name": tool, "tool_input": input });
+            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied, "{tool}: {cmd}");
+            assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {tool}: {cmd}");
             let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             let mut ctx = crate::permit::Ctx { cwd: Some(root.clone()), write: vec![root], ..Default::default() };
             let budget_denied = |out| matches!(out, crate::permit::Verdict::Deny(ref why) if why.contains(DENY_RUST));
-            assert_eq!(budget_denied(crate::permit::decide("exec_command", &input, &ctx)), denied, "{shell}: {cmd}");
+            assert_eq!(budget_denied(crate::permit::decide(tool, &input, &ctx)), denied, "{tool}: {cmd}");
             ctx.qa = true;
-            assert!(!budget_denied(crate::permit::decide("exec_command", &input, &ctx)), "QA: {shell}: {cmd}");
+            assert!(!budget_denied(crate::permit::decide(tool, &input, &ctx)), "QA: {tool}: {cmd}");
         }
     }
 
@@ -853,7 +837,7 @@ mod tests {
             ("/c/Rust/bin/cargo.exe test --lib", true),
             (r"C:\Rust\bin\cargo.exe test --lib", false),
         ] {
-            let body = json!({ "tool_name": "Bash", "tool_input": { "cmd": cmd } });
+            let body = json!({ "tool_name": "Bash", "tool_input": { "command": cmd } });
             assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied, "Bash: {cmd}");
             assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
         }
@@ -920,12 +904,12 @@ mod tests {
             assert_eq!(full(cmd), denied, "{cmd}");
             // Bash consumes unquoted backslashes; its actual executable-path cases are above.
             let tools: &[&str] = if cmd == r"C:\Rust\bin\cargo.exe test --lib" {
-                &["PowerShell", "shell", "exec_command", "local_shell"]
+                &["PowerShell"]
             } else {
-                &["Bash", "PowerShell", "shell", "exec_command", "local_shell"]
+                &["Bash", "PowerShell"]
             };
             for tool in tools {
-                let body = json!({ "tool_name": tool, "tool_input": { "cmd": cmd } });
+                let body = json!({ "tool_name": tool, "tool_input": { "command": cmd } });
                 for agent in ["kaan", "ayla", "timur", "unknown"] {
                     let out = on_pre_tool(&c, agent, &body);
                     assert_eq!(out.is_some(), denied, "{tool}: {agent}: {cmd}");
@@ -940,25 +924,17 @@ mod tests {
                 assert!(on_pre_tool(&c, "bora", &body).is_none(), "QA: {cmd}");
             }
         }
-        for (argv, denied) in [
-            (json!(["cargo", "test", "-p", "dex-core", "--lib"]), true),
-            (json!(["cargo", "test", "-p", "dex-core", "--lib", "chat"]), false),
-        ] {
-            let body = json!({ "tool_name": "shell", "tool_input": { "command": argv } });
-            assert_eq!(on_pre_tool(&c, "kaan", &body).is_some(), denied);
-            assert!(on_pre_tool(&c, "bora", &body).is_none());
-        }
     }
 
     #[test]
     fn rust_test_budget_permit_message() {
         let mut ctx = crate::permit::Ctx::default();
-        let input = json!({ "cmd": "cargo test -p dex-core --lib" });
-        let out = crate::permit::decide("exec_command", &input, &ctx);
+        let input = json!({ "command": "cargo test -p dex-core --lib" });
+        let out = crate::permit::decide("Bash", &input, &ctx);
         assert!(matches!(out, crate::permit::Verdict::Deny(ref reason)
             if reason.contains("cargo test -p dex-core --lib <modül>") && reason.contains("tam paket QA'nın işi")), "{out:?}");
         ctx.qa = true;
-        assert_eq!(crate::permit::decide("exec_command", &input, &ctx), crate::permit::Verdict::Allow);
+        assert_eq!(crate::permit::decide("Bash", &input, &ctx), crate::permit::Verdict::Allow);
     }
 
     #[test]
@@ -979,7 +955,7 @@ mod tests {
         let cmd = "godot --headless --check-only -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
         assert!(!full(cmd));
         let c = crate::db::open(Path::new(":memory:")).unwrap();
-        let body = json!({ "tool_name": "exec_command", "tool_input": { "cmd": cmd } });
+        let body = json!({ "tool_name": "Bash", "tool_input": { "command": cmd } });
         assert!(on_pre_tool(&c, "kaan", &body).is_none());
         let broad = "godot -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs";
         assert!(!full(&format!("timeout 1200 env CI=1 {broad} --check-only")));
@@ -1028,19 +1004,17 @@ mod tests {
     fn gut_hook_denies_everyone_but_qa_with_file_example() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         let cmd = "timeout 1200 godot_console.exe --headless --path . -s addons/gut/gut_cmdln.gd -gdir=res://tests/e2e -ginclude_subdirs -gexit";
-        for tool in ["Bash", "PowerShell", "shell", "exec_command", "local_shell"] {
-            let body = json!({ "tool_name": tool, "tool_input": { "cmd": cmd } });
+        for tool in ["Bash", "PowerShell"] {
+            let body = json!({ "tool_name": tool, "tool_input": { "command": cmd } });
             for agent in ["kaan", "ayla", "timur", "unknown"] {
                 let out: Value = serde_json::from_str(&on_pre_tool(&c, agent, &body).expect(agent)).unwrap();
                 assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
                 assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], DENY_GUT);
             }
             assert!(on_pre_tool(&c, "bora", &body).is_none(), "qa runs GUT");
-            let selected = json!({ "tool_name": tool, "tool_input": { "cmd": format!("{cmd} -gtest=res://tests/e2e/test_x.gd") } });
+            let selected = json!({ "tool_name": tool, "tool_input": { "command": format!("{cmd} -gtest=res://tests/e2e/test_x.gd") } });
             assert!(on_pre_tool(&c, "kaan", &selected).is_none());
         }
-        let argv = json!({ "tool_name": "shell", "tool_input": { "command": ["godot", "-s", "addons/gut/gut_cmdln.gd", "-gdir=res://tests", "-ginclude_subdirs"] } });
-        assert!(on_pre_tool(&c, "kaan", &argv).is_some());
     }
 
     #[test]
@@ -1135,7 +1109,5 @@ mod tests {
         assert!(on_pre_tool(&c, "kaan", &spec).is_none());
         let other = json!({ "tool_name": "Write", "tool_input": { "command": "npx playwright test" } });
         assert!(on_pre_tool(&c, "kaan", &other).is_none());
-        let argv = json!({ "tool_name": "shell", "tool_input": { "command": ["npx", "playwright", "test"] } });
-        assert!(on_pre_tool(&c, "kaan", &argv).is_some());
     }
 }

@@ -855,7 +855,7 @@ mod auth_tests {
                     let result = crate::db::with(&db_core.db, |c| {
                         // A different worker's hook/RPC progresses while the catalogue is paused.
                         worker_read?;
-                        c.execute("UPDATE agents SET active_engine='codex',active_model='gpt-chain' WHERE id='kaan'", [])
+                        c.execute("UPDATE agents SET active_provider='glm',active_model='GLM-5.3' WHERE id='kaan'", [])
                             .map_err(|e| e.to_string())?;
                         Ok(())
                     });
@@ -871,16 +871,16 @@ mod auth_tests {
                 crate::db::with(&core.db, |c| {
                     if plan {
                         let note = crate::plan::take_notes(c, "timur")?.unwrap();
-                        assert!(note.contains("Plan kabul edildi") && note.contains("gpt-chain"), "{note}");
+                        assert!(note.contains("Plan kabul edildi") && note.contains("GLM-5.3"), "{note}");
                         crate::plan::step(c)?;
                     }
                     let p = crate::proposals::list_pending(c)?.remove(0);
                     crate::proposals::decide(c, Path::new("."), p.id, true, None)?;
                     let mut a = crate::teams::get_agent(c, "kaan")?;
                     assert!(!crate::job_model::apply(c, &mut a, p.delegation_id)?);
-                    assert_eq!(a.active_model.as_deref(), Some("gpt-chain"));
+                    assert_eq!(a.active_model.as_deref(), Some("GLM-5.3"));
                     let note = crate::plan::take_notes(c, "timur")?.unwrap();
-                    assert!(note.contains("opus") && note.contains("gpt-chain") && note.contains("Neden:"), "{note}");
+                    assert!(note.contains("opus") && note.contains("GLM-5.3") && note.contains("Neden:"), "{note}");
                     Ok(())
                 }).unwrap();
                 core.shutdown();
@@ -986,7 +986,7 @@ mod auth_tests {
         let core = Core::start(crate::Paths {data_dir:root.join("data"),config_dir:root.join("config")},crate::Events::new(crate::events::NullSink)).unwrap();
         let lead = crate::db::with(&core.db,|c| {
             c.execute("UPDATE agents SET provider='glm',model='GLM-5.3' WHERE id='kaan'",[]).unwrap();
-            crate::chain::set_order(c,&["glm".into(),"anthropic".into(),"codex".into(),"muse".into(),"local".into()])?;
+            crate::chain::set_order(c,&["glm".into(),"anthropic".into(),"muse".into(),"local".into()])?;
             delegate::caller(c,"timur")
         }).unwrap();
         let d=delegate_call(&core,&lead,&json!({"agentId":"kaan","prompt":"Model zinciri","model":"GLM-5.3-Flash","modelReason":"Hızlı analiz"}),false).unwrap();
@@ -2000,7 +2000,7 @@ fn delegate_call(core: &Core, c: &Caller, args: &Value, service: bool) -> Result
     drop(conn);
     drop(_gate);
     if let (Some(snapshot), Some(model)) = (&model_snapshot, model) {
-        snapshot.route.validate_catalog(model, Some(core))?;
+        snapshot.route.validate_catalog(model)?;
     }
     let ready = crate::project_context::validate(&context).map_err(|e| e.to_string())?;
     let _gate = core.agent_start_gate.lock().map_err(|_| "başlatma kilidi zehirli")?;
@@ -2235,7 +2235,7 @@ impl Core {
             crate::plan::resolve_projects(&conn, &self.paths.data_dir, c, &p)?
         };
         drop(_gate);
-        crate::job_model::validate_plan_catalog(&p, Some(self))?;
+        crate::job_model::validate_plan_catalog(&p)?;
         let ready = contexts.iter().map(crate::project_context::validate).collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
         let _gate = self.agent_start_gate.lock().map_err(|_| "başlatma kilidi zehirli")?;
         let conn = lock(self)?;

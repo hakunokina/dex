@@ -37,7 +37,7 @@ const notes = [];
 if (changed === null) {
   notes.push(`! git diff ${BASE}...HEAD koşmadı: ${diff.stderr.trim()}`);
 } else {
-  const policy = changed.filter((f) => /^crates\/dex-core\/src\/(permit|hooks|pty|codex)\.rs$/.test(f));
+  const policy = changed.filter((f) => /^crates\/dex-core\/src\/(permit|hooks|pty)\.rs$/.test(f));
   if (policy.length) {
     notes.push(
       [

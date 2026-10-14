@@ -664,7 +664,6 @@ const POLICY_FILES: &[&str] = &[
     "crates/dex-core/src/permit.rs",
     "crates/dex-core/src/hooks.rs",
     "crates/dex-core/src/pty.rs",
-    "crates/dex-core/src/codex.rs",
     "crates/dex-core/src/merge_gate.rs",
     ".gitleaks.toml",
     "scripts/hooks/",
@@ -676,7 +675,7 @@ const POLICY_FILES: &[&str] = &[
 ];
 
 pub fn tools() -> Vec<Value> {
-    vec![json!({ "name": "delegation_merge", "description": "YALNIZ LİDER. Bitmiş bir devretmenin worker dalını (kendi git worktree'sinde çalıştıysa) takım dalına `git merge --no-ff` ile alır; başarılıysa worktree ve dal silinir. Çakışmada birleştirme geri alınır ve çakışan dosyalar döner. Yalnız dal ucunun kod incelemesi `onay` ise birleştirir: inceleme sürüyorsa ya da kararı `düzelt` ise merged:false ve önemli bulgular döner; incelenmemiş uca Dex inceleme açar. Takımda code-review üyesi yoksa yalnız inceleme kapısı yoktur. Birleştirme öncesi tüm gelen commitlerin sızıntı taraması ve author/committer e-posta denetimi zorunludur; gitleaks yoksa ya da bulgu varsa reddeder. forcePolicy/forceReview bu denetimi atlamaz. Projeye bağlı iş yalnız kendi projesinin ana checkout'u işin hedef dalındayken birleşir; başka dal/detached HEAD → merged:false, code project_branch_mismatch (otomatik checkout yok). Dal politika dosyalarına (permit/hooks/pty/codex/merge_gate/gitleaks/CI) dokunuyorsa birleştirmez, patron onayı ister; onaydan sonra forcePolicy: true ile tekrar çağır.",
+    vec![json!({ "name": "delegation_merge", "description": "YALNIZ LİDER. Bitmiş bir devretmenin worker dalını (kendi git worktree'sinde çalıştıysa) takım dalına `git merge --no-ff` ile alır; başarılıysa worktree ve dal silinir. Çakışmada birleştirme geri alınır ve çakışan dosyalar döner. Yalnız dal ucunun kod incelemesi `onay` ise birleştirir: inceleme sürüyorsa ya da kararı `düzelt` ise merged:false ve önemli bulgular döner; incelenmemiş uca Dex inceleme açar. Takımda code-review üyesi yoksa yalnız inceleme kapısı yoktur. Birleştirme öncesi tüm gelen commitlerin sızıntı taraması ve author/committer e-posta denetimi zorunludur; gitleaks yoksa ya da bulgu varsa reddeder. forcePolicy/forceReview bu denetimi atlamaz. Projeye bağlı iş yalnız kendi projesinin ana checkout'u işin hedef dalındayken birleşir; başka dal/detached HEAD → merged:false, code project_branch_mismatch (otomatik checkout yok). Dal politika dosyalarına (permit/hooks/pty/merge_gate/gitleaks/CI) dokunuyorsa birleştirmez, patron onayı ister; onaydan sonra forcePolicy: true ile tekrar çağır.",
         "inputSchema": { "type": "object", "additionalProperties": false, "required": ["delegationId"], "properties": {
             "delegationId": { "type": "integer" },
             "forcePolicy": { "type": "boolean", "description": "Politika dosyası değişikliğini patron onayladıysa true" },

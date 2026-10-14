@@ -51,10 +51,9 @@ fn sweep_stale(dir: &Path) {
     }
 }
 
-/// The stdio server as (command, args); codex profiles (DEX-26) embed the same server.
+/// The stdio server as (command, args).
 pub fn stdio() -> (&'static str, Vec<&'static str>) {
-    // Keep the borrowed argv contract shared with Codex. Cache successes only: the first
-    // npx fallback may populate the cache for the next session.
+    // Cache successes only: the first npx fallback may populate the cache for the next session.
     static CLI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if CLI.get().is_none() {
         if let Some(cli) = npm_cache().and_then(|cache| cached_cli(&cache)) {

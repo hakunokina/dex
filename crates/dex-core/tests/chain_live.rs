@@ -1,7 +1,7 @@
-//! DEX-17 canlı: GLM kotası dolu → StopFailure → transcript özetiyle yeni Codex oturumu.
+//! DEX-17 canlı: GLM kotası dolu → StopFailure → aynı oturum Claude'da (anthropic) sürer.
 //!
 //! `DEX_LIVE_CHAIN=1 cargo test -p dex-core --test chain_live -- --nocapture` (~2-3 dk).
-//! Gerçek kota harcar: GLM turu 429'da hızlı batar (harcama yok); Codex tek kısa devam turu yapar.
+//! Gerçek kota harcar: GLM turu 429'da hızlı batar (harcama yok); Claude tek kısa devam turu yapar.
 //! Kasa yalnız OKUNUR; DB/config geçici dizinde.
 
 use std::sync::{Arc, Mutex};
@@ -73,8 +73,8 @@ fn glm_quota_fails_over_with_resume() {
     let id = members.iter().find(|a| a.kind == "worker").unwrap().id.clone();
     let delegation_id = dex_core::db::with(&core.db, |c| {
         teams::update_agent(c, &id, teams::AgentPatch { provider: Some("glm".into()), model: Some("sonnet".into()), ..Default::default() }).map(|_| ())?;
-        // Kota senaryosu: diğer krediler yok; GLM'den sonraki son halka Codex.
-        dex_core::chain::set_order(c, &["glm".into(), "codex".into(), "anthropic".into(), "muse".into(), "local".into()])?;
+        // Kota senaryosu: GLM'den sonraki halka Claude (anthropic).
+        dex_core::chain::set_order(c, &["glm".into(), "anthropic".into(), "muse".into(), "local".into()])?;
         let caller = dex_core::delegate::caller(c, &leader)?;
         let delegation = dex_core::delegate::insert(c, dex_core::delegate::NewDelegation {
             from: &caller,
@@ -116,8 +116,8 @@ fn glm_quota_fails_over_with_resume() {
     let ev = rec.find(|e, p| e == "dex-chain" && p["agentId"] == id.as_str()).unwrap();
     println!("dex-chain: {ev}");
     assert_eq!(ev["from"], "glm");
-    assert_eq!(ev["to"], "codex");
-    assert_eq!(ev["activeEngine"], "codex");
+    assert_eq!(ev["to"], "anthropic");
+    assert_eq!(ev["activeEngine"], "claude");
 
     // Aynı worker devretmesi motor geçişinde parçalanmaz/failed olmaz; lider tek satır not alır.
     let note_end = Instant::now() + Duration::from_secs(2);
@@ -144,7 +144,7 @@ fn glm_quota_fails_over_with_resume() {
     };
     assert_eq!(delegation.status, "running", "StopFailure devretmeyi failed yapmamalı");
     assert!(note_count > 0, "lider zincir geçiş notunu almalı");
-    assert_eq!(saved_engine, "claude", "kaynak StopFailure oturumu Codex diye kaydedilmemeli");
+    assert_eq!(saved_engine, "claude", "kaynak StopFailure oturumu Claude oturumu olarak kalmalı");
     println!("devretme #{delegation_id} running kaldı; lider notu ve Claude oturum kaydı doğrulandı");
 
     // Kalıcı durum: GLM tükenen kayda girdi, ajan geçicide.
@@ -156,8 +156,8 @@ fn glm_quota_fails_over_with_resume() {
     assert!(gone.iter().any(|x| x.provider == "glm"), "GLM tükenen kayda girmeli");
     assert_eq!(a.provider, "glm", "asıl sağlayıcı değişmez");
     assert_eq!(a.engine, "claude", "asıl motor değişmez");
-    assert_eq!(a.active_engine.as_deref(), Some("codex"), "geçici motor Codex olmalı");
-    assert!(a.active_provider.is_none(), "Codex sağlayıcı yönlendirmesi kullanmaz");
+    assert!(a.active_engine.is_none(), "motor Claude Code'da kalır");
+    assert_eq!(a.active_provider.as_deref(), Some("anthropic"), "geçici sağlayıcı Claude olmalı");
     assert!(core.ptys.is_running(&id), "geçiş PTY'si açık olmalı");
 
     // Devam turu cevap verene kadar bekle (sıradaki sağlayıcıda tek kısa tur).

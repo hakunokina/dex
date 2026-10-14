@@ -42,9 +42,8 @@ pub fn pty_spawn(
     rows: u16,
     on_data: Channel<InvokeResponseBody>,
     on_exit: Channel<()>,
-    codex: Option<dex_core::codex::Launch>,
 ) -> Result<(), String> {
-    let req = Spawn { id, cmd, args, cwd, memory_dir, provider, cols, rows, codex, env: Vec::new() };
+    let req = Spawn { id, cmd, args, cwd, memory_dir, provider, cols, rows, env: Vec::new() };
     core.pty_spawn(req, ChannelSink { data: on_data, exit: on_exit })
 }
 

@@ -197,8 +197,8 @@ fn permit_hook_reply_fields(agent: &str, body: &Value, reply: Option<&str>) -> O
 
 fn permit_path_class(tool: &str, input: &Value, ctx: Option<&crate::permit::Ctx>) -> &'static str {
     use std::path::Component;
-    if matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell" | "apply_patch") {
-        return "unknown"; // The authoritative shell/patch parser is private to permit, and is unchanged.
+    if matches!(tool, "Bash" | "PowerShell") {
+        return "unknown"; // The authoritative shell parser is private to permit, and is unchanged.
     }
     let Some(path) = ["file_path", "notebook_path", "path"].iter().find_map(|k| input.get(k).and_then(Value::as_str)) else {
         return "no_path";
@@ -380,8 +380,8 @@ mod tests {
             assert!(!fields.to_string().contains("private-person"));
             assert!(!fields.to_string().contains("secret body"));
         }
-        let fields = sanitize(permit_fields("worker", "leader", "policy", "deferred", "exec_command",
-            &json!({"cmd":"secret body /private-person/path"}), Some(&ctx), None));
+        let fields = sanitize(permit_fields("worker", "leader", "policy", "deferred", "Bash",
+            &json!({"command":"secret body /private-person/path"}), Some(&ctx), None));
         assert_eq!(fields["final_rule"], "deferred");
         assert_eq!(fields["path_class"], "unknown");
         assert!(!fields.to_string().contains("secret body"));
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn later_dex_gate_denial_is_distinct_from_a_deferred_permit() {
-        let body = json!({"tool_name":"exec_command","tool_input":{"cmd":"private command"}});
+        let body = json!({"tool_name":"Bash","tool_input":{"command":"private command"}});
         let reply = json!({"hookSpecificOutput":{"permissionDecision":"deny",
             "permissionDecisionReason":"Alt takım kabuk çalıştıramaz; private path"}}).to_string();
         let fields = sanitize(permit_hook_reply_fields("worker", &body, Some(&reply)).unwrap());

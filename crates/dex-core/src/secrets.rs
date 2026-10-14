@@ -143,93 +143,9 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-// OAuth records exceed Windows Credential Manager's single-entry limit. Two slots:
-// write the inactive slot, commit its small head last, then clear the old slot.
-// Caller serializes updates. Existing provider entries keep their old representation.
-pub(crate) fn record_get(service: &str, account: &str) -> Result<Option<String>, String> {
-    record_get_with(account, &|key| protected_get(service,key))
-}
-fn protected_get(service: &str, key: &str) -> Result<Option<String>, String> {
-    match store() {
-        Store::Keyring => match entry(service, key)?.get_password() {
-            Ok(v) => Ok(Some(v)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(_) => Err("gateway_secret_unavailable".into()),
-        },
-        Store::Files(_) => get(service, key),
-    }
-}
-pub(crate) fn record_set(service: &str, account: &str, value: &str) -> Result<(), String> {
-    record_set_with(account, value, &|key| protected_get(service,key), &|key,v| set(service,key,v), &|key| delete(service,key))
-}
-type RecordGet<'a> = &'a dyn Fn(&str) -> Result<Option<String>, String>;
-type RecordSet<'a> = &'a dyn Fn(&str, &str) -> Result<(), String>;
-type RecordDelete<'a> = &'a dyn Fn(&str) -> Result<(), String>;
-fn record_head(account: &str, get: RecordGet) -> Result<Option<(usize, usize)>, String> {
-    let Some(head) = get(account)? else { return Ok(None); };
-    let (slot, count) = head.split_once(':').ok_or("gateway_secret_invalid")?;
-    let slot: usize = slot.parse().map_err(|_| "gateway_secret_invalid")?;
-    let count: usize = count.parse().map_err(|_| "gateway_secret_invalid")?;
-    if slot > 1 || !(1..=256).contains(&count) { return Err("gateway_secret_invalid".into()); }
-    Ok(Some((slot,count)))
-}
-fn record_get_with(account: &str, get: RecordGet) -> Result<Option<String>, String> {
-    use base64::Engine;
-    let Some((slot,count)) = record_head(account,get)? else { return Ok(None); };
-    let mut bytes = String::new();
-    for i in 0..count {
-        let chunk = get(&format!("{account}.slot{slot}.{i}"))?.ok_or("gateway_secret_invalid")?;
-        if chunk.len() > 900 { return Err("gateway_secret_invalid".into()); }
-        bytes.push_str(&chunk);
-    }
-    let bytes = base64::engine::general_purpose::STANDARD.decode(bytes).map_err(|_| "gateway_secret_invalid")?;
-    String::from_utf8(bytes).map(Some).map_err(|_| "gateway_secret_invalid".into())
-}
-fn record_set_with(account: &str, value: &str, get: RecordGet, set: RecordSet, delete: RecordDelete) -> Result<(), String> {
-    use base64::Engine;
-    let old = record_head(account,get)?;
-    let slot = old.map(|(slot,_)| 1-slot).unwrap_or(0);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(value);
-    let chunks: Vec<_> = encoded.as_bytes().chunks(900).collect();
-    if chunks.is_empty() || chunks.len()>256 { return Err("gateway_secret_limit".into()); }
-    let count_key=format!("{account}.slot{slot}.count");
-    let previous=get(&count_key)?.map(|s|s.parse::<usize>().map_err(|_|"gateway_secret_invalid")).transpose()?.unwrap_or(0);
-    if previous>256 {return Err("gateway_secret_invalid".into());}
-    // Record the whole write extent first so even interrupted/failed writes are cleaned later.
-    set(&count_key,&previous.max(chunks.len()).to_string())?;
-    for (i,chunk) in chunks.iter().enumerate() {
-        set(&format!("{account}.slot{slot}.{i}"), std::str::from_utf8(chunk).unwrap())?;
-    }
-    set(account,&format!("{slot}:{}",chunks.len()))?;
-    for i in chunks.len()..previous {delete(&format!("{account}.slot{slot}.{i}"))?;}
-    set(&count_key,&chunks.len().to_string())?;
-    if let Some((old,count)) = old {
-        for i in 0..count { delete(&format!("{account}.slot{old}.{i}"))?; }
-        delete(&format!("{account}.slot{old}.count"))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn protected_record_rotation_is_atomic_across_keyring_sized_chunks() {
-        let rows = std::sync::Mutex::new(std::collections::HashMap::<String,String>::new());
-        let get = |key: &str| Ok(rows.lock().unwrap().get(key).cloned());
-        let set = |key: &str, value: &str| { assert!(value.len() <= 900); rows.lock().unwrap().insert(key.into(), value.into()); Ok(()) };
-        let delete = |key: &str| { rows.lock().unwrap().remove(key); Ok(()) };
-        let old = "a".repeat(8000);
-        record_set_with("oauth", &old, &get, &set, &delete).unwrap();
-        assert_eq!(record_get_with("oauth", &get).unwrap(), Some(old.clone()));
-        let failed = |key: &str, value: &str| { if key.ends_with(".3") { Err("synthetic failure".into()) } else { set(key, value) } };
-        assert!(record_set_with("oauth", &"b".repeat(8000), &get, &failed, &delete).is_err());
-        assert_eq!(record_get_with("oauth", &get).unwrap(), Some(old));
-        record_set_with("oauth", "new", &get, &set, &delete).unwrap();
-        assert_eq!(record_get_with("oauth", &get).unwrap().as_deref(), Some("new"));
-        assert!(rows.lock().unwrap().keys().all(|k|k=="oauth" || k=="oauth.slot1.0" || k=="oauth.slot1.count"));
-    }
-
     // The process-wide store stays Keyring in tests (other tests never touch it); the file
     // functions are exercised directly.
     #[test]

@@ -81,14 +81,14 @@ Bağlantı düzeyi olaylar (nokta ad alanlı):
 |---|---|
 | Görev | `task_list {teamId?}`, `task_create {task}`, `task_update {id, patch}`, `task_delete {id}` |
 | Takım | `team_list`, `team_create {team}`, `team_update {id, patch}`, `team_delete {id}`, `team_set_workers_model {teamId, target}` |
-| Ajan | `agent_list`, `agent_create {agent}`, `agent_update {id, patch}`, `agent_delete {id}`, `agent_apply_pending {id}`, `agent_start {id, options?}`, `agent_status_list`, `agent_input {id, draft}`, `leader_reset {id, action}`, `role_list`, `codex_models` |
+| Ajan | `agent_list`, `agent_create {agent}`, `agent_update {id, patch}`, `agent_delete {id}`, `agent_apply_pending {id}`, `agent_start {id, options?}`, `agent_status_list`, `agent_input {id, draft}`, `leader_reset {id, action}`, `role_list` |
 | Sohbet (S5-B) | `chat_history {agentId, before?, limit?}` — sayfalı transcript (`{messages, cursor, hasMore}`), `chat_send {agentId, text}` — kapalıysa `agent_start` ile başlatır, boştaysa yapıştırır, meşgulse kuyruğa alır (`started \| sent \| queued`), `chat_screen {agentId}` — PTY'nin görünen ekranı (bekleyen soru) |
 | Devretme | `delegation_list`, `delegation_seen {agentId}`, `delegation_stalled {agentId, minutes}` — başlatma/kuyruk/teslim sunucu tarafındadır |
 | İlk yanıt (FIX-3) | `agent_first_reply_retry {id}`, `agent_first_reply_cancel {id}`, `first_reply_get`, `first_reply_set {provider, secs}` |
 | Soru | `question_list`, `question_answer {id, text}` |
 | Plan / öneri | `plan_list`, `proposal_list`, `proposal_decide {id, approve, name?}` — plan devamı sunucu açılışında bir kez koşar |
 | Sağlayıcı | `provider_list`, `provider_import_routes`, `provider_set_token {id, token}`, `provider_local_set_base_url {url}`, `provider_local_status`, `provider_local_add {name}`, `provider_local_delete {name}` |
-| Motor zinciri (DEX-17) | `chain_get` — `{order, exhausted}`, `chain_set_order {order}`, `chain_set_agent {id, off}`, `chain_back {id}`. Varsayılan sıra `anthropic → muse → glm → local → codex`; `codex` hedefi Claude resume kullanmaz, transcript devriyle yeni Codex oturumu açar. Ajan kaydında asıl `engine/provider/model` değişmez; geçici hedef `activeEngine/activeProvider/activeModel`, dönüş uygunluğu `chainReturnReady` alanlarındadır. Olaylar: `dex-chain {agentId, from, to, activeEngine, activeProvider, resetAt, text}`, `dex-chain-wait {agentId, text}`, `dex-chain-available {provider, text}`. |
+| Motor zinciri (DEX-17) | `chain_get` — `{order, exhausted}`, `chain_set_order {order}`, `chain_set_agent {id, off}`, `chain_back {id}`. Varsayılan sıra `anthropic → muse → glm → local`. Ajan kaydında asıl `engine/provider/model` değişmez; geçici hedef `activeEngine/activeProvider/activeModel`, dönüş uygunluğu `chainReturnReady` alanlarındadır. Olaylar: `dex-chain {agentId, from, to, activeEngine, activeProvider, resetAt, text}`, `dex-chain-wait {agentId, text}`, `dex-chain-available {provider, text}`. |
 | Ayar | `limits_get`, `limits_set {limits}` |
 | Maliyet | `usage_summary {teamId, since?}`, `usage_delegation {id}`, `settings_usage_prices`, `settings_set_usage_prices {prices}` — token ve API eşdeğer maliyeti; [sözleşme ve fiyatlar](usage-cost.md) |
 | Notlar (DEX-41) | `note_get {scope}`, `note_set {scope, body}` — `scope` = `"shared"` ya da takım id'si |
@@ -109,7 +109,7 @@ Bağlantı / oturum metotları (nokta ad alanlı, Tauri karşılığı yok):
 
 ## PTY kanalları
 
-- `pty_spawn` = Tauri komutunun argümanları (`id, cmd, args?, cwd?, memoryDir?, provider?, codex?, cols, rows`) + **`channel`** (u32, `0` ayrılmış). Kanal numarasını **istemci seçer** ve istekten önce kaydeder: çıktı cevaptan önce gelebilir.
+- `pty_spawn` = Tauri komutunun argümanları (`id, cmd, args?, cwd?, memoryDir?, provider?, cols, rows`) + **`channel`** (u32, `0` ayrılmış). Kanal numarasını **istemci seçer** ve istekten önce kaydeder: çıktı cevaptan önce gelebilir.
 - Kanal bağlantıya özeldir; aynı bağlantıda kullanımdaki bir kanal yeniden verilemez (`bad_request`).
 - **İkili çerçeve**, iki yön de: `[kanal: u32 big-endian][ham baytlar]`. Sunucu → istemci: PTY çıktısı. İstemci → sunucu: klavye girdisi (sırası korunur). Bilinmeyen kanala yazılan çerçeve yok sayılır.
 - PTY'ler **sunucunundur**, bağlantının değil: bağlantı koparsa kanalları susar, süreçler çalışır; yeni bağlantı `pty.list` + `pty.attach` ile geri bağlanır (istemci taşıma katmanı bunu otomatik yapar).

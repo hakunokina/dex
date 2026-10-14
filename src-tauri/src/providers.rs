@@ -9,22 +9,6 @@ use crate::host::CoreState;
 pub fn provider_list(core: State<CoreState>) -> Result<Vec<ProviderInfo>, String> {
     core.provider_list()
 }
-#[tauri::command]
-pub async fn gateway_auth_start(core: State<'_,CoreState>,account_id: Option<String>) -> Result<dex_core::gateway::auth::Started,String> {
-    blocking(&core,move |c|c.gateway_auth_start(account_id.as_deref())).await
-}
-#[tauri::command]
-pub async fn gateway_auth_status(core: State<'_,CoreState>) -> Result<dex_core::gateway::auth::Status,String> {
-    blocking(&core,|c|c.gateway_auth_status()).await
-}
-#[tauri::command]
-pub async fn gateway_auth_logout(core: State<'_,CoreState>,account_id: Option<String>) -> Result<dex_core::gateway::auth::LoggedOut,String> {
-    blocking(&core,move |c|c.gateway_auth_logout(account_id.as_deref())).await
-}
-#[tauri::command]
-pub async fn gateway_models(core: State<'_,CoreState>) -> Result<Vec<dex_core::gateway::auth::Model>,String> {
-    blocking(&core,|c|c.gateway_models()).await
-}
 
 #[tauri::command]
 pub fn provider_import_routes(core: State<CoreState>) -> Result<Vec<ImportRow>, String> {

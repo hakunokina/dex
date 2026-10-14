@@ -82,9 +82,3 @@ pub fn agent_apply_pending(core: State<CoreState>, id: String) -> Result<bool, S
     core.agent_apply_pending(&id)
 }
 
-/// DEX-26: runs `codex debug models` (first call only) — off the UI thread.
-#[tauri::command]
-pub async fn codex_models(core: State<'_, CoreState>) -> Result<Vec<dex_core::codex::ModelInfo>, String> {
-    let core = core.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || core.codex_models()).await.map_err(|e| e.to_string())?
-}

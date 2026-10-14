@@ -1,8 +1,7 @@
 //! DEX-17 — motor zinciri: kredi/limit bitince otomatik sağlayıcı geçişi + resume.
 //!
 //! Akış event-driven: birincil sinyal Claude Code'un `StopFailure` hook'u. Geçici hatalarda
-//! (5xx, ağ, timeout) zincir ÇALIŞMAZ; yalnız kalıcı kota/kredi bitiminde çalışır. Codex motorunda
-//! StopFailure yok → Codex ajanları kapsam dışı (UI'da belirtilir).
+//! (5xx, ağ, timeout) zincir ÇALIŞMAZ; yalnız kalıcı kota/kredi bitiminde çalışır.
 //!
 //! Karar backend'de verilir (istemci kapalıyken de çalışır). Tükenen sağlayıcı host'ta kalıcı
 //! saklanır (`provider_exhausted`); saati dolunca kaydı kalkar ama ajan OTOMATİK geri taşınmaz —
@@ -21,9 +20,8 @@ pub struct ChainView {
     pub exhausted: Vec<Exhausted>,
 }
 
-/// Varsayılan zincir: Claude sağlayıcıları, son çare olarak yeni bir Codex oturumu.
-pub const DEFAULT_CHAIN: &[&str] = &["anthropic", "muse", "glm", "local", "codex"];
-// Gateway is opt-in through set_order; existing chains retain their order.
+/// Varsayılan zincir: Claude Code sağlayıcıları.
+pub const DEFAULT_CHAIN: &[&str] = &["anthropic", "muse", "glm", "local"];
 
 const CHAIN_ORDER_KEY: &str = "chain_order";
 const CHAIN_DISABLED_KEY: &str = "chain_disabled";
@@ -347,133 +345,6 @@ pub fn earliest_reset(conn: &Connection) -> Result<Option<i64>, String> {
         .min())
 }
 
-// ── Ölçülen kota: Codex'in kendi kaydı ───────────────────────────────────────
-
-/// En çok bu kadar yeni rollout dosyasına bakılır (en yeni gün klasörlerinden).
-const CODEX_ROLLOUT_FILES: usize = 4;
-/// Her dosyanın yalnız sonu okunur.
-const CODEX_ROLLOUT_TAIL: u64 = 256 * 1024;
-
-/// Codex kotası BİLİNİYOR ve bitmişse sıfırlanma anı (epoch ms). Kaynak: Codex CLI'nin her turda
-/// rollout JSONL'ına (`<sessions>/<Y>/<M>/<G>/rollout-*.jsonl`) yazdığı `token_count` olayının
-/// `rate_limits`'i — resmî sözleşme değil, biçim değişirse bilinmiyor'a düşer. Yalnız en yeni
-/// [`CODEX_ROLLOUT_FILES`] dosyanın sonundan geriye ilk `limit_id = "codex"` satırı okunur; o
-/// satırda birincil ya da ikincil pencere %100 ve sıfırlanması gelecekteyse tükenmiş sayılır.
-/// Satır yok / pencere `null` / sıfırlanma geçmiş / ayrıştırma hatası → `None` (bilinmiyor).
-pub fn codex_exhausted_until(sessions: &std::path::Path, now: i64) -> Option<i64> {
-    for file in newest_rollouts(sessions) {
-        if let Some(limits) = last_codex_limits(&file) {
-            return exhausted_window(&limits, now);
-        }
-    }
-    None
-}
-
-/// Tek rollout dosyasında (çalışan ajanın kendi oturumu) Codex kotası bitmişse sıfırlanma anı;
-/// okuma kuralları [`codex_exhausted_until`] ile aynı.
-pub fn codex_file_exhausted_until(file: &std::path::Path, now: i64) -> Option<i64> {
-    exhausted_window(&last_codex_limits(file)?, now)
-}
-
-/// #1027: Codex'te StopFailure hook'u yok; kota bitince tur rollout'a
-/// `event_msg/task_complete` + `error.codex_error_info = "usage_limit_exceeded"` yazılarak biter
-/// (codex-cli 0.154 olay sözleşmesi; hemen önceki `token_count` satırı `rate_limits`'i %100 taşır).
-/// `Some(true)` = kota hatasıyla biten tur, `Some(false)` = başka biten tur, `None` = tur sonu değil.
-pub fn codex_turn_limit(v: &serde_json::Value) -> Option<bool> {
-    if v["type"] != "event_msg" || v["payload"]["type"] != "task_complete" {
-        return None;
-    }
-    // CLI dize gönderir; ileride nesneye dönerse (`{"usage_limit_exceeded": {…}}`) anahtar da sayılır.
-    let info = &v["payload"]["error"]["codex_error_info"];
-    Some(info == "usage_limit_exceeded" || info.get("usage_limit_exceeded").is_some())
-}
-
-/// #1033: izleyici kurulurken dosyada zaten olan, [`CODEX_RECENT_MS`]'den yeni ve son tur sonu olan
-/// kota hatası (taze oturumun izleyiciden önce biten ilk turu). Eski oturumun (resume) bayat hatası
-/// ya da arkasından yeni tur başlamış hata sayılmaz.
-pub fn codex_recent_limit(rollout: &[u8], now: i64) -> bool {
-    let mut last = None;
-    for line in rollout.split(|b| *b == b'\n') {
-        // Hızlı ön süzgeç: yalnız tur başı/sonu satırları ayrıştırılır.
-        if !line.windows(5).any(|w| w == b"task_") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else { continue };
-        if v["type"] == "event_msg" && v["payload"]["type"] == "task_started" {
-            last = None;
-        } else if let Some(limit) = codex_turn_limit(&v) {
-            last = Some((limit, v["timestamp"].as_str().and_then(parse_rfc3339)));
-        }
-    }
-    matches!(last, Some((true, Some(at))) if now - at <= CODEX_RECENT_MS)
-}
-
-/// [`codex_recent_limit`] tazelik sınırı: izleyici kurulmadan hemen önce biten turu yakalar.
-pub const CODEX_RECENT_MS: i64 = 60_000;
-
-/// Son günlerin rollout'ları, en son yazılan önce.
-fn newest_rollouts(sessions: &std::path::Path) -> Vec<std::path::PathBuf> {
-    // Klasör adları sayısal (YYYY/MM/DD): ters ad sırası = en yeni önce.
-    let desc = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
-        let mut v: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).collect();
-        v.sort();
-        v.reverse();
-        v
-    };
-    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = Vec::new();
-    let mut days = 0;
-    'walk: for y in desc(sessions).iter().filter(|p| p.is_dir()) {
-        for m in desc(y).iter().filter(|p| p.is_dir()) {
-            for d in desc(m).iter().filter(|p| p.is_dir()) {
-                for f in desc(d) {
-                    let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if name.starts_with("rollout-") && name.ends_with(".jsonl") {
-                        let at = std::fs::metadata(&f).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
-                        files.push((at, f));
-                    }
-                }
-                days += 1;
-                // Gece yarısını aşan oturum dünün klasöründe yazmaya devam eder: iki gün (boş
-                // günlerde en çok bir hafta geriye).
-                if (days >= 2 && !files.is_empty()) || days >= 7 {
-                    break 'walk;
-                }
-            }
-        }
-    }
-    files.sort_by(|a, b| b.0.cmp(&a.0));
-    files.into_iter().take(CODEX_ROLLOUT_FILES).map(|(_, f)| f).collect()
-}
-
-/// Dosyanın sonundan geriye ilk `limit_id = "codex"` `rate_limits` nesnesi.
-fn last_codex_limits(file: &std::path::Path) -> Option<serde_json::Value> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(file).ok()?;
-    let len = f.metadata().ok()?.len();
-    f.seek(SeekFrom::Start(len.saturating_sub(CODEX_ROLLOUT_TAIL))).ok()?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf);
-    text.lines().rev().filter(|l| l.contains("\"rate_limits\"")).find_map(|l| {
-        let v: serde_json::Value = serde_json::from_str(l).ok()?;
-        let limits = v.pointer("/payload/rate_limits")?;
-        (limits.get("limit_id").and_then(|x| x.as_str()) == Some("codex")).then(|| limits.clone())
-    })
-}
-
-/// `primary`/`secondary` pencerelerinden dolu (%100) ve sıfırlanması gelecekte olanın en geç sıfırlanması.
-fn exhausted_window(limits: &serde_json::Value, now: i64) -> Option<i64> {
-    ["primary", "secondary"]
-        .iter()
-        .filter_map(|k| {
-            let w = limits.get(k).filter(|w| w.is_object())?;
-            let used = w.get("used_percent")?.as_f64()?;
-            let reset = w.get("resets_at")?.as_i64()?.checked_mul(1000)?;
-            (used >= 100.0 && reset > now).then_some(reset)
-        })
-        .max()
-}
-
 // ── Zincir sırası (Ayarlar) ──────────────────────────────────────────────────
 
 /// Kayıtlı sıra (yoksa varsayılan). Bilinmeyen id'ler düşer, eksik bilinenler sona eklenir.
@@ -554,11 +425,11 @@ pub fn set_disabled(conn: &Connection, ids: &[String]) -> Result<Vec<String>, St
 // ── Seçim ────────────────────────────────────────────────────────────────────
 
 fn valid_target(id: &str) -> bool {
-    id == "codex" || crate::providers::get(id).is_some()
+    crate::providers::get(id).is_some()
 }
 
 /// Sıradaki hedefi seç: jetonu/oturumu olmayan, kapalı ya da tükenmiş sağlayıcı atlanır.
-/// `available`: sağlayıcıda kullanılabilir jeton var mı; `codex` için CLI/giriş kullanılabilir mi.
+/// `available`: sağlayıcıda kullanılabilir jeton var mı.
 /// `current`: az önce tükenen (dışlanır). `None` = zincir bitti, ajan bekler.
 pub fn pick_next(
     conn: &Connection,
@@ -582,8 +453,8 @@ pub fn pick_next(
 
 /// #1027: zincirde geçilecek motor yokken nedeni — kota mı bitti, jeton/erişim mi yok. Bakılan
 /// küme [`pick_next`]'inki (`current`'tan sonraki açık motorlar) artı ajanın asıl sağlayıcısı
-/// `home` (kapalı olsa da dönülebilir). `skipped` = seçimde erişimi olmadığı için atlanan vardı
-/// (Codex hazır değil / modeli yok); `available` = jeton/oturum.
+/// `home` (kapalı olsa da dönülebilir). `skipped` = seçimde erişimi olmadığı için atlanan vardı;
+/// `available` = jeton/oturum.
 pub fn none_reason(conn: &Connection, current: &str, home: &str, skipped: bool, available: &dyn Fn(&str) -> bool) -> &'static str {
     let gone: Vec<String> = exhausted(conn).unwrap_or_default().into_iter().map(|e| e.provider).collect();
     let off = disabled(conn);
@@ -628,18 +499,6 @@ pub fn map_model(provider: &str, model: &str) -> String {
 fn is_light(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
     m == "haiku" || m.starts_with("claude-haiku") || m.contains("flash")
-}
-
-/// Codex kataloğu öncelik sırasındadır: ilk güçlü, son hafif, orta katman ortadaki model.
-/// Katalog canlıdır; burada model adı hard-code edilmez.
-pub fn map_codex_model(source_model: &str, models: &[String]) -> Option<String> {
-    if models.is_empty() {
-        return None;
-    }
-    let light = is_light(source_model);
-    let middle = source_model == "sonnet" || source_model.starts_with("claude-sonnet") || source_model.starts_with("muse-");
-    let index = if light { models.len() - 1 } else if middle { models.len() / 2 } else { 0 };
-    models.get(index).cloned()
 }
 
 /// Zincir geçişinde PTY'ye verilen kısa devam turu. `[Dex] ` önekiyle başlar: tur Dex turu
@@ -734,24 +593,20 @@ mod tests {
         assert_eq!(map_model("glm", "claude-haiku-4-5-20251001"), "GLM-5.3-Flash");
         assert_eq!(map_model("glm", "claude-opus-5-5"), "GLM-5.3");
         assert_eq!(map_model("local", "qwen3-coder-next"), "qwen3-coder-next");
-        let codex = ["gpt-strong".into(), "gpt-mid".into(), "gpt-light".into()];
-        assert_eq!(map_codex_model("opus", &codex).as_deref(), Some("gpt-strong"));
-        assert_eq!(map_codex_model("sonnet", &codex).as_deref(), Some("gpt-mid"));
-        assert_eq!(map_codex_model("GLM-5.3-Flash", &codex).as_deref(), Some("gpt-light"));
-        assert_eq!(map_codex_model("claude-sonnet-5-5", &codex).as_deref(), Some("gpt-mid"));
-        assert_eq!(map_codex_model("claude-haiku-4-5-20251001", &codex).as_deref(), Some("gpt-light"));
-        assert_eq!(map_codex_model("opus", &[]), None);
     }
 
     #[test]
     fn order_defaults_validates_and_dedups() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(order(&c), vec!["anthropic", "muse", "glm", "local", "codex"]);
-        assert_eq!(set_order(&c, &["glm".into(), "glm".into(), "anthropic".into(), "codex".into()]).unwrap(),
-            vec!["glm", "anthropic", "codex", "muse", "local"]);
+        assert_eq!(order(&c), vec!["anthropic", "muse", "glm", "local"]);
+        assert_eq!(set_order(&c, &["glm".into(), "glm".into(), "anthropic".into(), "local".into()]).unwrap(),
+            vec!["glm", "anthropic", "local", "muse"]);
         assert!(set_order(&c, &[]).is_err());
         assert!(set_order(&c, &["bogus".into()]).is_err());
-        assert_eq!(order(&c), vec!["glm", "anthropic", "codex", "muse", "local"], "reddedilen yazım kaydı değiştirmez");
+        // Kaldırılan hedefler (Codex motoru, gateway) artık zincire yazılamaz.
+        assert!(set_order(&c, &["codex".into()]).is_err());
+        assert!(set_order(&c, &["gateway".into()]).is_err());
+        assert_eq!(order(&c), vec!["glm", "anthropic", "local", "muse"], "reddedilen yazım kaydı değiştirmez");
     }
 
     #[test]
@@ -763,7 +618,7 @@ mod tests {
         // Kapalı sağlayıcı sırada durur ama atlanır.
         assert!(order(&c).contains(&"local".to_string()));
         let next = pick_next(&c, "glm", &|_| true).unwrap();
-        assert_eq!(next.as_deref(), Some("codex"), "kapalı local atlanır");
+        assert_eq!(next, None, "kapalı local atlanır; zincir başa sarmaz");
         // Kapatma kalkınca zincire döner.
         assert!(set_disabled(&c, &[]).unwrap().is_empty());
         let next = pick_next(&c, "glm", &|_| true).unwrap();
@@ -787,105 +642,6 @@ mod tests {
         assert!(!unreachable_signal("", "model not found"));
     }
 
-    /// Sentetik Codex `token_count` satırı; olay biçimi CLI sözleşmesini korur.
-    fn limits_line(id: &str, primary: &str) -> String {
-        format!(
-            r#"{{"timestamp":"2002-01-01T12:00:20Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"{id}","primary":{primary},"secondary":null,"credits":{{"has_credits":false}}}}}}}}"#
-        )
-    }
-
-    fn window(used: f64, reset_s: i64) -> String {
-        format!(r#"{{"used_percent":{used},"window_minutes":10080,"resets_at":{reset_s}}}"#)
-    }
-
-    #[test]
-    fn codex_rollout_quota_known_only_when_full_and_future() {
-        let root = std::env::temp_dir().join(format!("dex-codex-rl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let day = root.join("2002").join("01").join("01");
-        std::fs::create_dir_all(&day).unwrap();
-        let now = 1_009_886_430_000; // Sentetik UTC: 2002-01-01T12:00:30Z.
-        let future = now / 1000 + 3_600;
-        assert_eq!(codex_exhausted_until(&root.join("yok"), now), None, "klasör yok = bilinmiyor");
-        // Dolu codex satırı, ardından daha yeni "premium" satırı (yok sayılır) ve bozuk satır.
-        let file = day.join("rollout-2002-01-01T12-00-20-a.jsonl");
-        let body = [
-            r#"{"type":"session_meta","payload":{}}"#.to_string(),
-            limits_line("codex", &window(40.0, future)),
-            limits_line("codex", &window(100.0, future)),
-            limits_line("premium", "null"),
-            r#"{"rate_limits": bozuk"#.to_string(),
-        ]
-        .join("\n");
-        std::fs::write(&file, body).unwrap();
-        assert_eq!(codex_exhausted_until(&root, now), Some(future * 1000), "son codex satırı %100");
-        // Sıfırlanması geçmiş = bilinmiyor.
-        std::fs::write(&file, limits_line("codex", &window(100.0, now / 1000 - 60))).unwrap();
-        assert_eq!(codex_exhausted_until(&root, now), None);
-        // Pencere null = bilinmiyor; kotası olan = aday.
-        std::fs::write(&file, limits_line("codex", "null")).unwrap();
-        assert_eq!(codex_exhausted_until(&root, now), None);
-        std::fs::write(&file, limits_line("codex", &window(97.0, future))).unwrap();
-        assert_eq!(codex_exhausted_until(&root, now), None);
-        // En son yazılan dosya karar verir (eski günün dolu satırı geçersiz).
-        let old = root.join("2001").join("12").join("31");
-        std::fs::create_dir_all(&old).unwrap();
-        let old_line = limits_line("codex", &window(100.0, future)).replace("2002-01-01T12:00:20Z", "2001-12-31T12:00:20Z");
-        std::fs::write(old.join("rollout-2001-12-31T12-00-20-b.jsonl"), old_line).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(&file, limits_line("codex", &window(10.0, future))).unwrap();
-        assert_eq!(codex_exhausted_until(&root, now), None, "en yeni ölçüm kotası var diyor");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn codex_usage_limit_turn_end_is_the_signal() {
-        // Sentetik UTC takvimi, codex-cli 0.154 olay biçimi: kota sinyali task_complete'ta;
-        // önceki token_count tek başına tur sonu hatasını temsil etmez.
-        let hit: serde_json::Value = serde_json::from_str(
-            r#"{"timestamp":"2002-01-01T12:00:30.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":null,"error":{"message":"You’ve hit your usage limit. … try again at Jan 7th, 2002 1:38:54 PM UTC.","codex_error_info":"usage_limit_exceeded"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(codex_turn_limit(&hit), Some(true));
-        let obj = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":{"usage_limit_exceeded":{}}}}});
-        assert_eq!(codex_turn_limit(&obj), Some(true));
-        let ok = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"bitti"}});
-        assert_eq!(codex_turn_limit(&ok), Some(false));
-        let other = serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","error":{"codex_error_info":"internal_server_error"}}});
-        assert_eq!(codex_turn_limit(&other), Some(false), "kota dışı hata zinciri tetiklemez");
-        assert_eq!(codex_turn_limit(&serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}})), None);
-    }
-
-    #[test]
-    fn codex_recent_limit_only_for_a_fresh_last_turn() {
-        let now = 1_009_886_430_000; // 2002-01-01T12:00:30Z (synthetic UTC)
-        let started = r#"{"timestamp":"2002-01-01T12:00:20.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}"#;
-        let limit = |ts: &str| format!(r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t","error":{{"codex_error_info":"usage_limit_exceeded"}}}}}}"#);
-        let ok = r#"{"timestamp":"2002-01-01T12:00:29.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"u","last_agent_message":"bitti"}}"#;
-        let fresh = limit("2002-01-01T12:00:28.000Z");
-        assert!(codex_recent_limit(format!("{started}\n{fresh}\n").as_bytes(), now));
-        assert!(codex_recent_limit(format!("{started}\n{fresh}").as_bytes(), now), "son satır yarım kalmış newline'sız");
-        assert!(!codex_recent_limit(format!("{started}\n{}\n", limit("2002-01-01T11:58:00.000Z")).as_bytes(), now), "bayat");
-        assert!(!codex_recent_limit(format!("{fresh}\n{started}\n").as_bytes(), now), "arkasından yeni tur başladı");
-        assert!(!codex_recent_limit(format!("{fresh}\n{ok}\n").as_bytes(), now), "son tur başarılı");
-        assert!(!codex_recent_limit(format!("{}\n", limit("yok")).as_bytes(), now), "damgasız/okunamayan saat");
-        assert!(!codex_recent_limit(b"", now));
-    }
-
-    #[test]
-    fn codex_own_rollout_gives_the_reset() {
-        let dir = std::env::temp_dir().join(format!("dex-codex-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("rollout-2002-01-01T12-00-20-x.jsonl");
-        let now = 1_009_886_430_000; // Sentetik UTC: 2002-01-01T12:00:30Z; reset 2002-01-07T13:38:54Z.
-        std::fs::write(&file, format!("{}\n{}\n", limits_line("codex", &window(100.0, 1_010_410_734)), limits_line("premium", "null"))).unwrap();
-        assert_eq!(codex_file_exhausted_until(&file, now), Some(1_010_410_734_000));
-        std::fs::write(&file, limits_line("codex", &window(40.0, 1_010_410_734))).unwrap();
-        assert_eq!(codex_file_exhausted_until(&file, now), None);
-        assert_eq!(codex_file_exhausted_until(&dir.join("yok.jsonl"), now), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn rfc3339_parses_usage_resets() {
         assert_eq!(parse_rfc3339("2002-01-01T09:42:19Z"), Some(1_009_878_139_000));
@@ -904,7 +660,7 @@ mod tests {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         assert_eq!(earliest_reset(&c).unwrap(), None);
         let now = now_ms();
-        mark_exhausted(&c, "codex", Some(now + 7_200_000), "kota").unwrap();
+        mark_exhausted(&c, "muse", Some(now + 7_200_000), "kota").unwrap();
         mark_exhausted(&c, "glm", Some(now + 3_600_000), "kota").unwrap();
         assert_eq!(earliest_reset(&c).unwrap(), Some(now + 3_600_000));
         set_disabled(&c, &["glm".into()]).unwrap();
@@ -914,29 +670,31 @@ mod tests {
     #[test]
     fn none_reason_tells_quota_from_access() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
-        set_disabled(&c, &["muse".into(), "local".into()]).unwrap();
+        set_disabled(&c, &["local".into()]).unwrap();
         let later = now_ms() + 3_600_000;
-        // Claude'dan sonra açık: GLM, Codex.
+        // Claude'dan sonra açık: Muse, GLM.
         let no_glm = |p: &str| p != "glm";
-        // Codex hazır değil (seçimde atlandı), GLM jetonsuz: kota değil erişim.
+        // Muse seçimde atlandı, GLM jetonsuz: kota değil erişim.
         assert_eq!(none_reason(&c, "anthropic", "anthropic", true, &no_glm), "zincirde jetonu/erişimi olan motor yok");
-        mark_exhausted(&c, "codex", Some(later), "kota").unwrap();
+        mark_exhausted(&c, "muse", Some(later), "kota").unwrap();
         assert_eq!(none_reason(&c, "anthropic", "anthropic", false, &no_glm), "zincirde kotası olan motor yok, kalanların jetonu/erişimi yok");
-        set_disabled(&c, &["muse".into(), "local".into(), "glm".into()]).unwrap();
+        set_disabled(&c, &["local".into(), "glm".into()]).unwrap();
         assert_eq!(none_reason(&c, "anthropic", "anthropic", false, &no_glm), "zincirde kotası olan motor yok");
-        // Codex'ten çıkış: sırada kimse yok, asıl sağlayıcı (Claude) sayılır.
-        assert_eq!(none_reason(&c, "codex", "anthropic", false, &no_glm), "zincirde kullanılabilir hedef yok");
+        // Zincirin sonundan çıkış: sırada kimse yok, asıl sağlayıcı (Claude) sayılır.
+        assert_eq!(none_reason(&c, "local", "anthropic", false, &no_glm), "zincirde kullanılabilir hedef yok");
         mark_exhausted(&c, "anthropic", Some(later), "kota").unwrap();
-        assert_eq!(none_reason(&c, "codex", "anthropic", false, &no_glm), "zincirde kotası olan motor yok");
+        assert_eq!(none_reason(&c, "local", "anthropic", false, &no_glm), "zincirde kotası olan motor yok");
     }
 
     #[test]
     fn pick_skips_exhausted_and_tokenless() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         mark_exhausted(&c, "muse", Some(now_ms() + 3_600_000), "kota").unwrap();
-        // Zincir geri sarmaz: GLM'den sonra token'sız local atlanır, Codex'e geçilir.
-        let next = pick_next(&c, "glm", &|p| p == "codex").unwrap();
-        assert_eq!(next.as_deref(), Some("codex"));
+        // Tükenmiş Muse ve jetonsuz GLM atlanır, Local'e geçilir.
+        let next = pick_next(&c, "anthropic", &|p| p == "local").unwrap();
+        assert_eq!(next.as_deref(), Some("local"));
+        // Zincir geri sarmaz: GLM'den sonra jetonsuz local atlanır, baştaki Claude'a dönülmez.
+        assert_eq!(pick_next(&c, "glm", &|_| false).unwrap(), None);
         // Süresi dolan kayıt kalkar.
         mark_exhausted(&c, "anthropic", Some(now_ms() - 1), "eski").unwrap();
         let next = pick_next(&c, "eski-hedef", &|_| false).unwrap();
@@ -945,7 +703,7 @@ mod tests {
         mark_exhausted(&c, "anthropic", Some(now_ms() + 3_600_000), "k").unwrap();
         mark_exhausted(&c, "glm", Some(now_ms() + 3_600_000), "k").unwrap();
         mark_exhausted(&c, "local", Some(now_ms() + 3_600_000), "k").unwrap();
-        assert_eq!(pick_next(&c, "muse", &|p| p == "codex").unwrap().as_deref(), Some("codex"));
+        assert_eq!(pick_next(&c, "muse", &|_| true).unwrap(), None);
         assert_eq!(pick_next(&c, "muse", &|_| false).unwrap(), None);
         // Varsayılan süre 5 sa.
         mark_exhausted(&c, "x", None, "k").unwrap();

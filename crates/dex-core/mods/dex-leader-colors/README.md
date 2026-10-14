@@ -15,7 +15,7 @@ ve mobile yüzeyleri test edilir; gerekli eleman yoksa varsayılan render sürer
 Dex modu ikiliye gömer ve lider başlangıcında `skills.root/dex-leader-colors`
 altına kurar. Yalnız Claude liderin spawn env'ine `CLAUDE_CODE_PLUGIN_DIRS`
 eklenir; mevcut değer korunur. Yol ayracı Windows'ta `;`, diğer platformlarda
-`:`. Worker, inceleyici ve Codex liderlere bu mod Dex tarafından eklenmez.
+`:`. Worker ve inceleyicilere bu mod Dex tarafından eklenmez.
 
 ```sh
 claude plugin validate --strict crates/dex-core/mods/dex-leader-colors

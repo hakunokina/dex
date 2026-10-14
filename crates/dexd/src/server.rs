@@ -834,7 +834,6 @@ fn handle(srv: &Server, conn: &Conn, req: &Request) -> Result<Value, Error> {
                 provider: arg(p, "provider")?,
                 cols: arg(p, "cols")?,
                 rows: arg(p, "rows")?,
-                codex: arg(p, "codex")?,
                 env: Vec::new(),
             };
             let channel = arg(p, "channel")?;

@@ -42,7 +42,7 @@ pub enum UsageStatus {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsage {
-    /// Sağlayıcı kimliği (`claude`, `codex`, `zai`, `muse`…); etiket/renk UI'ın işi.
+    /// Sağlayıcı kimliği (`claude`, `zai`, `muse`…); etiket/renk UI'ın işi.
     pub id: String,
     /// Birincil pencerede kalan yüzde; `None` = sağlayıcı şu an bir şey bildirmiyor ("--").
     pub remaining_percent: Option<f64>,
@@ -148,13 +148,11 @@ fn remaining(w: &Value) -> Option<f64> {
 /// TM'nin `compactLimitSelection`'ı: session > daily > weekly > billing; aynı türden birden çok
 /// havuz varsa etiketsiz (kanonik) olan, yoksa en dar olan.
 fn primary_window(provider: &Value) -> Option<&Value> {
-    let id = provider["provider"].as_str().unwrap_or("");
     let windows = provider["windows"].as_array()?;
     for kind in WINDOW_ORDER {
         let pool: Vec<&Value> = windows
             .iter()
             .filter(|w| w["kind"] == kind && w["showMeter"] != Value::Bool(false))
-            .filter(|w| !(id == "codex" && w["additional"] == Value::Bool(true)))
             .filter(|w| remaining(w).is_some())
             .collect();
         let canonical = |w: &&&Value| {
@@ -546,7 +544,7 @@ mod tests {
                     {"kind": "weekly", "usedPercent": 50},
                     {"kind": "session", "remainingPercent": 66.4, "resetsAt": "2026-10-02T23:10:00.000Z"}
                 ]},
-                {"provider": "codex", "status": "ok", "windows": [
+                {"provider": "gemini", "status": "ok", "windows": [
                     {"kind": "session", "label": "", "usedPercent": 3},
                     {"kind": "session", "label": "spark", "additional": true, "usedPercent": 90}
                 ]},
@@ -568,9 +566,9 @@ mod tests {
         assert_eq!(snap.today_cost_usd, Some(94.04));
         assert_eq!(snap.tok_per_sec, None, "ilk itme yalnız taban");
         let ids: Vec<_> = snap.providers.iter().map(|p| (p.id.as_str(), p.remaining_percent)).collect();
-        // claude: iki hesap → en dar (20); codex: ek havuz sayılmaz; muse hata → "--";
+        // claude: iki hesap → en dar (20); gemini: etiketsiz (kanonik) havuz; muse hata → "--";
         // cursor penceresiz → yok; zai bayat → "--".
-        assert_eq!(ids, vec![("claude", Some(20.0)), ("codex", Some(97.0)), ("muse", None), ("zai", None)]);
+        assert_eq!(ids, vec![("claude", Some(20.0)), ("gemini", Some(97.0)), ("muse", None), ("zai", None)]);
         assert_eq!(snap.providers[1].window.as_deref(), Some("session"));
 
         apply_stats(&mut snap, &mut rate, &stats(1000.0 + 1130.0, 20_000.0), 9);

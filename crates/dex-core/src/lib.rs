@@ -6,7 +6,6 @@ pub mod agents;
 pub mod chain;
 pub mod chat;
 pub mod cost;
-pub mod codex;
 pub mod db;
 pub mod diagnostics;
 pub mod effort;
@@ -15,7 +14,6 @@ pub mod delegate;
 pub mod events;
 pub mod first_reply;
 pub mod gpu;
-pub mod gateway;
 pub mod hooks;
 mod hook_delivery;
 mod local_http;
@@ -84,8 +82,6 @@ pub struct Core {
     pub browser: browser::Browser,
     /// Per-process role-skill plugin root (DEX-23).
     pub skills: skills::Skills,
-    pub(crate) gateway: Arc<gateway::ingress::Service>,
-    gateway_auth_local: bool,
     /// #41: this process's hold on `<data_dir>/dex.lock`; [`Core::shutdown`] lets it go.
     instance: Mutex<Option<instance::Lock>>,
     pub ptys: pty::Ptys,
@@ -192,15 +188,11 @@ impl Core {
             eprintln!("dex: hafıza taşıma: {err}");
         }
         let (hooks, listener) = hooks::start(&paths.config_dir)?;
-        let gateway = gateway::ingress::Service::start()?;
-        let events = gateway::ingress::tap(events,&gateway);
         let mcp = mcp::start(&paths.config_dir, hooks.port)?;
         // DEX-22: every `delegations-changed` also advances the leaders' plans.
         let (events, kicks) = plan::tap(events);
         let browser = browser::start(&paths.config_dir)?;
         let skills = skills::start(&paths.config_dir)?;
-        // DEX-26: codex profiles of crashed Dex processes (they live in the user's CODEX_HOME).
-        codex::sweep_stale(&codex::home());
         let db = Db::new(conn);
         let core = Arc::new_cyclic(|weak| Self {
             paths,
@@ -210,8 +202,6 @@ impl Core {
             mcp,
             browser,
             skills,
-            gateway,
-            gateway_auth_local: seed_default_team,
             instance: Mutex::new(Some(instance)),
             ptys: pty::Ptys::bound(weak.clone()),
             agent_states: agents::States::default(),
@@ -260,7 +250,6 @@ impl Core {
             gpu: gpu::State::default(),
             weak_self: weak.clone(),
         });
-        core.gateway.bind(core.weak_self.clone());
         // #161: a restart (drained, an update) left its marker: the queue stays, its leaders come back.
         let restarted = restart::take(&core.paths.data_dir);
         let keep_queued = restarted.is_some();
@@ -303,13 +292,11 @@ impl Core {
     /// Removes the per-process files (claude sessions of this process die with it anyway).
     pub fn shutdown(&self) {
         self.team_idle.lock().unwrap().clear();
-        self.gateway.shutdown();
         diagnostics::event("shutdown", serde_json::json!({}));
         self.hooks.remove_settings();
         self.mcp.remove_config();
         self.browser.remove_config();
         self.skills.remove_all();
-        codex::remove_own(&codex::home());
         self.instance.lock().unwrap().take();
     }
 
@@ -426,13 +413,10 @@ impl Core {
             self.worker_notes_reconcile(agent);
             if event == "UserPromptSubmit" { self.worker_notes_prompt_received(agent, body); }
         }
-        if event == "Stop" && stop.is_none() && body["session_id"].is_string()
-            && self.agent_states.get(agent).engine.as_deref() != Some("codex")
-        {
+        if event == "Stop" && stop.is_none() && body["session_id"].is_string() {
             return None; // Its ingress was fenced by a completed or newer turn.
         }
-        let pending = (event == "Stop" && self.agent_states.get(agent).engine.as_deref() != Some("codex"))
-            .then(hook_delivery::Pending::default);
+        let pending = (event == "Stop").then(hook_delivery::Pending::default);
         if event == "UserPromptSubmit" {
             self.inbox_prompt_received(agent, body.get("prompt").and_then(Value::as_str).unwrap_or(""));
             self.reported_workers.lock().unwrap().remove(agent);
@@ -448,7 +432,7 @@ impl Core {
         // Görev #26: the same policy before the tool runs — whatever the session's permission mode
         // (auto / acceptEdits / bypass never raise a PermissionRequest). A deny ends it here.
         let pre = (event == "PreToolUse").then(|| self.permit_answer(agent, body, permit::GRAY_AT_PRE_TOOL)).flatten();
-        if let Some((Err(why), _)) = &pre {
+        if let Some(Err(why)) = &pre {
             return Some(pre_tool_answer("deny", Some(why)));
         }
         // DEX-33: the whole e2e suite is QA's (test budget); others give a spec or a grep.
@@ -477,11 +461,9 @@ impl Core {
             }
         }
         // Görev #26: an allowed call skips the patron's dialog — unless a Dex rule above answered
-        // (service-worker limits, AskUserQuestion). Codex: deny only (a bare allow is not its shape).
-        if let (None, Some((Ok(()), claude))) = (&out, &pre) {
-            if *claude {
-                return Some(pre_tool_answer("allow", None));
-            }
+        // (service-worker limits, AskUserQuestion).
+        if let (None, Some(Ok(()))) = (&out, &pre) {
+            return Some(pre_tool_answer("allow", None));
         }
         // S5-B: a Stop that continued nothing ends the turn — the chat queue goes in.
         if event == "Stop" && !is_blocked(&out) {
@@ -687,7 +669,7 @@ impl Core {
         let settled = match state.status {
             agents::Status::Idle | agents::Status::Offline => true,
             // #125: a "working" no hook will ever end (claude only: the transcript is the witness).
-            agents::Status::Working => state.engine.as_deref() != Some("codex") && self.stale_working(agent),
+            agents::Status::Working => self.stale_working(agent),
             agents::Status::Waiting => false,
         };
         if !settled
@@ -929,10 +911,8 @@ impl Core {
             Ok((delegate::start_request(conn, &d)?, delegate::has_other_work(conn, &d)?, a.active_engine.unwrap_or(a.engine), worker))
         })?;
         // Görev #19: claude gets only a short trigger in its pane (argument or paste); the job comes
-        // as that prompt's UserPromptSubmit context. Codex has no such hook: the full text stays.
-        if engine != "codex" {
-            request.prompt = delegate::trigger_line(d.id);
-        }
+        // as that prompt's UserPromptSubmit context.
+        request.prompt = delegate::trigger_line(d.id);
         let mut status = self.agent_states.get(&d.to_agent).status;
         let running = self.ptys.is_running(&d.to_agent);
         if running && status == agents::Status::Offline {
@@ -973,10 +953,6 @@ impl Core {
                             None
                         }
                     };
-                    // Codex gets the full text now; its worktree line was not known yet.
-                    if wt.is_some() && engine == "codex" {
-                        request.prompt = with(&self.db, |c| delegate::worker_prompt(c, &d))?;
-                    }
                     let mut options = agents::job_start(request.prompt, request.add_dirs);
                     options.effort = d.effort;
                     // #838 G/D: the session, its MCP key, folder, memory and system text are this job's.
@@ -1181,38 +1157,7 @@ impl Core {
     // ---- providers ----
 
     pub fn provider_list(&self) -> Result<Vec<providers::ProviderInfo>, String> {
-        let mut providers=providers::list()?;
-        if let Some(gateway)=providers.iter_mut().find(|p|p.id=="gateway") {
-            if self.gateway_auth_local {
-                let status=self.gateway.auth.status()?;
-                gateway.has_token=status.active_account_id.is_some();
-                gateway.models=status.models.into_iter().map(|m|providers::ModelInfo {id:m.id,label:m.label,legacy:false}).collect();
-            }
-        }
-        Ok(providers)
-    }
-    fn gateway_local(&self) -> Result<(),String> {
-        if !self.gateway_auth_local {return Err("giriş yalnız yerel Dex'ten".into());}
-        if self.gateway.is_open() {Ok(())}else{Err("gateway_closed".into())}
-    }
-    pub fn gateway_auth_start(&self, account_id: Option<&str>) -> Result<gateway::auth::Started,String> {
-        self.gateway_local()?;
-        let gateway=Arc::downgrade(&self.gateway);
-        let core=self.weak_self.clone();
-        self.gateway.auth.start_login(account_id,move |success| {
-            if success {if let Some(gateway)=gateway.upgrade() {gateway.revoke_all();}}
-            if let Some(core)=core.upgrade() {core.changed("gateway-auth-changed");core.changed("providers-changed");}
-        })
-    }
-    pub fn gateway_auth_status(&self) -> Result<gateway::auth::Status,String> {self.gateway_local()?;self.gateway.auth.status()}
-    pub fn gateway_auth_logout(&self, account_id: Option<&str>) -> Result<gateway::auth::LoggedOut,String> {
-        self.gateway_local()?;self.gateway.revoke_all();
-        let result=self.gateway.auth.logout(account_id);
-        self.changed("gateway-auth-changed");self.changed("providers-changed");result
-    }
-    pub fn gateway_models(&self) -> Result<Vec<gateway::auth::Model>,String> {self.gateway_local()?;self.gateway.auth.models()}
-    pub(crate) fn gateway_spawn_env(&self, agent: &str, model: &str) -> Result<Vec<(String,String)>,String> {
-        self.gateway_local()?;self.gateway.spawn_env(self,agent,model)
+        providers::list()
     }
 
     pub fn provider_import_routes(&self) -> Result<Vec<providers::ImportRow>, String> {
@@ -1278,11 +1223,6 @@ impl Core {
         Ok(a)
     }
 
-    /// DEX-26: models the codex login can use (runs `codex debug models` once per process).
-    pub fn codex_models(&self) -> Result<Vec<codex::ModelInfo>, String> {
-        codex::models()
-    }
-
     /// Görev #120: sağlayıcıların sunduğu, Dex kataloğunda olmayan ve kapatılmamış modeller.
     /// Ağa çıkar (en çok ~13 sn) — host bunu UI iş parçacığında koşmamalı. Sağlayıcı başına
     /// 24 saatte en çok bir kez sorulur; o pencerede atlanan sağlayıcı haber üretmez.
@@ -1337,7 +1277,6 @@ impl Core {
 
     pub(crate) fn pty_exited(&self, id: &str) {
         self.reported_workers.lock().unwrap().remove(id);
-        self.gateway.revoke_agent(id);
         if let Err(error) = with(&self.db, |c| cost::end_agent(c,id)) {
             log::error!("usage session end: {error}");
         }
@@ -1362,11 +1301,11 @@ impl Core {
 }
 
 impl Core {
-    /// Görev #23: allow / deny a worker's PermissionRequest (claude + codex share the answer shape).
+    /// Görev #23: allow / deny a worker's PermissionRequest.
     /// `None` (the patron's prompt, as before) for anything Dex cannot place and for a leader's
     /// call that is not a hard no (#164 P7).
     fn permit_on_request(&self, agent: &str, body: &Value) -> Option<String> {
-        let (answer, _) = self.permit_answer(agent, body, true)?;
+        let answer = self.permit_answer(agent, body, true)?;
         let decision = match answer {
             Ok(()) => serde_json::json!({ "behavior": "allow" }),
             Err(message) => serde_json::json!({ "behavior": "deny", "message": message }),
@@ -1376,21 +1315,21 @@ impl Core {
 
     /// The policy's answer for a worker's tool call (`Ok` allow, `Err` deny with the worker's
     /// message), audited once. `gray`: whether an out-of-policy call is answered (a numbered
-    /// request for the leader) or left alone (`None`, so the session decides). The bool: claude.
+    /// request for the leader) or left alone (`None`, so the session decides).
     /// `None` for anything Dex cannot place. #164 P7: a leader gets the hard noes only — its allowed
     /// and out-of-policy calls are `None` (the session decides, as before).
     /// #164 P3: a worker spawned fail-closed whose call Dex cannot place (DB error, row gone) is
     /// denied rather than left to bypass mode.
-    fn permit_answer(&self, agent: &str, body: &Value, gray: bool) -> Option<(Result<(), String>, bool)> {
+    fn permit_answer(&self, agent: &str, body: &Value, gray: bool) -> Option<Result<(), String>> {
         let tool = body.get("tool_name").and_then(Value::as_str)?;
         let input = body.get("tool_input").cloned().unwrap_or(Value::Null);
         let placed = with(&self.db, |c| Ok((self.permit_ctx(c, agent, body)?, running_job(c, agent)?)));
-        let (ctx, claude, worker, running) = match placed {
-            Ok((Some((ctx, claude, worker)), running)) => (ctx, claude, worker, running),
+        let (ctx, worker, running) = match placed {
+            Ok((Some((ctx, worker)), running)) => (ctx, worker, running),
             _ if self.hooks.is_fail_closed(agent) => {
                 diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "policy", "policy_unavailable", tool, &input, None, None));
                 self.permit_audit(agent, "deny", "policy_unavailable", None, input.to_string().len());
-                return Some((Err("Dex izin denetimi şu an karar veremiyor; araç engellendi. Biraz sonra aynı adımı yeniden dene; sürerse raporunda belirt.".into()), true));
+                return Some(Err("Dex izin denetimi şu an karar veremiyor; araç engellendi. Biraz sonra aynı adımı yeniden dene; sürerse raporunda belirt.".into()));
             }
             _ => return None,
         };
@@ -1436,7 +1375,7 @@ impl Core {
         };
         diagnostics::event("permit", diagnostics::permit_fields(agent, if answer.is_ok() { "allow" } else { "deny" }, "policy",
             answer.as_ref().err().map_or("allow_policy", |why| diagnostics::denial_rule(why)), tool, &input, Some(&ctx), None));
-        Some((answer, claude))
+        Some(answer)
     }
 
     /// Persist metadata only; commands stay in the transient request and approval question.
@@ -1471,16 +1410,15 @@ impl Core {
         });
     }
 
-    /// Workers and leaders (the bools: claude, worker): their team folder (a service team's workdir)
+    /// Workers and leaders (the bool: worker): their team folder (a service team's workdir)
     /// and team memory to write, a service job's `docs/research` too, its requester project to
     /// read; other teams' folders are off limits. A leader with no team folder is not placed.
-    fn permit_ctx(&self, c: &rusqlite::Connection, agent: &str, body: &Value) -> Result<Option<(permit::Ctx, bool, bool)>, String> {
+    fn permit_ctx(&self, c: &rusqlite::Connection, agent: &str, body: &Value) -> Result<Option<(permit::Ctx, bool)>, String> {
         let a = teams::get_agent(c, agent)?;
         let worker = a.kind == "worker";
         if !worker && a.kind != "leader" {
             return Ok(None);
         }
-        let claude = a.active_engine.as_deref().unwrap_or(&a.engine) != "codex";
         let all = teams::list_teams(c, &self.paths.data_dir)?;
         let Some(team) = all.iter().find(|t| t.id == a.team_id) else { return Ok(None) };
         let home = team.cwd.clone().or_else(|| team.workdir.clone()).map(std::path::PathBuf::from);
@@ -1497,7 +1435,7 @@ impl Core {
             ctx.read.push(pc.team_memory_root.join("shared"));
             ctx.read.push(slug::memory_dir(c, &pc.agent_memory_root, agent)?);
             ctx.cwd = pc.project_root.or_else(|| ctx.team_root.clone());
-            return Ok(Some((ctx, claude, true)));
+            return Ok(Some((ctx, true)));
         }
         // #222: izinli push hedef desenleri — settings satırı (ajan yazamaz), boş = kapalı.
         ctx.push_allow = settings::push_allow(c);
@@ -1588,18 +1526,16 @@ impl Core {
         // #293: the reviewer reads Dex's role skills and writes only its own report (permit.rs).
         if ctx.read_only {
             ctx.read.push(self.skills.root.clone());
-            if claude {
-                use rusqlite::OptionalExtension;
-                let state = self.agent_states.get(agent);
-                let saved: Option<(String, Option<String>)> = c.query_row(
-                    "SELECT session_id, transcript FROM agent_sessions WHERE agent_id = ?1 AND engine = ?2",
-                    rusqlite::params![agent, a.active_engine.as_deref().unwrap_or(&a.engine)],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                ).optional().map_err(|e| e.to_string())?;
-                let session = state.session_id.as_deref().or_else(|| saved.as_ref().map(|s| s.0.as_str()));
-                let transcript = state.transcript.as_deref().or_else(|| saved.as_ref().and_then(|s| s.1.as_deref()));
-                ctx.tool_results = session.zip(transcript).and_then(|(s, t)| permit::claude_tool_results(t, s));
-            }
+            use rusqlite::OptionalExtension;
+            let state = self.agent_states.get(agent);
+            let saved: Option<(String, Option<String>)> = c.query_row(
+                "SELECT session_id, transcript FROM agent_sessions WHERE agent_id = ?1 AND engine = ?2",
+                rusqlite::params![agent, a.active_engine.as_deref().unwrap_or(&a.engine)],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional().map_err(|e| e.to_string())?;
+            let session = state.session_id.as_deref().or_else(|| saved.as_ref().map(|s| s.0.as_str()));
+            let transcript = state.transcript.as_deref().or_else(|| saved.as_ref().and_then(|s| s.1.as_deref()));
+            ctx.tool_results = session.zip(transcript).and_then(|(s, t)| permit::claude_tool_results(t, s));
         }
         // #35: Claude Code's own scratch space of this session (common hook field), nothing wider.
         if let Some(sp) = body.get("scratchpad_dir").and_then(Value::as_str).and_then(permit::scratchpad) {
@@ -1607,7 +1543,7 @@ impl Core {
             ctx.read.push(sp);
         }
         ctx.cwd = body.get("cwd").and_then(Value::as_str).map(Into::into).or(wt.map(|w| w.path)).or(place);
-        Ok(Some((ctx, claude, worker)))
+        Ok(Some((ctx, worker)))
     }
 }
 
@@ -1811,12 +1747,12 @@ mod permit_tests {
             Events::new(events::NullSink)).unwrap();
         with(&core.db, |c| c.execute("UPDATE teams SET cwd=?1 WHERE id='default'", [proj.to_string_lossy()]).map_err(|e| e.to_string())).unwrap();
         let request = serde_json::json!({"tool_name":"Bash", "tool_input":{"command":COMMAND}, "cwd":proj});
-        let (answer, _) = core.permit_answer("kaan", &request, true).unwrap();
+        let answer = core.permit_answer("kaan", &request, true).unwrap();
         assert!(answer.unwrap_err().contains("short-demo-token"), "the approval question keeps the command");
         core.permits.grant(1, permit::Scope::Once, None).unwrap();
-        assert!(core.permit_answer("kaan", &request, true).unwrap().0.is_ok());
+        assert!(core.permit_answer("kaan", &request, true).unwrap().is_ok());
         let denied = serde_json::json!({"tool_name":"Bash", "tool_input":{"command":"git push origin private-text"}, "cwd":proj});
-        assert!(core.permit_answer("kaan", &denied, true).unwrap().0.is_err());
+        assert!(core.permit_answer("kaan", &denied, true).unwrap().is_err());
         core.shutdown();
     }
 
@@ -1907,7 +1843,7 @@ mod permit_tests {
         phase.set("trusted context");
         with(&core.db, |c| {
             let claimed = serde_json::json!({ "leader": true, "kind": "leader", "team_root": root, "extra_push_roots": [root], "cwd": root });
-            let (ctx, _, worker) = core.permit_ctx(c, "kaan", &claimed)?.unwrap();
+            let (ctx, worker) = core.permit_ctx(c, "kaan", &claimed)?.unwrap();
             assert!(worker && !ctx.leader);
             assert_eq!(ctx.team_root.as_deref(), Some(proj.as_path()));
             assert!(!ctx.extra_push_roots.contains(&root), "hook input must not supply a push root");
@@ -2026,7 +1962,7 @@ mod permit_tests {
         assert_eq!(edit(&wt.path, &proj.join("src/a.rs")), "deny", "the main checkout is not the job's");
         assert_eq!(edit(&wt.path, &wt.path.join(".git")), "deny", "protected as before");
         with(&core.db, |c| {
-            let (ctx, _, _) = core.permit_ctx(c, "kaan", &serde_json::json!({}))?.unwrap();
+            let (ctx, _) = core.permit_ctx(c, "kaan", &serde_json::json!({}))?.unwrap();
             assert!(ctx.read.contains(&proj), "the team folder stays readable");
             assert!(ctx.read.contains(&proj.join(".dex").join("tmp")), "#200: .dex/tmp readable too");
             assert_eq!(ctx.cwd.as_deref(), Some(wt.path.as_path()));
@@ -2063,8 +1999,7 @@ mod pre_tool_tests {
         )
         .unwrap();
         with(&core.db, |c| {
-            c.execute("UPDATE teams SET cwd = ?1 WHERE id = 'default'", [proj.to_string_lossy()]).map_err(|e| e.to_string())?;
-            c.execute("UPDATE agents SET engine = 'codex' WHERE id = 'ayla'", []).map_err(|e| e.to_string())
+            c.execute("UPDATE teams SET cwd = ?1 WHERE id = 'default'", [proj.to_string_lossy()]).map_err(|e| e.to_string())
         })
         .unwrap();
         let hook = |agent: &str, event: &str, tool: &str, input: Value| -> Option<Value> {
@@ -2089,9 +2024,6 @@ mod pre_tool_tests {
         assert!(pre("kaan", "curl -sI https://example.com").is_none());
         let pr = hook("kaan", "PermissionRequest", "Bash", serde_json::json!({ "command": "curl -sI https://example.com" })).unwrap();
         assert!(pr["hookSpecificOutput"]["decision"]["message"].as_str().unwrap().contains("izin #1"));
-        // Codex: deny only; an allow is left to its sandbox.
-        assert_eq!(decision(&pre("ayla", "git push")).as_deref(), Some("deny"));
-        assert!(pre("ayla", "cargo test -p dex-core --lib chat").is_none());
         // #164 P7: the leader gets the hard noes only; safe and gray calls stay with its session.
         assert_eq!(decision(&pre("timur", "git push")).as_deref(), Some("deny"));
         assert!(pre("timur", "cargo test -p dex-core --lib chat").is_none());
@@ -2135,7 +2067,7 @@ mod pre_tool_tests {
             c.execute("UPDATE agents SET role_slug = ?1, engine = 'claude', active_engine = NULL WHERE id = 'kaan'", [review::ROLE]).map_err(|e| e.to_string())?;
             agents::record_session(c, "kaan", "s1", "claude", Some(&transcript.to_string_lossy()))?;
             let claimed = serde_json::json!({"transcript_path": project.join("s2.jsonl"), "session_id": "s2", "tool_results": project.join("s2/tool-results")});
-            let (ctx, _, _) = core.permit_ctx(c, "kaan", &claimed)?.unwrap();
+            let (ctx, _) = core.permit_ctx(c, "kaan", &claimed)?.unwrap();
             assert_eq!(ctx.tool_results, Some(project.join("s1/tool-results")));
             assert!(!ctx.read.contains(&project), "do not grant the projects tree");
             c.execute("UPDATE agents SET role_slug = 'backend' WHERE id = 'kaan'", []).map_err(|e| e.to_string())?;
@@ -2660,81 +2592,16 @@ mod queue_tests {
         done(core, root);
     }
 
-    /// Görev #21: codex's `turn_aborted` row does for a codex worker what claude's interrupt row does.
-    #[test]
-    fn codex_turn_aborted_row_turns_the_worker_idle_and_delivers_the_queue() {
-        let (core, root) = core("esc-codex");
-        let rollout = root.join("rollout.jsonl");
-        std::fs::write(&rollout, "{\"type\":\"session_meta\",\"payload\":{}}
-").unwrap();
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &rollout);
-        std::thread::sleep(Duration::from_millis(300));
-        set(&core, agents::Status::Working);
-        let d = delegate(&core, "iş yedi");
-        assert_eq!(d.status, "queued");
-        let row = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"t1\",\"reason\":\"interrupted\"}}
-";
-        std::fs::OpenOptions::new().append(true).open(&rollout).unwrap().write_all(row.as_bytes()).unwrap();
-        assert_eq!(status_within(&core, d.id, Duration::from_millis(3_000)), "running");
-        core.chat_watches.drop_watch("kaan");
-        done(core, root);
-    }
-
-    #[test]
-    fn codex_rollout_patron_turn_holds_job_until_complete() {
-        let (core, root) = core("patron-codex");
-        with(&core.db, |c| {
-            c.execute("UPDATE agents SET engine = 'codex' WHERE id = 'kaan'", []).map_err(|e| e.to_string())
-        }).unwrap();
-        core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt": "[Dex] devam"}), false);
-        set(&core, agents::Status::Idle);
-        let rollout = root.join("rollout.jsonl");
-        std::fs::write(&rollout, "").unwrap();
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &rollout);
-        let append = |mut row: Value| {
-            // Real rollout rows carry timestamps; this clock is after the fixture's Idle hook.
-            row["timestamp"] = serde_json::json!("9999-01-01T00:00:00.000Z");
-            writeln!(std::fs::OpenOptions::new().append(true).open(&rollout).unwrap(), "{row}").unwrap();
-        };
-        // Codex's real rows: task_started precedes the context and the actual user message.
-        // No UserPromptSubmit hook reaches Dex in this replay.
-        append(serde_json::json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"patron"}}));
-        append(serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\ncontext"}]}}));
-        append(serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"patron soruyor"}]}}));
-        let end = Instant::now() + Duration::from_secs(2);
-        while (core.agent_states.get("kaan").status != agents::Status::Working || core.turns.dex_turn("kaan") != Some(false)) && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(core.agent_states.get("kaan").status, agents::Status::Working, "rollout alone protects the patron turn");
-        assert_eq!(core.turns.dex_turn("kaan"), Some(false), "context does not own the turn");
-        let d = delegate(&core, "bekleyen is");
-        assert_eq!(d.status, "queued");
-        assert_eq!(core.chat_send("kaan", "sonraki patron mesaji"), Ok("queued"));
-        // Leave only the job queue: the independent chat FIFO has existing coverage.
-        core.chat_queues.lock().unwrap().remove("kaan");
-        append(serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"patron","last_agent_message":"bitti"}}));
-        assert_eq!(status_within(&core, d.id, Duration::from_secs(3)), "running", "after the real turn end, delivered in the patron session");
-        core.chat_watches.drop_watch("kaan");
-        done(core, root);
-    }
-
     #[test]
     fn chat_send_claims_the_patron_turn_without_waiting_for_a_hook() {
         let (core, root) = core("chat-owner");
-        for engine in ["claude", "codex"] {
-            with(&core.db, |c| c.execute("UPDATE agents SET engine = ?1 WHERE id = 'kaan'", [engine]).map_err(|e| e.to_string())).unwrap();
-            core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":"[Dex] devam"}), false);
-            set(&core, agents::Status::Idle);
-            assert_eq!(core.chat_send("kaan", "echo patron"), Ok("sent"));
-            let owner = core.turns.dex_turn("kaan");
-            assert_eq!(core.agent_states.get("kaan").status, agents::Status::Working);
-            if owner != Some(false) {
-                done(core, root);
-                assert_eq!(owner, Some(false), "chat already knows this came from the patron ({engine})");
-                return;
-            }
-        }
+        core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":"[Dex] devam"}), false);
+        set(&core, agents::Status::Idle);
+        assert_eq!(core.chat_send("kaan", "echo patron"), Ok("sent"));
+        let owner = core.turns.dex_turn("kaan");
+        assert_eq!(core.agent_states.get("kaan").status, agents::Status::Working);
         done(core, root);
+        assert_eq!(owner, Some(false), "chat already knows this came from the patron");
     }
 
     /// Esc running işi kapatmaz; kuyruk onun ardında, patronun sonraki
