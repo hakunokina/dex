@@ -1,0 +1,11 @@
+        <!-- dex-push:begin — build-apk.sh bu bloğu her derlemede silip </application> önüne yeniden ekler. -->
+        <!-- #1719 Echo cevapları: FCM data mesajı → yerel bildirim (DexMessagingService.kt). Bildirim izni
+             (POST_NOTIFICATIONS) tauri-plugin-notification'ın manifestinden gelir. -->
+        <service
+            android:name="com.hakunokina.dex.hosttokens.DexMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <!-- dex-push:end -->

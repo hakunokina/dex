@@ -49,7 +49,7 @@ let selfBack = 0;
 let pendingBack: ReturnType<typeof setTimeout> | null = null;
 
 /** Android back / back gesture closes the screen (→ agent list) instead of leaving the app. */
-function useBackToList(onClose: () => void) {
+export function useBackToList(onClose: () => void) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
   useEffect(() => {
@@ -87,12 +87,15 @@ export function AgentScreen({
   teamId,
   agentId,
   autoStart,
+  initialView,
   onClose,
   onStarted,
 }: {
   teamId: string;
   agentId: string;
   autoStart: boolean;
+  /** #1719: Echo cevabından "Terminale geç" → terminal görünümünde açılır. */
+  initialView?: "term" | "chat";
   onClose: () => void;
   onStarted: () => void;
 }) {
@@ -100,7 +103,7 @@ export function AgentScreen({
   const agent = agents.find((a) => a.id === agentId);
   // #142: an older dexd without chat → terminal only.
   const chat = chatSupported(agentId);
-  const [view, setView] = useState<"term" | "chat">(autoStart || !chat ? "term" : "chat");
+  const [view, setView] = useState<"term" | "chat">(autoStart || !chat ? "term" : initialView ?? "chat");
   const [, setTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setTick((n) => n + 1), 500);

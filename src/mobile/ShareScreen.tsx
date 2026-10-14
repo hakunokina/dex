@@ -8,6 +8,7 @@ import { callHost, hostSupports, onHostUp, rawId, useHosts } from "../api/hosts"
 import type { RawShare } from "../api/shareTarget";
 import { listAgents, listTeams } from "../team/api";
 import { previewUrl, prepareImage } from "./shareImage";
+import { askNotifyOnce } from "./push";
 import {
   assistantTeams,
   buildSubmit,
@@ -118,6 +119,7 @@ export function ShareScreen({ share, ready, defaultHost, task: initialTask, clie
     try {
       const r = await callHost<{ queued?: boolean }>(hostKey, "inbox_submit", { ...buildSubmit(rawId(teamId), taskText(task, text), image, clientId.current) });
       setDone(resultText(r));
+      void askNotifyOnce(); // #1719: ilk paylaşımda bildirim izni (Echo cevap verince haber)
     } catch (e) {
       setErr(String(e));
     } finally {

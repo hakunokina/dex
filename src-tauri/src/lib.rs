@@ -80,7 +80,10 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.manage(storage);
     #[cfg(mobile)]
-    let builder = builder.plugin(mobile_hosts::init()).plugin(mobile_hosts::init_share());
+    let builder = builder
+        .plugin(mobile_hosts::init())
+        .plugin(mobile_hosts::init_share())
+        .plugin(mobile_hosts::init_push());
     // #41: first, so a second launch exits before `host::plugin` starts a Core on the same dex.db;
     // the running window comes forward instead. (The Core's own dex.lock is the hard guard.)
     // #150: with the core in dexd a second window is harmless — `tauri dev` opens next to the
@@ -253,7 +256,10 @@ pub fn run() {
         mobile_hosts::host_token_set,
         mobile_hosts::host_token_delete,
         mobile_hosts::share_take,
-        mobile_hosts::share_done
+        mobile_hosts::share_done,
+        mobile_hosts::push_token,
+        mobile_hosts::push_take,
+        mobile_hosts::push_open_url
     ]);
     let app = builder.build(context).expect("error while running tauri application");
     app.run(|_app, _e| {

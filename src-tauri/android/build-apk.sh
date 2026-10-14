@@ -3,6 +3,8 @@
 # S5-A. Tek komutluk tekrar derleme. Gereksinimler (bir kez kurulur, bu dosya kurmaz):
 #   JDK 17, Android SDK (platform-34, build-tools 34, NDK 26), Rust + aarch64-linux-android hedefi,
 #   node 22 + pnpm, ~/.config/dex/release.keystore (0600) + keystore.pass (0600).
+#   İsteğe bağlı (#1719 bildirimler): Firebase'in google-services.json'u repo DIŞINDA,
+#   ~/.config/dex/google-services.json (0600; DEX_FCM_JSON ile değiştirilebilir). Yoksa APK FCM'siz derlenir.
 # Ayrı derleme kullanıcısı: servis kullanıcısı ajan ortamını çalıştırır (dexd.service); derleme araçları
 # (SDK ~10GB, Rust toolchain, Gradle önbelleği) o ortamı kirletmesin diye ayrı kullanıcıda.
 set -euo pipefail
@@ -49,6 +51,8 @@ fi
 # MainActivity singleTask olmalı (açık uygulamaya yeni paylaşım onNewIntent ile gelir).
 SKT=src-tauri/android/ShareTargetPlugin.kt
 [ -f "$SKT" ] && cp "$SKT" "$(dirname "$DST")/ShareTargetPlugin.kt"
+# #1719 Echo cevapları: bildirim köprüsü (jeton / bildirimden açılış / tarayıcı) + FCM servisi.
+for k in PushPlugin DexMessagingService; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
 M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
 awk -v f=src-tauri/android/share-aliases.xml '
   /Paylaş hedefi \(ShareTargetPlugin.kt\): metin/ { skip = 2; next }
@@ -60,7 +64,34 @@ awk -v f=src-tauri/android/share-aliases.xml '
   || { echo "manifest'e Paylaş girişleri eklenemedi"; exit 1; }
 grep -q 'android:launchMode="singleTask"' "$M" || sed -i '0,/<activity/s//<activity android:launchMode="singleTask"/' "$M"
 grep -q 'android:launchMode="singleTask"' "$M" || { echo 'MainActivity singleTask yapılamadı; Paylaş (açık uygulama) çalışmaz'; exit 1; }
+# #1719 FCM servisi: işaretli blok her derlemede silinip </application> önüne yeniden eklenir.
+awk -v f=src-tauri/android/push-service.xml '
+  /dex-push:begin/, /dex-push:end/ { next }
+  !done && /<\/application>/ { while ((getline l < f) > 0) print l; done = 1 }
+  { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+[ "$(grep -c 'android:name="com.hakunokina.dex.hosttokens.DexMessagingService"' "$M")" = 1 ] || { echo "manifest'e FCM servisi eklenemedi"; exit 1; }
 grep -q security-crypto "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("androidx.security:security-crypto:1.1.0-alpha06")|' "$G"
+# #1719 FCM: kütüphane her zaman (Kotlin servisi derlensin); google-services eklentisi yalnız
+# google-services.json varken. Dosya yoksa FirebaseApp kurulmaz: uygulama çalışır, jeton/bildirim yok.
+# Dosya repoya girmez; gen/ içine her derlemede kopyalanır (yoksa oradan da silinir).
+grep -q firebase-messaging "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("com.google.firebase:firebase-messaging:24.1.0")|' "$G"
+grep -q firebase-messaging "$G" || { echo "firebase-messaging bağımlılığı eklenemedi"; exit 1; }
+FCM_JSON="${DEX_FCM_JSON:-$HOME/.config/dex/google-services.json}"
+R=src-tauri/gen/android/build.gradle.kts
+if [ -f "$FCM_JSON" ]; then
+  cp "$FCM_JSON" src-tauri/gen/android/app/google-services.json
+  grep -q 'com.google.gms:google-services' "$R" \
+    || sed -i 's|classpath("com.android.tools.build:gradle:[^"]*")|&\n        classpath("com.google.gms:google-services:4.4.2")|' "$R"
+  grep -q 'id("com.google.gms.google-services")' "$G" \
+    || sed -i 's|id("org.jetbrains.kotlin.android")|&\n    id("com.google.gms.google-services")|' "$G"
+  grep -q 'com.google.gms:google-services' "$R" && grep -q 'id("com.google.gms.google-services")' "$G" \
+    || { echo "google-services eklentisi eklenemedi"; exit 1; }
+  echo "FCM: açık"
+else
+  rm -f src-tauri/gen/android/app/google-services.json
+  sed -i '/id("com.google.gms.google-services")/d' "$G"
+  echo "FCM: kapalı (google-services.json yok) — bildirimsiz derleniyor"
+fi
 
 # Release R8 strips classes it can't see referenced; the bridge is loaded by name from Rust.
 P=src-tauri/gen/android/app/proguard-rules.pro

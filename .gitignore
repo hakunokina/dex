@@ -74,3 +74,5 @@ _netrc
 /scripts/yayin/yayin.conf
 /docs/agent-results/
 /docs/tasks/
+# #1719: Firebase config lives outside the repo (build-apk.sh copies it into gen/ per build).
+google-services.json
