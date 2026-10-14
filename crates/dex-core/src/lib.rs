@@ -2062,27 +2062,28 @@ mod pre_tool_tests {
         assert_eq!(decision(&pre("kaan", "git push --dry-run dex-test-yok HEAD")).as_deref(), Some("deny"));
         let edit = hook("kaan", "PreToolUse", "Write", serde_json::json!({ "file_path": root.join("x.rs").to_string_lossy() }));
         assert_eq!(decision(&edit).as_deref(), Some("deny"));
+        assert_eq!(decision(&pre("kaan", "cargo test -p dex-core --lib")).as_deref(), Some("deny"));
         // Safe: allowed (no dialog, no wait).
-        assert_eq!(decision(&pre("kaan", "cargo test -p dex-core --lib")).as_deref(), Some("allow"));
+        assert_eq!(decision(&pre("kaan", "cargo test -p dex-core --lib chat")).as_deref(), Some("allow"));
         // Gray: no answer — the session's mode decides; a dialog would come back as PermissionRequest.
         assert!(pre("kaan", "curl -sI https://example.com").is_none());
         let pr = hook("kaan", "PermissionRequest", "Bash", serde_json::json!({ "command": "curl -sI https://example.com" })).unwrap();
         assert!(pr["hookSpecificOutput"]["decision"]["message"].as_str().unwrap().contains("izin #1"));
         // Codex: deny only; an allow is left to its sandbox.
         assert_eq!(decision(&pre("ayla", "git push")).as_deref(), Some("deny"));
-        assert!(pre("ayla", "cargo test").is_none());
+        assert!(pre("ayla", "cargo test -p dex-core --lib chat").is_none());
         // #164 P7: the leader gets the hard noes only; safe and gray calls stay with its session.
         assert_eq!(decision(&pre("timur", "git push")).as_deref(), Some("deny"));
-        assert!(pre("timur", "cargo test").is_none());
+        assert!(pre("timur", "cargo test -p dex-core --lib chat").is_none());
         assert!(pre("timur", "curl -sI https://example.com").is_none());
         let leader_write = |p: &std::path::Path| decision(&hook("timur", "PreToolUse", "Write", serde_json::json!({ "file_path": p.to_string_lossy() })));
         assert_eq!(leader_write(&proj.join(".claude").join("settings.local.json")).as_deref(), Some("deny"));
         assert_eq!(leader_write(&root.join("x.rs")).as_deref(), Some("deny"));
         assert!(leader_write(&proj.join("src").join("a.rs")).is_none());
         // #164 P3: a fail-closed worker Dex cannot place is denied; anyone else is left alone.
-        assert!(pre("ghost", "cargo test").is_none());
+        assert!(pre("ghost", "cargo test -p dex-core --lib chat").is_none());
         core.hooks.fail_closed.lock().unwrap().insert("ghost".into());
-        let out = pre("ghost", "cargo test");
+        let out = pre("ghost", "cargo test -p dex-core --lib chat");
         assert_eq!(decision(&out).as_deref(), Some("deny"));
         assert!(out.unwrap()["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("karar veremiyor"));
         // Only the curl request needs the leader; hard denials remain in the audit log.
