@@ -190,7 +190,6 @@
 .m-marks .mark.ask { color: var(--amber); border: 1px solid var(--amber-line); }
 .m-marks .mark.warn { color: var(--red-hi); border: 1px solid var(--red-line); }
 .m-agent-side { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
-.m-engine { font-size: 10px; color: var(--muted); border: 1px solid var(--line); border-radius: var(--r-pill); padding: 1px 6px; }
 .m-status-text { font-size: 11px; color: var(--text-2); }
 .m-chev-agent { color: var(--faint); }
 
@@ -432,7 +431,6 @@ code { color: var(--text-2); }
   .m-agent { padding: 10px var(--sp-2); }
   .m-agent-main b { font-size: 14px; }
   .m-agent-sub { display: none; }
-  .m-engine { display: none; }
   .m-status-text { display: none; }
   .m-host-label { display: none; }
   .m-keys { gap: 4px; }

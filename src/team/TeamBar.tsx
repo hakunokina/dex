@@ -27,6 +27,7 @@ import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../
 import { isActive } from "../layout/rackOrder";
 import { teamAccent } from "./accent";
 import { providerModels } from "./providerModels";
+import { normalizeCloneTemplate } from "./cloneTemplate";
 import { TestLevelToggle } from "./TestLevelToggle";
 import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 
@@ -238,6 +239,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   const [catalogRetry, setCatalogRetry] = useState(0);
   const [busy, setBusy] = useState(false);
   const [template, setTemplate] = useState<TeamCloneTemplate | null>(null);
+  const [codexConverted, setCodexConverted] = useState(false);
   const [loading, setLoading] = useState(!!sourceId);
   const [retry, setRetry] = useState(0);
   const formRef = useRef<HTMLFormElement>(null);
@@ -271,6 +273,11 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
     }, e => { if (live) { setCatalogError(`Model kataloğu alınamadı: ${String(e)}`); setCatalogLoading(false); } });
     return () => { live = false; };
   }, [host, sourceId, catalogRetry]);
+  useEffect(() => {
+    if (!template || catalogLoading) return;
+    const r = normalizeCloneTemplate(template, providers);
+    if (r.converted) { setTemplate(r.template); setCodexConverted(true); }
+  }, [template, providers, catalogLoading]);
   // Modern hosts create the team/Main folders when cwd is omitted; old hosts still need a picker.
   const projects = hostSupports(host, "project_list");
   const educationSupport = education?.host === host ? education.supported : null;
@@ -393,6 +400,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
       {loading && <p className="team-note" role="status">Takım üyeleri yükleniyor…</p>}
       {templateError && <p className="team-err" role="alert">{templateError}</p>}
       {sourceId && !loading && !template && <button type="button" onClick={() => setRetry(r => r + 1)}>Yeniden dene</button>}
+      {codexConverted && <p className="team-note" role="status">Codex üyeleri Claude'a çevrildi</p>}
       {template && !template.members.length && <p className="team-note">Kaynak takımda üye yok; yeni takım boş başlayacak.</p>}
       {sourceId && <p className="team-note">Hafıza, oturumlar ve projeler yeni takımda sıfırdan başlar.</p>}
       {educationSelected && (educationSupport === null

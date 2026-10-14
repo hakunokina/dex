@@ -167,7 +167,7 @@ export interface TeamMemberTemplate {
   title?: string;
   model: string;
   provider?: string | null;
-  engine?: "claude" | null;
+  engine?: string | null;
   roleSlug?: string | null;
   chainOff?: boolean;
   effort?: null;
@@ -196,12 +196,10 @@ export interface NewAgent {
   provider?: string;
   /** Empty title + role → title is the role's name. */
   roleSlug?: string | null;
-  /** DEX-26: absent → `claude`. */
-  engine?: string;
 }
 
 export type TeamPatch = Partial<Pick<TeamRec, "name" | "cwd" | "worktrees" | "workspaceRoot" | "testLevel">>;
-export type AgentPatch = Partial<Pick<AgentRec, "name" | "kind" | "title" | "model" | "provider" | "roleSlug" | "engine">>;
+export type AgentPatch = Partial<Pick<AgentRec, "name" | "kind" | "title" | "model" | "provider" | "roleSlug">>;
 
 const team = (host: string, t: TeamRec): TeamRec => ({ ...t, host, id: qid(host, t.id), defaultProjectId: qOpt(host, t.defaultProjectId) });
 const agent = (host: string, a: AgentRec): AgentRec => ({ ...a, host, id: qid(host, a.id), teamId: qid(host, a.teamId) });

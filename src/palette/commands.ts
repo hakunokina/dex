@@ -140,9 +140,9 @@ export function buildCommands(bridge: Bridge): Command[] {
     // DEX-30: bulk model switch for the active team's workers (leaders stay); running ones wait.
     {
       id: "workers.claude",
-      title: "Worker'ları Claude yap",
+      title: "Worker'ları Anthropic'e (Sonnet 5.5) al",
       hint: `Takım · ${teamName(activeId)} · Sonnet 5.5`,
-      keywords: "motor engine claude anthropic model toplu hepsi",
+      keywords: "claude anthropic sonnet model toplu hepsi",
       restoreFocus: true,
       run: async () => void (await setWorkersModel(activeId, { engine: "claude", provider: "anthropic", model: "claude-sonnet-5-5" })),
     },
