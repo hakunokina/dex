@@ -1,42 +1,61 @@
-// #33: arayüz yoğunluğu — bu cihazın görünüm tercihi (src/density.ts), anında uygulanır.
-import { useEffect, useId, useState } from "react";
+// Bu cihaz › Genel › Görünüm: yoğunluk, terminal yazı boyutu, kullanım şeridi.
+// Üçü de bu cihazın tercihi (localStorage); değişiklik anında uygulanır.
+import { useEffect, useState } from "react";
 import { density, setDensity, type Density } from "../density";
-import { termSize, ZOOM_EVENT } from "../termZoom";
+import { setTermSize, termSize, ZOOM_EVENT } from "../termZoom";
+import { setStripVisible, useStripVisible } from "../usage/store";
+import { Row } from "./kit/Row";
+import { Section } from "./kit/Section";
+import { Segmented } from "./kit/Segmented";
+import { Switch } from "./kit/Switch";
 
-const OPTIONS: { value: Density; label: string }[] = [
-  { value: "compact", label: "Kompakt" },
-  { value: "normal", label: "Normal" },
-];
-
-export function DensitySection() {
-  // Ayarlar her takım dock'unda mount'lu: sabit name/id kopyaları tek radyo grubuna bağlar.
-  const uid = useId();
-  const [value, setValue] = useState(density);
+export function AppearanceSection() {
+  const [value, setValue] = useState<Density>(density);
   const [size, setSize] = useState(termSize);
+  const visible = useStripVisible();
   useEffect(() => {
     const on = (e: Event) => setSize((e as CustomEvent<number>).detail);
     window.addEventListener(ZOOM_EVENT, on);
     return () => window.removeEventListener(ZOOM_EVENT, on);
   }, []);
-  const pick = (d: Density) => { setDensity(d); setValue(d); };
-  return <section className="settings-section" aria-label="Görünüm">
-    <h4>Görünüm</h4>
-    <div className="settings-row settings-row-wide" role="radiogroup" aria-labelledby={`${uid}-label`}>
-      <span id={`${uid}-label`}>Yoğunluk</span>
-      <div className="density-opts">
-        {OPTIONS.map((o) => (
-          <label key={o.value}>
-            <input type="radio" name={`${uid}-density`} value={o.value} checked={value === o.value} onChange={() => pick(o.value)} />
-            {o.label}
-          </label>
-        ))}
-      </div>
-    </div>
-    <p className="settings-note">Kompakt daha çok satır gösterir. Yalnız bu cihazda saklanır.</p>
-    <div className="settings-row settings-row-wide">
-      <span>Terminal yazı boyutu</span>
-      <span className="settings-value">{size} px</span>
-    </div>
-    <p className="settings-note">Terminalde Ctrl+tekerlek ile büyütün/küçültün, Ctrl+0 ile sıfırlayın.</p>
-  </section>;
+  return (
+    <Section label="Görünüm">
+      <Row
+        id="density"
+        label="Yoğunluk"
+        description="Kompakt daha çok satır gösterir."
+        control={
+          <Segmented
+            label="Yoğunluk"
+            value={value}
+            options={[{ value: "compact", label: "Kompakt" }, { value: "normal", label: "Normal" }]}
+            onChange={(d) => { setDensity(d); setValue(d); }}
+          />
+        }
+      />
+      <Row
+        id="termsize"
+        label="Terminal yazı boyutu"
+        description="Terminalde Ctrl+tekerlek de değiştirir, Ctrl+0 sıfırlar."
+        control={
+          <span className="set-field" role="group" aria-label="Terminal yazı boyutu">
+            <button type="button" className="set-icon-btn" aria-label="Yazıyı küçült" disabled={size <= 9}
+              onClick={() => setTermSize(size - 1)}>−</button>
+            <span className="set-value" role="status">{size} px</span>
+            <button type="button" className="set-icon-btn" aria-label="Yazıyı büyüt" disabled={size >= 24}
+              onClick={() => setTermSize(size + 1)}>+</button>
+            <button type="button" aria-label="Yazı boyutunu sıfırla" onClick={() => setTermSize(null)}>Sıfırla</button>
+          </span>
+        }
+      />
+      <Row
+        id="strip"
+        label="Sağ kenarda göster"
+        description="Kullanım şeridi: sağ kenarda Token Monitor verisi."
+        control={
+          <Switch label="Sağ kenarda göster" checked={visible} onChange={setStripVisible} />
+        }
+      />
+    </Section>
+  );
 }

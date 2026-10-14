@@ -1,9 +1,14 @@
-import { useId, useState } from "react";
+// Bu cihaz › Bildirimler › Olay sesleri: bu bilgisayarın tercihi, anında uygulanır.
+import { useState } from "react";
+import { Play } from "lucide-react";
 import { previewSound, setSoundSettings, useSoundSettings } from "../sound";
 import { SOUND_LABELS, type SoundKind, type SoundSettings } from "../sound/model";
+import { Row } from "./kit/Row";
+import { Section } from "./kit/Section";
+import { Switch } from "./kit/Switch";
+import { FieldMsg } from "./kit/states";
 
 export function SoundsSection() {
-  const uid = useId();
   const { settings, error, audioError } = useSoundSettings();
   const [busy, setBusy] = useState<SoundKind | null>(null);
   const [message, setMessage] = useState<{ error: boolean; text: string } | null>(null);
@@ -19,31 +24,52 @@ export function SoundsSection() {
       setMessage({ error: true, text: e instanceof Error ? e.message : "Ses çalınamadı." });
     } finally { setBusy(null); }
   };
-  return <section className="settings-section sounds" aria-label="Olay sesleri">
-    <h4>Olay sesleri</h4>
-    <p className="settings-note">Dex arka plandayken de çalar. Tercihler bu cihazda saklanır; değişiklikler hemen uygulanır.</p>
-    <label className="sound-toggle">
-      <input type="checkbox" checked={settings.enabled} onChange={e => save({ ...settings, enabled: e.target.checked })} />
-      <span>Sesleri aç</span>
-    </label>
-    <label className="sound-volume" htmlFor={`${uid}-volume`}>
-      <span>Ses düzeyi</span>
-      <input id={`${uid}-volume`} type="range" min={0} max={100} step={5} value={settings.volume * 100}
-        onChange={e => save({ ...settings, volume: Number(e.target.value) / 100 })} />
-      <output htmlFor={`${uid}-volume`}>%{Math.round(settings.volume * 100)}</output>
-    </label>
-    {(Object.keys(SOUND_LABELS) as SoundKind[]).map(kind => <div className="sound-row" key={kind}>
-      <label className="sound-toggle">
-        <input type="checkbox" checked={settings.events[kind]}
-          onChange={e => save({ ...settings, events: { ...settings.events, [kind]: e.target.checked } })} />
-        <span>{SOUND_LABELS[kind]}</span>
-      </label>
-      <button aria-label={`${SOUND_LABELS[kind]} dinle`} disabled={busy !== null} onClick={() => void listen(kind)}>
-        {busy === kind ? "Çalınıyor…" : "Dinle"}
-      </button>
-    </div>)}
-    <p className="settings-note">Dinle, kapalı sesleri de seçili ses düzeyinde çalar.</p>
-    {problem && <p className="settings-err" role="alert">{problem}</p>}
-    {message && !message.error && <p className="settings-note" role="status">{message.text}</p>}
-  </section>;
+  return (
+    <Section label="Olay sesleri" description="Dex arka plandayken de çalar.">
+      <Row
+        label="Sesler"
+        control={<Switch label="Sesleri aç" checked={settings.enabled} onChange={(enabled) => save({ ...settings, enabled })} />}
+      />
+      <Row
+        label="Ses düzeyi"
+        control={
+          <span className="set-field">
+            <input
+              type="range" aria-label="Ses düzeyi" min={0} max={100} step={5} value={settings.volume * 100}
+              style={{ accentColor: "var(--text-2)" }}
+              onChange={(e) => save({ ...settings, volume: Number(e.target.value) / 100 })}
+            />
+            <output className="set-value">%{Math.round(settings.volume * 100)}</output>
+          </span>
+        }
+      />
+      {(Object.keys(SOUND_LABELS) as SoundKind[]).map((kind) => (
+        <Row
+          key={kind}
+          label={SOUND_LABELS[kind]}
+          control={
+            <>
+              <Switch
+                label={SOUND_LABELS[kind]}
+                checked={settings.events[kind]}
+                onChange={(on) => save({ ...settings, events: { ...settings.events, [kind]: on } })}
+              />
+              <button
+                type="button"
+                className="set-icon-btn"
+                aria-label={`${SOUND_LABELS[kind]} sesini dinle`}
+                disabled={busy !== null}
+                onClick={() => void listen(kind)}
+              >
+                <Play />
+              </button>
+            </>
+          }
+        />
+      ))}
+      {problem ? <div className="set-pad"><FieldMsg ok={false} text={problem} /></div>
+        : message && !message.error ? <div className="set-pad"><FieldMsg ok text={message.text} /></div>
+        : <div className="set-pad"><p className="set-note">Dinle, kapalı sesleri de seçili ses düzeyinde çalar.</p></div>}
+    </Section>
+  );
 }

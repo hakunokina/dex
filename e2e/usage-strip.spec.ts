@@ -136,7 +136,7 @@ test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ay
 
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
   await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Genel" }).click();
-  const toggle = app.getByRole("checkbox", { name: "Sağ kenarda göster" });
+  const toggle = app.getByRole("switch", { name: "Sağ kenarda göster" });
   await expect(toggle).toBeChecked();
   await toggle.uncheck();
   await expect(strip).toHaveCount(0);

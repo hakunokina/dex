@@ -15,7 +15,7 @@ import { newShellCwd, resolveShellCwd } from "../project/store";
 import { projectErrorText } from "../project/model";
 import { toast } from "../toast/store";
 import { remapDock, type FavoriteTarget } from "./favorite";
-import { selectSettingsTab, type SettingsTab } from "../settings/tab";
+import { focusSetting, selectSettingsTab, type SettingsTab } from "../settings/tab";
 import { movePlaysFx, workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
@@ -168,7 +168,7 @@ function cornerGroup(api: DockviewApi): string | undefined {
 
 // ---- #49: the floating screens (Görevler, Ayarlar, Takım) open in the middle of the Dex window ----
 
-const FLOAT_SIZE = { board: [760, 520], settings: [620, 380], team: [920, 680], memory: [1020, 680] } as const;
+const FLOAT_SIZE = { board: [760, 520], settings: [880, 620], team: [920, 680], memory: [1020, 680] } as const;
 type FloatKind = keyof typeof FLOAT_SIZE;
 const isFloatKind = (id: string): id is FloatKind => id in FLOAT_SIZE;
 /** Gap kept between a float and the dock's edge when the window is too small for it. */
@@ -189,8 +189,11 @@ function centerFloat(api: DockviewApi, p: IDockviewPanel) {
   const box = f?.overlay.element.parentElement?.getBoundingClientRect();
   if (!f || !box?.width || !box.height || !isFloatKind(p.id)) return;
   const [w, h] = FLOAT_SIZE[p.id];
-  const width = Math.max(0, Math.min(w, box.width - 2 * FLOAT_MARGIN));
-  const height = Math.max(0, Math.min(h, box.height - 2 * FLOAT_MARGIN));
+  // Pencere merkezine oturtulabilirlik de bir sınırdır: dock kutusu pencerenin
+  // içinde kaymışsa (üstte topbar), float kutuya değil pencereye göre kırpılır.
+  // Yoksa clamp üst bandı tutar ve büyük float (Ayarlar 880×620) merkezden sapar.
+  const width = Math.max(0, Math.min(w, box.width - 2 * FLOAT_MARGIN, window.innerWidth - 2 * box.left - 2 * FLOAT_MARGIN));
+  const height = Math.max(0, Math.min(h, box.height - 2 * FLOAT_MARGIN, window.innerHeight - 2 * box.top - 2 * FLOAT_MARGIN));
   const clamp = (v: number, max: number) => Math.round(Math.max(0, Math.min(v, max)));
   f.overlay.setBounds({
     width, height,
@@ -297,9 +300,11 @@ function open(teamId: string, spec: Spec | null, onOpened?: () => void): boolean
 
 export const openAgent = (teamId: string, agentId: string) => open(teamId, agentSpec(teamId, agentId));
 export const openPanel = (teamId: string, which: keyof typeof FIXED) => open(teamId, FIXED[which]);
-/** Ayarlar on a given tab (Sunucular for a host that lost its token, Ajanlar for the limits). */
-export function openSettings(teamId: string, tab: SettingsTab) {
+/** Ayarlar on a given page (Bağlantılar for a host that lost its token, Kaynak sınırları for the limits). */
+export function openSettings(teamId: string, tab: SettingsTab, setting?: string) {
   selectSettingsTab(tab);
+  // Mounted view focuses at once; an opening view consumes it on mount.
+  if (setting) focusSetting(setting);
   return openPanel(teamId, "settings");
 }
 

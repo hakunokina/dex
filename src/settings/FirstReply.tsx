@@ -1,58 +1,55 @@
-// FIX-4: "İlk yanıt bekçisi" (FIX-3's first-reply watchdog) — seconds per provider before a turn
-// with no event yet is marked "yanıt gecikiyor"; 0 = off. Stored by dex-core (`first_reply_set`).
+// Yanıt gecikmesi uyarısı: sağlayıcı başına saniye (0 = kapalı).
+// Sağlayıcı kartının içinde durur; alan bazlı Kaydet ile yazılır (DB `settings.first_reply_secs`).
 import { useEffect, useState } from "react";
 import { callHost } from "../api/hosts";
-import { listProviders } from "../team/api";
+import { TextField } from "./kit/TextField";
+import { FieldMsg, SavedFlash } from "./kit/states";
 
 type Secs = Record<string, number>;
 
-export function FirstReplySection({ host }: { host: string }) {
-  const [labels, setLabels] = useState<Record<string, string>>({});
-  const [saved, setSaved] = useState<Secs | null>(null);
-  const [form, setForm] = useState<Record<string, string>>({});
+export function FirstReplyField({ host, provider, label }: { host: string; provider: string; label: string }) {
+  const [saved, setSaved] = useState<number | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [flash, setFlash] = useState(0);
 
-  const fill = (v: Secs) => {
-    setSaved(v);
-    setForm(Object.fromEntries(Object.entries(v).map(([k, s]) => [k, String(s)])));
-  };
   useEffect(() => {
-    callHost<Secs>(host, "first_reply_get").then(fill, (e) => setMsg({ ok: false, text: String(e) }));
-    listProviders(host).then((ps) => setLabels(Object.fromEntries(ps.map((p) => [p.id, p.label]))), () => {});
-  }, [host]);
+    callHost<Secs>(host, "first_reply_get").then(
+      (v) => setSaved(v[provider] ?? 0),
+      (e) => setMsg({ ok: false, text: String(e) }),
+    );
+  }, [host, provider]);
 
-  async function save() {
-    if (!saved) return;
-    const changed = Object.keys(saved).filter((k) => Math.round(Number(form[k]) || 0) !== saved[k]);
+  async function save(next: string) {
+    const secs = Math.round(Number(next) || 0);
     try {
-      let v = saved;
-      for (const provider of changed) v = await callHost<Secs>(host, "first_reply_set", { provider, secs: Math.round(Number(form[provider]) || 0) });
-      fill(v);
-      setMsg({ ok: true, text: changed.length ? "Kaydedildi. Yeni eşik bir sonraki turdan itibaren geçerli." : "Değişiklik yok." });
+      const v = await callHost<Secs>(host, "first_reply_set", { provider, secs });
+      setSaved(v[provider] ?? secs);
+      setMsg(null);
+      setFlash((n) => n + 1);
     } catch (e) {
       setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-      callHost<Secs>(host, "first_reply_get").then(fill, () => {});
     }
   }
 
   return (
-    <details className="settings-section settings-fold" aria-label="İlk yanıt bekçisi">
-      <summary>
-        <b>Yanıt gecikme uyarısı</b>
-        <span>Ajan mesajdan sonra bu kadar saniye sessiz kalırsa "yanıt gecikiyor" işareti çıkar (yeniden dene / iptal).</span>
-      </summary>
-      {saved &&
-        Object.keys(saved).map((id) => (
-          <label className="settings-row" key={id}>
-            <span>{labels[id] ?? id}</span>
-            <input type="number" min={0} max={3600} value={form[id] ?? ""} onChange={(e) => setForm({ ...form, [id]: e.target.value })} />
-            <em>sn · 0 = kapalı, aksi hâlde 10–3600</em>
-          </label>
-        ))}
-      <div className="settings-actions">
-        <button className="primary" disabled={!saved} onClick={() => void save()}>Kaydet</button>
-      </div>
-      {msg && <p className={msg.ok ? "settings-note" : "settings-err"} role={msg.ok ? "status" : "alert"}>{msg.text}</p>}
-    </details>
+    <span className="set-field">
+      {saved === null && !msg ? (
+        <span className="set-note" role="status">Yükleniyor…</span>
+      ) : (
+        <>
+          <TextField
+            label={`Yanıt gecikmesi uyarısı (${label})`}
+            type="number"
+            min={0}
+            max={3600}
+            unit="sn · 0 = kapalı"
+            value={saved === null ? "" : String(saved)}
+            onSave={(v) => void save(v)}
+          />
+          <SavedFlash stamp={flash} />
+        </>
+      )}
+      {msg && <FieldMsg ok={msg.ok} text={msg.text} />}
+    </span>
   );
 }

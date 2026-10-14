@@ -1,10 +1,12 @@
-// #290: Settings → Ajanlar → "GPU kaynağı". The patron's view of the GPU broker dexd talks to
-// (crates/dex-core/src/gpu.rs): addresses, a write-only token (dexd keeps it in its secret store and
-// only says `tokenSet`), whether it answers, which models it serves and who may use them.
-// #305: models in three groups — ajana açık, servis ediliyor (patronun), yalnız diskte (folded: ~50 rows).
+// Sunucu › GPU: ev GPU makinesi (görsel üretim, arka plan silme, LLM).
+// Bağlantı birlikte doğrulanan formdur ("Kaydet ve bağlan"); Limitler yönetici
+// şifreli formdur; Ajanlar adresi ve anahtarı görmez.
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { callHost } from "../api/hosts";
 import { configPatch, connectionLine, limitsPatch, modelGroups, type GpuConfig, type GpuLimits, type GpuLimitsForm, type GpuModel, type GpuOverview } from "../gpu/view";
+import { Row, Pad } from "./kit/Row";
+import { Section } from "./kit/Section";
+import { FieldMsg, LoadingRows } from "./kit/states";
 
 export function GpuSection({ host }: { host: string }) {
   const [config, setConfig] = useState<GpuConfig | null>(null);
@@ -27,10 +29,13 @@ export function GpuSection({ host }: { host: string }) {
     try { await f(); } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
   };
   useEffect(() => {
+    setConfig(null);
+    setView(null);
     void run(async () => {
       fill(await callHost<GpuConfig>(host, "gpu_config_get"));
       await look(false);
     });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [host]);
 
   const save = () => run(async () => {
@@ -43,57 +48,99 @@ export function GpuSection({ host }: { host: string }) {
   const line = view && connectionLine(view);
   const s = view?.authorized ? view.status : null;
   return (
-    <section className="settings-section" aria-label="GPU kaynağı">
-      <h4>GPU kaynağı</h4>
-      <p className="settings-note">
-        Ev GPU makinesi (görsel üretim, arka plan silme, LLM). Ajanlar adresi ve token'ı görmez; lider bir iş için izin ister, sen onaylarsın.
-      </p>
-      <label className="settings-row settings-row-wide">
-        <span>Birincil adres</span>
-        <input value={form.primary} onChange={(e) => setForm({ ...form, primary: e.target.value })} placeholder="http://192.0.2.10:8100" />
-      </label>
-      <label className="settings-row settings-row-wide">
-        <span>Yedek adres</span>
-        <input value={form.fallback} onChange={(e) => setForm({ ...form, fallback: e.target.value })} placeholder="boş → yok" />
-      </label>
-      {editToken ? (
-        <label className="settings-row settings-row-wide">
-          <span>Token</span>
-          <input type="password" autoComplete="off" value={form.token} onChange={(e) => setForm({ ...form, token: e.target.value })}
-            placeholder={config?.tokenSet ? "yeni token" : "broker token'ı"} />
-        </label>
-      ) : (
-        <div className="settings-row settings-row-wide">
-          <span>Token</span>
-          <span className="gpu-token">
-            <span className="settings-value">kayıtlı</span>
-            <button onClick={() => setEditToken(true)}>Değiştir</button>
-          </span>
-        </div>
-      )}
-      <div className="settings-actions">
-        <button className="primary" disabled={busy || !config} onClick={() => void save()}>{busy ? "Kontrol ediliyor…" : "Kaydet"}</button>
-        <button disabled={busy || !config} onClick={() => void run(() => look(true))}>Yenile</button>
-      </div>
-      {err && <p className="settings-err" role="alert">{err}</p>}
-      {!view && !err && <p className="settings-note" role="status">Kontrol ediliyor…</p>}
-      {line && (
-        <p className="gpu-line" role="status">
-          <span className={`host-dot gpu-${line.tone}`} aria-hidden />
-          {line.text}
-        </p>
-      )}
-      {s && (
-        <p className="settings-note gpu-status">
-          GPU sahibi: <b>{s.owner ?? "boşta"}</b>{s.owner === "llm" && s.llmModel ? ` (${s.llmModel})` : ""} · kuyruk {s.queued}
-          {s.runningJob ? " · bir iş çalışıyor" : ""} · bugün {s.dailyUsed}/{s.dailyLimit}
-        </p>
-      )}
+    <>
+      <Section
+        label="GPU bağlantısı"
+        description="Ajanlar adresi ve anahtarı görmez; lider bir iş için izin ister, sen onaylarsın."
+      >
+        {!config && !err && <LoadingRows rows={3} />}
+        {config && (
+          <>
+            <Row
+              id="gpu-primary"
+              label="Birincil adres"
+              control={
+                <span className="set-field">
+                  <input aria-label="Birincil adres" value={form.primary}
+                    onChange={(e) => setForm({ ...form, primary: e.target.value })} placeholder="http://192.0.2.10:8100" />
+                </span>
+              }
+            />
+            <Row
+              id="gpu-fallback"
+              label="Yedek adres"
+              control={
+                <span className="set-field">
+                  <input aria-label="Yedek adres" value={form.fallback}
+                    onChange={(e) => setForm({ ...form, fallback: e.target.value })} placeholder="boş → yok" />
+                </span>
+              }
+            />
+            <Row
+              id="gpu-token"
+              label="GPU anahtarı"
+              control={editToken ? (
+                <span className="set-field">
+                  <input type="password" autoComplete="off" aria-label="GPU anahtarı" value={form.token}
+                    onChange={(e) => setForm({ ...form, token: e.target.value })}
+                    placeholder={config.tokenSet ? "yeni anahtar" : "broker anahtarı"} />
+                </span>
+              ) : (
+                <span className="set-secret">
+                  <code>kayıtlı</code>
+                  <button type="button" onClick={() => setEditToken(true)}>Değiştir</button>
+                </span>
+              )}
+              feedback={err && <FieldMsg ok={false} text={err} />}
+            />
+            <Pad>
+              <span className="set-field-btns">
+                <button type="button" className="primary" disabled={busy || !config} onClick={() => void save()}>
+                  {busy ? "Kontrol ediliyor…" : "Kaydet ve bağlan"}
+                </button>
+                <button type="button" disabled={busy || !config} onClick={() => void run(() => look(true))}>Yenile</button>
+              </span>
+            </Pad>
+          </>
+        )}
+        {err && !config && (
+          <Pad><FieldMsg ok={false} text={err} /></Pad>
+        )}
+      </Section>
+
+      <Section label="GPU durumu">
+        {!view && !err && <LoadingRows rows={2} />}
+        {line && (
+          <Row
+            label="Bağlantı"
+            control={<span className={`set-dot ${line.tone === "ok" ? "ok" : line.tone === "down" ? "bad" : ""}`} aria-hidden />}
+            feedback={<p className="set-note" role="status">{line.text}</p>}
+          />
+        )}
+        {s && (
+          <Row
+            label="Kullanım"
+            control={
+              <span className="set-value">
+                sahip {s.owner ?? "boşta"}{s.owner === "llm" && s.llmModel ? ` (${s.llmModel})` : ""} · kuyruk {s.queued}
+                {s.runningJob ? " · bir iş çalışıyor" : ""} · bugün {s.dailyUsed}/{s.dailyLimit}
+              </span>
+            }
+          />
+        )}
+        {!view && err && <Pad><FieldMsg ok={false} text={err} /></Pad>}
+      </Section>
+
       <LimitsSection key={`${host}:${limitsRevision}`} host={host} configBusy={busy} />
-      {view?.authorized && (view.models.length === 0
-        ? <p className="settings-note">Broker model bildirmedi.</p>
-        : <Models models={view.models} />)}
-    </section>
+
+      {view?.authorized && (
+        <Section label="GPU modelleri">
+          {view.models.length === 0
+            ? <Pad><p className="set-note">Broker model bildirmedi.</p></Pad>
+            : <Models models={view.models} />}
+        </Section>
+      )}
+    </>
   );
 }
 
@@ -140,46 +187,73 @@ function LimitsSection({ host, configBusy }: { host: string; configBusy: boolean
     } finally { setBusy(false); }
   };
   return (
-    <fieldset aria-label="Limitler" disabled={busy || configBusy}>
-      <legend>Limitler</legend>
-      <p className="settings-note">Her değişiklikte yönetici şifresi sorulur; şifre kaydedilmez. Boş limit alanı değiştirilmez.</p>
-      {([
-        ["daily_image_limit", "Günlük görsel"], ["max_pending_jobs", "Kuyruk"], ["max_count_per_request", "İstek başına"],
-      ] as const).map(([key, label]) => (
-        <label key={key} className="settings-row settings-row-wide">
-          <span>{label}</span>
-          <input type="number" min={1} max={key === "max_count_per_request" ? 4 : undefined} step={1}
-            disabled={confirm} value={form[key]} onChange={(e) => setForm({ ...form, [key]: e.target.value })} />
-        </label>
-      ))}
-      <label className="settings-row settings-row-wide">
-        <span>Sebep</span>
-        <input value={reason} disabled={confirm} onChange={(e) => setReason(e.target.value)} placeholder="opsiyonel" />
-      </label>
-      {confirm ? (
-        <form onSubmit={(e) => void save(e)}>
-          <label className="settings-row settings-row-wide">
-            <span>Yönetici şifresi</span>
-            <input ref={password} type="password" autoComplete="off" required minLength={1} maxLength={9} autoFocus />
-          </label>
-          <div className="settings-actions">
-            <button type="submit" className="primary">Onayla</button>
-            <button type="button" onClick={() => { if (password.current) password.current.value = ""; setConfirm(false); }}>Vazgeç</button>
-          </div>
-        </form>
-      ) : (
-        <div className="settings-actions">
-          <button className="primary" onClick={() => {
-            setError(null); setMessage(null);
-            try { limitsPatch(form, saved); setConfirm(true); }
-            catch (e) { setError(e instanceof Error ? e.message : String(e)); }
-          }}>Kaydet</button>
-          <button onClick={() => void refresh()}>Limitleri yenile</button>
-        </div>
-      )}
-      {error && <p className="settings-err" role="alert">{error}</p>}
-      {message && <p className="settings-note" role="status">{message}</p>}
-    </fieldset>
+    <Section
+      label="GPU limitleri"
+      description="Harici: GPU makinesi. Her değişiklikte yönetici şifresi sorulur; şifre kaydedilmez. Boş alan değiştirilmez."
+    >
+      <fieldset style={{ border: 0, margin: 0, padding: 0, display: "contents" }} disabled={busy || configBusy}>
+        {([
+          ["daily_image_limit", "Günlük görsel"], ["max_pending_jobs", "Kuyruk"], ["max_count_per_request", "İstek başına"],
+        ] as const).map(([key, label]) => (
+          <Row
+            key={key}
+            label={label}
+            control={
+              <span className="set-field">
+                <input type="number" aria-label={label} min={1} max={key === "max_count_per_request" ? 4 : undefined} step={1}
+                  disabled={confirm} value={form[key]} onChange={(e) => setForm({ ...form, [key]: e.target.value })} />
+              </span>
+            }
+          />
+        ))}
+        <Row
+          label="Sebep"
+          control={
+            <span className="set-field">
+              <input aria-label="Sebep" value={reason} disabled={confirm}
+                onChange={(e) => setReason(e.target.value)} placeholder="opsiyonel" />
+            </span>
+          }
+        />
+        {confirm ? (
+          <Pad>
+            <form onSubmit={(e) => void save(e)}>
+              <Row
+                label="Yönetici şifresi"
+                control={
+                  <span className="set-field">
+                    <input ref={password} type="password" autoComplete="off" aria-label="Yönetici şifresi" required minLength={1} maxLength={9} autoFocus />
+                    <span className="set-field-btns">
+                      <button type="submit" className="primary">Onayla</button>
+                      <button type="button" onClick={() => { if (password.current) password.current.value = ""; setConfirm(false); }}>Vazgeç</button>
+                    </span>
+                  </span>
+                }
+              />
+            </form>
+          </Pad>
+        ) : (
+          <Pad>
+            <span className="set-field-btns">
+              <button
+                type="button"
+                className="primary"
+                onClick={() => {
+                  setError(null); setMessage(null);
+                  try { limitsPatch(form, saved); setConfirm(true); }
+                  catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+                }}
+              >
+                Kaydet
+              </button>
+              <button type="button" onClick={() => void refresh()}>Limitleri yenile</button>
+            </span>
+            {error && <FieldMsg ok={false} text={error} />}
+            {message && <FieldMsg ok text={message} />}
+          </Pad>
+        )}
+      </fieldset>
+    </Section>
   );
 }
 
@@ -190,7 +264,7 @@ function Models({ models }: { models: GpuModel[] }) {
       <Group title="Ajana açık" note="lider izin isteyince, onayınla" models={g.agent} />
       <Group title="Servis ediliyor" note="senin kullanımında, ajanlara kapalı" models={g.served} />
       {g.diskOnly.length > 0 && (
-        <details className="settings-fold gpu-fold">
+        <details className="set-fold">
           <summary><b>Yalnız diskte ({g.diskOnly.length})</b></summary>
           <ModelList label="Yalnız diskte" models={g.diskOnly} />
         </details>
@@ -201,20 +275,20 @@ function Models({ models }: { models: GpuModel[] }) {
 
 function Group({ title, note, models }: { title: string; note: string; models: GpuModel[] }) {
   return (
-    <div className="gpu-group">
-      <h5>{title} ({models.length}) <span>{note}</span></h5>
-      {models.length ? <ModelList label={title} models={models} /> : <p className="settings-note">yok</p>}
+    <div className="set-pad">
+      <h4 className="set-sub">{title} ({models.length}) <span>{note}</span></h4>
+      {models.length ? <ModelList label={title} models={models} /> : <p className="set-note">yok</p>}
     </div>
   );
 }
 
 function ModelList({ label, models }: { label: string; models: GpuModel[] }) {
   return (
-    <ul className="gpu-models" aria-label={label}>
+    <ul aria-label={label} style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 8 }}>
       {models.map((m) => (
-        <li key={`${m.name}|${m.path ?? ""}`} title={[m.engine, m.path].filter(Boolean).join(" · ") || undefined}>
+        <li key={`${m.name}|${m.path ?? ""}`} title={[m.engine, m.path].filter(Boolean).join(" · ") || undefined} className="set-field">
           <b>{m.name}</b>
-          <code className="gpu-type">{m.type}</code>
+          <code className="set-note">{m.type}</code>
         </li>
       ))}
     </ul>
