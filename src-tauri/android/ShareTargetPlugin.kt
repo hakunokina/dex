@@ -6,7 +6,13 @@
 // verilir; olay yalnız "bekleyen var" der. İçerik loglanmaz.
 // #1717: Paylaş menüsünde üç giriş (manifest activity-alias'ları, aynı MainActivity): hangi alias'tan
 // gelindiği yükte `task` olur (repo | verify | ask). Hızlı gönderim sonrası `done` kısa bir Toast
-// gösterip görevi arka plana alır; kullanıcı paylaştığı uygulamaya döner.
+// gösterip Dex'i kapatır; kullanıcı paylaştığı uygulamaya döner.
+// Neden `moveTaskToBack` değil: paylaşım Dex'in `singleTask` MainActivity'sine gelir; soğuk açılışta
+// paylaşım için YENİ bir Dex görevi kurulur ve arkaya almak bu görevi başlatıcıda/önde bırakabilir,
+// ayrıca görev son kullanılanlarda ayrı bir "paylaşım" kopyası olur. Soğuk paylaşımda
+// `finishAndRemoveTask` görevi tamamen kaldırır (arkada Instagram belirir, kopya kalmaz). Uygulama
+// zaten açıkken gelen paylaşımda (`onNewIntent`) mevcut görev kullanılır, o yüzden eski davranış
+// (`moveTaskToBack`) korunur. Gönderim ekranı (ShareScreen) açılırsa Dex bilerek önde kalır.
 
 package com.hakunokina.dex.hosttokens
 
@@ -33,14 +39,17 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
 
     private var webView: WebView? = null
     private var pending: JSObject? = null
+    /** Soğuk açılış paylaşımı mı: `load()` paylaşımla açıldı, `onNewIntent` görmedi. `done` tüketir. */
+    private var coldShare = false
 
     override fun load(webView: WebView) {
         this.webView = webView
-        capture(activity.intent)
+        coldShare = capture(activity.intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         if (capture(intent)) {
+            coldShare = false
             activity.runOnUiThread {
                 webView?.evaluateJavascript("window.dispatchEvent(new Event('dex-share'))", null)
             }
@@ -54,7 +63,7 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(p ?: JSObject())
     }
 
-    /** Hızlı gönderim bitti: kısa Toast (WebView arka planda görünmez) + görevi arka plana al. */
+    /** Hızlı gönderim bitti: kısa Toast, sonra Dex'i kapat (soğuk paylaşım) ya da arka plana al. */
     @Command
     fun done(invoke: Invoke) {
         val args = try {
@@ -63,9 +72,18 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
             null
         }
         val msg = args?.message.orEmpty().take(MAX_TOAST)
+        val cold = synchronized(this) { coldShare.also { coldShare = false } }
         activity.runOnUiThread {
             if (msg.isNotEmpty()) Toast.makeText(activity.applicationContext, msg, Toast.LENGTH_SHORT).show()
-            activity.moveTaskToBack(true)
+            if (cold) {
+                try {
+                    activity.finishAndRemoveTask()
+                } catch (e: Exception) {
+                    activity.finish()
+                }
+            } else {
+                activity.moveTaskToBack(true)
+            }
         }
         invoke.resolve(JSObject())
     }
