@@ -60,6 +60,16 @@ THEME=src-tauri/android/dex-theme.xml
 THD=src-tauri/gen/android/app/src/main/res/values/dex-theme.xml
 [ -f "$THEME" ] && cp "$THEME" "$THD"
 [ -f "$THD" ] || { echo "saydam tema kopyalanamadı (dex-theme.xml)"; exit 1; }
+# Dex simgesi: `tauri android init` gen/'i varsayılan simgelerle üretir; repodaki Dex
+# simgeleri (src-tauri/icons/android, `tauri icon` çıktısı) her derlemede gen/ res/
+# üzerine kopyalanır (idempotent, varsayılanları ezer).
+ICON_SRC=src-tauri/icons/android
+ICON_DST=src-tauri/gen/android/app/src/main/res
+[ -d "$ICON_SRC" ] || { echo 'Dex android simgeleri yok (src-tauri/icons/android)'; exit 1; }
+mkdir -p "$ICON_DST"
+cp -r "$ICON_SRC/." "$ICON_DST/"
+cmp -s "$ICON_SRC/mipmap-xxxhdpi/ic_launcher.png" "$ICON_DST/mipmap-xxxhdpi/ic_launcher.png" \
+  || { echo 'Dex simgeleri gen/ res/ altına kopyalanamadı'; exit 1; }
 # #1719 Echo cevapları: bildirim köprüsü (jeton / bildirimden açılış / tarayıcı) + FCM servisi.
 for k in PushPlugin DexMessagingService; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
 M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
