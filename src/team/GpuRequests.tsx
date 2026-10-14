@@ -3,7 +3,7 @@
 // (crates/dex-core/src/gpu.rs). Same card look and corner stack as the member proposals.
 import { useState, useSyncExternalStore } from "react";
 import { callHost, LOCAL, onEvent, onHostUp, qid, remoteHosts, subscribeHosts } from "../api/hosts";
-import { budgetMax, parseBudget, waitingToastText, type GpuLimits, type GpuRequest, type GpuWaiting } from "../gpu/view";
+import { budgetMax, budgetUnit, parseBudget, waitingToastText, type GpuLimits, type GpuRequest, type GpuWaiting } from "../gpu/view";
 import { findAgent } from "../agents";
 import { toast } from "../toast/store";
 import { useTeams } from "./store";
@@ -32,14 +32,14 @@ function start() {
     void callHost<GpuRequest[]>(host, "gpu_request_list")
       .then(async (r) => {
         if (reloads.get(host) !== version) return;
-        const maxBudget = maxByHost.get(host) ?? budgetMax();
-        byHost.set(host, r.map((q) => ({ ...q, host, key: `${host}:${q.id}`, maxBudget })));
+        const hostMax = maxByHost.get(host) ?? budgetMax();
+        byHost.set(host, r.map((q) => ({ ...q, host, key: `${host}:${q.id}`, maxBudget: budgetMax(hostMax, q.types) })));
         publish();
         const limits = r.length ? await callHost<GpuLimits>(host, "gpu_limits_get").catch(() => null) : null;
         if (reloads.get(host) !== version || !limits) return;
         const nextMax = budgetMax(limits.daily_image_limit);
         maxByHost.set(host, nextMax);
-        byHost.set(host, (byHost.get(host) ?? []).map((q) => ({ ...q, maxBudget: nextMax })));
+        byHost.set(host, (byHost.get(host) ?? []).map((q) => ({ ...q, maxBudget: budgetMax(nextMax, q.types) })));
         publish();
       })
       .catch(() => {}); // pre-#289 dexd: no GPU, no cards
@@ -47,9 +47,9 @@ function start() {
   onHostUp(reload);
   onEvent("gpu-requests-changed", (_, host) => reload(host));
   onEvent<GpuLimits>("gpu-limits-changed", ({ payload }, host) => {
-    const maxBudget = budgetMax(payload.daily_image_limit);
-    maxByHost.set(host, maxBudget);
-    byHost.set(host, (byHost.get(host) ?? []).map((r) => ({ ...r, maxBudget })));
+    const hostMax = budgetMax(payload.daily_image_limit);
+    maxByHost.set(host, hostMax);
+    byHost.set(host, (byHost.get(host) ?? []).map((r) => ({ ...r, maxBudget: budgetMax(hostMax, r.types) })));
     publish();
   });
   // #311: a worker's job waits for the patron's LLM → one toast per job (each poll re-sends the event).
@@ -99,7 +99,7 @@ function Card({ r }: { r: Row }) {
     setBusy(true);
     setError(null);
     try {
-      await callHost(r.host, "gpu_request_decide", approve ? { id: r.id, approve, budget: parseBudget(budget, r.budget, r.maxBudget) } : { id: r.id, approve });
+      await callHost(r.host, "gpu_request_decide", approve ? { id: r.id, approve, budget: parseBudget(budget, r.budget, r.maxBudget, r.types) } : { id: r.id, approve });
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -116,7 +116,7 @@ function Card({ r }: { r: Row }) {
       </p>
       <p className="proposal-reason">{r.reason}</p>
       <label>
-        Bütçe (görsel, en çok {r.maxBudget})
+        Bütçe ({budgetUnit(r.types)}, en çok {r.maxBudget})
         <input type="number" min={1} max={r.maxBudget} value={budget} onChange={(e) => setBudget(e.target.value)} aria-label="GPU bütçesi" />
       </label>
       {error && <p className="team-err" role="alert">{error}</p>}
