@@ -56,7 +56,7 @@ impl Wt {
         }
         // #415: the branch's own name segment (`dex/<slug>/<job>`); an old branch keeps its id's dir.
         let name = self.branch.strip_prefix("dex/").and_then(|b| b.split('/').next()).unwrap_or(&self.agent_id);
-        vec![("CARGO_TARGET_DIR".into(), target_dir(&self.root, name).to_string_lossy().into_owned())]
+        vec![("CARGO_TARGET_DIR".into(), target_dir_str(&self.root, name))]
     }
 }
 
@@ -125,6 +125,13 @@ pub fn active(conn: &Connection, agent: &str) -> Result<Option<Wt>, String> {
 
 pub fn target_dir(root: &Path, agent: &str) -> PathBuf {
     root.join(".dex").join("target").join(safe(agent))
+}
+
+/// [`target_dir`] as forward-slash text: safe both as a process env value and when
+/// the worker retypes it into Git Bash, where backslashes get eaten (`C:\x` → `C:x`)
+/// and stray build dirs appear in the worktree. Cargo accepts `/` on Windows.
+pub fn target_dir_str(root: &Path, agent: &str) -> String {
+    target_dir(root, agent).to_string_lossy().replace('\\', "/")
 }
 
 fn safe(s: &str) -> String {
@@ -653,7 +660,7 @@ pub fn prompt_line(w: &Wt) -> String {
         w.root.display()
     );
     if let Some((_, dir)) = w.env().into_iter().find(|(k, _)| k == "CARGO_TARGET_DIR") {
-        s.push_str(&format!(" Rust çıktısı CARGO_TARGET_DIR={dir} (sana özel, işler arasında sıcak kalır)."));
+        s.push_str(&format!(" Rust çıktısı CARGO_TARGET_DIR=\"{dir}\" (sana özel, işler arasında sıcak kalır)."));
     }
     s.push('\n');
     s
@@ -1517,10 +1524,15 @@ pub(crate) mod tests {
         assert_eq!(wb.branch, format!("dex/pixel-1-2/{}", b.id), "same slug, later member: the next number");
         std::fs::write(wa.path.join("Cargo.toml"), "").unwrap();
         let target = wa.env().into_iter().find(|(k, _)| k == "CARGO_TARGET_DIR").unwrap().1;
-        assert!(target.ends_with(&format!("target{}pixel-1", std::path::MAIN_SEPARATOR)), "{target}");
+        assert!(target.ends_with("target/pixel-1"), "{target}");
+        assert!(!target.contains('\\'), "Git Bash eats backslashes: {target}");
         // A tree recorded under the old name keeps its id's target dir.
         let old = Wt { branch: format!("dex/kaan/{}", a.id), ..wa.clone() };
-        assert!(old.env()[0].1.ends_with(&format!("target{}kaan", std::path::MAIN_SEPARATOR)));
+        assert!(old.env()[0].1.ends_with("target/kaan"));
+        // The prompt hands the same value quoted, so a copy-paste into Bash stays intact.
+        let line = prompt_line(&wa);
+        assert!(line.contains(&format!("CARGO_TARGET_DIR=\"{target}\"")), "{line}");
+        assert!(!line[line.find("CARGO_TARGET_DIR").unwrap()..].contains('\\'), "{line}");
     }
 
     #[test]

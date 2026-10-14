@@ -3628,7 +3628,7 @@ mod launch_tests {
     }
 
     fn target(p: &Project, agent: &str) -> (String, String) {
-        ("CARGO_TARGET_DIR".into(), crate::worktree::target_dir(Path::new(p.root_path.as_deref().unwrap()), agent).to_string_lossy().into_owned())
+        ("CARGO_TARGET_DIR".into(), crate::worktree::target_dir_str(Path::new(p.root_path.as_deref().unwrap()), agent))
     }
 
     /// A session row as its hooks would leave it.
