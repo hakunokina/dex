@@ -12,6 +12,7 @@ import {
   hasShare,
   imageFitsAsIs,
   initialText,
+  isShareFastMode,
   resolveShareHost,
   resultText,
   scaleToFit,
@@ -182,6 +183,12 @@ test("fastSendPlan: belirsizlik ya da hata → ekran (ilk eksik koşul)", () => 
   assert.equal(why({ problem: "Görsel çok büyük" }), "invalid");
   // sürücünün karamsar varsayılanları: hiçbir olgu yokken asla gönderilmez
   assert.equal(why({ hostIds: [], connected: false, supportsInbox: false, targets: [] }), "no-host");
+});
+
+test("isShareFastMode: yalnız hızlı gönderim sürerken saydam kök + push'suz", () => {
+  assert.equal(isShareFastMode(null), false);
+  assert.equal(isShareFastMode({ fast: true }), true);
+  assert.equal(isShareFastMode({ fast: false }), false);
 });
 
 test("dative / sentToast: Türkçe yönelme eki, içerik yok", () => {

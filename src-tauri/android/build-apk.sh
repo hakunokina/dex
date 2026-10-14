@@ -51,6 +51,15 @@ fi
 # MainActivity singleTask olmalı (açık uygulamaya yeni paylaşım onNewIntent ile gelir).
 SKT=src-tauri/android/ShareTargetPlugin.kt
 [ -f "$SKT" ] && cp "$SKT" "$(dirname "$DST")/ShareTargetPlugin.kt"
+# #1759 şeffaf paylaşım: WebView'sız tramplen (ShareActivity.kt, paket com.hakunokina.dex) + saydam
+# MainActivity teması (dex-theme.xml → gen/ res/values/). Tramplen manifest blokla birlikte gelir.
+SAT=src-tauri/android/ShareActivity.kt
+SAD=src-tauri/gen/android/app/src/main/java/com/hakunokina/dex/ShareActivity.kt
+[ -f "$SAT" ] && cp "$SAT" "$SAD"
+THEME=src-tauri/android/dex-theme.xml
+THD=src-tauri/gen/android/app/src/main/res/values/dex-theme.xml
+[ -f "$THEME" ] && cp "$THEME" "$THD"
+[ -f "$THD" ] || { echo "saydam tema kopyalanamadı (dex-theme.xml)"; exit 1; }
 # #1719 Echo cevapları: bildirim köprüsü (jeton / bildirimden açılış / tarayıcı) + FCM servisi.
 for k in PushPlugin DexMessagingService; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
 M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
@@ -62,8 +71,21 @@ awk -v f=src-tauri/android/share-aliases.xml '
   { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
 [ "$(grep -c '<activity-alias' "$M")" = 3 ] && [ "$(grep -c 'android.intent.action.SEND' "$M")" = 6 ] \
   || { echo "manifest'e Paylaş girişleri eklenemedi"; exit 1; }
+[ "$(grep -c 'android:name=".ShareActivity"' "$M")" = 1 ] \
+  || { echo "manifest'e ShareActivity eklenemedi"; exit 1; }
+[ "$(grep -c 'targetActivity=".ShareActivity"' "$M")" = 3 ] \
+  || { echo "Paylaş girişleri ShareActivity'ye bağlı değil"; exit 1; }
 grep -q 'android:launchMode="singleTask"' "$M" || sed -i '0,/<activity/s//<activity android:launchMode="singleTask"/' "$M"
 grep -q 'android:launchMode="singleTask"' "$M" || { echo 'MainActivity singleTask yapılamadı; Paylaş (açık uygulama) çalışmaz'; exit 1; }
+# #1759: MainActivity saydam tema (soğuk paylaşımda arkada Instagram görünür). Açılış etiketi çok
+# satıra yayılabileceği için awk ile MainActivity bloğunda değiştirilir/eklenir (idempotent).
+awk '
+  /<activity[[:space:]>]/ { inact = 1; ismain = ($0 ~ /\.MainActivity/) }
+  inact && /\.MainActivity/ { ismain = 1 }
+  inact && ismain && /android:theme="/ { sub(/android:theme="[^"]*"/, "android:theme=\"@style/DexTranslucent\""); themed = 1 }
+  inact && />/ { if (ismain && !themed) sub(/>/, " android:theme=\"@style/DexTranslucent\">"); inact = 0; ismain = 0 }
+  { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+grep -q 'android:theme="@style/DexTranslucent"' "$M" || { echo 'MainActivity saydam tema yapılamadı'; exit 1; }
 # #1719 FCM servisi: işaretli blok her derlemede silinip </application> önüne yeniden eklenir.
 awk -v f=src-tauri/android/push-service.xml '
   /dex-push:begin/, /dex-push:end/ { next }

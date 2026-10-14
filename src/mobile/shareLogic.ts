@@ -200,6 +200,14 @@ export function shouldReloadTargets(upHost: string, selectedHost: string | null,
   return lookupFailed && upHost === selectedHost;
 }
 
+/**
+ * #1759 paylaşım modu: hızlı gönderim sürerken kök saydam çizilir (kullanıcı paylaştığı uygulamayı
+ * görür) ve arka plan işleri (push kaydı) durur. Ekran açılınca ya da paylaşım yoksa normal.
+ */
+export function isShareFastMode(share: { fast: boolean } | null): boolean {
+  return share?.fast === true;
+}
+
 /** `inbox_submit` cevabı → kısa sonuç metni. */
 export function resultText(r: { queued?: boolean } | null | undefined): string {
   return r?.queued ? "Sıraya alındı" : "Asistana gönderildi";

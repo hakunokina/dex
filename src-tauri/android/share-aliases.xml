@@ -1,10 +1,18 @@
         <!-- dex-share-aliases:begin — build-apk.sh bu bloğu her derlemede silip yeniden ekler. -->
-        <!-- Paylaş hedefi (ShareTargetPlugin.kt): üç giriş, aynı MainActivity; alias adı görevi seçer
-             (ShareRepo → repo, ShareVerify → verify, ShareAsk → ask). Metin/bağlantı ve tek görsel;
+        <!-- #1759 şeffaf paylaşım: üç giriş WebView'sız ShareActivity tramplenine gider (hedef
+             ShareActivity; alias adı görevi seçer: ShareRepo → repo, ShareVerify → verify,
+             ShareAsk → ask; görev `dex.task` ile MainActivity'ye taşınır). Tramplen şeffaf temalı,
+             iz bırakmaz (noHistory, son kullanılanlarda yok). Metin/bağlantı ve tek görsel;
              SEND_MULTIPLE MVP dışı. Simge uygulamanınki. -->
+        <activity
+            android:name=".ShareActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:noHistory="true"
+            android:excludeFromRecents="true" />
         <activity-alias
             android:name=".ShareRepo"
-            android:targetActivity=".MainActivity"
+            android:targetActivity=".ShareActivity"
             android:label="Dex · Repo incele"
             android:exported="true">
             <intent-filter>
@@ -20,7 +28,7 @@
         </activity-alias>
         <activity-alias
             android:name=".ShareVerify"
-            android:targetActivity=".MainActivity"
+            android:targetActivity=".ShareActivity"
             android:label="Dex · Kaynak doğrula"
             android:exported="true">
             <intent-filter>
@@ -36,7 +44,7 @@
         </activity-alias>
         <activity-alias
             android:name=".ShareAsk"
-            android:targetActivity=".MainActivity"
+            android:targetActivity=".ShareActivity"
             android:label="Dex · Asistana sor"
             android:exported="true">
             <intent-filter>
