@@ -1230,7 +1230,8 @@ mod tests {
         assert!(p["rootPath"].as_str().unwrap().ends_with("NewApp"));
         let before = dex_core::db::with(&core.db,|c|Ok(c.total_changes())).unwrap();
         let template = rpc("team_clone_template",json!({"teamId":t.id})).unwrap();
-        assert_eq!(template.as_object().unwrap().len(),2);
+        assert_eq!(template.as_object().unwrap().len(),3);
+        assert_eq!(template["profile"],"dev");
         assert!(template["members"].as_array().unwrap().iter().all(|a| a.get("id").is_none()));
         assert_eq!(before,dex_core::db::with(&core.db,|c|Ok(c.total_changes())).unwrap());
         assert!(methods::METHODS.contains(&"team_clone_template"));
