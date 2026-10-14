@@ -1,7 +1,7 @@
 //! Görev #671: the leader's per-job reasoning effort. Low and max are excluded — the type
 //! holds only medium | high | xhigh. Claude Code (anthropic, glm, muse) gets it as
-//! `CLAUDE_CODE_EFFORT_LEVEL` (the env beats `--effort`, measured in #637), codex as
-//! `-c model_reasoning_effort=`. Never `/effort` in a session: it writes the patron's settings.
+//! `CLAUDE_CODE_EFFORT_LEVEL` (the env beats `--effort`, measured in #637). Never `/effort` in a
+//! session: it writes the patron's settings.
 
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSql, ToSqlOutput, ValueRef};
 use serde::{Deserialize, Serialize};

@@ -57,9 +57,6 @@ pub fn get(id: &str) -> Option<&'static ProviderDef> {
 
 pub static PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
-        id: "gateway",label: "Claude Code + OpenAI",base_url: None,models: &[],env: &[],live: true,
-    },
-    ProviderDef {
         id: "anthropic",
         label: "Claude",
         base_url: None,
@@ -168,7 +165,6 @@ fn spawn_env_with(
     let Some(id) = provider.filter(|p| *p != "anthropic") else {
         return Ok(None);
     };
-    if id=="gateway" {return Err("gateway_core_routing_required".into());}
     let def = get(id).ok_or_else(|| format!("bilinmeyen sağlayıcı: {id}"))?;
     let token = secret(id)?.ok_or_else(|| format!("{id} jetonu yok — Takım → Sağlayıcılar'dan içe aktar ya da gir"))?;
     let model = model
@@ -189,11 +185,6 @@ fn spawn_env_with(
         env.push((k.to_string(), v));
     }
     Ok(Some(env))
-}
-pub(crate) fn gateway_env(base: &str, token: &str, model: &str) -> Vec<(String,String)> {
-    let mut env=vec![("ANTHROPIC_BASE_URL".into(),base.into()),("ANTHROPIC_AUTH_TOKEN".into(),token.into())];
-    for name in ["ANTHROPIC_MODEL","ANTHROPIC_DEFAULT_OPUS_MODEL","ANTHROPIC_DEFAULT_SONNET_MODEL","ANTHROPIC_DEFAULT_HAIKU_MODEL","CLAUDE_CODE_SUBAGENT_MODEL"] {env.push((name.into(),model.into()));}
-    env
 }
 
 /// `pty_spawn` argümanlarından `--model` değerini okur (muse env'i modele göre kurulur).
@@ -252,7 +243,6 @@ fn route_dir() -> PathBuf {
 pub const KEYRING_SERVICE: &str = "dex-provider";
 
 pub fn set_token(id: &str, token: &str) -> Result<(), String> {
-    if id=="gateway" {return Err("gateway_use_sign_in_with_chatgpt".into());}
     let token = token.trim();
     (!token.is_empty()).then_some(()).ok_or_else(|| "jeton boş olamaz".to_string())?;
     get(id).ok_or_else(|| format!("bilinmeyen sağlayıcı: {id}"))?;
@@ -473,7 +463,7 @@ pub fn list() -> Result<Vec<ProviderInfo>, String> {
     Ok(PROVIDERS
         .iter()
         .map(|p| {
-            let token = if p.id!="gateway" && (p.base_url.is_some() || p.live) {
+            let token = if p.base_url.is_some() || p.live {
                 keyring_secret(p.id).ok().flatten()
             } else {
                 None
@@ -481,7 +471,7 @@ pub fn list() -> Result<Vec<ProviderInfo>, String> {
             ProviderInfo {
                 id: p.id.to_string(),
                 label: p.label.to_string(),
-                base_url: if p.id=="gateway" {None} else if p.live { base_url_from(&keyring_secret).ok() } else { p.base_url.map(str::to_string) },
+                base_url: if p.live { base_url_from(&keyring_secret).ok() } else { p.base_url.map(str::to_string) },
                 // Canlı sağlayıcının modelleri `local_status`'tan gelir (liste açılışını ağa bağlamaz).
                 models: p.models.iter().map(|m| ModelInfo { id: m.id.into(), label: m.label.into(), legacy: m.legacy }).collect(),
                 has_token: token.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
@@ -818,7 +808,7 @@ mod tests {
             assert!(std::path::Path::new(&r).is_file(), "{r} yok");
             assert!(!r.contains("claude-route"), "shim'e çözüldü: {r}");
         }
-        assert_eq!(resolve_claude("C:\\tools\\codex.exe"), "C:\\tools\\codex.exe");
+        assert_eq!(resolve_claude("C:\\tools\\node.exe"), "C:\\tools\\node.exe");
     }
 
     #[test]

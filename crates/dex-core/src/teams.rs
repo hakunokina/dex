@@ -55,7 +55,7 @@ pub struct Agent {
     pub role_slug: Option<String>,
     /// Catalog name of `role_slug` (None when unset or no longer in the catalog).
     pub role_name: Option<String>,
-    /// DEX-26: `claude` | `codex`.
+    /// DEX-26: the CLI the agent runs; only `claude` (#1710 removed Codex).
     pub engine: String,
     /// DEX-30: a bulk change that lands when the running session ends.
     pub pending: Option<PendingModel>,
@@ -69,8 +69,7 @@ pub struct Agent {
     pub chain_return_ready: bool,
 }
 
-/// DEX-30: target of a bulk "all workers" change. `provider` is Claude-only (absent → anthropic);
-/// a codex target keeps each agent's stored provider.
+/// DEX-30: target of a bulk "all workers" change. `provider` absent → anthropic.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingModel {
@@ -263,7 +262,7 @@ pub struct AgentPatch {
     pub chain_off: Option<bool>,
 }
 
-pub const ENGINES: &[&str] = &["claude", "codex"];
+pub const ENGINES: &[&str] = &["claude"];
 
 fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
     Option::<String>::deserialize(d).map(Some)
@@ -289,12 +288,8 @@ fn check_provider(v: &str) -> Result<String, String> {
 
 /// DEX-13: model, sağlayıcının kataloğundan olmalı (anthropic → sürümlü claude-* + eski takma adlar;
 /// glm → GLM alias/native adları; muse → muse-spark-*).
-/// DEX-26: a codex agent's model is from the codex catalog; its provider is not used.
 fn check_model(engine: &str, provider: &str, model: &str) -> Result<(), String> {
     one_of(engine, ENGINES, "motor")?;
-    if engine == "codex" {
-        return crate::codex::check_model(model);
-    }
     let def = crate::providers::get(provider).ok_or_else(|| format!("geçersiz sağlayıcı: {provider}"))?;
     // DEX-25: canlı sağlayıcının kataloğu sunucuda; ad boş değilse sunucu karar verir.
     let ok = if def.live { !model.trim().is_empty() } else { def.models.iter().any(|m| m.id == model) };
@@ -988,17 +983,13 @@ pub fn update_agent(conn: &Connection, id: &str, p: AgentPatch) -> Result<Agent,
     Ok(a)
 }
 
-/// DEX-30: `engine` + optional `provider` + `model` → the stored triple, validated. Codex takes
-/// no provider (routing is claude-only), so "codex + GLM" is refused rather than silently dropped.
+/// DEX-30: `engine` + optional `provider` + `model` → the stored triple, validated.
 fn resolve_target(t: &PendingModel) -> Result<PendingModel, String> {
     let engine = t.engine.trim().to_string();
     one_of(&engine, ENGINES, "motor")?;
-    let provider = t.provider.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let provider = match (engine.as_str(), provider) {
-        ("codex", None | Some("anthropic")) => None,
-        ("codex", Some(p)) => return Err(format!("Codex motoru sağlayıcı yönlendirmesi almaz ({p}) — sağlayıcı yalnız Claude Code'da")),
-        (_, None) => Some("anthropic".to_string()),
-        (_, Some(p)) => Some(check_provider(p)?),
+    let provider = match t.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => Some("anthropic".to_string()),
+        Some(p) => Some(check_provider(p)?),
     };
     let model = t.model.trim().to_string();
     check_model(&engine, provider.as_deref().unwrap_or("anthropic"), &model)?;
@@ -1827,9 +1818,9 @@ mod tests {
         assert!(update_agent(&c, &g.id, serde_json::from_str(r#"{"model":"GLM-5.3"}"#).unwrap()).is_err());
     }
 
-    /// DEX-26: engine defaults to claude; codex takes a codex model and survives a round trip.
+    /// DEX-26: engine defaults to claude; #1710: the removed Codex engine is refused.
     #[test]
-    fn engine_switch_validates_model() {
+    fn engine_is_claude_only() {
         let c = mem();
         assert!(list_agents(&c).unwrap().iter().all(|a| a.engine == "claude"), "existing rows stay claude");
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
@@ -1839,16 +1830,13 @@ mod tests {
                 model: model.into(), provider: None, role_slug: None, engine: engine.map(String::from),
             })
         };
-        let x = mk(Some("codex"), "gpt-5.5").unwrap();
-        assert_eq!((x.engine.as_str(), x.model.as_str()), ("codex", "gpt-5.5"));
+        assert!(mk(Some("codex"), "gpt-5.5").is_err(), "Codex motoru kaldırıldı");
         assert!(mk(Some("gemini"), "gpt-5.5").is_err());
-        assert!(mk(None, "gpt-5.5").is_err(), "claude motoru codex modelini almaz");
-        // Engine switch without a fitting model is refused; with one it goes through.
-        assert!(update_agent(&c, &x.id, serde_json::from_str(r#"{"engine":"claude"}"#).unwrap()).is_err());
-        let back = update_agent(&c, &x.id, serde_json::from_str(r#"{"engine":"claude","model":"sonnet"}"#).unwrap()).unwrap();
-        assert_eq!((back.engine.as_str(), back.model.as_str()), ("claude", "sonnet"));
-        let again = update_agent(&c, &x.id, serde_json::from_str(r#"{"engine":"codex","model":"gpt-5.6-sol"}"#).unwrap()).unwrap();
-        assert_eq!(get_agent(&c, &again.id).unwrap().engine, "codex");
+        assert!(mk(None, "gpt-5.5").is_err(), "claude motoru katalog dışı modeli almaz");
+        let x = mk(Some("claude"), "sonnet").unwrap();
+        assert_eq!((x.engine.as_str(), x.model.as_str()), ("claude", "sonnet"));
+        assert!(update_agent(&c, &x.id, serde_json::from_str(r#"{"engine":"codex","model":"gpt-5.6-sol"}"#).unwrap()).is_err());
+        assert_eq!(get_agent(&c, &x.id).unwrap().engine, "claude");
     }
 
     fn target(engine: &str, provider: Option<&str>, model: &str) -> PendingModel {
@@ -1865,19 +1853,19 @@ mod tests {
         let c = mem();
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let other = crew_of(&c, "default");
-        let out = set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), |_| false).unwrap();
         let crew = crew_of(&c, &s.id);
         assert_eq!(out.applied.len(), 4);
         assert!(out.pending.is_empty());
         for a in &crew {
-            let want = if a.kind == "leader" { ("claude", "claude-opus-5-5") } else { ("codex", "gpt-5.5") };
+            let want = if a.kind == "leader" { ("claude", "claude-opus-5-5") } else { ("claude", "haiku") };
             assert_eq!((a.engine.as_str(), a.model.as_str()), want, "{}", a.name);
             assert_eq!(a.provider, "anthropic");
         }
         // Other teams are untouched.
         assert_eq!(crew_of(&c, "default").iter().map(|a| &a.model).collect::<Vec<_>>(), other.iter().map(|a| &a.model).collect::<Vec<_>>());
 
-        // Back to claude on GLM: provider travels with the change.
+        // To GLM: provider travels with the change.
         set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), |_| false).unwrap();
         let w: Vec<_> = crew_of(&c, &s.id).into_iter().filter(|a| a.kind == "worker").collect();
         assert!(w.iter().all(|a| (a.engine.as_str(), a.provider.as_str(), a.model.as_str()) == ("claude", "glm", "GLM-5.3")));
@@ -1903,8 +1891,7 @@ mod tests {
         let c = mem();
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let before: Vec<_> = crew_of(&c, &s.id).into_iter().map(|a| (a.engine, a.provider, a.model)).collect();
-        let err = set_workers_model(&c, &s.id, &target("codex", Some("glm"), "gpt-5.5"), |_| false).unwrap_err();
-        assert!(err.contains("Codex"), "{err}");
+        assert!(set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).is_err(), "Codex motoru kaldırıldı");
         assert!(set_workers_model(&c, &s.id, &target("claude", Some("glm"), "gpt-5.5"), |_| false).is_err());
         assert!(set_workers_model(&c, &s.id, &target("claude", Some("muse"), "opus"), |_| false).is_err());
         assert!(set_workers_model(&c, &s.id, &target("gemini", None, "x"), |_| false).is_err());
@@ -1921,36 +1908,36 @@ mod tests {
         let crew = crew_of(&c, &s.id);
         let (lead, busy, idle) = (&crew[0], &crew[1], &crew[2]);
         let live = |id: &str| id == busy.id || id == lead.id;
-        let out = set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), live).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
         assert_eq!(out.pending, [busy.id.clone()]);
         assert!(out.applied.contains(&idle.id) && !out.applied.contains(&lead.id));
 
         let b = get_agent(&c, &busy.id).unwrap();
         assert_eq!((b.engine.as_str(), b.model.as_str()), ("claude", "claude-sonnet-5-5"), "running CLI unchanged");
-        assert_eq!(b.pending, Some(target("codex", None, "gpt-5.5")));
+        assert_eq!(b.pending, Some(target("claude", Some("anthropic"), "haiku")));
         assert!(get_agent(&c, &lead.id).unwrap().pending.is_none(), "leader never gets pending");
 
         // Session ends → it lands and clears; a second call is a no-op.
         assert!(apply_pending(&c, &busy.id).unwrap());
         let b = get_agent(&c, &busy.id).unwrap();
-        assert_eq!((b.engine.as_str(), b.model.as_str(), b.pending.is_none()), ("codex", "gpt-5.5", true));
+        assert_eq!((b.engine.as_str(), b.model.as_str(), b.pending.is_none()), ("claude", "haiku", true));
         assert!(!apply_pending(&c, &busy.id).unwrap());
 
         // A newer bulk change replaces the pending one; asking for what already runs voids it.
-        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
         set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), live).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, Some(target("claude", Some("glm"), "GLM-5.3")));
-        set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, None);
 
         // A hand edit overrides a waiting bulk change.
-        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
-        update_agent(&c, &busy.id, serde_json::from_str(r#"{"engine":"claude","model":"opus"}"#).unwrap()).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
+        update_agent(&c, &busy.id, serde_json::from_str(r#"{"engine":"claude","model":"sonnet"}"#).unwrap()).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, None);
 
         // Startup: nothing survives, everything pending lands.
-        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
         assert_eq!(apply_all_pending(&c).unwrap(), 1);
-        assert_eq!(get_agent(&c, &busy.id).unwrap().model, "haiku");
+        assert_eq!(get_agent(&c, &busy.id).unwrap().model, "opus");
     }
 }

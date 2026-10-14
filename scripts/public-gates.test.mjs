@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { generateKeyPairSync } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -408,43 +407,6 @@ test("permit fixtures are exempt only at their exact file and endpoint values", 
     writeFileSync(resolve(repo, path), `${content}\n`);
     git(repo, "add", path);
     assert.notEqual(run(repo, "git", ["commit", "-m", "Changed fixture"]).status, 0);
-  }
-});
-
-test("RSA allowlist accepts the exact public fixture and rejects replacement keys", () => {
-  const repo = fixture();
-  installScanner(repo);
-  const path = "crates/dex-core/src/gateway/test-key.json";
-  const publicKey = readFileSync(resolve(root, path), "utf8");
-  mkdirSync(dirname(resolve(repo, path)), { recursive: true });
-  writeFileSync(resolve(repo, path), publicKey);
-  git(repo, "add", path);
-  git(repo, "commit", "-m", "Public RSA fixture");
-  const { env } = publicRemote(repo);
-  assert.equal(publish(repo, env, "--initial").status, 0, "exact fixture passes tree scanning");
-  scanAbsoluteFixture(repo, path);
-  const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
-  for (const content of [
-    JSON.stringify({ pkcs8: privateKey.export({ type: "pkcs8", format: "der" }).toString("base64") }),
-    privateKey.export({ type: "pkcs8", format: "pem" }),
-    publicKey.replace(/}\s*$/, `, "other": "${["0123456789abcdef".repeat(2), ".", "A1".repeat(8)].join("")}"}`),
-  ]) {
-    writeFileSync(resolve(repo, path), content);
-    git(repo, "add", path);
-    const result = run(repo, "git", ["commit", "-m", "Replacement key check"]);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /Gitleaks/);
-  }
-  git(repo, "reset", "--", path);
-  for (const [file, content] of [
-    ["other/test-key.json", publicKey],
-    [`fake/${path}`, JSON.stringify({ pkcs8: privateKey.export({ type: "pkcs8", format: "der" }).toString("base64") })],
-  ]) {
-    mkdirSync(dirname(resolve(repo, file)), { recursive: true });
-    writeFileSync(resolve(repo, file), content);
-    git(repo, "add", file);
-    assert.notEqual(run(repo, "git", ["commit", "-m", "Copied key fixture"]).status, 0);
-    git(repo, "reset", "--", file);
   }
 });
 

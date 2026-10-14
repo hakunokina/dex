@@ -1,5 +1,4 @@
 //! Per-job model approval. The saved agent model is never changed.
-use crate::Core;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
@@ -51,8 +50,8 @@ impl Route {
         }
     }
 
-    pub(crate) fn validate_catalog(&self, model: &str, core: Option<&Core>) -> Result<(), String> {
-        catalog(&self.engine, &self.provider, model.trim(), core)
+    pub(crate) fn validate_catalog(&self, model: &str) -> Result<(), String> {
+        catalog(&self.engine, &self.provider, model.trim())
     }
 }
 
@@ -121,22 +120,13 @@ thread_local! {
     pub(crate) static CATALOG_HOOK: std::cell::RefCell<Option<Box<dyn Fn() -> Result<(), String>>>> = Default::default();
 }
 
-fn catalog(engine: &str, provider: &str, model: &str, core: Option<&Core>) -> Result<(), String> {
+fn catalog(engine: &str, provider: &str, model: &str) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = CATALOG_HOOK.with(|hook| hook.borrow().as_ref().map(|f| f())) {
         return result;
     }
-    let valid = if engine == "codex" {
-        crate::codex::models()?.iter().any(|m| m.id == model)
-    } else if engine != "claude" {
+    let valid = if engine != "claude" {
         return Err(format!("iş modeli bu motorda desteklenmiyor: {engine}"));
-    } else if provider == "gateway" {
-        // Production ingress validates outside the DB lock against the authenticated account.
-        // The DB-only runner has no account; apply still requires a proven ingress route.
-        match core {
-            Some(c) => c.gateway_models()?.iter().any(|m| m.id == model),
-            None => return Ok(()),
-        }
     } else if provider == "local" {
         crate::providers::local_status()?.models.iter().any(|m| m.id == model)
     } else {
@@ -191,11 +181,7 @@ pub(crate) fn request(conn: &Connection, id: i64, model: Option<&str>, reason: O
             role.map(str::to_owned).or(a.role_slug.clone()).unwrap_or_default(),
             if role.is_some() { None } else { Some(&a.name) },
             model.trim(),
-            if engine == "codex" {
-                "codex"
-            } else {
-                provider
-            },
+            provider,
             reason,
             d.created_at
         ],
@@ -252,10 +238,10 @@ pub(crate) fn snapshot_plan(conn: &Connection, team: &str, plan: &mut crate::pla
     Ok(())
 }
 
-pub(crate) fn validate_plan_catalog(plan: &crate::plan::NewPlan, core: Option<&Core>) -> Result<(), String> {
+pub(crate) fn validate_plan_catalog(plan: &crate::plan::NewPlan) -> Result<(), String> {
     for task in &plan.tasks {
         if let (Some(model), Some(snapshot)) = (&task.model, &task.model_snapshot) {
-            snapshot.route.validate_catalog(model, core)?;
+            snapshot.route.validate_catalog(model)?;
         }
     }
     Ok(())
@@ -323,7 +309,6 @@ pub fn record_spawn(
     model: &str,
     reason: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let provider = if engine == "codex" { "codex" } else { provider };
     let Some(id) = job else { return Ok(None) };
     let d = crate::delegate::get(conn, id)?;
     if d.to_agent != agent {
@@ -353,7 +338,6 @@ pub fn record_spawn(
             Ok((r.get(0)?, r.get(1)?))
         })
         .map_err(|e| e.to_string())?;
-    let approved_provider = if approved_engine == "codex" { "codex" } else { &approved_provider };
     if requested != model || engine != approved_engine || provider != approved_provider || d.actual_model.is_some() {
         crate::plan::note(&tx,&d.from_agent,&format!("İş #{id}: istenen model {requested}; fiilen çalışan {engine}/{provider}/{model}. Neden: {}. İş devam ediyor; yeni onay gerekmiyor.",
             reason.unwrap_or(if d.target_role.is_some() && d.actual_model.is_none() {
@@ -500,7 +484,7 @@ mod tests {
                 .unwrap()
         };
         let before = count();
-        assert!(snapshot(&c, "kaan", Some("does-not-exist"), Some("gerekçe"), None).unwrap().unwrap().route.validate_catalog("does-not-exist", None)
+        assert!(snapshot(&c, "kaan", Some("does-not-exist"), Some("gerekçe"), None).unwrap().unwrap().route.validate_catalog("does-not-exist")
             .unwrap_err()
             .contains("kataloğunda model yok"));
         assert!(snapshot(&c, "kaan", Some("opus"), None, None).unwrap_err().contains("modelReason"));
@@ -522,7 +506,7 @@ mod tests {
         let role = crate::teams::get_agent(&c, "kaan").unwrap().role_slug.unwrap();
         let snapshot = snapshot(&c, "kaan", Some("opus"), Some("analysis"), Some(&role)).unwrap().unwrap();
         assert!(snapshot.revalidate(&c).unwrap());
-        c.execute("UPDATE agents SET active_engine='codex',active_model='chain' WHERE id='kaan'", []).unwrap();
+        c.execute("UPDATE agents SET active_provider='glm',active_model='GLM-5.3' WHERE id='kaan'", []).unwrap();
         assert!(!snapshot.revalidate(&c).unwrap(), "route change remains authorized");
         c.execute("UPDATE agents SET role_slug=NULL WHERE id='kaan'", []).unwrap();
         assert_eq!(snapshot.revalidate(&c).unwrap_err(), crate::projects::ProjectError::NotFound.to_string());

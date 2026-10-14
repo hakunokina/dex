@@ -1,4 +1,4 @@
-//! Görev #23 — a worker's permission requests (PermissionRequest hook, claude + codex) answered by
+//! Görev #23 — a worker's permission requests (PermissionRequest hook) answered by
 //! policy instead of the patron: safe work inside the worker's folders is allowed, dangerous work
 //! is denied with a reason, everything else goes to its leader (a denial naming a permit request
 //! the leader may grant). Leaders are never asked here.
@@ -73,14 +73,14 @@ pub fn decide(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
         return v;
     }
     match tool {
-        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch" if !writes_own_report(tool, input, ctx) => {
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" if !writes_own_report(tool, input, ctx) => {
             Verdict::Deny(format!("{READ_ONLY} ({tool})"))
         }
         // Session plumbing that touches no file: loading the dex tools, a skill, the todo list.
-        "ToolSearch" | "Skill" | "TodoWrite" | "update_plan" => Verdict::Allow,
+        "ToolSearch" | "Skill" | "TodoWrite" => Verdict::Allow,
         _ => {
-            let command = shell_command(tool, input).map(|c| bash_text(&c, dialect(tool, input)));
-            match (v, command.as_deref().map(|c| parsed(c, dialect(tool, input), ctx))) {
+            let command = shell_command(tool, input).map(|c| bash_text(&c, dialect(tool)));
+            match (v, command.as_deref().map(|c| parsed(c, dialect(tool), ctx))) {
                 (v @ Verdict::Deny(_), _) => v,
                 // #402: a shell command passes only the read-only parser — `lex` hands what it does
                 // not know to the leader (the reviewer has none) and reads `& (…)` as a plain group.
@@ -134,13 +134,6 @@ fn writes_own_report(tool: &str, input: &Value, ctx: &Ctx) -> bool {
     let s = |k: &str| input.get(k).and_then(Value::as_str);
     let files = match tool {
         "Write" | "Edit" | "MultiEdit" => s("file_path").into_iter().collect(),
-        "apply_patch" => {
-            let text = s("command").or_else(|| s("patch")).unwrap_or("");
-            if text.lines().any(|l| l.starts_with("*** Delete File: ") || l.starts_with("*** Move to: ")) {
-                return false;
-            }
-            patch_files(text)
-        }
         _ => Vec::new(),
     };
     // #298: no `..` — `resolve` drops it lexically, the OS walks it after a link (`link/../.dex`).
@@ -184,11 +177,9 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
             Some(p) => write_path(&resolve(ctx.cwd.as_deref(), p), ctx),
             None => Verdict::Leader(tool.into()),
         },
-        "apply_patch" => patch(s("command").or_else(|| s("patch")).unwrap_or(""), ctx),
-        "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell" => match input.get("command").or_else(|| input.get("cmd")) {
-            Some(Value::String(c)) => shell(c, dialect(tool, input), ctx),
-            Some(Value::Array(a)) => shell(&a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" "), dialect(tool, input), ctx),
-            _ => Verdict::Leader(tool.into()),
+        "Bash" | "PowerShell" => match s("command") {
+            Some(c) => shell(c, dialect(tool), ctx),
+            None => Verdict::Leader(tool.into()),
         },
         _ => Verdict::Leader(tool.into()),
     }
@@ -503,27 +494,6 @@ fn protected(p: &Path, roots: &[PathBuf]) -> bool {
     parts.iter().any(|c| matches!(c.as_str(), ".claude" | ".git" | ".codex"))
         || matches!(name, ".mcp.json" | "claude.md" | "claude.local.md" | "agents.md")
         || (name == "tasks.json" && parent == Some(".vscode"))
-}
-
-/// codex `apply_patch`: every file it adds, updates, deletes or moves to must be writable.
-fn patch(text: &str, ctx: &Ctx) -> Verdict {
-    let files = patch_files(text);
-    if files.is_empty() {
-        return Verdict::Leader("apply_patch".into());
-    }
-    worst(files.into_iter().map(|f| write_path(&resolve(ctx.cwd.as_deref(), f), ctx)))
-}
-
-/// The files an `apply_patch` adds, updates, deletes or moves to.
-fn patch_files(text: &str) -> Vec<&str> {
-    text.lines()
-        .filter_map(|l| {
-            ["*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "]
-                .iter()
-                .find_map(|h| l.strip_prefix(h))
-                .map(str::trim)
-        })
-        .collect()
 }
 
 /// Deny beats leader beats allow.
@@ -1777,8 +1747,8 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
 // ---- #402/#495: the shell, read for real ----
 //
 // `lex` is blind to `& (…)`, braces and Unicode quotes, so an allow also needs this reader. It
-// reads the command in the shell that runs it (Bash tool: bash; PowerShell tool: PowerShell;
-// codex `exec_command`: its `shell` field, else PowerShell on Windows) and allows only simple
+// reads the command in the shell that runs it (Bash tool: bash; PowerShell tool: PowerShell)
+// and allows only simple
 // commands with literal arguments, joined by `|`, `;`, newlines, `&&` and `||`. #495: nothing
 // else is ever allowed — no `$` outside single quotes (but PowerShell's `>$null`), no backtick,
 // `$( )`, `<( )`, group, block, loop or assignment — and none of it ends the reading: the commands
@@ -2339,35 +2309,21 @@ impl Rd {
 
 /// A shell tool's command, as `judge` reads it.
 fn shell_command(tool: &str, input: &Value) -> Option<String> {
-    if !matches!(tool, "Bash" | "PowerShell" | "shell" | "exec_command" | "local_shell") {
+    if !matches!(tool, "Bash" | "PowerShell") {
         return None;
     }
-    match input.get("command").or_else(|| input.get("cmd")) {
-        Some(Value::String(c)) => Some(c.clone()),
-        Some(Value::Array(a)) => Some(a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" ")),
-        _ => Some(String::new()),
-    }
+    Some(input.get("command").and_then(Value::as_str).unwrap_or_default().to_string())
 }
 
-/// The shell a tool's command runs in. #495: codex `exec_command` names it (`shell`); without
-/// one, codex runs PowerShell on Windows. None: a shell this reader does not know.
-pub(crate) fn dialect(tool: &str, input: &Value) -> Option<Dialect> {
-    let default = || match tool {
+/// The shell a tool's command runs in: the Bash tool's is bash, the PowerShell tool's
+/// PowerShell; anything else the platform's (PowerShell on Windows).
+pub(crate) fn dialect(tool: &str) -> Option<Dialect> {
+    Some(match tool {
         "Bash" => Dialect::Bash,
         "PowerShell" => Dialect::Pwsh,
         _ if cfg!(windows) => Dialect::Pwsh,
         _ => Dialect::Bash,
-    };
-    match input.get("shell") {
-        Some(Value::String(s)) if tool == "exec_command" => match name(s).as_str() {
-            "bash" => Some(Dialect::Bash),
-            "pwsh" | "powershell" => Some(Dialect::Pwsh),
-            _ => None,
-        },
-        Some(Value::Null) | None => Some(default()),
-        Some(_) if tool == "exec_command" => None,
-        Some(_) => Some(default()),
-    }
+    })
 }
 
 /// Why `parsed` said no.
@@ -2670,7 +2626,7 @@ mod tests {
         ] {
             assert!(matches!(decide("Bash", &json!({"command": cmd}), &c), Verdict::Deny(_)), "{cmd}");
         }
-        assert!(matches!(decide("apply_patch", &json!({"patch": "*** Begin Patch\n*** Add File: .git/info/grafts\n+fixture\n*** End Patch"}), &c), Verdict::Deny(_)));
+        assert!(matches!(decide("Write", &json!({"file_path": ".git/info/grafts", "content": "fixture"}), &c), Verdict::Deny(_)));
         for cmd in [
             "Set-Content -LiteralPath .git/info/grafts -Value fixture",
             "Add-Content .git/info/grafts fixture",
@@ -3022,8 +2978,6 @@ mod tests {
             let v = run(tool, cmd);
             assert!(matches!(v, Verdict::Leader(_)), "{tool}: {cmd}: {v:?}");
         }
-        let codex = decide("shell", &json!({ "command": ["git show HEAD:a | & (Get-ChildItem x.exe)"] }), &c);
-        assert_ne!(codex, Verdict::Allow);
         // Hard noes stay hard.
         assert!(matches!(run("PowerShell", "Write-Output “a” ; git push"), Verdict::Deny(_)));
         assert!(matches!(run("Bash", "echo x > /tmp/out.txt"), Verdict::Deny(_)));
@@ -3451,18 +3405,7 @@ mod tests {
         assert!(matches!(t("Write", "/d/w/proj/src/a.rs"), Verdict::Deny(m) if m.contains("D:\\w\\proj")));
     }
 
-    #[test]
-    fn codex_patch_and_argv_are_judged_the_same_way() {
-        let c = ctx();
-        let p = |body: &str| decide("apply_patch", &json!({ "command": body }), &c);
-        assert_eq!(p("*** Begin Patch\n*** Update File: src/a.rs\n@@\n-a\n+b\n*** End Patch"), Verdict::Allow);
-        assert!(matches!(p("*** Begin Patch\n*** Add File: ../x.rs\n+x\n*** End Patch"), Verdict::Deny(_)));
-        assert!(matches!(p("*** Begin Patch\n*** Update File: a.rs\n*** Move to: ../../b.rs\n*** End Patch"), Verdict::Deny(_)));
-        assert_eq!(decide("exec_command", &json!({ "cmd": ["git", "status"] }), &c), Verdict::Allow);
-        assert!(matches!(decide("shell", &json!({ "command": ["git", "push"] }), &c), Verdict::Deny(_)));
-    }
-
-    /// #164 P2: agent/git config inside the folder is never written — file tools, shell, patches.
+    /// #164 P2: agent/git config inside the folder is never written — file tools, shell.
     #[test]
     fn agent_and_git_config_is_protected() {
         let c = ctx();
@@ -3502,9 +3445,6 @@ mod tests {
         ] {
             deny(cmd);
         }
-        let p = |body: &str| decide("apply_patch", &json!({ "command": body }), &c);
-        assert!(matches!(p("*** Begin Patch\n*** Add File: AGENTS.md\n+x\n*** End Patch"), Verdict::Deny(_)));
-        assert!(matches!(p("*** Begin Patch\n*** Update File: a.rs\n*** Move to: .codex/config.toml\n*** End Patch"), Verdict::Deny(_)));
         // git's own writes to .git stay allowed.
         allow("git add a.rs && git commit -m x");
         // Judged below the root: a worktree under `.claude/worktrees` is a normal folder.
@@ -3653,7 +3593,6 @@ mod tests {
             ("Edit", json!({ "file_path": file, "old_string": "a", "new_string": "b" })),
             ("MultiEdit", json!({ "file_path": file, "edits": [] })),
             ("NotebookEdit", json!({ "notebook_path": abs("/w/proj/n.ipynb") })),
-            ("apply_patch", json!({ "command": "*** Begin Patch\n*** Update File: src/a.rs\n*** End Patch" })),
         ] {
             assert!(matches!(decide(tool, &input, &reviewer), Verdict::Deny(ref w) if w.starts_with(READ_ONLY)), "{tool}");
             assert_eq!(decide(tool, &input, &worker), Verdict::Allow, "{tool}");
@@ -3668,7 +3607,6 @@ mod tests {
         assert_eq!(decide("mcp__dex__report", &json!({ "delegationId": 1 }), &reviewer), Verdict::Allow);
         assert_eq!(decide("mcp__dex__ask_leader", &json!({ "question": "?" }), &reviewer), Verdict::Allow);
         assert_eq!(decide("Read", &json!({ "file_path": file }), &reviewer), Verdict::Allow);
-        assert_eq!(decide("exec_command", &json!({ "cmd": "git diff" }), &reviewer), Verdict::Allow);
         assert_eq!(decide("ToolSearch", &json!({ "query": "select:mcp__dex__report" }), &reviewer), Verdict::Allow);
         // What the policy allows a worker but changes the repo or the disk: a hard no for the reviewer.
         for c in ["git commit -m x", "git add src/a.rs", "git branch topic", "echo x > f", "echo x >> f", "cat a.rs > b.rs",
@@ -3703,7 +3641,7 @@ mod tests {
         }
         let inbox = assistant.cwd.as_ref().unwrap().join(".dex/inbox/image.png");
         assert_eq!(decide("Read", &serde_json::json!({"file_path":inbox}), &assistant), Verdict::Allow);
-        for tool in ["Write", "Edit", "apply_patch", "Bash", "exec_command", "mcp__dex__task_create", "mcp__dex__report", "Skill", "Agent"] {
+        for tool in ["Write", "Edit", "Bash", "PowerShell", "mcp__dex__task_create", "mcp__dex__report", "Skill", "Agent"] {
             assert!(matches!(decide(tool, &serde_json::json!({"command":"git status","file_path":inbox}), &assistant), Verdict::Deny(_)), "{tool}");
         }
     }
@@ -3784,23 +3722,13 @@ mod tests {
         let own = results.join("291.md");
         let own_s = own.to_string_lossy().to_string();
         let write = |p: &str, x: &Ctx| decide("Write", &json!({ "file_path": p, "content": "x" }), x);
-        let patch = |body: &str, x: &Ctx| decide("apply_patch", &json!({ "command": format!("*** Begin Patch
-{body}
-*** End Patch") }), x);
         let denied = |v: Verdict| matches!(v, Verdict::Deny(ref w) if w.starts_with(READ_ONLY));
 
-        // Its own report: Write (absolute and relative), Edit, MultiEdit, codex apply_patch.
+        // Its own report: Write (absolute and relative), Edit, MultiEdit.
         assert_eq!(write(&own_s, &reviewer), Verdict::Allow);
         assert_eq!(write(".dex/results/291.md", &reviewer), Verdict::Allow);
         assert_eq!(decide("Edit", &json!({ "file_path": own_s, "old_string": "a", "new_string": "b" }), &reviewer), Verdict::Allow);
         assert_eq!(decide("MultiEdit", &json!({ "file_path": own_s, "edits": [] }), &reviewer), Verdict::Allow);
-        assert_eq!(patch("*** Add File: .dex/results/291.md
-+ok", &reviewer), Verdict::Allow);
-        std::fs::write(&own, "x").unwrap();
-        assert_eq!(patch(&format!("*** Update File: {own_s}
-@@
--x
-+y"), &reviewer), Verdict::Allow);
 
         // Another job's report, another file, a sibling trick, outside the dir: no.
         for p in [".dex/results/290.md", ".dex/results/2910.md", ".dex/results/291.md.bak", ".dex/results/291.txt",
@@ -3808,13 +3736,6 @@ mod tests {
             assert!(denied(write(p, &reviewer)), "{p}");
         }
         assert!(denied(write(&base.join("other").join(".dex").join("results").join("291.md").to_string_lossy(), &reviewer)));
-        assert!(denied(patch("*** Add File: .dex/results/291.md
-+ok
-*** Add File: src/a.rs
-+x", &reviewer)));
-        assert!(denied(patch("*** Delete File: .dex/results/291.md", &reviewer)));
-        assert!(denied(patch("*** Update File: .dex/results/291.md
-*** Move to: src/a.rs", &reviewer)));
         assert!(denied(decide("NotebookEdit", &json!({ "notebook_path": own_s }), &reviewer)));
         // No running job, no report to write.
         assert!(denied(write(&own_s, &Ctx { job: None, ..reviewer_clone(&reviewer) })));
@@ -3858,7 +3779,6 @@ mod tests {
             std::os::unix::fs::symlink(&sub, root.join("link")).unwrap();
             assert!(denied(write("link/../.dex/results/291.md", &reviewer)));
             assert!(denied(write(&root.join("link").join("..").join(".dex").join("results").join("291.md").to_string_lossy(), &reviewer)));
-            assert!(denied(patch("*** Add File: link/../.dex/results/291.md\n+x", &reviewer)));
         }
         #[cfg(windows)]
         {
@@ -3891,7 +3811,6 @@ mod tests {
                 assert!(denied(write(p, &reviewer)), "{p}");
             }
             assert!(denied(write(&root.join("link").join("..").join(".dex").join("results").join("291.md").to_string_lossy(), &reviewer)));
-            assert!(denied(patch("*** Add File: link/../.dex/results/291.md\n+x", &reviewer)));
             // The plain path still passes beside the junction.
             assert_eq!(write(".dex/results/291.md", &reviewer), Verdict::Allow);
         }
@@ -3944,21 +3863,6 @@ mod tests {
         for c in &pwsh[5..] {
             assert_eq!(sh("PowerShell", c, &worker), Verdict::Allow, "{c}");
         }
-        // #495: codex names its shell; without one it is PowerShell on Windows.
-        let exec = |input: Value, x: &Ctx| decide("exec_command", &input, x);
-        assert_eq!(exec(json!({ "cmd": if cfg!(windows) { pwsh[2] } else { &bash[1] } }), &reviewer), Verdict::Allow);
-        for shell in ["bash", "/usr/bin/bash", r"C:\Program Files\Git\bin\bash.exe"] {
-            assert_eq!(exec(json!({ "cmd": bash[1], "shell": shell }), &reviewer), Verdict::Allow, "{shell}");
-        }
-        for shell in ["powershell", "pwsh", "powershell.exe", r"C:\Program Files\PowerShell\7\pwsh.exe"] {
-            assert_eq!(exec(json!({ "cmd": pwsh[5], "shell": shell }), &reviewer), Verdict::Allow, "{shell}");
-        }
-        // A shell this reader does not know: denied to the reviewer, the leader's for a worker.
-        for shell in [json!("zsh"), json!("sh"), json!("cmd"), json!("fish"), json!(1)] {
-            assert!(matches!(exec(json!({ "cmd": "git status", "shell": shell }), &reviewer), Verdict::Deny(_)), "{shell}");
-            assert!(matches!(exec(json!({ "cmd": "git status", "shell": shell }), &worker), Verdict::Leader(_)), "{shell}");
-        }
-
         // #471/#495: no variable, substitution, backtick, assignment or loop — in any role. The
         // reviewer is told why, a worker's goes to the leader (never an allow).
         let dynamic = [
@@ -4025,9 +3929,9 @@ mod tests {
         // #479: the holes of #471's reader.
         let other = abs("/w/other/a.txt").replace('\\', "/");
         let holes = [
-            // The shell named in the input, not the one of the platform: bash runs `rm f`.
-            exec(json!({ "shell": "bash", "cmd": "echo `rm f`x" }), &reviewer),
-            exec(json!({ "shell": "bash", "cmd": "echo `rm -rf src`x" }), &worker),
+            // The tool's shell, not the one of the platform: bash runs `rm f`.
+            sh("Bash", "echo `rm f`x", &reviewer),
+            sh("Bash", "echo `rm -rf src`x", &worker),
             // A non-ASCII variable is a variable too.
             sh("PowerShell", "git diff \"$é$(echo --output=.dex/tmp/review.txt)\"", &reviewer),
             sh("PowerShell", "git diff $é --output=.dex/tmp/review.txt", &reviewer),
@@ -4049,7 +3953,7 @@ mod tests {
         ] {
             assert!(matches!(sh(tool, c, &worker), Verdict::Leader(_)), "{tool}: {c}: {:?}", sh(tool, c, &worker));
         }
-        assert!(matches!(exec(json!({ "shell": "bash", "cmd": "echo `rm f`x" }), &worker), Verdict::Leader(_)));
+        assert!(matches!(sh("Bash", "echo `rm f`x", &worker), Verdict::Leader(_)));
 
         // #484: a deny is found behind anything this reader does not follow, in any role.
         for (tool, c) in [

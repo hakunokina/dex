@@ -1,6 +1,6 @@
 //! DEX-35: what an agent's CLI gets as its system prompt — Katman 1 (the role text from
 //! `seed/roles.json`) + Katman 2 (`DEX_RULES`, one block for every agent). Claude takes it as
-//! `--append-system-prompt`, codex as `developer_instructions`; both come from `system_prompt`.
+//! `--append-system-prompt`, built by `system_prompt`.
 //! Event-time texts (DENY_ASK, worker_prompt, results_text, …) are hook answers, not this.
 
 use rusqlite::{Connection, OptionalExtension};
@@ -661,28 +661,6 @@ mod tests {
         let w = system_prompt(&c, "ayla", Some((&s, &o)));
         assert!(!w.contains("Rol kataloğu") && !w.contains("backend — Backend") && !w.contains("mobile-x"), "{w}");
         println!("katalog metni: {} karakter", crate::roles::catalog_text(&c).chars().count());
-    }
-
-    #[test]
-    fn codex_worker_gets_the_same_text_as_developer_instructions() {
-        let c = db();
-        c.execute("UPDATE agents SET engine = 'codex' WHERE id = 'ayla'", []).unwrap();
-        let (s, o) = mem();
-        let t = system_prompt(&c, "ayla", Some((&s, &o)));
-        let toml = crate::codex::profile_toml(&crate::codex::Profile {
-            worker: true,
-            instructions: &t,
-            port: 1,
-            browser: None,
-            trust: vec![],
-            migration: None,
-        });
-        let line = toml.lines().find(|l| l.starts_with("developer_instructions = ")).unwrap();
-        assert!(line.contains("Rolün: Backend Mühendisi.") && line.contains("# Dex çalışma kuralları"), "{line}");
-        assert!(line.contains("`ask_leader`") && !line.contains("`plan_retry`"), "{line}");
-        for o in OLD {
-            assert!(!line.contains(o), "eski ek: {o}");
-        }
     }
 
     #[test]

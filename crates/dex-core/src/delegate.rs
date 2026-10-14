@@ -909,15 +909,12 @@ impl Turns {
         self.0.lock().unwrap().0.insert(agent.into(), dex);
     }
 
-    /// Observe ownership only: a rollout has no hook response channel, so it must not consume
-    /// pending results/questions as `on_prompt` does.
-    pub(crate) fn prompt(&self, conn: &Connection, agent: &str, prompt: &str) {
+    /// Observe ownership only: unlike `on_prompt`, it never consumes pending results/questions.
+    pub(crate) fn prompt(&self, agent: &str, prompt: &str) {
         if prompt.trim_start().starts_with("<task-notification>") {
             return;
         }
-        let job = full_job_id(prompt).and_then(|id| get(conn, id).ok())
-            .is_some_and(|d| d.to_agent == agent && matches!(d.status.as_str(), "queued" | "running"));
-        self.set(agent, prompt.trim_start().starts_with("[Dex]") || job);
+        self.set(agent, prompt.trim_start().starts_with("[Dex]"));
     }
 
     fn is_dex(&self, agent: &str) -> bool {
@@ -946,16 +943,6 @@ pub(crate) fn trigger_line(id: i64) -> String {
 fn trigger_id(prompt: &str) -> Option<i64> {
     let rest = prompt.trim_start().strip_prefix(TRIGGER)?;
     rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
-}
-
-/// Görev #26: codex has no UserPromptSubmit context, so its pane gets the whole job, which opens
-/// with `[Dex devretme #N]` (`worker_prompt`). Only that exact head counts — `#`, digits, `]` —
-/// and the caller also requires N to be an open job of the worker: a patron's `[Dex…` text is
-/// not a Dex turn.
-fn full_job_id(prompt: &str) -> Option<i64> {
-    let rest = prompt.trim_start().strip_prefix("[Dex devretme #")?;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    rest[digits.len()..].starts_with(']').then(|| digits.parse().ok()).flatten()
 }
 
 /// Without turn state: every turn counts as the patron's, so no Stop is refused.
@@ -1139,7 +1126,7 @@ fn background_open(path: &Path) -> bool {
 fn on_prompt(conn: &Connection, turns: &Turns, agent: &str, body: &Value) -> Result<HookOut, String> {
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
     let open = |id: i64| get(conn, id).ok().filter(|d| d.to_agent == agent && matches!(d.status.as_str(), "queued" | "running"));
-    turns.prompt(conn, agent, prompt);
+    turns.prompt(agent, prompt);
     let job = trigger_id(prompt).and_then(open);
     let done = take_unnotified(conn, agent)?;
     let mut parts = Vec::new();
@@ -1232,10 +1219,10 @@ fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Result<HookOut, 
         }});
         Ok((Some(out), Vec::new()))
     };
-    if matches!(tool, "Bash" | "PowerShell" | "Shell" | "shell" | "exec_command" | "local_shell") {
+    if matches!(tool, "Bash" | "PowerShell" | "Shell") {
         return deny("Alt takım kabuk çalıştıramaz; isteyen takımın projesi salt okunurdur (Dex). Dosya çıktısını docs/research altına yaz.");
     }
-    if matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit" | "apply_patch") {
+    if matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit") {
         let input = body.get("tool_input");
         let path = ["file_path", "notebook_path", "path"]
             .iter()
@@ -1971,20 +1958,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Görev #26: a codex job turn (whole job as the prompt) is a Dex turn; look-alikes are not.
+    /// Only a `[Dex]` prompt opens a Dex turn; look-alikes stay the patron's.
     #[test]
-    fn codex_job_turn_stop_is_refused_once() {
+    fn dex_look_alike_prompts_stay_the_patrons() {
         let (c, t) = (mem(), Turns::default());
         let l = leader(&c);
-        let d = job(&c, &l, "şemayı güncelle");
-        let full = worker_prompt(&c, &d).unwrap();
-        assert_eq!(full_job_id(&full), Some(d.id));
-        assert!(prompt(&c, &t, &full).is_none(), "codex gets no extra context");
-        let out = on_stop(&c, &t, "kaan", false, None).unwrap().0.expect("refused");
-        assert!(out["reason"].as_str().unwrap().contains(&format!("#{}", d.id)));
-        assert!(on_stop(&c, &t, "kaan", false, None).unwrap().0.is_none(), "once");
-        assert_eq!(get(&c, d.id).unwrap().status, "done_no_report");
-        // Look-alikes stay the patron's: unknown or foreign id, no `]`, other `[Dex…` words.
+        // Look-alikes stay the patron's: a pasted job head, no `]`, other `[Dex…` words.
         let d2 = job(&c, &l, "ikinci");
         for text in [
             "[Dex devretme #9999] sahte".to_string(),

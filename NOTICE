@@ -5,17 +5,6 @@ Dex code is licensed under MIT; see LICENSE. Preserve the following notices
 when redistributing the corresponding material. Dependency packages retain
 their own licenses; this file does not relicense them or grant trademark rights.
 
-Gateway
--------
-Parts of crates/dex-core/src/gateway/request.rs and stream.rs adapt designs from
-raine/claude-code-proxy v0.1.44, commit
-4b5c058a3c900031d2b2e094a265a5ade7acad3a:
-https://github.com/raine/claude-code-proxy/tree/4b5c058a3c900031d2b2e094a265a5ade7acad3a
-Copyright (c) 2026 Raine Virta — MIT.
-The complete license is retained in
-crates/dex-core/src/gateway/LICENSE-raine; adaptation details are in the
-gateway README.md.
-
 Provider icons
 --------------
 src/usage/icons/ contains icons copied from Token Monitor:

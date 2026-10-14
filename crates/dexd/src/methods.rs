@@ -25,7 +25,7 @@ fn project<T: Serialize>(r: Result<T, String>) -> Result<Value, Error> {
 
 type Handler = fn(&Core, &Value) -> Result<Value, Error>;
 
-/// Blocking (DB, file and — for providers/codex — network calls): run it off the async runtime.
+/// Blocking (DB, file and — for providers — network calls): run it off the async runtime.
 pub fn call(core: &Core, method: &str, p: &Value) -> Result<Value, Error> {
     let h = handler(method)
         .ok_or_else(|| Error::new("unknown_method", format!("bilinmeyen metot: {method}")))?;
@@ -124,7 +124,6 @@ handlers! {
             |core, p| ok(core.chain_set_agent(&arg::<String>(p, "id")?, arg(p, "off")?))
         },
         "chain_back" => |core, p| ok(core.chain_back(&arg::<String>(p, "id")?)),
-        "codex_models" => |core, _| ok(core.codex_models()),
         "model_news" => |core, _| ok(core.model_news()),
         "model_news_dismiss" => |core, p| ok(core.model_news_dismiss(arg(p, "keys")?)),
         "team_set_workers_model" => |core, p| {
@@ -209,10 +208,6 @@ handlers! {
             |core, p| ok(core.delegation_stalled(&arg::<String>(p, "agentId")?, arg(p, "minutes")?))
         },
         "provider_list" => |core, _| ok(core.provider_list()),
-        "gateway_auth_start" => |core,p| ok(core.gateway_auth_start(arg::<Option<String>>(p,"accountId")?.as_deref())),
-        "gateway_auth_status" => |core,_| ok(core.gateway_auth_status()),
-        "gateway_auth_logout" => |core,p| ok(core.gateway_auth_logout(arg::<Option<String>>(p,"accountId")?.as_deref())),
-        "gateway_models" => |core,_| ok(core.gateway_models()),
         "provider_import_routes" => |core, _| ok(core.provider_import_routes()),
         "provider_set_token" => |core, p| {
             ok(core.provider_set_token(&arg::<String>(p, "id")?, &arg::<String>(p, "token")?))
@@ -284,19 +279,6 @@ mod tests {
         for (params,code) in [(serde_json::json!({}),"bad_request"),(serde_json::json!({"teamId":"default"}),"inbox_empty"),(serde_json::json!({"teamId":"default","text":"x"}),"inbox_no_assistant"),(serde_json::json!({"teamId":"default","text":"x","path":"evil"}),"bad_request")] {
             assert_eq!(call(&core,"inbox_submit",&params).unwrap_err().code,code);
         }
-        core.shutdown();
-    }
-
-    #[test]
-    fn gateway_auth_rpcs_are_advertised_and_remote_hosts_refuse_local_login() {
-        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/1072/rpc-{}",std::process::id()));
-        let core=Core::start_bare(Paths {data_dir:root.join("data"),config_dir:root.join("config")},Events::new(NullSink)).unwrap();
-        for method in ["gateway_auth_start","gateway_auth_status","gateway_auth_logout","gateway_models"] {
-            assert!(METHODS.contains(&method));
-            let error=call(&core,method,&serde_json::json!({})).unwrap_err();
-            assert_eq!(error.message,"giriş yalnız yerel Dex'ten");
-        }
-        assert_eq!(call(&core,"gateway_auth_start",&serde_json::json!({"accountId":12})).unwrap_err().code,"bad_request");
         core.shutdown();
     }
 

@@ -1,15 +1,15 @@
 # Dex
 
-Dex is a desktop multi-agent orchestrator for **Claude Code and Codex CLI**. A leader delegates work to workers; you follow their terminals, task board, plans and results in one app. The UI and bundled agent instructions are currently **Turkish**.
+Dex is a desktop multi-agent orchestrator for **Claude Code**. A leader delegates work to workers; you follow their terminals, task board, plans and results in one app. The UI and bundled agent instructions are currently **Turkish**.
 
-Türkçe not: Dex, Claude Code / Codex CLI ajanlarını lider ve worker takımlarıyla yönetir. Arayüz Türkçedir; birincil platform Windows'tur.
+Türkçe not: Dex, Claude Code ajanlarını lider ve worker takımlarıyla yönetir. Arayüz Türkçedir; birincil platform Windows'tur.
 
 ## What it does
 
 - Teams with leaders and workers, a task board, delegation and dependency plans ([delegation](crates/dex-core/src/delegate.rs), [plans](crates/dex-core/src/plan.rs)).
 - Git worktrees for delegated jobs and a merge review gate when the team has a code-review member. Without that role, there is no review gate ([worktrees](crates/dex-core/src/worktree.rs), [review](crates/dex-core/src/review.rs)).
 - Hook policies for tool use and job lifecycle, plus persistent project/team/agent memory ([hooks](crates/dex-core/src/hooks.rs), [policy](crates/dex-core/src/permit.rs), [memory](crates/dex-core/src/memory.rs)).
-- A provider chain for quota exhaustion and proactive Claude worker quota switching. Native Codex sessions do not initiate the same StopFailure chain ([chain](crates/dex-core/src/chain.rs), [quota](crates/dex-core/src/quota.rs)).
+- A provider chain for quota exhaustion and proactive Claude worker quota switching ([chain](crates/dex-core/src/chain.rs), [quota](crates/dex-core/src/quota.rs)).
 
 ## Status and platforms
 
@@ -35,10 +35,10 @@ Install these before building:
 | pnpm | **10.17.0**, pinned in [package.json](package.json) |
 | Rust via rustup | **1.96.0**, pinned in [rust-toolchain.toml](rust-toolchain.toml); use the Windows MSVC toolchain |
 | Native build tools | Microsoft C++ Build Tools, **Desktop development with C++**, Windows SDK and WebView2 Runtime; follow [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) |
-| Claude Code and/or Codex CLI | Install separately and complete login before launching agents. Codex needs **0.154.0+** and `hooks stable true` in `codex features list`; enable `[features] hooks = true` in its config if needed |
+| Claude Code | Install separately and complete login before launching agents |
 | curl | **8.3+** on the hook process PATH, for curl's environment expansion |
 
-CLI/hook requirements: [Claude launch](crates/dex-core/src/pty.rs), [Codex validation](crates/dex-core/src/codex.rs), [curl hooks](crates/dex-core/src/hooks.rs). Neither CLI nor its subscription is included with Dex.
+CLI/hook requirements: [Claude launch](crates/dex-core/src/pty.rs), [curl hooks](crates/dex-core/src/hooks.rs). Neither the CLI nor its subscription is included with Dex.
 
 From a checkout of this repository:
 
@@ -47,7 +47,7 @@ pnpm install
 pnpm tauri dev
 ```
 
-The dev command builds local `dexd` before starting the desktop UI ([Tauri config](src-tauri/tauri.conf.json)). No remote server is needed. In the Turkish UI, configure your project/team, select the installed CLI engine and start its leader; CLI login is separate from optional gateway login.
+The dev command builds local `dexd` before starting the desktop UI ([Tauri config](src-tauri/tauri.conf.json)). No remote server is needed. In the Turkish UI, configure your project/team and start its leader; Claude Code login is separate.
 
 For a distributable desktop package:
 
@@ -65,7 +65,6 @@ pnpm release
 | GPU broker | Configure broker addresses and credentials. Without them, GPU operations are unavailable; normal local agent work continues. Submissions require an approved job grant and budget ([GPU](crates/dex-core/src/gpu.rs)). |
 | Token Monitor | Separate local hub for the usage strip. If absent, the strip remains offline; it does not prevent agents from running ([usage](src-tauri/src/usage.rs)). |
 | Browser tools | Browser-enabled roles use Node/npx and Playwright MCP 0.0.79. Windows uses Edge, macOS Chrome, Linux Playwright Chromium. Missing browser/package access breaks those tools; other roles do not require them ([browser](crates/dex-core/src/browser.rs)). |
-| SIWC / gateway | Optional Sign in with ChatGPT route for Claude Code through Dex's local gateway. Requires explicit login and account-visible models; native Claude/Codex operation does not need gateway login. The gateway service is still part of Core startup ([gateway](crates/dex-core/src/gateway/README.md)). |
 | Android | Requires a paired host. `pnpm release:apk` is a separate SSH/SDK/NDK/keystore pipeline; configure it before use. `pnpm release:all` also runs that pipeline ([APK script](scripts/release-apk.mjs)). |
 
 ## Data and network
@@ -76,7 +75,7 @@ Dex has no analytics or telemetry collector. It does make authenticated model ca
 
 ## Security
 
-**Agents run with broad access by default.** Claude uses `bypassPermissions`; Codex uses `-a never -s danger-full-access`. Agents can act with your OS user's file, command and network privileges ([Claude launch](crates/dex-core/src/pty.rs), [Codex launch](crates/dex-core/src/codex.rs)).
+**Agents run with broad access by default.** Claude uses `bypassPermissions`. Agents can act with your OS user's file, command and network privileges ([Claude launch](crates/dex-core/src/pty.rs)).
 
 Dex's hooks apply role/job policies and the Core controls delegation, GPU grants and applicable merge reviews. This is application policy, **not an OS sandbox or complete containment boundary**. Worktrees isolate Git work, not the host. Use an isolated account or machine for untrusted repositories and tasks. Report vulnerabilities through [SECURITY.md](SECURITY.md).
 

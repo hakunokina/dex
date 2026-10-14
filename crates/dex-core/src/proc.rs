@@ -128,7 +128,7 @@ pub struct Tree {
 unsafe impl Send for Tree {}
 
 impl Tree {
-    /// Defaults + env ([`limits_from_env`]), no stored settings. `pty::spawn` (claude + codex)
+    /// Defaults + env ([`limits_from_env`]), no stored settings. `pty::spawn` (claude)
     /// uses [`Tree::adopt_with`] with the Settings panel's limits.
     #[cfg(windows)]
     pub fn adopt(pid: u32) -> Option<Tree> {
@@ -259,7 +259,7 @@ pub struct AgentProcess {
     /// Working set.
     pub mem_mb: f64,
     pub kind: ProcKind,
-    /// The agent's own CLI (claude/codex): shown, never killed.
+    /// The agent's own CLI (claude): shown, never killed.
     pub root: bool,
 }
 

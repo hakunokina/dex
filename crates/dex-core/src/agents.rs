@@ -57,12 +57,6 @@ pub struct State {
     /// Interrupt remains ineligible even if delayed tool hooks mark this turn busy again.
     #[serde(skip)]
     team_turn_interrupted: bool,
-    /// Rollout fallback completion must belong to this PTY generation and active turn.
-    #[serde(skip)]
-    codex_turn: Option<(u64, String)>,
-    /// A settled turn's delayed rollout rows cannot cross this boundary into the next turn.
-    #[serde(skip)]
-    codex_after: u64,
     /// #1033: Dex parked it for quota (zincir bekletmesi) — any later status ends the wait.
     #[serde(skip)]
     pub(crate) chain_wait: bool,
@@ -80,12 +74,6 @@ impl State {
     fn set_status(&mut self, status: Status) {
         if matches!(status, Status::Working | Status::Waiting) {
             self.team_turn_checked = self.team_turn_interrupted;
-        }
-        if !matches!(status, Status::Working | Status::Waiting) {
-            if matches!(self.status, Status::Working | Status::Waiting) {
-                self.codex_after = now();
-            }
-            self.codex_turn = None;
         }
         self.status = status;
         self.status_seq = next_seq();
@@ -116,7 +104,6 @@ impl States {
     pub fn started(&self, id: &str, engine: &str, prompted: bool) -> State {
         self.change(id, |state| {
             state.set_status(Status::Idle);
-            state.codex_after = 0; // A new process has its own rollout boundary.
             state.team_turn_interrupted = false;
             state.engine = Some(engine.into());
             state.prompt_pending = prompted;
@@ -217,13 +204,6 @@ impl States {
                 if matches!(status, Status::Working | Status::Waiting) {
                     state.team_turn_checked = state.team_turn_interrupted;
                 }
-                if !matches!(status, Status::Working | Status::Waiting) {
-                    // Idle with an initial prompt pending is SessionStart, not that turn's end.
-                    if !state.prompt_pending || matches!(state.status, Status::Working | Status::Waiting) {
-                        state.codex_after = now();
-                    }
-                    state.codex_turn = None;
-                }
                 state.status = status;
                 state.status_seq = seq;
                 state.chain_wait = false;
@@ -252,44 +232,6 @@ impl States {
         }
         state.team_turn_checked = true;
         true
-    }
-
-    /// Gate both start and prompt under the status lock. Use the preceding end rather than
-    /// the Working hook clock: Codex writes the new start before UserPromptSubmit reaches us.
-    pub(crate) fn codex_observed(&self, id: &str, process: u64, turn: Option<&str>, timestamp: Option<u64>) -> Option<State> {
-        let mut states = self.0.lock().unwrap();
-        let state = states.entry(id.into()).or_insert_with(|| State { agent_id: id.into(), ..Default::default() });
-        if state.codex_after != 0 && timestamp.is_none_or(|ts| ts < state.codex_after) {
-            return None;
-        }
-        state.pre_session = false;
-        state.hook_at = now();
-        state.team_turn_interrupted = false;
-        state.set_status(Status::Working);
-        state.prompt_pending = false;
-        if let Some(turn) = turn {
-            state.codex_turn = Some((process, turn.into()));
-        }
-        Some(state.clone())
-    }
-
-    /// Check and end under the same lock: a Stop/new prompt between them cannot end a newer turn.
-    pub(crate) fn codex_completed(&self, id: &str, process: u64, turn: &str, timestamp: Option<u64>) -> Option<State> {
-        let mut states = self.0.lock().unwrap();
-        let state = states.get_mut(id)?;
-        if !matches!(state.status, Status::Working | Status::Waiting)
-            || !state.codex_turn.as_ref().is_some_and(|(p, t)| *p == process && t == turn)
-        {
-            return None;
-        }
-        state.pre_session = false;
-        state.hook_at = now();
-        // A single read may also contain the next turn, written before this read's clock.
-        // Preserve a newer hook boundary; missing rollout clocks retain the conservative gate.
-        let after = state.codex_after.max(timestamp.unwrap_or_else(now));
-        state.set_status(Status::Idle);
-        state.codex_after = after;
-        Some(state.clone())
     }
 
     /// `true` when this ends a draft (the patron sent or emptied the prompt).
@@ -466,16 +408,6 @@ thread_local! {
     pub(crate) static CAPTURE: std::cell::RefCell<Option<Vec<Captured>>> = const { std::cell::RefCell::new(None) };
     /// #838 G (tests): the captured starts' launch contexts (memory, system text), in order.
     pub(crate) static LAUNCHES: std::cell::RefCell<Vec<crate::pty::AgentLaunch>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// #1018 (tests): Codex rollout klasörü; boşsa Codex kotası bilinmiyor (gerçek ~/.codex okunmaz).
-    pub(crate) static CODEX_SESSIONS: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
-/// Codex'in rollout klasörü: worker'lar Dex'in kendi `CODEX_HOME`'unu (yoksa ~/.codex) görür.
-fn codex_sessions() -> Option<std::path::PathBuf> {
-    #[cfg(test)]
-    return CODEX_SESSIONS.with(|s| s.borrow().clone());
-    #[cfg(not(test))]
-    Some(crate::codex::home().join("sessions"))
 }
 
 /// #838 D: the agent's `agent_sessions` row, launch binding included.
@@ -700,7 +632,7 @@ fn restore_session_row(conn: &Connection, agent: &str, prior: Option<&SessionRow
 
 /// #671: where the effort goes. Claude Code (anthropic, glm, muse): `CLAUDE_CODE_EFFORT_LEVEL`
 /// in the spawn env, which pty sets after its strip and the provider env, so it wins over the
-/// patron's own and over `--effort`. Codex: its argv (`codex::Launch::effort`). None: nothing.
+/// patron's own and over `--effort`. None: nothing.
 /// #671: the effort a spawn uses — the given one, else (a worker's respawn mid-job: provider chain,
 /// quota route back, restart, lost resume) its running job's. Leaders and job-less spawns: none.
 pub fn spawn_effort(conn: &rusqlite::Connection, agent: &crate::teams::Agent, given: Option<crate::effort::Effort>) -> Result<Option<crate::effort::Effort>, String> {
@@ -711,8 +643,8 @@ pub fn spawn_effort(conn: &rusqlite::Connection, agent: &crate::teams::Agent, gi
     }
 }
 
-pub fn effort_env(engine: &str, effort: Option<crate::effort::Effort>, env: &mut Vec<(String, String)>) {
-    if let Some(e) = effort.filter(|_| engine != "codex") {
+pub fn effort_env(effort: Option<crate::effort::Effort>, env: &mut Vec<(String, String)>) {
+    if let Some(e) = effort {
         env.retain(|(k, _)| k != crate::effort::CLAUDE_ENV);
         env.push((crate::effort::CLAUDE_ENV.into(), e.as_str().into()));
     }
@@ -877,8 +809,7 @@ impl crate::Core {
         if let Some(info) = self.ptys.list().into_iter().find(|pty| pty.id == id) {
             return Ok(info);
         }
-        // #838 D: a caller's fresh start is a new session; a quota route to Codex below makes a
-        // continuing one fresh too, yet it keeps its binding.
+        // #838 D: a caller's fresh start is a new session; it keeps its binding.
         let renew = options.fresh;
         self.quota_route(id, &mut options);
         let (agent, engine, plan) = crate::db::with(&self.db, |conn| {
@@ -907,29 +838,18 @@ impl crate::Core {
         // DEX-17: zincirle geçici motor/sağlayıcı/modeldeyse onlar kullanılır; asıl ayar değişmez.
         let eff_provider = agent.active_provider.clone().unwrap_or_else(|| agent.provider.clone());
         let eff_model = agent.active_model.clone().unwrap_or_else(|| agent.model.clone());
-        let codex = (engine == "codex").then(|| crate::codex::Launch {
-            model: Some(eff_model.clone()),
-            add_dirs: options.add_dirs.clone(),
-            resume: resume.clone(),
-            prompt: options.prompt.clone(),
-            effort: options.effort,
-        });
-        let args = if codex.is_some() {
-            Vec::new()
-        } else {
-            options
-                .add_dirs
-                .iter()
-                .flat_map(|dir| ["--add-dir".into(), dir.clone()])
-                .chain((eff_model != crate::providers::CLAUDE_DEFAULT).then(|| ["--model".into(), eff_model.clone()]).into_iter().flatten())
-                .chain(resume.into_iter().flat_map(|session| ["--resume".into(), session]))
-                .chain(options.prompt.clone())
-                .collect()
-        };
+        let args = options
+            .add_dirs
+            .iter()
+            .flat_map(|dir| ["--add-dir".into(), dir.clone()])
+            .chain((eff_model != crate::providers::CLAUDE_DEFAULT).then(|| ["--model".into(), eff_model.clone()]).into_iter().flatten())
+            .chain(resume.into_iter().flat_map(|session| ["--resume".into(), session]))
+            .chain(options.prompt.clone())
+            .collect();
         // Before the spawn: the CLI may print its "not found" line and exit at once.
-        let mut env = {
+        let env = {
             let mut env = options.env.clone();
-            effort_env(&engine, options.effort, &mut env);
+            effort_env(options.effort, &mut env);
             leader_colors_env(&self.skills, &engine, &agent.kind, std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok().as_deref(), &mut env)?;
             env
         };
@@ -945,15 +865,6 @@ impl crate::Core {
                 Err(err) => restore_session_row(c, id, prior.as_ref()).and(Err(err)),
             }
         })?;
-        if engine=="claude" && eff_provider=="gateway" {
-            match self.gateway_spawn_env(id,&eff_model) {
-                Ok(gateway_env) => env.extend(gateway_env),
-                Err(error) => {
-                    let _=crate::db::with(&self.db,|c|restore_session_row(c,id,prior.as_ref()));
-                    return Err(error);
-                }
-            }
-        }
         match watch {
             Some(w) => self.resume_watch.lock().unwrap().insert(id.into(), w),
             None => self.resume_watch.lock().unwrap().remove(id),
@@ -968,14 +879,12 @@ impl crate::Core {
                 provider: Some(eff_provider.clone()),
                 cols: options.cols.unwrap_or(120),
                 rows: options.rows.unwrap_or(36),
-                codex,
                 env,
             },
             launch,
             AgentSink::new(self, id),
         )
         .inspect_err(|_| {
-            self.gateway.revoke_agent(id);
             self.resume_watch.lock().unwrap().remove(id);
             if let Err(err) = crate::db::with(&self.db, |c| restore_session_row(c, id, prior.as_ref())) {
                 log::error!("session row restore: {err}");
@@ -1003,7 +912,7 @@ impl crate::Core {
     }
 
     /// The CLI's PTY. #838 D (tests): with [`CAPTURE`] set the request is kept and a shell stands
-    /// in for the CLI — core tests never start a real claude or codex.
+    /// in for the CLI — core tests never start a real claude.
     fn agent_pty_spawn(&self, req: crate::pty::Spawn, launch: crate::pty::AgentLaunch, sink: AgentSink) -> Result<(), String> {
         #[cfg(test)]
         if CAPTURE.with(|c| c.borrow().is_some()) {
@@ -1027,7 +936,6 @@ impl crate::Core {
         crate::db::with(&self.db, |c| {
             let a = crate::teams::get_agent(c, &d.to_agent)?;
             let b = session_row(c, &a.id)?.map(|s| s.binding).unwrap_or_default();
-            if a.active_provider.as_deref().unwrap_or(&a.provider)=="gateway" && b.delegation_id!=Some(d.id) {return Ok(false);}
             binding_fits(c, &self.paths.data_dir, &a.id, &a.team_id, &b, d.project_id.as_deref())
         })
         .unwrap_or(false)
@@ -1061,9 +969,6 @@ impl crate::Core {
         transcript: Option<&str>,
         engine_hint: Option<&str>,
     ) {
-        if event=="SessionEnd" && self.agent_states.get(agent).session_id.as_deref()==Some(session) {
-            self.gateway.revoke_agent(agent);
-        }
         // A hook means the CLI got past the resume — except SessionEnd: claude sends one, with the
         // missing id, right after "No conversation found".
         if event != "SessionEnd" {
@@ -1169,8 +1074,7 @@ impl crate::Core {
     /// Sağlayıcıda kullanılabilir jeton var mı (zincir atlama kuralı). `anthropic` yerleşik,
     /// jeton istemez; `local` adres + jeton ister.
     pub(crate) fn chain_has_token(&self, id: &str) -> bool {
-        if id=="gateway" {return self.gateway_auth_status().is_ok_and(|s|s.active_account_id.is_some());}
-        if id == "anthropic" || id == "codex" {
+        if id == "anthropic" {
             return true;
         }
         let secret = |acct: &str| crate::secrets::get(crate::providers::KEYRING_SERVICE, acct).ok().flatten();
@@ -1196,9 +1100,6 @@ impl crate::Core {
         let msg = field("last_assistant_message");
         // Geçici sağlayıcıda ağ/timeout: unreachable say + ilerle (asıl sağlayıcıda değişmez).
         let (kind, reason) = if crate::chain::classify(field("error"), msg) == crate::chain::Kind::Permanent {
-            if a.active_engine.is_some() {
-                return None;
-            }
             (true, "kota")
         } else if on_temp && crate::chain::unreachable_signal(field("error"), msg) {
             (true, "unreachable")
@@ -1257,7 +1158,7 @@ impl crate::Core {
         };
         let source_model = a.active_model.as_deref().unwrap_or(&a.model);
         let (picked, skipped) = self.chain_pick(plan.next.clone(), source_model);
-        let Some((next, active_engine, active_provider, model)) = picked else {
+        let Some((next, model)) = picked else {
             let suffix = if skipped.is_empty() { String::new() } else { format!(" ({})", skipped.join("; ")) };
             if let Some(why) = &plan.threshold {
                 // Eşikte iş durmaz: worker Claude'da kalır.
@@ -1278,10 +1179,8 @@ impl crate::Core {
             return;
         };
         let to_label = chain_target_label(&next);
-        // #1027: Codex'ten çıkışta devir bağlamı Codex'in kendi rollout'undan; sürdürülecek Claude oturumu yok.
-        let from_codex = plan.current == "codex";
         let handoff = self
-            .chain_handoff_summary_from(if from_codex { "codex" } else { "claude" }, plan.session.as_deref(), plan.transcript.as_deref(), 3_600)
+            .chain_handoff_summary_from(plan.session.as_deref(), plan.transcript.as_deref(), 3_600)
             .unwrap_or_else(|_| {
             "Önceki oturumun transcript'i okunamadı. Son kullanıcı işini kaldığın yerden sürdür; bitmiş adımları tekrar etme.".into()
         });
@@ -1293,12 +1192,9 @@ impl crate::Core {
         // worktree and env — not in the team folder.
         let launch = match crate::db::with(&self.db, |c| {
             let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-            if next == "codex" {
-                save_chain_origin(&tx, agent, plan.session.as_deref(), plan.transcript.as_deref())?;
-            }
             tx.execute(
-                "UPDATE agents SET active_engine = ?2, active_provider = ?3, active_model = ?4 WHERE id = ?1",
-                rusqlite::params![agent, active_engine, active_provider, model],
+                "UPDATE agents SET active_engine = NULL, active_provider = ?2, active_model = ?3 WHERE id = ?1",
+                rusqlite::params![agent, next, model],
             )
             .map_err(|e| e.to_string())?;
             let launch = session_row(&tx, agent)?.map(|s| s.binding).unwrap_or_default();
@@ -1316,16 +1212,12 @@ impl crate::Core {
             Some(why) => crate::chain::continue_prompt_threshold(why, &to_label),
             None => crate::chain::continue_prompt(&from_label, &to_label),
         };
-        let mut options = if next == "codex" || from_codex {
-            StartOptions { prompt: Some(format!("{continuation}\n\n{handoff}")), fresh: true, launch, ..Default::default() }
-        } else {
-            StartOptions {
-                prompt: Some(continuation),
-                resume: plan.session.clone(),
-                fallback_prompt: Some(handoff),
-                launch,
-                ..Default::default()
-            }
+        let mut options = StartOptions {
+            prompt: Some(continuation),
+            resume: plan.session.clone(),
+            fallback_prompt: Some(handoff),
+            launch,
+            ..Default::default()
         };
         options.model_route_reason = Some(plan.threshold.clone().unwrap_or_else(|| plan.reason.clone()));
         let r = self.agent_spawn(agent, options);
@@ -1342,8 +1234,8 @@ impl crate::Core {
                 };
                 let _ = self.events.emit("dex-chain", &serde_json::json!({
                     "agentId": agent, "from": plan.current, "to": next,
-                    "activeEngine": active_engine.as_deref().unwrap_or("claude"),
-                    "activeProvider": active_provider,
+                    "activeEngine": "claude",
+                    "activeProvider": next,
                     "resetAt": plan.threshold_reset.clone().unwrap_or_else(|| ms_to_iso(reset)), "text": text,
                 }));
                 eprintln!("dex: {agent}: zincir {from_label} → {to_label}");
@@ -1352,50 +1244,22 @@ impl crate::Core {
                 self.chain_note_lead(agent, &format!("{agent}: {from} → {to_label} ile sürüyor — iş bölünmedi."));
             }
             Err(err) => {
-                let _ = crate::db::with(&self.db, |c| restore_chain_state(c, agent, &prior, next == "codex"));
+                let _ = crate::db::with(&self.db, |c| restore_chain_state(c, agent, &prior));
                 self.chain_spawn_failed(agent, &format!("{to_label} ile devam edilemedi: {err}"));
                 eprintln!("dex: {agent}: zincir geçişi başarısız: {err}");
             }
         }
     }
 
-    /// Zincirde `first`'ten başlayarak gerçekten kullanılabilir ilk hedef: (hedef, active_engine,
-    /// active_provider, model). Jetonsuz sağlayıcı / hazır olmayan Codex atlanır, nedeni döner.
-    #[allow(clippy::type_complexity)]
-    fn chain_pick(
-        &self,
-        first: Option<String>,
-        source_model: &str,
-    ) -> (Option<(String, Option<String>, Option<String>, String)>, Vec<String>) {
+    /// Zincirde `first`'ten başlayarak gerçekten kullanılabilir ilk hedef: (hedef sağlayıcı, model).
+    /// Jetonsuz sağlayıcı atlanır, nedeni döner.
+    fn chain_pick(&self, first: Option<String>, source_model: &str) -> (Option<(String, String)>, Vec<String>) {
         let mut candidate = first;
         let mut skipped = Vec::new();
         while let Some(next) = candidate {
-            if next == "gateway" {
-                match self.gateway_models() {
-                    Ok(rows) => {
-                        let catalog=rows.into_iter().map(|m|m.id).collect::<Vec<_>>();
-                        if let Some(model)=crate::chain::map_codex_model(source_model,&catalog) {
-                            return (Some((next,None,Some("gateway".into()),model)),skipped);
-                        }
-                        skipped.push("ChatGPT hesabında kullanılabilir model yok".into());
-                    }
-                    Err(error) => skipped.push(format!("ChatGPT kullanılamıyor: {error}")),
-                }
-            } else if next == "codex" {
-                let bin = crate::codex::resolve("codex");
-                match crate::codex::check_ready(&bin).and_then(|_| crate::codex::models()) {
-                    Ok(rows) => {
-                        let catalog = rows.into_iter().map(|m| m.id).collect::<Vec<_>>();
-                        if let Some(model) = crate::chain::map_codex_model(source_model, &catalog) {
-                            return (Some((next, Some("codex".to_string()), None, model)), skipped);
-                        }
-                        skipped.push("Codex hesabında kullanılabilir model yok".to_string());
-                    }
-                    Err(err) => skipped.push(format!("Codex kullanılamıyor: {err}")),
-                }
-            } else if next == "anthropic" || self.chain_has_token(&next) {
+            if next == "anthropic" || self.chain_has_token(&next) {
                 let model = crate::chain::map_model(&next, source_model);
-                return (Some((next.clone(), None, Some(next), model)), skipped);
+                return (Some((next, model)), skipped);
             } else {
                 skipped.push(format!("{} jetonu yok", chain_target_label(&next)));
             }
@@ -1425,29 +1289,15 @@ impl crate::Core {
         let handoff = self.chain_handoff_summary(agent, 3_600).ok();
         let prior = (a.active_engine.clone(), a.active_provider.clone(), a.active_model.clone());
         self.chain_guard.lock().unwrap().insert(agent.to_string());
-        // #838 D: back on the current session's binding; the original Claude session is resumed
-        // only if it ran on that same binding (another job's or project's is never resumed).
-        let (origin, launch) = match crate::db::with(&self.db, |c| {
-            let origin = c
-                .query_row(
-                    "SELECT session_id, project_id, delegation_id, cwd FROM agent_chain_origins WHERE agent_id = ?1 AND engine = 'claude'",
-                    [agent],
-                    |row| {
-                        Ok((
-                            row.get::<_, Option<String>>(0)?,
-                            Binding { project_id: row.get(1)?, delegation_id: row.get(2)?, cwd: row.get(3)? },
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| e.to_string())?;
+        // #838 D: back on the current session's binding (another job's or project's is never resumed).
+        let launch = match crate::db::with(&self.db, |c| {
             let launch = session_row(c, agent)?.map(|s| s.binding).unwrap_or_default();
             c.execute(
                 "UPDATE agents SET active_engine = NULL, active_provider = NULL, active_model = NULL WHERE id = ?1",
                 [agent],
             )
             .map_err(|e| e.to_string())?;
-            Ok((origin.filter(|(_, b)| *b == launch).and_then(|(s, _)| s), launch))
+            Ok(launch)
         }) {
             Ok(found) => found,
             Err(err) => {
@@ -1458,20 +1308,13 @@ impl crate::Core {
         self.ptys.kill(agent);
         let r = self.agent_spawn(agent, StartOptions {
             prompt: Some(handoff.unwrap_or_else(|| "Kaldığın yerden devam et: asıl sağlayıcı yeniden kullanılabilir durumda.".into())),
-            resume: origin,
             launch: Some(launch),
             model_route_reason: Some("zincirin kayıtlı sağlayıcıya dönüşü".into()),
             ..Default::default()
         });
         self.chain_guard.lock().unwrap().remove(agent);
-        if r.is_ok() {
-            let _ = crate::db::with(&self.db, |c| {
-                c.execute("DELETE FROM agent_chain_origins WHERE agent_id = ?1", [agent])
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-            });
-        } else {
-            // Keep the retry/back affordance and the original-session row if spawn failed.
+        if r.is_err() {
+            // Keep the retry/back affordance if spawn failed.
             let _ = crate::db::with(&self.db, |c| {
                 c.execute(
                     "UPDATE agents SET active_engine = ?2, active_provider = ?3, active_model = ?4 WHERE id = ?1",
@@ -1559,8 +1402,8 @@ impl crate::Core {
         }
     }
 
-    /// #1033: `provider` sıfırlandı — o motorda kota için bekletilen canlı oturum (asıl motoru
-    /// Codex olan dahil) aynı oturumda `[Dex]` devam turuyla sürer. Dönülecek asıl sağlayıcı
+    /// #1033: `provider` sıfırlandı — o motorda kota için bekletilen canlı oturum
+    /// aynı oturumda `[Dex]` devam turuyla sürer. Dönülecek asıl sağlayıcı
     /// burada değil ([`Self::chain_back`]); yazmakta olan patronun girdisine karışılmaz.
     fn chain_resume_waiting(&self, provider: &str) {
         let label = chain_target_label(provider);
@@ -1616,14 +1459,13 @@ impl crate::Core {
     }
 
     /// #1018: seçimden hemen önce, kotası ölçülüp BİLİNEN bitmiş motoru tükenmiş kaydına işler
-    /// (Claude: OAuth ölçümü, Codex: kendi rollout kaydı) — atlama, bildirim ve sıfırlanınca geri
+    /// (Claude: OAuth ölçümü) — atlama, bildirim ve sıfırlanınca geri
     /// dönüş StopFailure kaydıyla aynı yoldan. Ölçüm yok/bayat/okunamıyor = dokunulmaz (aday kalır).
     /// Poll yok: yalnız seçim anında okunur. GLM/Muse/local'de ölçüm yok, yalnız StopFailure kaydı.
     pub(crate) fn chain_measure(&self) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         let claude = self.quota.lock().unwrap().exhausted_until(now);
-        let codex = codex_sessions().and_then(|dir| crate::chain::codex_exhausted_until(&dir, now));
-        for (provider, reset) in [("anthropic", claude), ("codex", codex)] {
+        for (provider, reset) in [("anthropic", claude)] {
             let Some(reset) = reset else { continue };
             let marked = crate::db::with(&self.db, |c| {
                 if crate::chain::exhausted(c)?.iter().any(|e| e.provider == provider && e.reset_at >= reset) {
@@ -1642,82 +1484,10 @@ impl crate::Core {
     }
 
     /// #1027: zincirde geçilecek motor yokken nedeni ([`crate::chain::none_reason`]); `home` = ajanın
-    /// asıl sağlayıcısı (Codex'ten dönüş adayı).
+    /// asıl sağlayıcısı (dönüş adayı).
     fn chain_none_reason(&self, current: &str, home: &str, skipped: &[String]) -> &'static str {
         crate::db::with(&self.db, |c| Ok(crate::chain::none_reason(c, current, home, !skipped.is_empty(), &|p| self.chain_has_token(p))))
             .unwrap_or("zincirde kullanılabilir hedef yok")
-    }
-
-    /// #1027: Codex'te koşan ajanın turu kota hatasıyla bitti. Codex'te StopFailure hook'u yok;
-    /// sinyal rollout'un kendisi ([`crate::chain::codex_turn_limit`]), canlı sohbet izleyicisi
-    /// (dosya olayı, poll yok) çağırır. StopFailure eşdeğeri: Codex tükenmiş yazılır (sıfırlanma
-    /// aynı rollout'un `rate_limits`'inden, yoksa varsayılan) ve
-    /// - Claude'dan taşınmış zincirli worker sıradaki kotası olan motora geçer; sırada yoksa ve asıl
-    ///   sağlayıcısı tükenmemişse ona döner ([`Self::chain_back`]); hiçbiri yoksa bekler + tek not;
-    /// - asıl motoru Codex olan (zinciri olmayan) ajan bekler + tek not.
-    ///
-    /// `false` = işlenmedi (geçiş sürüyor / ajan Codex'te değil): izleyici sonraki kota turunu yine verir.
-    pub(crate) fn chain_codex_limit(&self, agent: &str, transcript: &std::path::Path) -> bool {
-        if self.chain_guard.lock().unwrap().contains(agent) {
-            return false;
-        }
-        let Ok(a) = crate::db::with(&self.db, |c| crate::teams::get_agent(c, agent)) else { return false };
-        if a.active_engine.as_deref().unwrap_or(&a.engine) != "codex" {
-            return false;
-        }
-        // #1033: aynı kuruyan tur ikinci kez görüldü (izleyici yeniden kuruldu): zaten bekliyor.
-        if self.agent_states.get(agent).chain_wait {
-            return true;
-        }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        let reset = crate::chain::codex_file_exhausted_until(transcript, now);
-        eprintln!("dex: {agent}: Codex turu kota hatasıyla bitti (usage_limit_exceeded)");
-        let mut plan = ChainPlan {
-            current: "codex".into(),
-            next: None,
-            reset,
-            reason: "kota".into(),
-            session: None,
-            transcript: Some(transcript.to_string_lossy().into_owned()),
-            threshold: None,
-            threshold_reset: None,
-        };
-        if a.engine != "claude" || a.chain_off {
-            let reset = reset.unwrap_or(now + crate::chain::DEFAULT_EXHAUST_MS);
-            if crate::db::with(&self.db, |c| crate::chain::mark_exhausted(c, "codex", Some(reset), "kota")).is_ok() {
-                self.chain_schedule_reset("codex", reset);
-            }
-            self.chain_wait(agent, "Codex kotası doldu — ajan bekliyor.", Some(reset));
-            self.chain_note_lead(agent, &format!("{agent}: Codex kotası doldu{} — iş bekliyor.", reset_clause(Some(reset))));
-            return true;
-        }
-        self.chain_measure();
-        plan.next = crate::db::with(&self.db, |c| crate::chain::pick_next(c, "codex", &|p| self.chain_has_token(p))).ok().flatten();
-        let home_free = crate::db::with(&self.db, |c| Ok(!crate::chain::exhausted(c)?.iter().any(|e| e.provider == a.provider)))
-            .unwrap_or(false);
-        if plan.next.is_none() && home_free {
-            let reset = reset.unwrap_or(now + crate::chain::DEFAULT_EXHAUST_MS);
-            if crate::db::with(&self.db, |c| crate::chain::mark_exhausted(c, "codex", Some(reset), "kota")).is_ok() {
-                self.chain_schedule_reset("codex", reset);
-            }
-            let to_label = chain_target_label(&a.provider);
-            match self.chain_back(agent) {
-                Ok(()) => {
-                    let text = format!("Codex limiti doldu → {to_label} ile devam ediliyor.");
-                    let _ = self.events.emit("dex-chain", &serde_json::json!({
-                        "agentId": agent, "from": "codex", "to": a.provider,
-                        "activeEngine": "claude", "activeProvider": serde_json::Value::Null,
-                        "resetAt": ms_to_iso(reset), "text": text,
-                    }));
-                    eprintln!("dex: {agent}: zincir Codex → {to_label} (asıl)");
-                    self.chain_note_lead(agent, &format!("{agent}: Codex → {to_label} ile sürüyor — iş bölünmedi."));
-                    return true;
-                }
-                Err(err) => eprintln!("dex: {agent}: Codex'ten {to_label}'e dönülemedi: {err}"),
-            }
-        }
-        self.chain_execute(agent, plan);
-        true
     }
 
     /// A replacement process could not start. Unlike chain exhaustion there is no live PTY that
@@ -1765,13 +1535,12 @@ impl crate::Core {
     }
 
     /// [`Self::quota_switch`]; `pick` = zincir seçimi (testler jeton kasasız verir). #1033: seçim
-    /// gerçekten kullanılabilir hedefe bakar — atlananlar (Codex hazır değil, jeton yok) nottaki
-    /// nedene girer.
+    /// gerçekten kullanılabilir hedefe bakar — atlananlar (jeton yok) nottaki nedene girer.
     #[allow(clippy::type_complexity)]
     fn quota_switch_by(
         &self,
         breach: &crate::quota::Breach,
-        pick: &dyn Fn(&str) -> (Option<(String, Option<String>, Option<String>, String)>, Vec<String>),
+        pick: &dyn Fn(&str) -> (Option<(String, String)>, Vec<String>),
     ) {
         let targets = self.quota_targets();
         if targets.is_empty() {
@@ -1836,8 +1605,7 @@ impl crate::Core {
     }
 
     /// Claude'dan sonraki gerçekten kullanılabilir hedef ([`Self::chain_pick`]) ve atlananlar.
-    #[allow(clippy::type_complexity)]
-    fn quota_pick(&self, model: &str) -> (Option<(String, Option<String>, Option<String>, String)>, Vec<String>) {
+    fn quota_pick(&self, model: &str) -> (Option<(String, String)>, Vec<String>) {
         let first = crate::db::with(&self.db, |c| crate::chain::pick_next(c, "anthropic", &|p| self.chain_has_token(p)))
             .ok()
             .flatten();
@@ -1850,7 +1618,7 @@ impl crate::Core {
         &self,
         id: &str,
         options: &mut StartOptions,
-        pick: &dyn Fn(&str) -> (Option<(String, Option<String>, Option<String>, String)>, Vec<String>),
+        pick: &dyn Fn(&str) -> (Option<(String, String)>, Vec<String>),
     ) {
         if self.chain_guard.lock().unwrap().contains(id) {
             return;
@@ -1867,45 +1635,35 @@ impl crate::Core {
             let q = self.quota.lock().unwrap();
             q.exhausted_window(now_ms).map(|(b, _)| b).or_else(|| q.breach_at(now_ms))
         };
-        // Ölçüm (Codex rollout taraması) yalnız seçim ya da dönüş kararı olacaksa.
+        // Ölçüm yalnız seçim ya da dönüş kararı olacaksa.
         if breach.is_some() || displaced {
             self.chain_measure();
         }
         match breach {
             Some(b) if !displaced => {
                 let (picked, skipped) = pick(&a.model);
-                let Some((to, engine, provider, model)) = picked else {
+                let Some((to, model)) = picked else {
                     self.quota_no_target(&b, &[id.to_string()], &skipped);
                     return;
                 };
-                let codex = to == "codex";
                 if crate::db::with(&self.db, |c| {
-                    let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-                    if codex {
-                        save_chain_origin(&tx, id, None, None)?;
-                    }
-                    tx.execute(
-                        "UPDATE agents SET active_engine = ?2, active_provider = ?3, active_model = ?4 WHERE id = ?1",
-                        params![id, engine, provider, model],
+                    c.execute(
+                        "UPDATE agents SET active_engine = NULL, active_provider = ?2, active_model = ?3 WHERE id = ?1",
+                        params![id, to, model],
                     )
-                    .map_err(|e| e.to_string())?;
-                    tx.commit().map_err(|e| e.to_string())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
                 })
                 .is_err()
                 {
                     return;
                 }
-                if codex {
-                    // Claude oturumu Codex'te açılamaz: yeni oturum.
-                    options.resume = None;
-                    options.fresh = true;
-                }
                 options.model_route_reason = Some(b.label());
                 let text = format!("{} → {} ile açıldı.", b.label(), chain_target_label(&to));
                 let _ = self.events.emit("dex-chain", &serde_json::json!({
                     "agentId": id, "from": "anthropic", "to": to,
-                    "activeEngine": engine.as_deref().unwrap_or("claude"),
-                    "activeProvider": provider,
+                    "activeEngine": "claude",
+                    "activeProvider": to,
                     "resetAt": b.resets_at, "text": text,
                 }));
                 eprintln!("dex: {id}: {} — {} ile açılıyor", b.label(), chain_target_label(&to));
@@ -1916,14 +1674,11 @@ impl crate::Core {
                     if crate::chain::exhausted(c)?.iter().any(|e| e.provider == "anthropic") {
                         return Ok(false);
                     }
-                    let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
-                    tx.execute(
+                    c.execute(
                         "UPDATE agents SET active_engine = NULL, active_provider = NULL, active_model = NULL, chain_return_pending = 0 WHERE id = ?1",
                         [id],
                     )
                     .map_err(|e| e.to_string())?;
-                    tx.execute("DELETE FROM agent_chain_origins WHERE agent_id = ?1", [id]).map_err(|e| e.to_string())?;
-                    tx.commit().map_err(|e| e.to_string())?;
                     Ok(true)
                 })
                 .unwrap_or(false);
@@ -1937,11 +1692,8 @@ impl crate::Core {
     }
 }
 
-/// #1033: ajanın şu an koştuğu motor (zincir kimliği): geçici Codex, geçici sağlayıcı, asıl motor.
+/// #1033: ajanın şu an koştuğu motor (zincir kimliği): geçici sağlayıcı, yoksa asıl sağlayıcı.
 fn current_motor(a: &crate::teams::Agent) -> &str {
-    if a.active_engine.as_deref() == Some("codex") || (a.active_engine.is_none() && a.engine == "codex") {
-        return "codex";
-    }
     a.active_provider.as_deref().unwrap_or(&a.provider)
 }
 
@@ -1970,55 +1722,20 @@ pub(crate) struct ChainPlan {
 }
 
 fn chain_target_label(id: &str) -> String {
-    if id == "codex" {
-        "Codex".into()
-    } else {
-        crate::providers::get(id).map(|p| p.label).unwrap_or(id).to_string()
-    }
-}
-
-fn save_chain_origin(conn: &Connection, agent: &str, session: Option<&str>, transcript: Option<&str>) -> Result<(), String> {
-    let saved = conn
-        .query_row(
-            "SELECT session_id, transcript FROM agent_sessions WHERE agent_id = ?1 AND engine = 'claude' AND session_id <> ''",
-            [agent],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let session = session.map(str::to_string).or_else(|| saved.as_ref().map(|x| x.0.clone()));
-    let transcript = transcript.map(str::to_string).or_else(|| saved.and_then(|x| x.1));
-    // #838 D: the origin keeps the binding it ran on; `chain_back` resumes it only on that one.
-    let b = session_row(conn, agent)?.map(|s| s.binding).unwrap_or_default();
-    conn.execute(
-        "INSERT INTO agent_chain_origins (agent_id, engine, session_id, transcript, project_id, delegation_id, cwd)
-         VALUES (?1, 'claude', ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(agent_id) DO UPDATE SET engine = excluded.engine,
-             session_id = excluded.session_id, transcript = excluded.transcript,
-             project_id = excluded.project_id, delegation_id = excluded.delegation_id, cwd = excluded.cwd",
-        rusqlite::params![agent, session, transcript, b.project_id, b.delegation_id, b.cwd],
-    )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    crate::providers::get(id).map(|p| p.label).unwrap_or(id).to_string()
 }
 
 fn restore_chain_state(
     conn: &Connection,
     agent: &str,
     prior: &(Option<String>, Option<String>, Option<String>),
-    clear_origin: bool,
 ) -> Result<(), String> {
-    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
-    tx.execute(
+    conn.execute(
         "UPDATE agents SET active_engine = ?2, active_provider = ?3, active_model = ?4 WHERE id = ?1",
         rusqlite::params![agent, prior.0, prior.1, prior.2],
     )
-    .map_err(|e| e.to_string())?;
-    if clear_origin {
-        tx.execute("DELETE FROM agent_chain_origins WHERE agent_id = ?1", [agent])
-            .map_err(|e| e.to_string())?;
-    }
-    tx.commit().map_err(|e| e.to_string())
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Lider notundaki ", en erken sıfırlanma <saat>" (UTC, RFC 3339); bilinmiyorsa boş.
@@ -2044,14 +1761,14 @@ fn ms_to_iso(ms: i64) -> String {
 }
 
 /// FIX-4: whether `--resume` can open this transcript. claude writes its file at the first prompt/// but only with metadata lines (last-prompt, mode…); `--resume` needs a conversation line
-/// (`user`/`assistant`), which lands once the turn gets going. A codex rollout is resumable once
-/// it exists (`session_meta` first). Only the head is read: those lines come early.
+/// (`user`/`assistant`), which lands once the turn gets going. Only the head is read: those lines
+/// come early.
 pub fn resumable_transcript(path: &std::path::Path) -> bool {
     use std::io::BufRead;
     let Ok(file) = std::fs::File::open(path) else { return false };
     std::io::BufReader::new(file).lines().take(64).map_while(Result::ok).any(|line| {
         serde_json::from_str::<serde_json::Value>(&line)
-            .is_ok_and(|v| matches!(v["type"].as_str(), Some("user" | "assistant" | "session_meta")))
+            .is_ok_and(|v| matches!(v["type"].as_str(), Some("user" | "assistant")))
     })
 }
 
@@ -2113,7 +1830,7 @@ mod tests {
         let root = std::env::current_dir().unwrap().join("../../.dex/tmp/leader-colors-env-test");
         let skills = crate::skills::Skills { root: root.clone() };
         let mut env = vec![("DEX_WT".into(), "x".into())];
-        for (engine, kind) in [("claude", "worker"), ("codex", "leader"), ("shell", "leader")] {
+        for (engine, kind) in [("claude", "worker"), ("shell", "leader")] {
             leader_colors_env(&skills, engine, kind, Some("existing"), &mut env).unwrap();
             assert_eq!(env.len(), 1);
             assert!(!root.exists(), "non-leader must not materialize the mod");
@@ -2167,19 +1884,17 @@ mod tests {
         assert_eq!(states.typing_retry_delay("ayla"), Some(std::time::Duration::ZERO));
     }
 
-    /// #671: effort as the CLI's env (claude engines) — none adds nothing, a given one wins over
-    /// an earlier entry; codex gets it in argv instead (codex.rs). A respawn with no effort of its
+    /// #671: effort as the CLI's env — none adds nothing, a given one wins over
+    /// an earlier entry. A respawn with no effort of its
     /// own (the chain/quota paths build fresh `StartOptions`) takes the running job's.
     #[test]
     fn effort_reaches_the_spawn_and_survives_a_respawn_mid_job() {
         use crate::effort::{Effort, CLAUDE_ENV};
         let mut env = vec![("DEX_WT".to_string(), "x".to_string())];
-        effort_env("claude", None, &mut env);
+        effort_env(None, &mut env);
         assert_eq!(env.len(), 1, "no effort: no env");
-        effort_env("codex", Some(Effort::High), &mut env);
-        assert_eq!(env.len(), 1, "codex: argv, not env");
         env.push((CLAUDE_ENV.into(), "low".into()));
-        effort_env("claude", Some(Effort::Medium), &mut env);
+        effort_env(Some(Effort::Medium), &mut env);
         assert_eq!(env.iter().filter(|(k, _)| k == CLAUDE_ENV).collect::<Vec<_>>(), [&(CLAUDE_ENV.to_string(), "medium".to_string())]);
 
         let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
@@ -2233,47 +1948,6 @@ mod tests {
         assert!(!states.get("kaan").in_turn(), "an exit too");
     }
 
-    #[test]
-    fn codex_pending_prompt_survives_session_start() {
-        let states = States::default();
-        let written_at = now().saturating_sub(1);
-        states.started("kaan", "codex", true);
-        states.hook("kaan", Some(Status::Idle), Some("session"));
-        assert!(states.codex_observed("kaan", 1, Some("A"), Some(written_at)).is_some(),
-            "SessionStart must not reject the prompted process's already written start");
-    }
-
-    #[test]
-    fn codex_completion_preserves_a_newer_hook_boundary() {
-        let states = States::default();
-        states.started("kaan", "codex", false);
-        states.hook("kaan", Some(Status::Idle), None);
-        let hook_boundary = states.get("kaan").codex_after;
-        assert!(states.codex_observed("kaan", 1, Some("B"), Some(hook_boundary)).is_some());
-        assert_eq!(states.codex_completed("kaan", 1, "B", Some(hook_boundary - 1)).unwrap().status, Status::Idle);
-        assert_eq!(states.get("kaan").codex_after, hook_boundary, "a delayed completion cannot move the hook boundary backwards");
-        assert!(states.codex_observed("kaan", 1, Some("A"), Some(hook_boundary - 1)).is_none());
-        assert!(states.codex_observed("kaan", 1, Some("C"), Some(hook_boundary)).is_some());
-    }
-
-    #[test]
-    fn codex_unobserved_turn_is_bounded_by_its_stop() {
-        let states = States::default();
-        states.started("kaan", "codex", false);
-        let written_at = now().saturating_sub(1);
-        // Even A's Working signal may still be unread when its Stop arrives.
-        states.hook("kaan", Some(Status::Idle), None);
-        states.hook("kaan", Some(Status::Working), None);
-        assert!(states.codex_observed("kaan", 1, Some("A"), Some(written_at)).is_none());
-        assert!(states.codex_observed("kaan", 1, Some("A"), None).is_none(), "unproven timestamps cannot cross the boundary");
-        assert_eq!(states.get("kaan").status, Status::Working);
-        let new_start = states.get("kaan").codex_after;
-        assert!(states.codex_observed("kaan", 1, Some("B"), Some(new_start)).is_some(),
-            "a new start written before the Working hook remains valid");
-        assert!(states.codex_completed("kaan", 1, "A", None).is_none());
-        assert_eq!(states.codex_completed("kaan", 1, "B", None).unwrap().status, Status::Idle);
-    }
-
     /// Synthetic hook race: the memory Write's PostToolUse was accepted before the Stop but its thread
     /// reached the status after it — the worker stayed "working" and its queue never moved.
     #[test]
@@ -2325,7 +1999,7 @@ mod tests {
         let conn = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         record_session(&conn, "kaan", "session-1", "claude", None).unwrap();
         assert_eq!(resumable_session(&conn, "kaan", "claude").unwrap().as_deref(), Some("session-1"));
-        assert_eq!(resumable_session(&conn, "kaan", "codex").unwrap(), None);
+        assert_eq!(resumable_session(&conn, "kaan", "shell").unwrap(), None);
         // FIX-4: a lost session goes; another agent's or another id's row stays.
         assert!(!forget_session(&conn, "kaan", "claude", "other").unwrap());
         assert!(forget_session(&conn, "kaan", "claude", "session-1").unwrap());
@@ -2356,7 +2030,7 @@ mod tests {
             crate::teams::update_agent(c, "kaan", crate::teams::AgentPatch {
                 provider: Some("glm".into()), model: Some("sonnet".into()), ..Default::default()
             })?;
-            crate::chain::set_order(c, &["glm".into(), "codex".into(), "anthropic".into(), "muse".into(), "local".into()])?;
+            crate::chain::set_order(c, &["muse".into(), "glm".into(), "anthropic".into(), "local".into()])?;
             Ok(())
         })
         .unwrap();
@@ -2364,16 +2038,16 @@ mod tests {
             "hook_event_name": "StopFailure", "error": "rate_limit",
             "last_assistant_message": "API Error: 429 · [1308][Usage limit reached for 5 hour. Your limit will reset at 2099-01-01 12:00:00]",
         });
-        // GLM'den sonraki son halka Codex; zincir listenin başına geri sarmaz.
+        // GLM'den sonraki halka Claude; zincir listenin başına (Muse) geri sarmaz.
         let plan = core.chain_plan("kaan", &body).expect("kalıcı kota → plan");
         assert_eq!(plan.current, "glm");
-        assert_eq!(plan.next.as_deref(), Some("codex"));
+        assert_eq!(plan.next.as_deref(), Some("anthropic"));
         assert_eq!(plan.reset, crate::chain::parse_glm_reset("reset at 2099-01-01 12:00:00"));
         // Zincir kapalıysa plan YOK (normal failed akışı).
         core.chain_set_agent("kaan", true).unwrap();
         assert!(core.chain_plan("kaan", &body).is_none());
         core.chain_set_agent("kaan", false).unwrap();
-        // Claude sağlayıcıları tükenince son halka Codex'tir.
+        // Sağlayıcıların hepsi tükenince sırada kimse yok: plan yine var, yürütücü bekletir.
         crate::db::with(&core.db, |c| {
             for p in ["anthropic", "muse", "local"] {
                 crate::chain::mark_exhausted(c, p, Some(9_999_999_999_999), "test")?;
@@ -2382,9 +2056,8 @@ mod tests {
         })
         .unwrap();
         let wait = core.chain_plan("kaan", &body).expect("tükenmiş zincir de plan");
-        assert_eq!(wait.next.as_deref(), Some("codex"));
-        // Codex'in kendisi kullanılamazsa yürütücünün ulaştığı son durum: bekleme.
-        core.chain_execute("kaan", ChainPlan { next: None, ..wait });
+        assert_eq!(wait.next, None);
+        core.chain_execute("kaan", wait);
         // GLM kayda girdi, PTY açılmadı (bekleme), olaylar yayında.
         let events = got.lock().unwrap();
         assert!(events.iter().any(|(e, _)| e == "dex-chain-wait"), "{events:?}");
@@ -2468,7 +2141,7 @@ mod tests {
             crate::teams::update_agent(c, "kaan", crate::teams::AgentPatch {
                 provider: Some("glm".into()), model: Some("sonnet".into()), ..Default::default()
             })?;
-            crate::chain::set_order(c, &["muse".into(), "anthropic".into(), "glm".into(), "local".into(), "codex".into()])?;
+            crate::chain::set_order(c, &["muse".into(), "anthropic".into(), "glm".into(), "local".into()])?;
             Ok(())
         })
         .unwrap();
@@ -2541,7 +2214,7 @@ mod tests {
             c.execute("UPDATE agents SET active_provider = 'muse', active_model = 'muse-spark-1.3' WHERE id = 'kaan'", [])
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
-            crate::chain::set_order(c, &["muse".into(), "anthropic".into(), "glm".into(), "local".into(), "codex".into()])?;
+            crate::chain::set_order(c, &["muse".into(), "anthropic".into(), "glm".into(), "local".into()])?;
             Ok(())
         })
         .unwrap();
@@ -2676,8 +2349,8 @@ mod tests {
         std::fs::write(&transcript, r#"{"type":"user","message":{"role":"user","content":"devam"}}"#).unwrap();
         crate::db::with(&core.db, |c| {
             c.execute(
-                "UPDATE agents SET active_engine = 'codex', active_model = 'gpt-5.6-terra',
-                 pending_engine = 'codex', pending_model = 'gpt-5.6-terra' WHERE id = 'kaan'",
+                "UPDATE agents SET active_provider = 'glm', active_model = 'GLM-5.3',
+                 pending_engine = 'claude', pending_model = 'claude-haiku-4-5' WHERE id = 'kaan'",
                 [],
             )
             .map(|_| ())
@@ -2690,7 +2363,7 @@ mod tests {
                 .map_err(|e| e.to_string())
         })
         .unwrap();
-        assert_eq!(engine, "claude", "geç kalan kaynak hook active_engine'e yazılmamalı");
+        assert_eq!(engine, "claude", "geç kalan kaynak hook kaynak motoruyla yazılmalı");
 
         core.chain_guard.lock().unwrap().insert("kaan".into());
         core.delegation_session_exited("kaan").unwrap();
@@ -2713,25 +2386,16 @@ mod tests {
         .unwrap();
         crate::db::with(&core.db, |c| {
             c.execute(
-                "UPDATE agents SET active_engine = 'codex', active_provider = 'glm', active_model = 'gpt-5.6-terra' WHERE id = 'kaan'",
+                "UPDATE agents SET active_provider = 'glm', active_model = 'GLM-5.3' WHERE id = 'kaan'",
                 [],
             )
             .map_err(|e| e.to_string())?;
-            save_chain_origin(c, "kaan", Some("source"), None)?;
-            restore_chain_state(c, "kaan", &(None, None, None), true)
+            restore_chain_state(c, "kaan", &(None, None, None))
         })
         .unwrap();
         core.chain_spawn_failed("kaan", "spawn testi");
-        let (agent, origins) = crate::db::with(&core.db, |c| {
-            let a = crate::teams::get_agent(c, "kaan")?;
-            let n = c
-                .query_row("SELECT COUNT(*) FROM agent_chain_origins WHERE agent_id = 'kaan'", [], |row| row.get::<_, i64>(0))
-                .map_err(|e| e.to_string())?;
-            Ok((a, n))
-        })
-        .unwrap();
+        let agent = crate::db::with(&core.db, |c| crate::teams::get_agent(c, "kaan")).unwrap();
         assert!(agent.active_engine.is_none() && agent.active_provider.is_none() && agent.active_model.is_none());
-        assert_eq!(origins, 0);
         assert!(!core.ptys.is_running("kaan"));
         assert_eq!(core.agent_states.get("kaan").status, Status::Offline);
         core.shutdown();
@@ -2787,7 +2451,6 @@ mod tests {
         let mut talk = meta.to_vec();
         talk.push(r#"{"type":"user","message":{"role":"user","content":"x"}}"#);
         assert!(resumable_transcript(&file("talk.jsonl", &talk)));
-        assert!(resumable_transcript(&file("codex.jsonl", &[r#"{"type":"session_meta","payload":{}}"#])));
         assert!(!resumable_transcript(&dir.join("missing.jsonl")));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3502,7 +3165,7 @@ mod quota_tests {
         fn resized(&mut self, _cols: u16, _rows: u16) {}
     }
 
-    type Pick = (Option<(String, Option<String>, Option<String>, String)>, Vec<String>);
+    type Pick = (Option<(String, String)>, Vec<String>);
 
     fn core(tag: &str) -> (Arc<crate::Core>, std::path::PathBuf, Arc<Fixed>) {
         let root = std::env::temp_dir().join(format!("dex-quota-{tag}-{}", std::process::id()));
@@ -3526,7 +3189,7 @@ mod quota_tests {
     }
 
     fn muse(_: &str) -> Pick {
-        (Some(("muse".into(), None, Some("muse".into()), "muse-spark-1.3".into())), Vec::new())
+        (Some(("muse".into(), "muse-spark-1.3".into())), Vec::new())
     }
 
     fn on_glm(core: &crate::Core, id: &str) {
@@ -3596,7 +3259,7 @@ mod quota_tests {
         assert!(!core.quota.lock().unwrap().warned);
         // Eşik üstü (5 sa 85) ama zincirde Claude dışında açık hedef yok: iş durmaz.
         crate::db::with(&core.db, |c| {
-            crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into(), "codex".into()]).map(|_| ())
+            crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into()]).map(|_| ())
         })
         .unwrap();
         set(&src, 85.0, 10.0);
@@ -3653,18 +3316,6 @@ mod quota_tests {
     }
 
     #[test]
-    fn codex_target_drops_the_claude_resume() {
-        let (core, root, src) = core("codex");
-        set(&src, 95.0, 10.0);
-        core.quota_tick();
-        let mut o = StartOptions { resume: Some("claude-session".into()), ..Default::default() };
-        core.quota_route_by("kaan", &mut o, &|_| (Some(("codex".into(), Some("codex".into()), None, "gpt-x".into())), Vec::new()));
-        assert!(o.resume.is_none() && o.fresh);
-        assert_eq!(agent(&core, "kaan").active_engine.as_deref(), Some("codex"));
-        finish(core, root);
-    }
-
-    #[test]
     fn threshold_plan_never_marks_claude_exhausted_or_parks_the_worker() {
         let (core, root, _) = core("plan");
         core.chain_execute("kaan", ChainPlan {
@@ -3684,20 +3335,13 @@ mod quota_tests {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
     }
 
-    /// Sentetik Codex rollout'u: haftalık pencere `used` dolu, çağıranın `reset_s` anında sıfırlanır.
-    fn codex_rollout(root: &std::path::Path, used: f64, reset_s: i64) {
-        let day = root.join("codex-sessions").join("2002").join("01").join("01");
-        std::fs::create_dir_all(&day).unwrap();
-        let line = format!(
-            r#"{{"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"limit_id":"codex","primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":{reset_s}}},"secondary":null}}}}}}"#
-        );
-        std::fs::write(day.join("rollout-2002-01-01T12-00-20-x.jsonl"), line).unwrap();
-        CODEX_SESSIONS.with(|s| *s.borrow_mut() = Some(root.join("codex-sessions")));
-    }
-
-    /// Zincirde yalnız Codex açık (Claude'dan sonra).
-    fn only_codex(core: &crate::Core) {
-        crate::db::with(&core.db, |c| crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into()]).map(|_| ())).unwrap();
+    /// Zincirde yalnız Muse açık (Claude'dan sonra); kotası `reset_ms`'e kadar bitmiş kayıtlı.
+    fn only_muse_dry(core: &crate::Core, reset_ms: i64) {
+        crate::db::with(&core.db, |c| {
+            crate::chain::set_disabled(c, &["glm".into(), "local".into()])?;
+            crate::chain::mark_exhausted(c, "muse", Some(reset_ms), "kota")
+        })
+        .unwrap();
     }
 
     fn notes(core: &crate::Core, lead: &str) -> Vec<String> {
@@ -3710,41 +3354,14 @@ mod quota_tests {
     }
 
     #[test]
-    fn unknown_codex_quota_keeps_codex_a_candidate() {
-        let (core, root, _) = core("codex-unknown");
-        only_codex(&core);
-        let next = |core: &crate::Core| {
-            core.chain_measure();
-            crate::db::with(&core.db, |c| crate::chain::pick_next(c, "anthropic", &|_| true)).unwrap()
-        };
-        // Ölçüm kaynağı yok: eski davranış.
-        assert_eq!(next(&core).as_deref(), Some("codex"));
-        // Kotası var / sıfırlanması geçmiş: aday.
-        codex_rollout(&root, 60.0, now() / 1000 + 3_600);
-        assert_eq!(next(&core).as_deref(), Some("codex"));
-        codex_rollout(&root, 100.0, now() / 1000 - 60);
-        assert_eq!(next(&core).as_deref(), Some("codex"));
-        assert!(crate::db::with(&core.db, crate::chain::exhausted).unwrap().is_empty());
-        // Bitmiş ve sıfırlanması gelecekte: atlanır, saatiyle tükenmiş kaydına girer.
-        let reset_s = now() / 1000 + 3_600;
-        codex_rollout(&root, 100.0, reset_s);
-        assert_eq!(next(&core), None);
-        let rows = crate::db::with(&core.db, crate::chain::exhausted).unwrap();
-        assert_eq!(rows.iter().map(|e| (e.provider.as_str(), e.reset_at)).collect::<Vec<_>>(), vec![("codex", reset_s * 1000)]);
-        CODEX_SESSIONS.with(|s| s.borrow_mut().take());
-        finish(core, root);
-    }
-
-    #[test]
-    fn threshold_with_codex_dry_stays_on_claude_and_notifies_once() {
-        let (core, root, src) = core("codex-dry");
+    fn threshold_with_next_dry_stays_on_claude_and_notifies_once() {
+        let (core, root, src) = core("next-dry");
         busy_team(&core);
-        only_codex(&core);
-        codex_rollout(&root, 100.0, now() / 1000 + 3_600);
+        only_muse_dry(&core, now() + 3_600_000);
         set(&src, 90.0, 10.0);
         assert!(core.quota_tick());
         let kaan = agent(&core, "kaan");
-        assert!(kaan.active_provider.is_none() && kaan.active_engine.is_none(), "Codex'e geçmez, Claude'da kalır");
+        assert!(kaan.active_provider.is_none() && kaan.active_engine.is_none(), "Muse'a geçmez, Claude'da kalır");
         assert!(core.ptys.is_running("kaan"), "oturum öldürülmez");
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
@@ -3752,19 +3369,17 @@ mod quota_tests {
         // Sonraki ölçüm ve aynı bölümde açılan worker yeni bildirim üretmez.
         assert!(core.quota_tick());
         core.quota_route("kaan", &mut job_start("iş".into(), vec![]));
-        assert!(agent(&core, "kaan").active_engine.is_none(), "taze spawn da Codex'te açılmaz");
+        assert!(agent(&core, "kaan").active_provider.is_none(), "taze spawn da Muse'da açılmaz");
         assert_eq!(notes(&core, "timur").len(), 1, "tek bildirim");
-        CODEX_SESSIONS.with(|s| s.borrow_mut().take());
         finish(core, root);
     }
 
     #[test]
     fn stop_failure_with_every_motor_dry_waits_with_earliest_reset() {
-        let (core, root, _) = core("codex-wait");
+        let (core, root, _) = core("all-dry-wait");
         busy_team(&core);
-        only_codex(&core);
-        let codex_reset = now() / 1000 + 7_200;
-        codex_rollout(&root, 100.0, codex_reset);
+        let muse_reset = now() + 7_200_000;
+        only_muse_dry(&core, muse_reset);
         let claude_reset = now() + 3_600_000;
         core.chain_measure();
         core.chain_execute("kaan", ChainPlan {
@@ -3775,8 +3390,7 @@ mod quota_tests {
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0], format!("kaan: zincirde kotası olan motor yok, en erken sıfırlanma {} — iş bekliyor.", ms_to_iso(claude_reset)));
-        assert!(codex_reset * 1000 > claude_reset);
-        CODEX_SESSIONS.with(|s| s.borrow_mut().take());
+        assert!(muse_reset > claude_reset);
         finish(core, root);
     }
 
@@ -3822,13 +3436,13 @@ mod quota_tests {
         let week = ms_to_iso(now() + 86_400_000);
         *src.0.lock().unwrap() = Usage { five_hour: 10.0, seven_day: 100.0, seven_day_resets_at: Some(week), ..Default::default() };
         assert!(core.quota_tick());
-        // Hedef yok (Codex hazır değil): Claude'da açılır, nedeni erişim — tek not.
-        let none = |_: &str| -> Pick { (None, vec!["Codex kullanılamıyor: giriş yok".into()]) };
+        // Hedef yok (jeton yok): Claude'da açılır, nedeni erişim — tek not.
+        let none = |_: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         assert!(agent(&core, "kaan").active_provider.is_none());
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].starts_with("kaan: Claude %100 (hafta) ama zincirde jetonu/erişimi olan motor yok (Codex kullanılamıyor: giriş yok)"), "{}", got[0]);
+        assert!(got[0].starts_with("kaan: Claude %100 (hafta) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"), "{}", got[0]);
         assert!(core.quota_tick(), "haftalık dolu sürerken ölçüm bildirimi sıfırlamaz");
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         assert_eq!(notes(&core, "timur").len(), 1, "tek bildirim");
@@ -3838,165 +3452,7 @@ mod quota_tests {
         finish(core, root);
     }
 
-    #[test]
-    fn below_threshold_on_claude_skips_the_codex_scan() {
-        let (core, root, src) = core("no-scan");
-        codex_rollout(&root, 100.0, now() / 1000 + 3_600);
-        set(&src, 10.0, 10.0);
-        core.quota_tick();
-        core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &muse);
-        assert!(crate::db::with(&core.db, crate::chain::exhausted).unwrap().is_empty(), "seçim yok: ölçüm yok");
-        set(&src, 90.0, 10.0);
-        core.quota_tick();
-        core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &muse);
-        let rows = crate::db::with(&core.db, crate::chain::exhausted).unwrap();
-        assert_eq!(rows.iter().map(|e| e.provider.as_str()).collect::<Vec<_>>(), vec!["codex"], "eşik üstü seçimde ölçülür");
-        CODEX_SESSIONS.with(|s| s.borrow_mut().take());
-        finish(core, root);
-    }
-
-    /// Codex'in kota biten turu (codex-cli 0.154): önce %100 `token_count`, sonra hatalı `task_complete`.
-    fn codex_limit_turn(file: &std::path::Path, reset_s: i64) {
-        codex_limit_turn_at(file, reset_s, now());
-    }
-
-    /// [`codex_limit_turn`], tur sonu `at_ms` zaman damgalı (rollout satırları damgalı yazılır).
-    fn codex_limit_turn_at(file: &std::path::Path, reset_s: i64, at_ms: i64) {
-        use std::io::Write;
-        let ts = ms_to_iso(at_ms);
-        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(file).unwrap();
-        writeln!(f, r#"{{"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"limit_id":"codex","primary":{{"used_percent":100.0,"window_minutes":10080,"resets_at":{reset_s}}},"secondary":null}}}}}}"#).unwrap();
-        writeln!(f, r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"t","last_agent_message":null,"error":{{"message":"You’ve hit your usage limit.","codex_error_info":"usage_limit_exceeded"}}}}}}"#).unwrap();
-    }
-
-    fn on_codex(core: &crate::Core, id: &str) {
-        crate::db::with(&core.db, |c| {
-            c.execute("UPDATE agents SET active_engine = 'codex', active_model = 'gpt-x' WHERE id = ?1", [id]).map(|_| ()).map_err(|e| e.to_string())
-        })
-        .unwrap();
-    }
-
-    fn exhausted_rows(core: &crate::Core) -> Vec<(String, i64)> {
-        crate::db::with(&core.db, crate::chain::exhausted).unwrap().into_iter().map(|e| (e.provider, e.reset_at)).collect()
-    }
-
-    #[test]
-    fn codex_limit_mid_job_returns_to_free_claude() {
-        let (core, root, _) = core("codex-limit-back");
-        busy_team(&core);
-        on_codex(&core, "kaan");
-        let file = root.join("rollout-kaan.jsonl");
-        let reset_s = now() / 1000 + 7_200;
-        codex_limit_turn(&file, reset_s);
-        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        core.chain_codex_limit("kaan", &file);
-        let starts = CAPTURE.with(|c| c.borrow_mut().take().unwrap());
-        let kaan = agent(&core, "kaan");
-        assert!(kaan.active_engine.is_none() && kaan.active_provider.is_none(), "asıl Claude'a döndü");
-        assert_eq!(starts.len(), 1, "tek yeniden başlatma");
-        assert_eq!(exhausted_rows(&core), vec![("codex".to_string(), reset_s * 1000)], "Codex rollout'taki sıfırlanmayla tükenmiş");
-        let got = notes(&core, "timur");
-        assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].starts_with("kaan: Codex → ") && got[0].ends_with("ile sürüyor — iş bölünmedi."), "{}", got[0]);
-        finish(core, root);
-    }
-
-    #[test]
-    fn codex_limit_with_claude_dry_waits_with_one_note() {
-        let (core, root, _) = core("codex-limit-wait");
-        busy_team(&core);
-        on_codex(&core, "kaan");
-        let claude_reset = now() + 3_600_000;
-        crate::db::with(&core.db, |c| crate::chain::mark_exhausted(c, "anthropic", Some(claude_reset), "kota")).unwrap();
-        let file = root.join("rollout-kaan.jsonl");
-        codex_limit_turn(&file, now() / 1000 + 7_200);
-        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        core.chain_codex_limit("kaan", &file);
-        assert!(CAPTURE.with(|c| c.borrow_mut().take().unwrap()).is_empty(), "başlatma yok");
-        assert_eq!(core.agent_states.get("kaan").status, Status::Waiting);
-        assert_eq!(agent(&core, "kaan").active_engine.as_deref(), Some("codex"));
-        let got = notes(&core, "timur");
-        assert_eq!(got, vec![format!("kaan: zincirde kotası olan motor yok, en erken sıfırlanma {} — iş bekliyor.", ms_to_iso(claude_reset))]);
-        // Claude sıfırlanınca bekleyen (geçici motoru tükenmiş) oturum kapanışı beklemeden döner.
-        crate::db::with(&core.db, |c| crate::chain::clear_exhausted(c, "anthropic")).unwrap();
-        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        core.chain_return("anthropic");
-        assert_eq!(CAPTURE.with(|c| c.borrow_mut().take().unwrap()).len(), 1);
-        assert!(agent(&core, "kaan").active_engine.is_none(), "bekleme Claude'a dönüşle biter");
-        finish(core, root);
-    }
-
-    #[test]
-    fn codex_engine_agent_waits_and_others_are_ignored() {
-        let (core, root, _) = core("codex-native");
-        busy_team(&core);
-        let file = root.join("rollout-kaan.jsonl");
-        let reset_s = now() / 1000 + 7_200;
-        codex_limit_turn(&file, reset_s);
-        // Claude'da koşan ajan: sinyal onun değil.
-        core.chain_codex_limit("kaan", &file);
-        assert!(exhausted_rows(&core).is_empty());
-        crate::db::with(&core.db, |c| c.execute("UPDATE agents SET engine = 'codex' WHERE id = 'kaan'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
-        core.chain_codex_limit("kaan", &file);
-        assert_eq!(core.agent_states.get("kaan").status, Status::Waiting);
-        assert_eq!(exhausted_rows(&core), vec![("codex".to_string(), reset_s * 1000)]);
-        assert_eq!(notes(&core, "timur"), vec![format!("kaan: Codex kotası doldu, en erken sıfırlanma {} — iş bekliyor.", ms_to_iso(reset_s * 1000))]);
-        finish(core, root);
-    }
-
-    #[test]
-    fn leaving_codex_starts_fresh_with_the_codex_handoff() {
-        let (core, root, _) = core("codex-leave");
-        on_codex(&core, "kaan");
-        let file = root.join("rollout-kaan.jsonl");
-        std::fs::write(&file, r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"göç betiğini yaz"}]}}
-"#).unwrap();
-        codex_limit_turn(&file, now() / 1000 + 7_200);
-        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        core.chain_execute("kaan", ChainPlan {
-            current: "codex".into(), next: Some("anthropic".into()), reset: None, reason: "kota".into(),
-            session: None, transcript: Some(file.to_string_lossy().into_owned()), threshold: None, threshold_reset: None,
-        });
-        let starts = CAPTURE.with(|c| c.borrow_mut().take().unwrap());
-        assert_eq!(starts.len(), 1);
-        assert!(!starts[0].0.args.iter().any(|a| a == "--resume"), "Codex oturumu Claude'da sürdürülemez: yeni oturum");
-        assert!(starts[0].0.args.iter().any(|a| a.contains("göç betiğini yaz")), "devir Codex rollout'undan, ilk turda: {:?}", starts[0].0.args);
-        assert_eq!(agent(&core, "kaan").active_engine, None);
-        finish(core, root);
-    }
-
-    /// Uçtan uca: canlı sohbet izleyicisi (dosya olayı) kota hatalı turu görür → ajan bekler.
-    #[test]
-    fn the_live_rollout_watch_catches_the_limit() {
-        let (core, root, _) = core("codex-watch");
-        busy_team(&core);
-        on_codex(&core, "kaan");
-        // Dönüş adayı yok: yol spawn'sız bekletmede biter (izleyici thread'i CAPTURE görmez).
-        crate::db::with(&core.db, |c| crate::chain::mark_exhausted(c, "anthropic", Some(now() + 3_600_000), "kota")).unwrap();
-        let file = root.join("rollout-kaan.jsonl");
-        std::fs::write(&file, "").unwrap();
-        // #1033: ensure izleyici dinlemeye başlayınca döner — uyku yok.
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &file);
-        codex_limit_turn(&file, now() / 1000 + 7_200);
-        let t = std::time::Instant::now();
-        while core.agent_states.get("kaan").status != Status::Waiting && t.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert_eq!(core.agent_states.get("kaan").status, Status::Waiting);
-        assert!(exhausted_rows(&core).iter().any(|(p, _)| p == "codex"));
-        core.chat_watches.drop_watch("kaan");
-        finish(core, root);
-    }
-
     // ── #1033 ──
-
-    fn wait_status(core: &crate::Core, id: &str, want: Status) -> bool {
-        let t = std::time::Instant::now();
-        while core.agent_states.get(id).status != want && t.elapsed() < std::time::Duration::from_secs(10) {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        core.agent_states.get(id).status == want
-    }
 
     #[test]
     fn unreachable_mark_leaves_a_healthy_session_alone() {
@@ -4025,22 +3481,23 @@ mod quota_tests {
     }
 
     #[test]
-    fn codex_reset_continues_a_native_codex_agent_waiting_on_quota() {
-        let (core, root, _) = core("codex-resume");
+    fn provider_reset_continues_an_agent_waiting_on_quota() {
+        let (core, root, _) = core("glm-resume");
         busy_team(&core);
         crate::db::with(&core.db, |c| {
-            c.execute("UPDATE agents SET engine = 'codex' WHERE id IN ('kaan', 'bora')", []).map(|_| ()).map_err(|e| e.to_string())
+            c.execute("UPDATE agents SET provider = 'glm', model = 'GLM-5.3' WHERE id IN ('kaan', 'bora')", []).map(|_| ()).map_err(|e| e.to_string())
         })
         .unwrap();
-        let file = root.join("rollout-kaan.jsonl");
-        codex_limit_turn(&file, now() / 1000 + 7_200);
-        assert!(core.chain_codex_limit("kaan", &file));
+        core.chain_execute("kaan", ChainPlan {
+            current: "glm".into(), next: None, reset: Some(now() + 7_200_000), reason: "kota".into(),
+            session: None, transcript: None, threshold: None, threshold_reset: None,
+        });
         assert_eq!(core.agent_states.get("kaan").status, Status::Waiting);
-        // bora başka bir nedenle bekliyor (izin penceresi): Codex sıfırlanması ona yazmaz.
+        // bora başka bir nedenle bekliyor (izin penceresi): GLM sıfırlanması ona yazmaz.
         core.agent_states.hook("bora", Some(Status::Waiting), None);
-        crate::db::with(&core.db, |c| crate::chain::clear_exhausted(c, "codex")).unwrap();
+        crate::db::with(&core.db, |c| crate::chain::clear_exhausted(c, "glm")).unwrap();
         CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
-        core.chain_return("codex");
+        core.chain_return("glm");
         assert!(CAPTURE.with(|c| c.borrow_mut().take().unwrap()).is_empty(), "aynı oturumda sürer, yeniden başlatma yok");
         let kaan = core.agent_states.get("kaan");
         assert_eq!(kaan.status, Status::Working, "devam turu verildi");
@@ -4050,62 +3507,11 @@ mod quota_tests {
     }
 
     #[test]
-    fn a_guarded_limit_is_not_swallowed_by_the_watch() {
-        let (core, root, _) = core("codex-guarded");
-        busy_team(&core);
-        on_codex(&core, "kaan");
-        crate::db::with(&core.db, |c| crate::chain::mark_exhausted(c, "anthropic", Some(now() + 3_600_000), "kota")).unwrap();
-        let file = root.join("rollout-kaan.jsonl");
-        std::fs::write(&file, "").unwrap();
-        // Eşzamanlı geçiş sürüyor: çağrı işlenmez.
-        core.chain_guard.lock().unwrap().insert("kaan".into());
-        assert!(!core.chain_codex_limit("kaan", &file));
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &file);
-        codex_limit_turn(&file, now() / 1000 + 7_200);
-        // Guard'lı çağrının koşması için pay; yük altında geç koşarsa test yalnız zayıflar, kırmızı olmaz.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_ne!(core.agent_states.get("kaan").status, Status::Waiting);
-        core.chain_guard.lock().unwrap().remove("kaan");
-        // Guard'lı tur işareti tutmaz: aynı oturumun sonraki kota turu zincire gider. (Eski davranışta
-        // işaret kalırdı ve hiçbir tekrar tetiklemezdi; tur, işaret inene dek yeniden yazılır.)
-        let t = std::time::Instant::now();
-        while core.agent_states.get("kaan").status != Status::Waiting && t.elapsed() < std::time::Duration::from_secs(10) {
-            codex_limit_turn(&file, now() / 1000 + 7_200);
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        assert_eq!(core.agent_states.get("kaan").status, Status::Waiting);
-        core.chat_watches.drop_watch("kaan");
-        finish(core, root);
-    }
-
-    #[test]
-    fn a_limit_written_before_the_watch_still_counts_if_fresh() {
-        let (core, root, _) = core("codex-early");
-        busy_team(&core);
-        on_codex(&core, "kaan");
-        crate::db::with(&core.db, |c| crate::chain::mark_exhausted(c, "anthropic", Some(now() + 3_600_000), "kota")).unwrap();
-        // Eski (resume edilen) oturumun bayat kota hatası: tetiklemez.
-        let old = root.join("rollout-old.jsonl");
-        codex_limit_turn_at(&old, now() / 1000 + 7_200, now() - 2 * crate::chain::CODEX_RECENT_MS);
-        // Karar ensure dönmeden verilir (tetik yoksa thread de yok): uyku gerekmez.
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &old);
-        assert_ne!(core.agent_states.get("kaan").status, Status::Waiting, "bayat hata zinciri tetiklemez");
-        // Taze oturum: ilk tur izleyici SessionStart'ta kurulmadan kota hatasıyla bitti.
-        let fresh = root.join("rollout-kaan.jsonl");
-        codex_limit_turn(&fresh, now() / 1000 + 7_200);
-        core.chat_watches.ensure(core.weak_self.clone(), "kaan", "codex", &fresh);
-        assert!(wait_status(&core, "kaan", Status::Waiting));
-        assert!(exhausted_rows(&core).iter().any(|(p, _)| p == "codex"));
-        core.chat_watches.drop_watch("kaan");
-        finish(core, root);
-    }
-
-    #[test]
     fn threshold_note_does_not_silence_the_weekly_full_note() {
         let (core, root, src) = core("warn-split");
         busy_team(&core);
         crate::db::with(&core.db, |c| {
-            crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into(), "codex".into()]).map(|_| ())
+            crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into()]).map(|_| ())
         })
         .unwrap();
         set(&src, 90.0, 10.0);
@@ -4132,12 +3538,12 @@ mod quota_tests {
         drop(src);
         core.quota.lock().unwrap().last = Some((now(), Usage { five_hour: 90.0, seven_day: 10.0, ..Default::default() }));
         let breach = core.quota.lock().unwrap().breach_at(now()).unwrap();
-        let none = |_: &str| -> Pick { (None, vec!["Codex kullanılamıyor: giriş yok".into()]) };
+        let none = |_: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
         core.quota_switch_by(&breach, &none);
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
-            got[0].starts_with("kaan: Claude %90 (5 sa) ama zincirde jetonu/erişimi olan motor yok (Codex kullanılamıyor: giriş yok)"),
+            got[0].starts_with("kaan: Claude %90 (5 sa) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"),
             "{}",
             got[0]
         );
@@ -4307,7 +3713,7 @@ mod launch_tests {
         .unwrap()
     }
 
-    /// Claude and Codex job starts: the dispatch's job (G passes `d.id`) binds the session to
+    /// Job starts: the dispatch's job (G passes `d.id`) binds the session to
     /// its P and W before the first hook — row, MCP key job, folder, env; nothing resumed.
     #[test]
     fn a_job_start_binds_its_project_and_worktree_before_the_first_hook() {
@@ -4322,7 +3728,7 @@ mod launch_tests {
         let (r, got) = captured(|| e.core.agent_spawn("kaan", o));
         r.unwrap();
         let (req, key_job) = &got[0];
-        assert_eq!(*key_job, Some(2), "MCP key and codex trust bound to the launch job");
+        assert_eq!(*key_job, Some(2), "MCP key bound to the launch job");
         assert_eq!(req.cwd.as_deref(), Some(w2.as_str()), "its worktree, found from the job alone");
         assert!(req.env.contains(&target(&e.p2, "kaan")), "{:?}", req.env);
         assert_eq!(resumed(req), None);
@@ -4332,22 +3738,6 @@ mod launch_tests {
         assert_eq!((ctx.project_id.as_deref(), ctx.delegation_id, ctx.cwd.to_str()), (Some(e.p2.id.as_str()), Some(2), Some(w2.as_str())),
             "SessionStart sees the job's project already");
         assert!(crate::db::with(&e.core.db, |c| resumable_session(c, "kaan", "claude")).unwrap().is_none());
-
-        // Codex: same binding; its trust holds the folder it starts in (no trust prompt there).
-        sql(&e, "UPDATE agents SET engine = 'codex', model = 'gpt-x' WHERE id = 'ayla'", &[]);
-        job(&e, 3, "ayla", &e.p1, "queued", None);
-        let w3 = worktree(&e, 3, "ayla", &e.p1);
-        let mut o = job_start("iş".into(), vec![]);
-        o.delegation_id = Some(3);
-        o.cwd = Some(w3.clone()); // the dispatch's worktree, as today
-        let (r, got) = captured(|| e.core.agent_spawn("ayla", o));
-        r.unwrap();
-        let (req, key_job) = &got[0];
-        assert_eq!((*key_job, req.cmd.as_str(), req.cwd.as_deref()), (Some(3), "codex", Some(w3.as_str())));
-        assert!(req.codex.as_ref().is_some_and(|l| l.resume.is_none()));
-        assert_eq!(row(&e, "ayla").unwrap().binding, bound(&e.p1, 3, &w3));
-        let trust = crate::db::with(&e.core.db, |c| crate::codex::trust_dirs(c, "ayla", true, req.cwd.as_deref(), *key_job)).unwrap();
-        assert_eq!(trust, [w3.as_str()]);
 
         // Never another agent's job.
         let mut o = job_start("iş".into(), vec![]);
@@ -4478,70 +3868,43 @@ mod launch_tests {
             assert_eq!(row(&e, "kaan").unwrap().binding, bound(&e.p2, 2, &w2));
         }
 
-        // To Codex (chain_execute's codex start, and a quota route at start): fresh, same binding.
+        // A fresh respawn on the running binding: new session, same binding, the job's effort.
         stop(&e.core, "kaan");
-        sql(&e, "UPDATE agents SET active_engine = 'codex', active_model = 'gpt-x' WHERE id = 'kaan'", &[]);
         let launch = row(&e, "kaan").unwrap().binding;
         let o = StartOptions { prompt: Some("devam".into()), fresh: true, launch: Some(launch), ..Default::default() };
         let (r, got) = captured(|| e.core.agent_spawn("kaan", o));
         r.unwrap();
         let (req, key_job) = &got[0];
-        assert_eq!((req.cmd.as_str(), req.cwd.as_deref(), *key_job), ("codex", Some(w2.as_str()), Some(2)));
-        assert!(req.codex.as_ref().is_some_and(|l| l.resume.is_none() && l.effort == Some(crate::effort::Effort::Xhigh)));
+        assert_eq!((req.cmd.as_str(), resumed(req), req.cwd.as_deref(), *key_job), ("claude", None, Some(w2.as_str()), Some(2)));
+        assert!(req.env.contains(&(crate::effort::CLAUDE_ENV.into(), "xhigh".into())), "{:?}", req.env);
         let r = row(&e, "kaan").unwrap();
         assert_eq!((r.session.as_str(), r.binding), (NO_SESSION, bound(&e.p2, 2, &w2)));
         crate::db::with(&e.core.db, |c| {
             let team = crate::teams::get_team(c, &e.core.paths.data_dir, "default")?;
             let a = crate::teams::get_agent(c, "kaan")?;
-            // quota_route turned a continuing start fresh (Codex): the caller did not renew it.
+            // A fresh start the caller did not renew keeps the saved binding.
             let o = StartOptions { fresh: true, ..Default::default() };
-            let plan = launch_plan(c, &e.core.paths.data_dir, &a, &team, "codex", &o, false)?;
+            let plan = launch_plan(c, &e.core.paths.data_dir, &a, &team, "claude", &o, false)?;
             assert_eq!((plan.binding, plan.cwd.as_deref(), plan.resume), (bound(&e.p2, 2, &w2), Some(w2.as_str()), None));
             Ok(())
         })
         .unwrap();
     }
 
-    /// Back to Claude: the origin session resumes only on the binding it ran on.
+    /// Back to the home provider: the running session resumes on its own binding.
     #[test]
-    fn chain_back_resumes_the_origin_only_on_its_own_binding() {
+    fn chain_back_resumes_the_running_session_on_its_binding() {
         let e = env("back", true);
-        job(&e, 1, "kaan", &e.p1, "done", None);
-        let w1 = worktree(&e, 1, "kaan", &e.p1);
         job(&e, 2, "kaan", &e.p2, "running", None);
         let w2 = worktree(&e, 2, "kaan", &e.p2);
-        let on_codex = |origin: &Binding| {
-            sql(&e, "UPDATE agents SET active_engine = 'codex', active_model = 'gpt-x' WHERE id = 'kaan'", &[]);
-            saved(&e, "kaan", "x1", "codex", &bound(&e.p2, 2, &w2));
-            sql(&e, "INSERT INTO agent_chain_origins(agent_id,engine,session_id,project_id,delegation_id,cwd) VALUES('kaan','claude','c1',?1,?2,?3)
-                     ON CONFLICT(agent_id) DO UPDATE SET session_id='c1', project_id=excluded.project_id, delegation_id=excluded.delegation_id, cwd=excluded.cwd",
-                &[&origin.project_id, &origin.delegation_id, &origin.cwd]);
-        };
-        on_codex(&bound(&e.p2, 2, &w2));
+        sql(&e, "UPDATE agents SET active_provider = 'glm', active_model = 'GLM-5.3' WHERE id = 'kaan'", &[]);
+        saved(&e, "kaan", "x1", "claude", &bound(&e.p2, 2, &w2));
         let (r, got) = captured(|| e.core.chain_back("kaan"));
         r.unwrap();
         let (req, key_job) = &got[0];
-        assert_eq!((req.cmd.as_str(), resumed(req).as_deref(), req.cwd.as_deref(), *key_job), ("claude", Some("c1"), Some(w2.as_str()), Some(2)));
-
-        stop(&e.core, "kaan");
-        on_codex(&bound(&e.p1, 1, &w1));
-        let (r, got) = captured(|| e.core.chain_back("kaan"));
-        r.unwrap();
-        let (req, key_job) = &got[0];
-        assert_eq!((resumed(req), req.cwd.as_deref(), *key_job), (None, Some(w2.as_str()), Some(2)), "P1's origin is not resumed for P2");
-
-        // The origin a Codex move saves carries the running binding.
-        stop(&e.core, "kaan");
-        saved(&e, "kaan", "s9", "claude", &bound(&e.p2, 2, &w2));
-        crate::db::with(&e.core.db, |c| save_chain_origin(c, "kaan", None, None)).unwrap();
-        let origin = crate::db::with(&e.core.db, |c| {
-            c.query_row("SELECT session_id, project_id, delegation_id, cwd FROM agent_chain_origins WHERE agent_id = 'kaan'", [], |r| {
-                Ok((r.get::<_, String>(0)?, Binding { project_id: r.get(1)?, delegation_id: r.get(2)?, cwd: r.get(3)? }))
-            })
-            .map_err(|e| e.to_string())
-        })
-        .unwrap();
-        assert_eq!(origin, ("s9".into(), bound(&e.p2, 2, &w2)));
+        assert_eq!((req.cmd.as_str(), resumed(req).as_deref(), req.cwd.as_deref(), *key_job), ("claude", Some("x1"), Some(w2.as_str()), Some(2)));
+        let a = crate::db::with(&e.core.db, |c| crate::teams::get_agent(c, "kaan")).unwrap();
+        assert!(a.active_provider.is_none() && a.active_model.is_none(), "back on the home provider");
     }
 
     /// A lost resume retries fresh on the same binding; a failed spawn leaves the row as it was.
