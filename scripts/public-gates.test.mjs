@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { basename, delimiter, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { test } from "node:test";
@@ -78,6 +78,46 @@ test("installer downloads the pinned scanner and is repeatable across worktrees"
   assert.notEqual(corrupted.status, 0, "unverified archive must not install");
   assert.match(corrupted.stderr, /SHA-256/);
   writeFileSync(archive, data);
+});
+
+test("diverged worktree scans staged changes against the worktree HEAD", () => {
+  const repo = fixture();
+  installScanner(repo);
+  writeFileSync(resolve(repo, "main.txt"), "main checkout change\n");
+  git(repo, "add", "main.txt");
+  git(repo, "commit", "-m", "Main checkout moves on");
+  const base = git(repo, "rev-parse", "HEAD~1");
+  const worktree = resolve(repo, ".dex/tmp/diverged");
+  git(repo, "worktree", "add", "--detach", worktree, base);
+  writeFileSync(resolve(worktree, "sample.txt"), "clean diverged change\n");
+  git(worktree, "add", "sample.txt");
+  assert.equal(run(worktree, "git", ["commit", "-m", "Clean diverged change"]).status, 0,
+    "clean staged diff against the worktree HEAD must pass");
+  writeFileSync(resolve(worktree, "sample.txt"), ["0123456789abcdef".repeat(2), ".", "A1".repeat(8), "\n"].join(""));
+  git(worktree, "add", "sample.txt");
+  const rejected = run(worktree, "git", ["commit", "-m", "Secret diverged change"]);
+  assert.notEqual(rejected.status, 0, "staged secret must still be rejected");
+  assert.match(rejected.stderr, /Gitleaks/);
+});
+
+test("split-index worktrees gate only the staged diff", () => {
+  const repo = fixture();
+  installScanner(repo);
+  const worktree = resolve(repo, ".dex/tmp/splitter");
+  git(repo, "worktree", "add", "-b", "splitter", worktree);
+  git(worktree, "config", "core.splitIndex", "true");
+  writeFileSync(resolve(worktree, "sample.txt"), "clean split-index change\n");
+  git(worktree, "add", "sample.txt");
+  const indexDir = dirname(git(worktree, "rev-parse", "--path-format=absolute", "--git-path", "index"));
+  assert.ok(readdirSync(indexDir).some((entry) => entry.startsWith("sharedindex.")),
+    "split index must be engaged for this test");
+  assert.equal(run(worktree, "git", ["commit", "-m", "Clean split-index change"]).status, 0,
+    "clean staged diff with split index must pass");
+  writeFileSync(resolve(worktree, "sample.txt"), ["0123456789abcdef".repeat(2), ".", "A1".repeat(8), "\n"].join(""));
+  git(worktree, "add", "sample.txt");
+  const rejected = run(worktree, "git", ["commit", "-m", "Secret split-index change"]);
+  assert.notEqual(rejected.status, 0, "staged secret must still be rejected");
+  assert.match(rejected.stderr, /Gitleaks/);
 });
 
 function installScanner(repo) {
