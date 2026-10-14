@@ -99,11 +99,29 @@ fn assistant_decide(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
     match tool {
         "WebFetch" | "WebSearch" | "AskUserQuestion" | "ToolSearch" | "mcp__dex__memory_search" => Verdict::Allow,
         "Read" | "Glob" | "Grep" | "LS" => {
-            let raw = input.get("file_path").or_else(|| input.get("path")).and_then(Value::as_str);
+            // Glob's absolute/parent pattern can override its otherwise scoped search path.
+            if tool == "Glob" && input.get("pattern").and_then(Value::as_str).is_some_and(|p| {
+                Path::new(p).has_root() || expand_home(p).is_some()
+                    || Path::new(p).components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            }) {
+                return Verdict::Deny("asistan Glob deseni izinli path altında göreli olmalı".into());
+            }
+            let raw = input.get(if tool == "Read" { "file_path" } else { "path" }).and_then(Value::as_str);
+            if raw.is_some_and(|p| Path::new(p).components().any(|c| c == Component::ParentDir)) {
+                return Verdict::Deny("asistan okuma yolunda üst dizin kullanamaz".into());
+            }
             let path = raw.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone());
             let real = path.as_ref().and_then(|p| p.canonicalize().ok());
-            let roots = ctx.read.iter().filter_map(|p| p.canonicalize().ok()).collect::<Vec<_>>();
-            if matches!(judge(tool, input, ctx), Verdict::Allow) && real.is_some_and(|p| !secret(&p) && within(&p, &roots)) {
+            // Judge the physical path and roots in the same spelling (Windows verbatim/UNC
+            // prefixes and casing included). Do not run the lexical worker judge first.
+            let physical = |p: &Path| PathBuf::from(crate::projects::path_key(&p.to_string_lossy()));
+            // A replaced inbox/memory root must not turn an outside directory into an allowed
+            // root. Trusted context paths already use their normalized absolute spelling.
+            let roots = ctx.read.iter().filter_map(|p| {
+                let real = p.canonicalize().ok()?;
+                (physical(&real) == physical(p)).then(|| physical(&real))
+            }).collect::<Vec<_>>();
+            if path.is_some_and(|p| !secret(&p)) && real.is_some_and(|p| !secret(&p) && within(&physical(&p), &roots)) {
                 Verdict::Allow
             } else { Verdict::Deny("asistan yalnız kendi takımının izinli dosyalarını okur".into()) }
         },
@@ -3688,6 +3706,45 @@ mod tests {
         for tool in ["Write", "Edit", "apply_patch", "Bash", "exec_command", "mcp__dex__task_create", "mcp__dex__report", "Skill", "Agent"] {
             assert!(matches!(decide(tool, &serde_json::json!({"command":"git status","file_path":inbox}), &assistant), Verdict::Deny(_)), "{tool}");
         }
+    }
+
+    #[test]
+    fn assistant_search_path_cannot_be_shadowed_by_unused_file_path() {
+        let f = crate::projects::tests::Fixture::new();
+        let inbox = f.0.join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let ctx = Ctx { assistant: true, read: vec![inbox.clone()], cwd: Some(f.0.clone()), ..Default::default() };
+        for tool in ["Glob", "Grep", "LS"] {
+            assert!(matches!(decide(tool, &json!({"file_path":inbox,"path":f.0,"pattern":"*"}), &ctx), Verdict::Deny(_)), "{tool}");
+        }
+    }
+
+    #[test]
+    fn assistant_glob_cannot_override_its_scoped_path() {
+        let f = crate::projects::tests::Fixture::new();
+        let inbox = f.0.join("inbox");
+        std::fs::create_dir(&inbox).unwrap();
+        let ctx = Ctx { assistant: true, read: vec![inbox.clone()], cwd: Some(f.0.clone()), ..Default::default() };
+        for pattern in [f.0.join("outside/*.txt").to_string_lossy().into_owned(), "../outside/*.txt".into()] {
+            assert!(matches!(decide("Glob", &json!({"path":inbox,"pattern":pattern}), &ctx), Verdict::Deny(_)));
+        }
+        assert_eq!(decide("Glob", &json!({"path":inbox,"pattern":"**/*.png"}), &ctx), Verdict::Allow);
+    }
+
+    #[test]
+    fn assistant_denies_a_linked_allowed_root() {
+        let f = crate::projects::tests::Fixture::new();
+        let outside = f.0.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("private.txt"), "fixture").unwrap();
+        let root = f.0.join("inbox");
+        #[cfg(windows)]
+        let link = std::os::windows::fs::symlink_dir(&outside, &root);
+        #[cfg(unix)]
+        let link = std::os::unix::fs::symlink(&outside, &root);
+        if link.is_err() { return; }
+        let ctx = Ctx { assistant: true, read: vec![root.clone()], cwd: Some(f.0.clone()), ..Default::default() };
+        assert!(matches!(decide("Read", &json!({"file_path":root.join("private.txt")}), &ctx), Verdict::Deny(_)));
     }
 
     #[test]

@@ -25,6 +25,8 @@ CREATE INDEX IF NOT EXISTS inbox_messages_fifo ON inbox_messages(agent_id,receip
 
 pub const IMAGE_LIMIT: usize = 700 * 1024;
 pub const TEXT_LIMIT: usize = 8 * 1024;
+/// Missing exact UPS is ambiguous, never a reason to replay personal content (#712).
+const UPS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 type DecodedImage = (Vec<u8>, &'static str);
 
 #[derive(Deserialize)]
@@ -123,6 +125,8 @@ impl crate::Core {
     }
 
     fn inbox_deliver_locked(&self, agent: &str) -> Result<Option<i64>, String> {
+        let gate = self.delivery_gate(agent);
+        let _delivery = gate.lock().map_err(|_| "teslim kilidi kullanılamıyor")?;
         let next = with(&self.db, |c| {
             let a = crate::teams::get_agent(c, agent)?;
             if a.role_slug.as_deref() != Some("assistant") { return Ok(None); }
@@ -143,11 +147,29 @@ impl crate::Core {
             with(&self.db, |c| c.execute("UPDATE inbox_messages SET pasted=0 WHERE receipt_id=?1", [id]).map(|_| ()).map_err(|e| e.to_string()))?;
             return Err(e);
         }
+        let weak = self.weak_self.clone();
+        let agent = agent.to_string();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(UPS_TIMEOUT);
+            let Some(core) = weak.upgrade() else { return };
+            // Receipt identity fences late timers: an accepted row or the next FIFO head is
+            // never removed. On DB failure retry only cleanup, never the ambiguous paste.
+            match with(&core.db, |c| c.execute("DELETE FROM inbox_messages WHERE receipt_id=?1 AND agent_id=?2 AND pasted=1", params![id,agent]).map_err(|e| e.to_string())) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        log::warn!("inbox: UPS süre aşımı; teslim belirsiz, içerik silindi");
+                        core.inbox_wake(&agent);
+                    }
+                    return;
+                }
+                Err(_) => log::warn!("inbox: belirsiz teslim temizliği başarısız; temizlik yeniden denenecek"),
+            }
+        });
         Ok(Some(id))
     }
 
     pub(crate) fn inbox_prompt_received(&self, agent: &str, prompt: &str) {
-        // Only the exact UPS is receipt evidence. Keep queued content on mismatches/errors.
+        // Only the exact UPS is receipt evidence. Mismatches wait for the ambiguity timeout.
         let _ = with(&self.db, |c| c.execute("DELETE FROM inbox_messages WHERE agent_id=?1 AND pasted=1 AND prompt=?2", params![agent,prompt]).map(|_| ()).map_err(|e| e.to_string()));
     }
 
@@ -203,13 +225,183 @@ fn store_image(root: &Path, bytes: &[u8], ext: &str) -> Result<PathBuf, String> 
     drop(file);
     if result.is_err() { let _ = std::fs::remove_file(&path); }
     result.map_err(|e| e.to_string())?;
-    Ok(path)
+    let ordinary = crate::teams::normalize_dir(&inbox.to_string_lossy())?;
+    Ok(PathBuf::from(ordinary).join(path.file_name().ok_or("inbox dosya adı yok")?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use base64::Engine;
+    #[test]
+    fn assistant_reads_real_store_image_with_unprefixed_team_context() {
+        let f = crate::projects::tests::Fixture::new();
+        let root = crate::teams::normalize_dir(f.0.to_str().unwrap()).unwrap();
+        let core = crate::Core::start(crate::Paths { data_dir: f.0.with_extension("data"), config_dir: f.0.with_extension("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        with(&core.db, |c| {
+            c.execute("UPDATE teams SET cwd=?1 WHERE id='default'", [&root]).map_err(|e| e.to_string())?;
+            c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map_err(|e| e.to_string())?;
+            Ok(())
+        }).unwrap();
+        let image = store_image(Path::new(&root), b"\x89PNG\r\n\x1a\n", "png").unwrap();
+        let ctx = with(&core.db, |c| Ok(core.permit_ctx(c, "ayla", &serde_json::json!({}))?.unwrap().0)).unwrap();
+        let verdict = crate::permit::decide("Read", &serde_json::json!({"file_path": image}), &ctx);
+        core.shutdown();
+        drop(core);
+        assert_eq!(verdict, crate::permit::Verdict::Allow);
+        assert!(!image.to_string_lossy().starts_with(r"\\?\"), "prompt image path must be ordinary absolute path");
+        assert_eq!(crate::permit::decide("Read", &serde_json::json!({"file_path": image.canonicalize().unwrap()}), &ctx), crate::permit::Verdict::Allow);
+    }
+
+    #[test]
+    fn assistant_permit_context_reads_only_inbox_shared_and_own_private_memory() {
+        let f = crate::projects::tests::Fixture::new();
+        let root = crate::teams::normalize_dir(f.0.to_str().unwrap()).unwrap();
+        let memory = f.0.join(".dex/memory");
+        let core = crate::Core::start(crate::Paths { data_dir: f.0.with_extension("data"), config_dir: f.0.with_extension("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        let own = with(&core.db, |c| {
+            c.execute("UPDATE teams SET cwd=?1,team_memory_root=?2,agent_memory_root=?2 WHERE id='default'", params![root,memory.to_string_lossy()]).map_err(|e| e.to_string())?;
+            c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map_err(|e| e.to_string())?;
+            crate::slug::memory_dir(c, &memory, "ayla")
+        }).unwrap();
+        let ctx = with(&core.db, |c| Ok(core.permit_ctx(c, "ayla", &serde_json::json!({}))?.unwrap().0)).unwrap();
+        let allowed = [f.0.join(".dex/inbox/image.png"), memory.join("shared/note.md"), own.join("private.md")];
+        let denied = [f.0.join("crates/core.rs"), f.0.join(".dex/results/1702.md"), memory.join("agents/kaan/private.md"), f.0.join(".dex/inbox-other/private.md"), f.0.join(".dex/inbox/.env")];
+        for path in allowed.iter().chain(&denied) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "fixture").unwrap();
+        }
+        core.shutdown();
+        drop(core);
+        for tool in ["Read", "Glob", "Grep", "LS"] {
+            for path in &allowed {
+                assert_eq!(crate::permit::decide(tool, &serde_json::json!({"file_path":path,"path":path}), &ctx), crate::permit::Verdict::Allow, "{tool}: {path:?}");
+            }
+            for path in &denied {
+                assert!(matches!(crate::permit::decide(tool, &serde_json::json!({"file_path":path,"path":path}), &ctx), crate::permit::Verdict::Deny(_)), "{tool}: {path:?}");
+            }
+            assert!(matches!(crate::permit::decide(tool, &serde_json::json!({}), &ctx), crate::permit::Verdict::Deny(_)), "implicit repo cwd: {tool}");
+        }
+    }
+
+    #[test]
+    fn missing_ups_expires_without_replay_and_wakes_next_fifo_share() {
+        use crate::agents::Status;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-timeout-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        core.agent_states.hook("ayla", Some(Status::Idle), Some("inbox-timeout"));
+        let mut first = input(); first.text = Some("lost".into()); first.client_id = Some("lost-share".into());
+        assert!(!core.inbox_submit(first).unwrap().queued);
+        let mut next = input(); next.text = Some("next".into());
+        assert!(core.inbox_submit(next).unwrap().queued);
+        core.inbox_prompt_received("ayla", "mismatched UPS");
+        core.agent_states.hook("ayla", Some(Status::Idle), None);
+        let rows = || with(&core.db, |c| {
+            let mut stmt = c.prepare("SELECT prompt,pasted FROM inbox_messages ORDER BY receipt_id").map_err(|e| e.to_string())?;
+            let mapped = stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, r.get::<_,bool>(1)?))).map_err(|e| e.to_string())?;
+            mapped.collect::<Result<Vec<_>,_>>().map_err(|e| e.to_string())
+        }).unwrap();
+        let expected = vec![("Patron paylaştı:\nnext".to_string(), true)];
+        let end = std::time::Instant::now() + UPS_TIMEOUT + std::time::Duration::from_secs(3);
+        while rows() != expected && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let actual = rows();
+        let mut duplicate = input(); duplicate.client_id = Some("lost-share".into());
+        assert!(!core.inbox_submit(duplicate).unwrap().queued, "receipt remains idempotent after ambiguity");
+        let after_duplicate = rows();
+        core.inbox_prompt_received("ayla", "Patron paylaştı:\nnext");
+        core.ptys.kill("ayla");
+        core.shutdown();
+        assert_eq!(actual, expected, "unaccepted personal text must expire and the next share must paste");
+        assert_eq!(after_duplicate, expected, "ambiguous share must never be retried");
+    }
+
+    #[test]
+    fn inbox_and_chat_serialize_before_enter_and_keep_fifo() {
+        use crate::agents::Status;
+        use std::{io::Write, sync::{Arc, Mutex, mpsc}, time::Duration};
+        struct Stop(Arc<crate::Core>);
+        impl Drop for Stop {
+            fn drop(&mut self) { self.0.ptys.kill("ayla"); self.0.shutdown(); }
+        }
+        struct Input {
+            _original: Box<dyn Write + Send>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+            written: mpsc::Sender<()>,
+        }
+        impl Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                let _ = self.written.send(());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-chat-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        let _stop = Stop(core.clone());
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        core.agent_states.hook("ayla", Some(Status::Idle), Some("inbox-chat"));
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (written_tx, written_rx) = mpsc::channel();
+        core.ptys.input_writer_for_test("ayla", |original| Box::new(Input { _original: original, bytes: bytes.clone(), written: written_tx }));
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *core.paste_pause.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let first = core.clone();
+        let inbox = std::thread::spawn(move || {
+            let mut share = input(); share.text = Some("first".into());
+            first.inbox_submit(share).unwrap()
+        });
+        paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        written_rx.recv_timeout(Duration::from_secs(1)).unwrap(); // First paste, before Enter.
+        let second = core.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let panel = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            second.chat_send("ayla", "panel").unwrap()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let interleaved = written_rx.recv_timeout(Duration::from_millis(300)).is_ok();
+        release_tx.send(()).unwrap();
+        let first = inbox.join().unwrap();
+        let panel = panel.join().unwrap();
+        assert!(!interleaved, "panel text reached PTY before inbox Enter");
+        assert!(!first.queued);
+        assert_eq!(panel, "queued", "readiness must be rechecked after the first Enter");
+        for text in ["second", "third"] {
+            let mut share = input(); share.text = Some(text.into());
+            assert!(core.inbox_submit(share).unwrap().queued);
+        }
+        core.inbox_prompt_received("ayla", "Patron paylaştı:\nfirst");
+        core.agent_states.hook("ayla", Some(Status::Idle), None);
+        core.chat_on_stop("ayla");
+        let end = std::time::Instant::now() + Duration::from_secs(4);
+        while bytes.lock().unwrap().iter().filter(|b| **b == b'\r').count() < 2 && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for text in ["second", "third"] {
+            core.agent_states.hook("ayla", Some(Status::Idle), None);
+            assert!(core.inbox_deliver_locked("ayla").unwrap().is_some());
+            core.inbox_prompt_received("ayla", &format!("Patron paylaştı:\n{text}"));
+        }
+        let actual = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let expected = ["Patron paylaştı:\nfirst", "panel", "Patron paylaştı:\nsecond", "Patron paylaştı:\nthird"]
+            .map(|p| format!("\x1b[200~{p}\x1b[201~\r")).join("");
+        assert_eq!(actual, expected, "each paste must have its own Enter, preserving inbox FIFO");
+        assert_eq!(with(&core.db, |c| c.query_row("SELECT COUNT(*) FROM inbox_messages", [], |r| r.get::<_,i64>(0)).map_err(|e| e.to_string())).unwrap(), 0);
+    }
     fn input() -> Submit { Submit { team_id: "default".into(), client_id: None, text: Some("bir\niki\u{1b}[201~\u{0}".into()), image: None } }
     #[test]
     fn validates_size_mime_base64_and_cleans_controls_without_accepting_paths() {
@@ -326,7 +518,7 @@ mod tests {
             let (_,image)=validate(&s).unwrap();
             let (bytes,extension)=image.unwrap();
             let path=store_image(&f.0,&bytes,extension).unwrap();
-            assert_eq!(path.parent().unwrap(),f.0.canonicalize().unwrap().join(".dex/inbox"));
+            assert_eq!(path.parent().unwrap(),PathBuf::from(crate::teams::normalize_dir(f.0.to_str().unwrap()).unwrap()).join(".dex/inbox"));
             assert_eq!(path.extension().unwrap(),ext);
             assert_eq!(std::fs::read(&path).unwrap(),header);
         }

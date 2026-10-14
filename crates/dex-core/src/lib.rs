@@ -110,6 +110,8 @@ pub struct Core {
     /// S5-B: live transcript watches (one per agent) + queued chat texts per agent.
     pub(crate) chat_watches: chat::Watches,
     pub(crate) chat_queues: Mutex<HashMap<String, VecDeque<String>>>,
+    /// Per-agent paste transaction: readiness through the final Enter, shared by chat/inbox.
+    delivery_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     inbox_gate: Mutex<()>,
     /// Görev #12: workers with a pending queue retry — at most one live retry thread per worker.
     /// #18: keyed to the thread's generation; a newer retry makes an older sleeping thread stale.
@@ -229,6 +231,7 @@ impl Core {
             chat_watches: chat::Watches::default(),
             chat_queues: Mutex::default(),
             inbox_gate: Mutex::default(),
+            delivery_gates: Mutex::default(),
             queue_retry: Mutex::default(),
             turns: delegate::Turns::default(),
             permits: permit::Permits::default(),
@@ -1489,10 +1492,10 @@ impl Core {
             ctx.assistant = true;
             ctx.read_only = true;
             ctx.leader = false;
-            ctx.read.extend(home);
+            ctx.read.extend(home.map(|p| p.join(".dex").join("inbox")));
             let pc = hooks::session_context(c, &self.paths.data_dir, agent, true).map_err(|e| e.to_string())?;
-            let memory = hooks::memory_scope(c, &pc)?;
-            ctx.read.extend(memory.write);
+            ctx.read.push(pc.team_memory_root.join("shared"));
+            ctx.read.push(slug::memory_dir(c, &pc.agent_memory_root, agent)?);
             ctx.cwd = pc.project_root.or_else(|| ctx.team_root.clone());
             return Ok(Some((ctx, claude, true)));
         }
