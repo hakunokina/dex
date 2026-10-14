@@ -1307,6 +1307,11 @@ impl Core {
             log::error!("usage session end: {error}");
         }
         self.permits.forget(id);
+        // İş #1787 (auv deseni): ölen turun bekleyen ask_leader/wait_answer'ı hemen kapansın;
+        // soru `cancelled` olur, lidere iptal notu gider, iş raporsuz kapanabilir.
+        if let Err(err) = self.answers.cancel_agent(&self.db, &self.events, id) {
+            eprintln!("dex: {id}: bekleyen soru iptali: {err}");
+        }
         self.resetting.lock().unwrap().remove(id);
         if with(&self.db, |conn| teams::get_agent(conn, id)).is_err() {
             return;

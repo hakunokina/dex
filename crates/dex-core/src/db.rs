@@ -427,6 +427,37 @@ const MIGRATIONS: &[&str] = &[
     // 39 (#1718): share replies + FCM device tokens, both host-only. Additive, IF NOT EXISTS.
     // Before commit: ROLLBACK. After commit: keep the tables; revert only the application.
     crate::inbox_reply::SCHEMA,
+    // 40 (İş #1787): kesilen worker'ın bekleyen sorusu `cancelled` olur; bloklanan ask_leader /
+    // wait_answer hemen kapanır, lidere iptal notu gider, geç cevap reddedilir. SQLite CHECK'i
+    // yalnız tabloyu yeniden kurarak değişir (migration 3 deseni); questions'a başvuran FK yok,
+    // veri aynen taşınır. Versioned runner tek sefer uygular, tekrar açılış idempotent.
+    // Before commit: ROLLBACK. After commit: tabloyu tut, yalnız uygulamayı geri al.
+    "CREATE TABLE questions_v40 (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        delegation_id       INTEGER NOT NULL REFERENCES delegations(id) ON DELETE CASCADE,
+        worker              TEXT    NOT NULL,
+        leader              TEXT    NOT NULL,
+        team_id             TEXT    NOT NULL,
+        question            TEXT    NOT NULL,
+        options             TEXT    NOT NULL DEFAULT '[]',
+        context             TEXT,
+        status              TEXT    NOT NULL DEFAULT 'open' CHECK (status IN ('open','escalated','answered','cancelled')),
+        note                TEXT,
+        answer              TEXT,
+        answered_by         TEXT    CHECK (answered_by IN ('leader','patron')),
+        leader_delivered_at INTEGER,
+        answer_delivered_at INTEGER,
+        created_at          INTEGER NOT NULL,
+        updated_at          INTEGER NOT NULL
+    );
+    INSERT INTO questions_v40 (id, delegation_id, worker, leader, team_id, question, options, context,
+        status, note, answer, answered_by, leader_delivered_at, answer_delivered_at, created_at, updated_at)
+        SELECT id, delegation_id, worker, leader, team_id, question, options, context,
+        status, note, answer, answered_by, leader_delivered_at, answer_delivered_at, created_at, updated_at FROM questions;
+    DROP TABLE questions;
+    ALTER TABLE questions_v40 RENAME TO questions;
+    CREATE INDEX questions_worker ON questions(worker, status);
+    CREATE INDEX questions_leader ON questions(leader, status);",
 ];
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
@@ -654,6 +685,37 @@ mod job_model_migration_tests {
         assert_eq!(counts(&clean), (0, 0));
         assert!(clean.execute("INSERT INTO teams(id,name,kind,created_at,profile) VALUES('bad','Bad','main',0,'unknown')", []).is_err());
         println!("education migration: before/after={before:?}; existing + clean DB 2 runs; FK=0");
+    }
+
+    #[test]
+    fn cancelled_question_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch("INSERT INTO delegations(from_agent,to_agent,team_id,prompt,created_at,updated_at)
+            VALUES('timur','kaan','default','keep',1,1);
+            INSERT INTO questions(delegation_id,worker,leader,team_id,question,created_at,updated_at)
+            VALUES(1,'kaan','timur','default','keep?',1,1);").unwrap();
+        let snapshot = |c: &Connection| -> (String, String) {
+            (c.query_row("SELECT status FROM questions WHERE id=1", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT question FROM questions WHERE id=1", [], |r| r.get(0)).unwrap())
+        };
+        assert!(c.execute("UPDATE questions SET status='cancelled' WHERE id=1", []).is_err(), "old CHECK rejects cancelled");
+        let before = snapshot(&c);
+        for _ in 0..2 {
+            migrate(&mut c).unwrap();
+            assert_eq!(snapshot(&c), before);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        c.execute("UPDATE questions SET status='cancelled' WHERE id=1", []).unwrap();
+        assert_eq!(c.query_row("SELECT status FROM questions WHERE id=1", [], |r| r.get::<_, String>(0)).unwrap(), "cancelled");
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        println!("cancelled migration: preserved={before:?}; v39 + clean DB 2 runs; FK=0");
     }
 
     #[test]

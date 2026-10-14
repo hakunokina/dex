@@ -748,8 +748,20 @@ pub(crate) fn serve(mut s: TcpStream, core: &Core, mcp: &Mcp, token: &str, deadl
             return respond(&mut s, "400 Bad Request", Some(&err.to_string()));
         }
     };
-    // Notifications / responses carry no id → 202, no body.
-    let Some(id) = msg.get("id").cloned() else { return respond(&mut s, "202 Accepted", None) };
+    // Notifications / responses carry no id → 202, no body. `notifications/cancelled`
+    // (Esc / oturum kesintisi, auv deseni): worker'ın bekleyen ask_leader/wait_answer'ı hemen
+    // kapansın, sorusu `cancelled` olup lidere iptal notu gitsin. Worker tek uçuşlu
+    // çalıştığından iptal anahtarı ajan bazlıdır (çağrı → soru eşleşmesi `Answers`'ta).
+    let Some(id) = msg.get("id").cloned() else {
+        if msg.get("method").and_then(Value::as_str) == Some("notifications/cancelled") {
+            match core.answers.cancel_agent(&core.db, &core.events, &req.agent) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("dex mcp: {} bekleyen sorusu iptal ({n})", req.agent),
+                Err(err) => eprintln!("dex mcp cancelled: {err}"),
+            }
+        }
+        return respond(&mut s, "202 Accepted", None);
+    };
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     let result = match method {
