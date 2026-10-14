@@ -187,6 +187,8 @@ impl Core {
         if let Err(err) = slug::migrate_memory(&conn, &paths.data_dir) {
             eprintln!("dex: hafıza taşıma: {err}");
         }
+        // #1728: GLM/Muse'nin son başarılı model listesi — ağ beklemeden seçici ve doğrulama görsün.
+        providers::set_live(model_news::catalogs(&conn));
         let (hooks, listener) = hooks::start(&paths.config_dir)?;
         let mcp = mcp::start(&paths.config_dir, hooks.port)?;
         // DEX-22: every `delegations-changed` also advances the leaders' plans.
@@ -1156,7 +1158,17 @@ impl Core {
 
     // ---- providers ----
 
+    /// GLM/Muse kataloğu önbellekten; saati dolmuşsa arka planda tazelenir, değişince
+    /// `providers-changed` gider ve seçici yeniden çeker (liste açılışı ağı beklemez).
     pub fn provider_list(&self) -> Result<Vec<providers::ProviderInfo>, String> {
+        if with(&self.db, |c| Ok(model_news::catalog_due(c, model_news::now_ms())))? {
+            let (db, events) = (self.db.clone(), self.events.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = model_news::refresh(&db, &events) {
+                    eprintln!("dex: model listesi tazelenemedi: {e}");
+                }
+            });
+        }
         providers::list()
     }
 
@@ -1223,20 +1235,12 @@ impl Core {
         Ok(a)
     }
 
-    /// Görev #120: sağlayıcıların sunduğu, Dex kataloğunda olmayan ve kapatılmamış modeller.
-    /// Ağa çıkar (en çok ~13 sn) — host bunu UI iş parçacığında koşmamalı. Sağlayıcı başına
-    /// 24 saatte en çok bir kez sorulur; o pencerede atlanan sağlayıcı haber üretmez.
+    /// Görev #120/#1728: vadesi gelen sağlayıcıları sorar (GLM/Muse saatte, Claude günde bir; ağ en
+    /// çok ~13 sn — host bunu UI iş parçacığında koşmamalı), sonra son listelerde olup sabit
+    /// katalogda olmayan, kapatılmamış güncel modelleri döner.
     pub fn model_news(&self) -> Result<Vec<model_news::NewModel>, String> {
-        let now = model_news::now_ms();
-        let due = with(&self.db, |c| Ok(model_news::due(c, now)))?;
-        if due.is_empty() {
-            return Ok(Vec::new());
-        }
-        let offered = model_news::fetch(&due);
-        with(&self.db, |c| {
-            model_news::mark_checked(c, &offered.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(), now)?;
-            Ok(model_news::news(&offered, &model_news::seen(c)))
-        })
+        model_news::refresh(&self.db, &self.events)?;
+        with(&self.db, |c| Ok(model_news::news(&model_news::cached(c), &model_news::seen(c))))
     }
 
     pub fn model_news_dismiss(&self, keys: Vec<String>) -> Result<(), String> {

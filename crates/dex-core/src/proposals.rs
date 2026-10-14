@@ -101,9 +101,10 @@ fn provider_model(provider: Option<&str>, model: Option<&str>) -> Result<(String
     let p = provider.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("anthropic");
     let def = crate::providers::get(p).ok_or_else(|| format!("geçersiz sağlayıcı: {p}"))?;
     let model = match model.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(m) if def.live || def.models.iter().any(|x| x.id == m) => m.to_string(),
+        Some(m) if def.live || crate::providers::has_model(def, m) => m.to_string(),
         Some(m) => {
-            let ids: Vec<&str> = def.models.iter().filter(|x| !x.legacy).map(|x| x.id).collect();
+            let all = crate::providers::models(def);
+            let ids: Vec<&str> = all.iter().filter(|x| !x.legacy).map(|x| x.id.as_str()).collect();
             return Err(format!("{p} sağlayıcısında model yok: {m}. Seçenekler: {}", ids.join(", ")));
         }
         None if def.live => return Err(format!("{p} sağlayıcısında model adı verilmeli (canlı liste: Takım → Sağlayıcılar)")),
