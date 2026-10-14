@@ -629,24 +629,31 @@ function drawPins(ctx: CanvasRenderingContext2D, chip: Chip, p: PcbTheme, status
  * The chain's active target wins over the configured one, as before.
  */
 function drawProviderBadge(ctx: CanvasRenderingContext2D, chip: Chip, p: PcbTheme) {
-  const { label, color } = providerOf(chip.agent, p);
+  const { label, color, fill } = providerOf(chip.agent, p);
   ctx.font = `700 8px ${p.mono}`;
   const text = ellipsis(ctx, label, chip.w - 28);
   const w = ctx.measureText(text).width + 8;
   const x = chip.x - chip.w / 2 + 8;
   const y = chip.y - chip.h / 2 - 5;
   roundRect(ctx, x, y, w, 10, 3);
-  ctx.fillStyle = p.board; ctx.fill();
-  ctx.strokeStyle = color; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = fill ?? p.board; ctx.fill();
+  ctx.strokeStyle = fill ? p.chipEdge : color; ctx.lineWidth = 1; ctx.stroke();
   ctx.fillStyle = color; ctx.textAlign = "left"; ctx.textBaseline = "middle";
   ctx.fillText(text, x + 4, y + 5.5);
 }
 
-function providerOf(agent: Agent, p: PcbTheme) {
-  const provider = agent.activeProvider ?? agent.provider;
-  const [label, color] = !provider || provider === "anthropic" ? ["ANTHROPIC", p.muted]
-    : [provider === "local" ? "LOCAL" : provider.toUpperCase(), p.amber];
-  return { label, color };
+/** Provider badge colours (patron, 2026-10-14): Anthropic brand orange, Muse blue, GLM black, local green. */
+const PROVIDER_LOOK: Record<string, { color: string; fill?: string }> = {
+  anthropic: { color: "#D97757" },
+  muse: { color: "#3B82F6" },
+  glm: { color: "#F5F5F5", fill: "#000000" },
+  local: { color: "#22C55E" },
+};
+
+function providerOf(agent: Agent, p: PcbTheme): { label: string; color: string; fill?: string } {
+  const provider = agent.activeProvider ?? agent.provider ?? "anthropic";
+  const label = provider === "local" ? "LOCAL" : provider.toUpperCase();
+  return { label, ...(PROVIDER_LOOK[provider] ?? { color: p.amber }) };
 }
 
 /** #229 spec: the only theme-less constants (readable on both boards). */
