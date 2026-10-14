@@ -26,3 +26,5 @@ export function workerMoves(before: readonly Job[], after: readonly Job[]): { ag
   }
   return moves;
 }
+/** A move's circuit trace is drawn over the whole window: only for the team on screen, never a hidden one. */
+export const movePlaysFx = (teamId: string, activeTeamId: string, reducedMotion: boolean) => teamId === activeTeamId && !reducedMotion;

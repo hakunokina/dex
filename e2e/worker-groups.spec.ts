@@ -184,3 +184,30 @@ test("geniş düzende yeni worker sağa bölünür ve işi bitince sola taşın�
   }, { teamId: team.id, id: workers[0].id });
   expect(restarted).toBe(opened.newGroup);
 });
+
+test("başka takım ekrandayken worker taşınır ama devre efekti oynamaz", async ({ app, dexd }) => {
+  await app.setViewportSize({ width: 1000, height: 720 });
+  const main = await newTeam(dexd, "Efekt ana");
+  const other = await newTeam(dexd, "Efekt jezdev");
+  const worker = (await teamAgents(dexd, main.id)).find(a => a.kind === "worker")!;
+  await app.reload();
+  await openTeam(app, main.name);
+  await expect(app.locator("canvas.office")).toBeVisible();
+  await openTeam(app, other.name);
+  await expect(app.locator(".team-stage:not(.hidden) canvas.office")).toBeVisible();
+  const move = (finished: boolean) => app.evaluate(async ({ teamId, id, finished }) => {
+    const { boundApi, agentPanelId, moveWorkerPanel } = await import("/src/layout/panels.ts");
+    const pane = () => boundApi(teamId)!.getPanel(agentPanelId(id))!;
+    const before = pane().group.id;
+    moveWorkerPanel(id, finished);
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    return { moved: pane().group.id !== before, fx: document.querySelectorAll(".office-fx polyline").length };
+  }, { teamId: main.id, id: worker.id, finished });
+  // The hidden team's layout still follows the job; only the window-wide trace stays off.
+  expect(await move(true)).toEqual({ moved: true, fx: 0 });
+  await openTeam(app, main.name);
+  await expect(app.locator(".team-stage:not(.hidden) canvas.office")).toBeVisible();
+  expect(await move(false)).toEqual({ moved: true, fx: 1 });
+  await expect(app.locator(".office-fx")).toHaveCount(0);
+});
+

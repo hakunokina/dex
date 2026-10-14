@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { workerMoves, workerGroups } from "./workerGroups.ts";
+import { movePlaysFx, workerMoves, workerGroups } from "./workerGroups.ts";
 
 test("FIFO: yeni queued iş önceki işin running geçişini maskelemez", () => {
   const queued = [2, 3].map(id => ({ id, toAgent: "w", status: "queued" }));
@@ -42,4 +42,11 @@ test("Kart altındaki sağ grup ve hemen sol komşusu seçilir, diğer gruplar k
   assert.deepEqual(workerGroups(office, groups), { working: new Set(["working"]), done: "done" });
   assert.deepEqual(workerGroups(office, []), { working: new Set() });
   assert.deepEqual(workerGroups({ ...office, width: 0 }, groups), { working: new Set() });
+});
+
+test("taşıma efekti yalnız ekrandaki takımda ve hareket azaltılmamışken oynar", () => {
+  assert.equal(movePlaysFx("main", "main", false), true);
+  assert.equal(movePlaysFx("main", "jezdev", false), false);
+  assert.equal(movePlaysFx("main", "", false), false);
+  assert.equal(movePlaysFx("main", "main", true), false);
 });
