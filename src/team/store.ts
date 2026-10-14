@@ -13,13 +13,14 @@ import * as layout from "../layout/store";
 import { killPty } from "../pty";
 import * as api from "./api";
 import { sortAgents } from "./order";
+import { loadRoles } from "./roles";
 import type { AgentRec, Role, TeamRec } from "./api";
 
 export interface TeamsState {
   ready: boolean;
   teams: TeamRec[];
   agents: AgentRec[];
-  /** Role catalog (static per build). */
+  /** Role catalog (static per build; refetched when the local core reconnects — #1720). */
   roles: Role[];
   activeId: string;
 }
@@ -81,9 +82,11 @@ async function reload() {
   // S5-A: the Android build has no in-process core — its teams/commands don't exist there.
   const hosts = [...(hasLocalCore ? [LOCAL] : []), ...remoteHosts().map(h => h.id)];
   const cache = readCache();
+  const rolesStale = init.rolesStale;
+  init.rolesStale = false;
   const [parts, roles] = await Promise.all([
     Promise.all(hosts.map(h => hostPart(h, cache))),
-    state.roles.length ? state.roles : hasLocalCore ? api.listRoles().catch((e) => (hostStatus(LOCAL) === "down" ? [] : Promise.reject(e))) : Promise.resolve<Role[]>([]),
+    hasLocalCore ? loadRoles(state.roles, rolesStale, api.listRoles, () => hostStatus(LOCAL) === "down") : Promise.resolve<Role[]>([]),
   ]);
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(hosts.map((h, i) => [h, parts[i]]))));
@@ -109,7 +112,7 @@ async function reload() {
   emit({ ready: true, teams, agents, roles, activeId });
 }
 
-const init = kept(hot, "init", () => ({ started: null as Promise<void> | null }));
+const init = kept(hot, "init", () => ({ started: null as Promise<void> | null, rolesStale: false, localSeen: false }));
 const reloadLatest = latest(hot, "reload", () => reload());
 export const refreshTeams = () => reloadLatest();
 
@@ -121,7 +124,15 @@ export function initTeams(): Promise<void> {
     api.onTeamsChanged(() => void reloadLatest().catch(() => {}));
     // Added / removed / (re)connected host: its teams come, go or refresh.
     subscribeHosts(() => void reloadLatest().catch(() => {}));
-    onHostUp((h) => h !== LOCAL && void reloadLatest().catch(() => {}));
+    onHostUp((h) => {
+      if (h === LOCAL) {
+        // The first call is this subscription's own (roles were just loaded); later ones are a
+        // reconnect — maybe to a new build with new roles (#1720).
+        if (!init.localSeen) return void (init.localSeen = true);
+        init.rolesStale = true;
+      }
+      void reloadLatest().catch(() => {});
+    });
   })();
   return init.started;
 }
