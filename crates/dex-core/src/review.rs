@@ -357,7 +357,8 @@ fn plan_item_title(conn: &Connection, delegation: i64) -> Option<String> {
 
 /// İstemden ilk anlamlı satır: boş satırlar, markdown başlıkları (`#`, `## Amaç` gibi
 /// biçim başlıkları) ve "Patronun sözü" satırı atlanır. Bulunamazsa boş döner.
-fn first_meaningful_line(s: &str, max: usize) -> String {
+/// Pano kartı başlığı için de kullanılır (#1768: `delegate` otomatik kartı).
+pub(crate) fn first_meaningful_line(s: &str, max: usize) -> String {
     let l = s
         .lines()
         .map(str::trim)
