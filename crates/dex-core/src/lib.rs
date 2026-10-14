@@ -1019,6 +1019,17 @@ impl Core {
                 Ok(d)
             }
             agents::Delivery::Paste => {
+                // #1779: patron oturumuna yapışan iş de kendi dalına bağlanır — yoksa kayıt
+                // "kendi worktree'sinde çalışmadı" sayılır, inceleme/birleştirme açılmaz.
+                // Oturum korunur (öldürülmez); canlı PTY'nin cwd'si değişmez, worker
+                // UserPromptSubmit bağlamındaki worktree satırıyla hazır ağaca geçer.
+                match worktree::prepare(&self.db, &d) {
+                    Ok(_) => {}
+                    Err(worktree::Error::Conflict(msg)) => return delegate::start_failed(&self.db, &self.events, d.id, &msg),
+                    Err(worktree::Error::Other(msg)) => {
+                        self.note_leader_of(&d, &format!("#{} worktree açılamadı, iş proje kökünde başlıyor: {msg}", d.id));
+                    }
+                }
                 // #838 G (#906): the bound session works on this job from now on — row and MCP key
                 // together, or neither; a failed paste puts both back.
                 let rebound = match self.session_take_job(&d) {
@@ -2287,6 +2298,37 @@ mod fresh_tests {
         assert_eq!(core.delegation_dispatch(k.clone()).unwrap().status, "running");
         assert!(core.ptys.is_running("kaan"), "the patron's session stays");
         assert!(with(&core.db, |c| delegate::get(c, k.id)).unwrap().effort_skipped);
+        done(core, root, &["kaan"]);
+    }
+
+    /// #1779: patron oturumundaki worker'a iş verilince de iş kendi dalında yürür —
+    /// kayıt `dex/<agent>/<id>` dalına bağlanır, inceleme/birleştirme normal akar.
+    /// Patron oturumu korunur (öldürülmez), effort yine uygulanmaz.
+    #[test]
+    fn patron_session_job_still_gets_its_worktree() {
+        let proj = worktree::tests::repo("patron-wt");
+        let (core, root) = core("patron-wt", &["kaan"]);
+        with(&core.db, |c| {
+            c.execute("UPDATE teams SET cwd = ?1 WHERE id = 'default'", [proj.to_string_lossy()]).map_err(|e| e.to_string())?;
+            c.execute("UPDATE projects SET root_path = ?1, root_key = ?2 WHERE id = 'legacy-default'", rusqlite::params![proj.to_string_lossy(), crate::projects::path_key(&proj.to_string_lossy())]).map_err(|e| e.to_string())?;
+            let ready = crate::projects::prepare_root(&proj.to_string_lossy(), None).map_err(|e| e.to_string())?;
+            crate::projects::verify(c, "default", "legacy-default", &ready).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        core.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({ "prompt": "patron soruyor" }), false);
+        core.agent_states.hook("kaan", Some(agents::Status::Idle), None);
+        let k = with(&core.db, |c| {
+            let from = delegate::caller(c, "timur")?;
+            delegate::insert(c, delegate::NewDelegation { from: &from, to_agent: "kaan".into(), team_id: "default".into(), service_team_id: None, prompt: "iş".into(), task_id: None, patron_words: None, effort: Some(effort::Effort::High) })
+        })
+        .unwrap();
+        assert_eq!(core.delegation_dispatch(k.clone()).unwrap().status, "running");
+        assert!(core.ptys.is_running("kaan"), "the patron's session stays");
+        let w = with(&core.db, |c| worktree::get(c, k.id)).unwrap().expect("patron oturumunda da iş kaydı dala bağlanır");
+        assert!(w.path.is_dir() && w.removed_at.is_none(), "{w:?}");
+        let prompt = with(&core.db, |c| delegate::worker_prompt(c, &delegate::get(c, k.id).unwrap())).unwrap();
+        assert!(prompt.contains(&w.branch) && prompt.contains(&w.path.display().to_string()), "{prompt}");
+        assert!(with(&core.db, |c| delegate::get(c, k.id)).unwrap().effort_skipped, "effort yine uygulanmaz");
         done(core, root, &["kaan"]);
     }
 
