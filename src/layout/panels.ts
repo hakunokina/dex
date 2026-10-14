@@ -10,6 +10,7 @@ import { requestFocus } from "../launcher";
 import { killPty } from "../pty";
 import { addShell, getFavorite, getSnapshot, removeShell, setDock, setFavorite, shellPtyId } from "./store";
 import { membersOf } from "../team/store";
+import { isAssignable } from "../team/rolePolicy";
 import { newShellCwd, resolveShellCwd } from "../project/store";
 import { projectErrorText } from "../project/model";
 import { toast } from "../toast/store";
@@ -18,6 +19,7 @@ import { selectSettingsTab, type SettingsTab } from "../settings/tab";
 import { workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
+import { assistantDirection } from "./assistantPlacement";
 
 const hot = import.meta.hot;
 const apis = kept(hot, "apis", () => new Map<string, DockviewApi>());
@@ -112,7 +114,7 @@ export const boundApi = (teamId: string) => apis.get(teamId);
 export const agentPanelId = (agentId: string) => `agent:${agentId}`;
 export const shellPanelId = (shellId: string) => `shell:${shellId}`;
 
-type Kind = "leader" | "worker" | "shell" | "office" | "board" | "settings" | "team" | "notes" | "memory" | "procs";
+type Kind = "leader" | "assistant" | "worker" | "shell" | "office" | "board" | "settings" | "team" | "notes" | "memory" | "procs";
 
 function kindOf(teamId: string, panelId: string): Kind | null {
   if (panelId === "office" || panelId === "board" || panelId === "settings" || panelId === "team" || panelId === "memory" || panelId === "procs") return panelId;
@@ -120,7 +122,7 @@ function kindOf(teamId: string, panelId: string): Kind | null {
   if (isNotes(panelId)) return "notes";
   if (panelId.startsWith("agent:")) {
     const a = membersOf(teamId).find(m => agentPanelId(m.id) === panelId);
-    return a ? a.kind : null;
+    return a ? a.roleSlug === "assistant" ? "assistant" : a.kind : null;
   }
   return null;
 }
@@ -199,9 +201,19 @@ function centerFloat(api: DockviewApi, p: IDockviewPanel) {
 /** Worker/shell cells narrower than this stack as tabs instead of splitting further. */
 const MIN_CELL_W = 420;
 
+function assistantOrigin(api: DockviewApi, leader: IDockviewPanel | undefined) {
+  return leader && api.width > 0 ? { assistantLeader: leader.id, assistantLeadShare: leader.group.api.width / api.width } : {};
+}
+
 /** Where a newly opened panel goes: next to its own kind first, else its default neighbour. */
 function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
   const kind = kindOf(teamId, spec.id);
+  if (kind === "assistant") {
+    const leader = api.panels.find(p => kindOf(teamId, p.id) === "leader");
+    const direction = assistantDirection(window.innerWidth);
+    return api.addPanel({ ...spec, params: { ...spec.params, assistantDirection: direction, ...assistantOrigin(api, leader) },
+      position: { ...(leader ? { referencePanel: leader } : {}), direction } });
+  }
   if (kind === "worker") {
     const pair = workerRowsOf(teamId, api);
     const groups = workingGroupsOf(api, pair);
@@ -371,7 +383,7 @@ export function saveFavoriteLayout(teamId: string): boolean {
   setFavorite({
     dock: api.toJSON(),
     leaders: members.filter(a => a.kind === "leader").map(a => a.id),
-    workers: members.filter(a => a.kind === "worker").map(a => a.id),
+    workers: members.filter(a => a.kind === "worker" && isAssignable(a)).map(a => a.id),
     shells: (getSnapshot().teams[teamId]?.shells ?? []).map(s => s.id),
     from: teamId,
   });
@@ -385,7 +397,7 @@ function favoriteTarget(teamId: string, shellCount: number): FavoriteTarget {
   const shells = have.map(s => s.id);
   // Kaynaktaki shell yuvası kadar kabuk: eksikse üret, fazlası durur (panelsiz kalır).
   for (let i = shells.length; i < shellCount; i++) shells.push(addShell(teamId, newShellCwd(teamId)));
-  const pick = (kind: "leader" | "worker") => members.filter(a => a.kind === kind).map(a => ({ id: a.id, name: a.name }));
+  const pick = (kind: "leader" | "worker") => members.filter(a => a.kind === kind && isAssignable(a)).map(a => ({ id: a.id, name: a.name }));
   return { leaders: pick("leader"), workers: pick("worker"), shells };
 }
 
@@ -489,7 +501,7 @@ function buildDefault(teamId: string, api: DockviewApi) {
     : put(NOTES.shared, office, "right");
   api.addPanel({ ...NOTES.team, inactive: true, position: { referenceGroup: notes.group } });
 
-  const workers = members.filter(a => a.kind === "worker").map(a => agentSpec(teamId, a.id)!);
+  const workers = members.filter(a => a.kind === "worker" && isAssignable(a)).map(a => agentSpec(teamId, a.id)!);
   // #65: a team without a shell gets one — its group carries "Yeni terminal", as on the patron's first team.
   const shellIds = t?.shells.length ? t.shells.map(s => s.id) : [addShell(teamId, newShellCwd(teamId))];
   const shells = shellIds.map(shellSpec);
@@ -522,15 +534,47 @@ function buildDefault(teamId: string, api: DockviewApi) {
   if (workers.length && shellCells.length) shellCells[0].group.api.setSize({ height: shellsH });
   heads.forEach(p => p.group.api.setSize({ width: leftW / heads.length }));
   shellCells.forEach(p => p.group.api.setSize({ width: leftW / shellCells.length }));
+  syncAssistantPanel(teamId, api);
   office.api.setActive();
+}
+
+/** Membership and viewport changes reuse the same agent slot and the existing session. */
+export function syncAssistantPanel(teamId: string, api: DockviewApi) {
+  const assistant = membersOf(teamId).find(a => a.roleSlug === "assistant");
+  if (!assistant || !api.totalPanels) return;
+  const spec = agentSpec(teamId, assistant.id)!;
+  const pane = api.getPanel(spec.id);
+  const direction = assistantDirection(window.innerWidth);
+  if (pane?.params?.assistantDirection === direction) return;
+  // Floating placement belongs to the patron.
+  if (pane && pane.api.location.type !== "grid") return;
+  quietly(teamId, () => {
+    if (!pane) add(teamId, api, { ...spec, inactive: true });
+    else {
+      const leader = api.panels.find(p => kindOf(teamId, p.id) === "leader");
+      if (!leader) return;
+      const origin = pane.params?.assistantLeader ? {} : assistantOrigin(api, leader);
+      pane.api.moveTo({ group: leader.group, position: direction === "below" ? "bottom" : "right", skipSetActive: true });
+      pane.api.updateParameters({ assistantDirection: direction, ...origin });
+    }
+  });
 }
 
 /** Drop panels whose agent left the team or whose shell is gone. */
 export function reconcile(teamId: string, api: DockviewApi) {
   const agents = new Set(membersOf(teamId).map(a => agentPanelId(a.id)));
   const shells = new Set((getSnapshot().teams[teamId]?.shells ?? []).map(s => shellPanelId(s.id)));
-  const stale = api.panels.filter(p => (p.id.startsWith("agent:") && !agents.has(p.id)) || (p.id.startsWith("shell:") && !shells.has(p.id)));
-  if (stale.length) quietly(teamId, () => stale.forEach(p => api.removePanel(p)));
+  const stale = api.panels.filter(p => (p.id.startsWith("agent:") && (!agents.has(p.id) || p.params?.assistantDirection && kindOf(teamId, p.id) !== "assistant")) || (p.id.startsWith("shell:") && !shells.has(p.id)));
+  if (stale.length) quietly(teamId, () => {
+    const origins = stale.map(p => ({ leader: p.params?.assistantLeader, share: p.params?.assistantLeadShare }));
+    stale.forEach(p => api.removePanel(p));
+    for (const { leader, share } of origins) {
+      if (typeof leader === "string" && typeof share === "number" && share > 0 && share < 1) {
+        api.getPanel(leader)?.group.api.setSize({ width: api.width * share });
+      }
+    }
+  });
+  syncAssistantPanel(teamId, api);
 }
 
 export function load(teamId: string, api: DockviewApi) {

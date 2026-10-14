@@ -30,7 +30,7 @@ import { OfficeBar } from "../office/OfficeBar";
 import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
 import {
   agentPanelId, bindApi, boundApi, closeShell, growIntoCorner, isBulk, isNotes, load, NOTES, openPanel, openShell, reconcile,
-  resetLayout, shellPanelId, unbindApi, type NotesPage,
+  resetLayout, shellPanelId, syncAssistantPanel, unbindApi, type NotesPage,
 } from "./panels";
 import "./workspace.css";
 
@@ -356,6 +356,17 @@ export function Workspace(props: Props) {
   useEffect(() => {
     if (api) reconcile(teamId, api);
   }, [api, teamId, agents, shells]);
+
+  useEffect(() => {
+    if (!api || !agents.some(a => a.teamId === teamId && a.roleSlug === "assistant")) return;
+    let frame = 0;
+    const resize = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => syncAssistantPanel(teamId, api));
+    };
+    window.addEventListener("resize", resize);
+    return () => { window.removeEventListener("resize", resize); cancelAnimationFrame(frame); };
+  }, [api, teamId, agents]);
 
   return (
     <WorkspaceCtx.Provider value={props}>

@@ -30,6 +30,7 @@ import { providerModels } from "./providerModels";
 import { openSettings } from "../layout/panels";
 import { onGatewayCatalogChanged } from "../settings/gatewayApi";
 import { TestLevelToggle } from "./TestLevelToggle";
+import { assistantTaken, memberRoles } from "./rolePolicy";
 
 /** DEX-25: swap the local provider's (empty) static catalog for the live server list. */
 function withLocalModels(providers: ProviderInfo[], st: LocalStatus | null): ProviderInfo[] {
@@ -64,19 +65,20 @@ function HostBadge({ host }: { host: string }) {
 const CATEGORY_TEXT: Record<string, string> = {
   leadership: "Liderlik", eng: "Mühendislik", qa: "Kalite", research: "Araştırma", design: "Tasarım",
   product: "Ürün", ops: "Operasyon", security: "Güvenlik", automation: "Otomasyon", marketing: "Pazarlama",
-  support: "Destek", game: "Oyun", education: "Eğitim",
+  support: "Destek", game: "Oyun", education: "Eğitim", personal: "Kişisel",
 };
 
 /** Roles kept in the catalog but demoted from the new-team form (DEX-21). */
 export const DEMOTED_ROLES = ["support", "marketing", "seo", "n8n-automation"];
 
 /** Role picker grouped by category (catalog order). With `other`, those slugs move to a trailing "Diğer" group. */
-function RoleSelect({ value, onChange, disabled, label, other, profile = "dev" }: {
+function RoleSelect({ value, onChange, disabled, label, other, profile = "dev", allowAssistant = false, assistantUnavailable = false }: {
   value: string; onChange: (slug: string) => void; disabled?: boolean; label?: string; other?: string[];
   profile?: TeamProfile;
+  allowAssistant?: boolean; assistantUnavailable?: boolean;
 }) {
   const { roles } = useTeams();
-  const available = roles.filter(r => (r.category === "education") === (profile === "edu"));
+  const available = memberRoles(roles, profile, allowAssistant);
   const groups = new Map<string, Role[]>();
   const rest: Role[] = [];
   for (const r of available) {
@@ -85,10 +87,11 @@ function RoleSelect({ value, onChange, disabled, label, other, profile = "dev" }
   }
   return (
     <select value={value} disabled={disabled} aria-label={label ?? "Rol"} onChange={(e) => onChange(e.target.value)}>
-      {!roles.some((r) => r.slug === value) && <option value={value}>{value || "—"}</option>}
+      {!available.some((r) => r.slug === value) && <option value={value}>{roles.find(r => r.slug === value)?.name ?? (value || "—")}</option>}
       {[...groups].map(([cat, rs]) => (
         <optgroup key={cat} label={CATEGORY_TEXT[cat] ?? cat}>
-          {rs.map((r) => <option key={r.slug} value={r.slug} title={r.description}>{r.name}</option>)}
+          {rs.map((r) => <option key={r.slug} value={r.slug} disabled={r.slug === "assistant" && assistantUnavailable}
+            title={r.slug === "assistant" && assistantUnavailable ? "Takımda zaten bir asistan var" : r.description}>{r.name}</option>)}
         </optgroup>
       ))}
       {rest.length > 0 && (
@@ -486,6 +489,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
     e.preventDefault();
     if (!chosenNewModel || newGatewayUnavailable) return;
     await run(async () => {
+      if (role === "assistant" && assistantTaken(membersOf(teamId))) throw new Error("Takımda zaten bir asistan var");
       await addAgent({ teamId, name, kind, model: chosenNewModel, provider, roleSlug: role, engine });
       setName("");
     });
@@ -544,7 +548,11 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
                 <td data-label="Ad"><i className="swatch" style={{ background: a.shirt }} />{a.name}</td>
                 <td data-label="Rol" title={a.title}>
                   <RoleSelect profile={team.profile} value={a.roleSlug ?? ""} disabled={busy} label={`${a.name} rolü`}
-                    onChange={(v) => run(() => patchAgent(a.id, { roleSlug: v }))} />
+                    allowAssistant={a.kind === "worker"} assistantUnavailable={assistantTaken(members, a.id)}
+                    onChange={(v) => run(() => {
+                      if (v === "assistant" && assistantTaken(membersOf(teamId), a.id)) throw new Error("Takımda zaten bir asistan var");
+                      return patchAgent(a.id, { roleSlug: v });
+                    })} />
                 </td>
                 <td data-label="Motor">
                   <select value={a.engine || "claude"} disabled={busy} aria-label={`${a.name} motoru`}
@@ -621,7 +629,8 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
           <option value="leader">lider</option>
           <option value="worker">worker</option>
         </select>
-        <RoleSelect profile={team.profile} value={role} onChange={setRole} label="Yeni üyenin rolü" />
+        <RoleSelect profile={team.profile} value={role} onChange={setRole} label="Yeni üyenin rolü"
+          allowAssistant={kind === "worker"} assistantUnavailable={assistantTaken(members)} />
         <select value={engine} aria-label="Yeni üyenin motoru"
           onChange={(e) => {
             setEngine(e.target.value);
@@ -639,8 +648,9 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
         <select value={chosenNewModel} disabled={!newModels.length} aria-label="Yeni üyenin modeli" onChange={(e) => setModel(e.target.value)}>
           {newModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
         </select>
-        <button type="submit" className="primary" disabled={!chosenNewModel || newGatewayUnavailable}>Ekle</button>
+        <button type="submit" className="primary" disabled={!chosenNewModel || newGatewayUnavailable || role === "assistant" && assistantTaken(members)}>Ekle</button>
       </form>
+      {role === "assistant" && assistantTaken(members) && <p className="team-warn" role="status">Takımda zaten bir asistan var</p>}
       {engine !== "codex" && provider === "gateway" && (newGatewayUnavailable || !newModels.length) && <p className="team-warn" role="status">
         {newGatewayUnavailable ? "ChatGPT girişi yok — Ayarlar → Sağlayıcılar’dan giriş yapın" : "Hesabın model listesi boş — Ayarlar → Sağlayıcılar’dan durumu yenileyin"}
       </p>}
@@ -648,7 +658,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
       <ProviderSettings host={host} providers={providers} reload={reloadProviders} local={local} setLocal={setLocal} />
       {providerError && <p className="team-err" role="alert">{providerError}</p>}
 
-      {error && <p className="team-err">{error}</p>}
+      {error && <p className="team-err" role="alert">{error}</p>}
       <div className="team-actions">
         {/* DEX-36: panels back to the default screen; sessions keep running. */}
         <button onClick={onReset} title="Panelleri varsayılan yerleşime döndür (oturumlar sürer)">
