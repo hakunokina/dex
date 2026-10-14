@@ -256,6 +256,7 @@ pub fn run() {
         mobile_hosts::host_token_set,
         mobile_hosts::host_token_delete,
         mobile_hosts::share_take,
+        mobile_hosts::share_opaque,
         mobile_hosts::share_done,
         mobile_hosts::push_token,
         mobile_hosts::push_take,

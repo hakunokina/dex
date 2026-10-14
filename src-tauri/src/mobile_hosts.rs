@@ -143,10 +143,30 @@ pub async fn share_take<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Val
     .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
 }
 
+/// #1762 geri düşüş: hızlı gönderim olmayıp gönderim ekranı açılacaksa pencere + WebView
+/// opaklığa döner (CSS'e güvenilmez). Dex önde kalır, bu komut kapatmaz/arkaya almaz.
+#[tauri::command]
+pub async fn share_opaque<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let handle = app
+        .try_state::<ShareTarget<R>>()
+        .ok_or("paylaş köprüsü yüklenemedi (Android eklentisi yok)")?
+        .inner()
+        .0
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .run_mobile_plugin::<serde_json::Value>("opaque", serde_json::json!({}))
+            .map(|_| ())
+            .map_err(|e| format!("paylaşım opaklaştırılamadı: {e}"))
+    })
+    .await
+    .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
+}
+
 /// #1717 hızlı gönderim bitti: Kotlin kısa bir Toast gösterir (`message`, en fazla 80 karakter; kişisel
 /// içerik taşımaz) ve Dex'i kapatır/arkaya alır — kullanıcı paylaştığı uygulamaya döner. Soğuk paylaşım
 /// açılışında görev tamamen kaldırılır (son kullanılanlarda kopya kalmaz); uygulama zaten açıksa görev
-/// arkaya alınır. Gönderim ekranı açılırsa çağrılmaz, Dex önde kalır.
+/// arkaya alınır (#1762: önce opaklığa dönülür). Gönderim ekranı açılırsa çağrılmaz, Dex önde kalır.
 #[tauri::command]
 pub async fn share_done<R: Runtime>(app: AppHandle<R>, message: String) -> Result<(), String> {
     let handle = app

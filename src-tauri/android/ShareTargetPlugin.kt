@@ -17,7 +17,8 @@
 // kullanılanlarda ayrı bir "paylaşım" kopyası olur. Soğuk paylaşımda `finishAndRemoveTask` görevi
 // tamamen kaldırır (arkada Instagram belirir, kopya kalmaz). Uygulama zaten açıkken gelen paylaşımda
 // (`onNewIntent`) mevcut görev kullanılır, o yüzden eski davranış (`moveTaskToBack`) korunur.
-// Gönderim ekranı (ShareScreen) açılırsa Dex bilerek önde kalır (opak CSS örter).
+// Gönderim ekranı (ShareScreen) açılırsa Dex bilerek önde kalır; JS `opaque` ile opaklığa
+// döndürür (#1762, CSS'e güvenilmez).
 
 package com.hakunokina.dex.hosttokens
 
@@ -37,6 +38,7 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+import com.hakunokina.dex.ShareActivity
 
 @InvokeArg
 class DoneArgs {
@@ -50,22 +52,35 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
     private var pending: JSObject? = null
     /** Soğuk açılış paylaşımı mı: `load()` paylaşımla açıldı, `onNewIntent` görmedi. `done` tüketir. */
     private var coldShare = false
+    /**
+     * #1762 hızlı gönderim sürüyor mu: `capture` ile açılır, `done`/`opaque` ile kapanır.
+     * Pencere kuralı (tek karar yeri: [setWindow], saf eşleniği `shareLogic.nextShareWindow`):
+     * YALNIZ bu bayrak varken saydam; diğer her durumda opak.
+     */
+    private var sharing = false
     /** #1759 tramplen `onCreate` damgası (`dex.share_t0`); yoksa -1. Yalnız süre ölçümü. */
     private var shareT0 = -1L
 
     override fun load(webView: WebView) {
         this.webView = webView
         coldShare = capture(activity.intent)
-        applyWindow(webView, coldShare)
+        sharing = coldShare
+        setWindow(webView, coldShare)
     }
 
     override fun onNewIntent(intent: Intent) {
         if (capture(intent)) {
             coldShare = false
-            webView?.let { applyWindow(it, true) }
+            sharing = true
+            webView?.let { setWindow(it, true) }
             activity.runOnUiThread {
                 webView?.evaluateJavascript("window.dispatchEvent(new Event('dex-share'))", null)
             }
+        } else {
+            // #1762: paylaşım sonrası arkaya alınmış Dex başlatıcıdan normal açılırsa (MAIN)
+            // saydam kalmasın.
+            sharing = false
+            webView?.let { setWindow(it, false) }
         }
     }
 
@@ -89,7 +104,11 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
         val t0 = synchronized(this) { shareT0.also { shareT0 = -1L } }
         // #1759: tramplenden kapanışa geçen süre; yalnız süre, içerik yok.
         if (cold && t0 > 0) Log.i(TAG, "soguk paylasim gonderimi ${SystemClock.elapsedRealtime() - t0} ms")
+        val view = webView
         activity.runOnUiThread {
+            // #1762: arkaya alma/kapanış öncesi opaklığa dön; yoksa başlatıcıdan normal açılış saydam kalır.
+            sharing = false
+            if (view != null) setWindowInner(view, false)
             if (msg.isNotEmpty()) Toast.makeText(activity.applicationContext, msg, Toast.LENGTH_SHORT).show()
             if (cold) {
                 try {
@@ -101,6 +120,17 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
                 activity.moveTaskToBack(true)
             }
         }
+        invoke.resolve(JSObject())
+    }
+
+    /**
+     * #1762 geri düşüş: hızlı gönderim olmayıp gönderim ekranı (ShareScreen) açılacaksa JS çağırır;
+     * pencere + WebView opaklığa döner (CSS'e güvenilmez).
+     */
+    @Command
+    fun opaque(invoke: Invoke) {
+        sharing = false
+        webView?.let { setWindow(it, false) }
         invoke.resolve(JSObject())
     }
 
@@ -129,26 +159,29 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
         out.put("task", taskOf(intent))
         synchronized(this) {
             pending = out
-            val t0 = intent.getLongExtra("dex.share_t0", -1L)
+            val t0 = intent.getLongExtra(ShareActivity.EXTRA_T0, -1L)
             if (t0 > 0) shareT0 = t0
         }
         return true
     }
 
     /**
-     * #1759 pencere saydamlığı: paylaşımda pencere + WebView saydam (arkada Instagram görünür),
-     * değilse opak siyah (translucent tema normal açılışta başlatıcıyı göstermesin; JS ilk karede
-     * gerçek temayı çizer). Her zaman UI iş parçacığında çağrılmalıdır.
+     * #1759 pencere saydamlığı (#1762: tek karar yeri): paylaşımda pencere + WebView saydam
+     * (arkada Instagram görünür), değilse opak siyah (translucent tema normal açılışta
+     * başlatıcıyı göstermesin; JS ilk karede gerçek temayı çizer). Her zaman UI iş
+     * parçacığında çağrılmalıdır — bkz. `setWindowInner`.
      */
-    private fun applyWindow(view: WebView, shared: Boolean) {
-        activity.runOnUiThread {
-            if (shared) {
-                view.setBackgroundColor(Color.TRANSPARENT)
-                activity.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
-            } else {
-                view.setBackgroundColor(Color.BLACK)
-                activity.window?.setBackgroundDrawable(ColorDrawable(Color.BLACK))
-            }
+    private fun setWindow(view: WebView, transparent: Boolean) {
+        activity.runOnUiThread { setWindowInner(view, transparent) }
+    }
+
+    private fun setWindowInner(view: WebView, transparent: Boolean) {
+        if (transparent) {
+            view.setBackgroundColor(Color.TRANSPARENT)
+            activity.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        } else {
+            view.setBackgroundColor(Color.BLACK)
+            activity.window?.setBackgroundDrawable(ColorDrawable(Color.BLACK))
         }
     }
 
@@ -158,7 +191,7 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
      * (doğrudan MainActivity çağrıları).
      */
     private fun taskOf(intent: Intent): String {
-        when (intent.getStringExtra("dex.task")) {
+        when (intent.getStringExtra(ShareActivity.EXTRA_TASK)) {
             "repo" -> return "repo"
             "verify" -> return "verify"
             "ask" -> return "ask"

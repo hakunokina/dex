@@ -13,6 +13,7 @@ import {
   imageFitsAsIs,
   initialText,
   isShareFastMode,
+  nextShareWindow,
   resolveShareHost,
   resultText,
   scaleToFit,
@@ -183,6 +184,13 @@ test("fastSendPlan: belirsizlik ya da hata → ekran (ilk eksik koşul)", () => 
   assert.equal(why({ problem: "Görsel çok büyük" }), "invalid");
   // sürücünün karamsar varsayılanları: hiçbir olgu yokken asla gönderilmez
   assert.equal(why({ hostIds: [], connected: false, supportsInbox: false, targets: [] }), "no-host");
+});
+
+test("nextShareWindow: YALNIZ hızlı gönderim sürerken saydam, diğer her olay opak", () => {
+  assert.equal(nextShareWindow("share"), "transparent");
+  assert.equal(nextShareWindow("fallback"), "opaque");
+  assert.equal(nextShareWindow("done"), "opaque");
+  assert.equal(nextShareWindow("plain"), "opaque");
 });
 
 test("isShareFastMode: yalnız hızlı gönderim sürerken saydam kök + push'suz", () => {

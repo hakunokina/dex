@@ -6,7 +6,7 @@
 // which the PCB canvas and the terminal both follow (ResizeObserver / visualViewport).
 import { useEffect, useState } from "react";
 import { LOCAL, onEvent, useHosts } from "../api/hosts";
-import { SHARE_EVENT, shareDone, takeShare, type RawShare } from "../api/shareTarget";
+import { SHARE_EVENT, shareDone, shareOpaque, takeShare, type RawShare } from "../api/shareTarget";
 import { REPLY_LINK_EVENT, takeReplyLink } from "../api/push";
 import { INBOX_REPLY_EVENT, type ReplyId } from "../api/replies";
 import { initTeams, selectTeam, useTeams } from "../team/store";
@@ -119,6 +119,8 @@ export default function MobileApp() {
               // İlk paylaşımda bildirim izni (Echo cevap verince haber vermek için), sonra arka plana.
               void askNotifyOnce().finally(() => shareDone(r.toast).catch(() => {}));
             } else {
+              // #1762 geri düşüş: gönderim ekranı opak açılır (pencere + WebView opaklığa döner).
+              void shareOpaque().catch(() => {});
               setShare((s) => (s?.seq === mine ? { ...s, fast: false, error: r.error } : s));
             }
           });
