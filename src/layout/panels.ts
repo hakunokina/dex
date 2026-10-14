@@ -8,7 +8,7 @@ import type {
 import { kept } from "../hot";
 import { requestFocus } from "../launcher";
 import { killPty } from "../pty";
-import { addShell, getFavorite, getSnapshot, removeShell, setDock, setFavorite, shellPtyId } from "./store";
+import { addShell, assistantOffered, getFavorite, getSnapshot, removeShell, setAssistantOffered, setDock, setFavorite, shellPtyId } from "./store";
 import { membersOf } from "../team/store";
 import { isAssignable } from "../team/rolePolicy";
 import { newShellCwd, resolveShellCwd } from "../project/store";
@@ -19,7 +19,7 @@ import { selectSettingsTab, type SettingsTab } from "../settings/tab";
 import { workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
-import { assistantDirection } from "./assistantPlacement";
+import { assistantDirection, opensAssistant } from "./assistantPlacement";
 
 const hot = import.meta.hot;
 const apis = kept(hot, "apis", () => new Map<string, DockviewApi>());
@@ -534,16 +534,23 @@ function buildDefault(teamId: string, api: DockviewApi) {
   if (workers.length && shellCells.length) shellCells[0].group.api.setSize({ height: shellsH });
   heads.forEach(p => p.group.api.setSize({ width: leftW / heads.length }));
   shellCells.forEach(p => p.group.api.setSize({ width: leftW / shellCells.length }));
-  syncAssistantPanel(teamId, api);
+  // A rebuilt default layout includes the assistant again, even one the patron had closed.
+  syncAssistantPanel(teamId, api, true);
   office.api.setActive();
 }
 
-/** Membership and viewport changes reuse the same agent slot and the existing session. */
-export function syncAssistantPanel(teamId: string, api: DockviewApi) {
+/**
+ * Membership and viewport changes reuse the same agent slot and the existing session. Dex opens the
+ * pane once per assistant (or on `fresh` default layouts); after the patron closes it, only the rack does.
+ */
+export function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = false) {
   const assistant = membersOf(teamId).find(a => a.roleSlug === "assistant");
   if (!assistant || !api.totalPanels) return;
   const spec = agentSpec(teamId, assistant.id)!;
   const pane = api.getPanel(spec.id);
+  const opens = fresh || opensAssistant(assistant.id, assistantOffered(teamId));
+  setAssistantOffered(teamId, assistant.id);
+  if (!pane && !opens) return;
   const direction = assistantDirection(window.innerWidth);
   if (pane?.params?.assistantDirection === direction) return;
   // Floating placement belongs to the patron.

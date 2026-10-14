@@ -84,4 +84,35 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
     Math.sign(g.x - other.x), Math.sign(g.y - other.y),
   ]));
   expect(order(afterGroups)).toEqual(order(beforeGroups));
+  // A newly added assistant opens by itself; closed by the patron, it stays closed through resizes
+  // and reloads, and only the rack brings it back.
+  await role.selectOption("assistant");
+  await settings.getByRole("button", { name: "Ekle", exact: true }).click();
+  let next = { id: "", name: "" };
+  await expect.poll(async () => {
+    next = (await dexd.call<{ id: string; name: string; teamId: string; roleSlug: string }[]>("agent_list"))
+      .find(a => a.teamId === team.id && a.roleSlug === "assistant") ?? next;
+    return next.id;
+  }).not.toBe("");
+  await app.locator('.team-stage:not(.hidden) .dv-tab').filter({ hasText: /^Kart$/ }).click();
+  await paneOf(app, next.name);
+  await app.locator(".team-stage:not(.hidden)").getByRole("button", { name: `${next.name} sekmesini kapat`, exact: true }).focus();
+  await app.keyboard.press("Enter");
+  await expect(region(next.name)).toHaveCount(0);
+  await app.setViewportSize({ width: 1300, height: 900 });
+  await app.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+  await expect(region(next.name)).toHaveCount(0);
+  // The debounced layout_save must carry the closed pane and the assistant it was opened for.
+  await expect.poll(async () => {
+    const save = (await calls(app)).filter(c => c.cmd === "layout_save").at(-1);
+    const t = (save?.args.layout as { teams?: Record<string, { dock?: { panels?: Record<string, unknown> }; assistant?: string }> })?.teams?.[team.id];
+    return { open: !!t?.dock?.panels && `agent:${next.id}` in t.dock.panels, assistant: t?.assistant };
+  }).toEqual({ open: false, assistant: next.id });
+  await app.reload();
+  await openTeam(app, team.name);
+  await paneOf(app, leader.name);
+  await expect(region(next.name)).toHaveCount(0);
+  await app.getByRole("group", { name: "Takım ajanları" }).locator(`[data-agent="${next.id}"]`).focus();
+  await app.keyboard.press("Enter");
+  await paneOf(app, next.name);
 });

@@ -30,7 +30,7 @@ import { providerModels } from "./providerModels";
 import { openSettings } from "../layout/panels";
 import { onGatewayCatalogChanged } from "../settings/gatewayApi";
 import { TestLevelToggle } from "./TestLevelToggle";
-import { assistantTaken, memberRoles } from "./rolePolicy";
+import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 
 /** DEX-25: swap the local provider's (empty) static catalog for the live server list. */
 function withLocalModels(providers: ProviderInfo[], st: LocalStatus | null): ProviderInfo[] {
@@ -768,7 +768,7 @@ function WorkersBulk({ teamId, providers, codexModels }: {
   const models = engineModels(codexModels, providers, engine, provider);
   // The list can change under the choice (live catalogs); never send a model it doesn't hold.
   const chosen = models.some((m) => m.id === model) ? model : models[0]?.id ?? "";
-  const workers = membersOf(teamId).filter((a) => a.kind === "worker");
+  const workers = membersOf(teamId).filter((a) => a.kind === "worker" && isAssignable(a));
   const waiting = workers.filter((a) => a.pending && isRunning(a.id));
   const warn = tokenWarning(providers, engine, provider);
   const noModels = !chosen
