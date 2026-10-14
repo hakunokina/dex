@@ -45,7 +45,13 @@ test("installed pre-commit rejects a missing scanner", () => {
   git(repo, "config", "--local", "core.hooksPath", "scripts/hooks");
   writeFileSync(resolve(repo, "sample.txt"), "clean content\n");
   git(repo, "add", "sample.txt");
-  const result = run(repo, "git", ["commit", "-m", "Clean change"]);
+  // Ortamda gitleaks kurulu olabilir (PATH'te); "tarayıcı yok" senaryosu yalıtılmış PATH ister.
+  const exe = process.platform === "win32" ? "gitleaks.exe" : "gitleaks";
+  const isolated = (process.env.PATH || "").split(delimiter)
+    .filter((dir) => dir && !existsSync(resolve(dir, exe)));
+  const nodeExe = process.platform === "win32" ? "node.exe" : "node";
+  if (!isolated.some((dir) => existsSync(resolve(dir, nodeExe)))) isolated.unshift(dirname(process.execPath));
+  const result = run(repo, "git", ["commit", "-m", "Clean change"], { PATH: isolated.join(delimiter) });
   assert.notEqual(result.status, 0, "missing gitleaks must block commit");
   assert.match(result.stderr, /gitleaks.*bulunamadi/);
 });

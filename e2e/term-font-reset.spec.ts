@@ -53,7 +53,7 @@ test("Ctrl+tekerlek yazı boyutunu değiştirir, PTY'yi yeniden boyutlar, reload
   await expect.poll(() => fontPx(pane)).toBe(base);
 });
 
-// Görev #51: the reset first asks the leader for a hand-over note (the `[Dex]` prompt reaches the
+// Görev #51: the reset first asks the leader for a hand-over note (the `[Dex-Sistem]` prompt reaches the
 // PTY); the fake cannot call `reset_ready` (core unit tests cover it), so the patron's "Şimdi sıfırla"
 // finishes it here — and "İptal" keeps the session.
 test("lider Temiz oturum: önce devir notu istemi gider; İptal oturumu korur, Şimdi sıfırla temiz açar", async ({ app, dexd }) => {
@@ -83,7 +83,7 @@ test("lider Temiz oturum: önce devir notu istemi gider; İptal oturumu korur, �
   app.once("dialog", (d) => void d.accept());
   await button.click();
   await expect(strip).toContainText("Devir notu yazılıyor");
-  await expect(rows).toContainText("RX:[Dex] Oturumun sıfırlanacak");
+  await expect(rows).toContainText("RX:[Dex-Sistem] Oturumun sıfırlanacak");
   await expect(button).toBeDisabled();
   await expect(dexd.call("leader_reset", { id: leader.id, action: "begin" })).rejects.toThrow(/zaten sürüyor/);
 
