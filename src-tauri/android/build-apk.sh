@@ -42,6 +42,18 @@ if [ -f "$KT" ]; then
   mkdir -p "$(dirname "$DST")"
   cp "$KT" "$DST"
 fi
+# Paylaş hedefi (Instagram vb. → Paylaş → Dex): ikinci Kotlin köprüsü + manifest intent-filter'ları.
+# gen/ commit'li değil; her derlemede idempotent eklenir. MainActivity singleTask olmalı (açık
+# uygulamaya yeni paylaşım onNewIntent ile gelir).
+SKT=src-tauri/android/ShareTargetPlugin.kt
+[ -f "$SKT" ] && cp "$SKT" "$(dirname "$DST")/ShareTargetPlugin.kt"
+M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
+if ! grep -q 'android.intent.action.SEND' "$M"; then
+  awk -v f=src-tauri/android/share-intent-filters.xml '!done && /<\/activity>/ { while ((getline l < f) > 0) print l; done=1 } { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+fi
+grep -q 'android.intent.action.SEND' "$M" || { echo "manifest'e Paylaş intent-filter eklenemedi"; exit 1; }
+grep -q 'android:launchMode="singleTask"' "$M" || sed -i '0,/<activity/s//<activity android:launchMode="singleTask"/' "$M"
+grep -q 'android:launchMode="singleTask"' "$M" || { echo 'MainActivity singleTask yapılamadı; Paylaş (açık uygulama) çalışmaz'; exit 1; }
 grep -q security-crypto "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("androidx.security:security-crypto:1.1.0-alpha06")|' "$G"
 
 # Release R8 strips classes it can't see referenced; the bridge is loaded by name from Rust.
