@@ -1027,7 +1027,7 @@ fn apply_target(conn: &Connection, id: &str, t: &PendingModel) -> Result<(), Str
     Ok(())
 }
 
-/// DEX-30: every `worker` of the team gets `target`; leaders are never touched. `live(id)` says
+/// DEX-30: every `worker` of the team gets `target`; leaders and the personal assistant are never touched. `live(id)` says
 /// whose session is open: those can't switch under a running CLI, so theirs is stored as pending
 /// and lands via [`apply_pending`] when the session ends. One transaction: all or nothing.
 pub fn set_workers_model(
@@ -1044,7 +1044,7 @@ pub fn set_workers_model(
     let workers: Vec<Agent> = list_agents(conn)?.into_iter().filter(|a| a.team_id == team_id).collect();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut out = WorkersOutcome::default();
-    for a in workers.iter().filter(|a| a.kind == "worker") {
+    for a in workers.iter().filter(|a| a.kind == "worker" && a.role_slug.as_deref() != Some("assistant")) {
         let same = a.engine == t.engine && a.model == t.model && t.provider.as_ref().is_none_or(|p| *p == a.provider);
         if !live(&a.id) {
             apply_target(&tx, &a.id, &t)?;
@@ -1881,6 +1881,20 @@ mod tests {
         set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), |_| false).unwrap();
         let w: Vec<_> = crew_of(&c, &s.id).into_iter().filter(|a| a.kind == "worker").collect();
         assert!(w.iter().all(|a| (a.engine.as_str(), a.provider.as_str(), a.model.as_str()) == ("claude", "glm", "GLM-5.3")));
+    }
+
+    /// The personal assistant's model changes only from its own member edit, never the bulk one.
+    #[test]
+    fn workers_bulk_change_spares_assistant() {
+        let c = mem();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let a: NewAgent = serde_json::from_value(serde_json::json!({"teamId": s.id, "name": "", "kind": "worker", "roleSlug": "assistant"})).unwrap();
+        let echo = create_agent(&c, Path::new("/data"), a).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).unwrap();
+        assert_eq!(out.applied.len(), 4);
+        assert!(!out.applied.contains(&echo.id));
+        let after = crew_of(&c, &s.id).into_iter().find(|a| a.id == echo.id).unwrap();
+        assert_eq!((after.engine.as_str(), after.model.as_str()), ("claude", crate::providers::CLAUDE_MID));
     }
 
     /// DEX-30: invalid combos fail whole — nothing half-applied.
