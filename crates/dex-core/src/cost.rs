@@ -130,7 +130,8 @@ pub(crate) fn reset_context(c: &Connection, agent: &str) -> Result<(), String> {
 struct ContextPre {
     team: String,
     model: String,
-    previous: Option<String>,
+    /// Raw `cost_context_heads.source_id` read here; `context_post` publishes only if unchanged.
+    head: Option<i64>,
     source: Option<(i64, String)>,
     ingest: Option<IngestPre>,
 }
@@ -152,16 +153,12 @@ fn context_pre(c: &Connection, agent: &str) -> Result<ContextPre, String> {
         [agent],
     )
     .map_err(err)?;
-    let (source, previous): (Option<i64>, Option<String>) = c
-        .query_row(
-            "SELECT source_id,snapshot FROM cost_context_heads WHERE agent_id=?1",
-            [agent],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let head: Option<i64> = c
+        .query_row("SELECT source_id FROM cost_context_heads WHERE agent_id=?1", [agent], |r| r.get(0))
         .map_err(err)?;
     let model = a.active_model.unwrap_or(a.model);
     // Only Claude transcripts are read; older engines' sources keep their history but are not re-read.
-    let source = match source {
+    let source = match head {
         Some(id) => c
             .query_row("SELECT engine,session,path FROM cost_sources WHERE id=?1 AND engine='claude'", [id], |r| {
                 Ok((id, r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
@@ -179,19 +176,13 @@ fn context_pre(c: &Connection, agent: &str) -> Result<ContextPre, String> {
             ingest = Some(IngestPre { engine, path, offset, state, force });
         }
     }
-    Ok(ContextPre { team: a.team_id, model, previous, source: source_id, ingest })
+    Ok(ContextPre { team: a.team_id, model, head, source: source_id, ingest })
 }
 
 /// Snapshot from the (possibly concurrently advanced) parser row; stores it on change.
-fn context_post(
-    c: &Connection,
-    agent: &str,
-    model: &str,
-    previous: Option<&str>,
-    session: Option<&str>,
-    source: Option<i64>,
-) -> Result<(AgentContext, bool), String> {
-    let mut out = AgentContext { window: model_window(model), model: model.into(), ..Default::default() };
+fn context_post(c: &Connection, agent: &str, pre: &ContextPre) -> Result<Option<(AgentContext, bool)>, String> {
+    let (source, session) = pre.source.clone().unzip();
+    let mut out = AgentContext { window: model_window(&pre.model), model: pre.model.clone(), ..Default::default() };
     if let (Some(source), Some(session)) = (source, session) {
         let parser: String = c
             .query_row("SELECT parser FROM cost_sources WHERE id=?1", [source], |r| r.get(0))
@@ -200,10 +191,26 @@ fn context_post(
         if let Some(snapshot) = state.context {
             out = snapshot;
         }
-        out.session_id = Some(session.into());
+        out.session_id = Some(session);
+    }
+    // Baş, kilit dışı okuma sırasında taze başlatmayla değişmiş olabilir: aynı kilit altında
+    // yeniden oku; kaynak artık aynı değilse bu ölçüm bayattır, yazma ve yayınlama.
+    let Some((head, previous)) = c
+        .query_row(
+            "SELECT source_id,snapshot FROM cost_context_heads WHERE agent_id=?1",
+            [agent],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    if head != pre.head {
+        return Ok(None);
     }
     let encoded = serde_json::to_string(&out).map_err(err)?;
-    let changed = previous != Some(encoded.as_str());
+    let changed = previous.as_deref() != Some(encoded.as_str());
     if changed {
         c.execute(
             "UPDATE cost_context_heads SET snapshot=?2 WHERE agent_id=?1",
@@ -211,7 +218,7 @@ fn context_post(
         )
         .map_err(err)?;
     }
-    Ok((out, changed))
+    Ok(Some((out, changed)))
 }
 
 #[cfg(test)]
@@ -228,8 +235,7 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
             commit_chunk(c, *source, &ig.path, &rows, &state, base, pos, ig.force)?;
         }
     }
-    let (source, session) = pre.source.clone().unzip();
-    context_post(c, agent, &pre.model, pre.previous.as_deref(), session.as_deref(), source)
+    context_post(c, agent, &pre)?.ok_or_else(|| "bağlam başı işlem sırasında değişti".to_string())
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -753,22 +759,28 @@ impl crate::Core {
     pub fn agent_context(&self, agent_id: &str) -> Result<AgentContext, String> {
         // #1813: kısa kilitler — dosya okuma/JSON çözümleme kilitsiz, her parça kısa bir işlem.
         // Böylece bir transcript kuyruğu işlenirken PreToolUse kararları kilidi aralarda alır.
-        let pre = crate::db::with(&self.db, |c| context_pre(c, agent_id))?;
-        if let (Some((source, _)), Some(ig)) = (pre.source.as_ref(), pre.ingest.as_ref()) {
-            let mut reader = TailReader::open(*source, &ig.path, ig.offset)?;
-            let mut state = ig.state.clone();
-            loop {
-                let Some((lines, pos)) = reader.next_chunk()? else { break };
-                let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
-                let (rows, next) = parse_chunk(*source, &ig.engine, &lines, state, base)?;
-                state = next;
-                crate::db::with(&self.db, |c| commit_chunk(c, *source, &ig.path, &rows, &state, base, pos, ig.force))?;
+        // Kilit dışındayken taze başlatma (`reset_context`/yeni SessionStart) başı değiştirebilir;
+        // o zaman eski ölçüm ne yazılır ne yayınlanır, güncel başla yeniden hesaplanır.
+        let mut attempts = 0;
+        let (pre, snapshot, changed) = loop {
+            let pre = crate::db::with(&self.db, |c| context_pre(c, agent_id))?;
+            if let (Some((source, _)), Some(ig)) = (pre.source.as_ref(), pre.ingest.as_ref()) {
+                let mut reader = TailReader::open(*source, &ig.path, ig.offset)?;
+                let mut state = ig.state.clone();
+                loop {
+                    let Some((lines, pos)) = reader.next_chunk()? else { break };
+                    let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
+                    let (rows, next) = parse_chunk(*source, &ig.engine, &lines, state, base)?;
+                    state = next;
+                    crate::db::with(&self.db, |c| commit_chunk(c, *source, &ig.path, &rows, &state, base, pos, ig.force))?;
+                }
             }
-        }
-        let (source, session) = pre.source.clone().unzip();
-        let (snapshot, changed) = crate::db::with(&self.db, |c| {
-            context_post(c, agent_id, &pre.model, pre.previous.as_deref(), session.as_deref(), source)
-        })?;
+            match crate::db::with(&self.db, |c| context_post(c, agent_id, &pre))? {
+                Some((snapshot, changed)) => break (pre, snapshot, changed),
+                None if attempts < 2 => attempts += 1,
+                None => return Err("bağlam başı hesaplama sırasında değişmeye devam etti".into()),
+            }
+        };
         if changed {
             // Kilit dışında: yavaş bir tüketici DB kilidini tutmasın. #1813'ün kök nedeni buydu:
             // her hook bu emit'i kilit altında yapıyor, sonraki PreToolUse 8 sn'yi aşıp
@@ -922,6 +934,27 @@ mod tests {
         })
         .unwrap();
         core.shutdown();
+    }
+
+    /// #1816: eski hook'un ölçümü kilit dışındayken taze başlatma başı sıfırlar; eski
+    /// `context_post` yeni oturumun snapshot'ını ezmemeli ve yayın için `changed` vermemeli.
+    #[test]
+    fn stale_context_post_after_reset_neither_writes_nor_publishes() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        observe(&c, "timur", "stale-old", "claude", None, "SessionStart").unwrap();
+        let old = context_pre(&c, "timur").unwrap();
+        assert_eq!(old.source.as_ref().map(|s| s.1.as_str()), Some("stale-old"));
+        reset_context(&c, "timur").unwrap();
+        let fresh = context(&c, "timur").unwrap().0;
+        assert_eq!(fresh.session_id, None);
+        assert_eq!(context_post(&c, "timur", &old).unwrap(), None);
+        let stored: String = c
+            .query_row("SELECT snapshot FROM cost_context_heads WHERE agent_id='timur'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<AgentContext>(&stored).unwrap(), fresh);
+        // Aynı baş ve aynı değer: geçerli, ama yeniden yayınlanmaz.
+        let same = context_pre(&c, "timur").unwrap();
+        assert_eq!(context_post(&c, "timur", &same).unwrap(), Some((fresh, false)));
     }
 
     #[test]
