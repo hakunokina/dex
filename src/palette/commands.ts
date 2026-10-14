@@ -62,14 +62,51 @@ export function buildCommands(bridge: Bridge): Command[] {
     { id: "notes.open", title: "Notları aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "not notlar notes ortak takım", run: () => void openNotes(activeId) },
     // #47: the Kart's Ayarlar button, for when the Kart is closed.
     { id: "settings.open", title: "Ayarlar", hint: "Ayarlar", keywords: "settings tercihler görünüm genel", run: () => void openPanel(activeId, "settings") },
-    // DEX-31: app settings as a floating panel; the limits live under Ajanlar (#44).
+    // DEX-31: app settings as a floating panel; the limits live under Sunucu › Kaynak sınırları.
     {
       id: "settings.panel",
-      title: "Ayarlar → Ajanlar: kaynak sınırları",
+      title: "Ayarlar → Sunucu: kaynak sınırları",
       hint: "Ayarlar",
-      keywords: "settings cpu bellek memory tavan limit sınır ajan",
-      run: () => void openSettings(activeId, "agents"),
+      keywords: "settings cpu bellek memory tavan limit sınır ajan kaynak",
+      run: () => void openSettings(activeId, "resources"),
     },
+    // Ayar sayfaları: paletin bulanık araması ayrı ayar aramasının işini görür.
+    ...(
+      [
+        ["general", "Ayar: Bu cihaz · Genel", "görünüm yoğunluk pano düzeni ekran alıntısı kısayol"],
+        ["notifications", "Ayar: Bu cihaz · Bildirimler", "ses takılma uyarı watchdog stall"],
+        ["connections", "Ayar: Bu cihaz · Bağlantılar", "sunucu telefondan erişim token monitor tm hub"],
+        ["providers", "Ayar: Sunucu · Sağlayıcılar", "sağlayıcı provider anahtar jeton token glm muse yerel llm"],
+        ["chain", "Ayar: Sunucu · Kota zinciri", "kota zincir motor failover"],
+        ["resources", "Ayar: Sunucu · Kaynak sınırları", "cpu bellek memory tavan limit sınır"],
+        ["gpu", "Ayar: Sunucu · GPU", "gpu ekran kartı broker"],
+      ] as const
+    ).map(([tab, title, keywords]) => ({
+      id: `settings.page:${tab}`,
+      title,
+      hint: "Ayarlar",
+      keywords: `settings ayar ${keywords}`,
+      run: () => void openSettings(activeId, tab),
+      restoreFocus: true,
+      group: "Eylemler" as Group,
+    })),
+    // Sık aranan satırlar: ilgili sayfayı açıp satırı odaklar.
+    ...(
+      [
+        ["notifications", "stall", "Ayar: Takılma uyarısı", "takıldı sessiz süre watchdog stall"],
+        ["general", "snip-shortcut", "Ayar: Ekran alıntısı kısayolu", "kısayol shortcut ekran alıntı snip"],
+        ["providers", "provider-glm", "Ayar: Sağlayıcı anahtarı", "sağlayıcı anahtar jeton token glm"],
+        ["chain", undefined, "Ayar: Kota zinciri", "kota zincir motor failover"],
+      ] as const
+    ).map(([tab, setting, title, keywords]) => ({
+      id: `settings.row:${setting ?? tab}`,
+      title,
+      hint: "Ayarlar",
+      keywords: `settings ayar ${keywords}`,
+      run: () => void openSettings(activeId, tab, setting),
+      restoreFocus: true,
+      group: "Eylemler" as Group,
+    })),
     {
       id: "layout.reset",
       title: "Düzeni sıfırla",

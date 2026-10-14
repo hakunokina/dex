@@ -1,7 +1,7 @@
 // #47: the Kart's one-line toolbar — the active team's status count and the team/app controls
 // that used to sit in the top bar. Kart closed → the palette has the same commands.
 import { useEffect, useState } from "react";
-import { Brain, Cpu, Plus, Settings, Settings2, SquareKanban, SquareTerminal } from "lucide-react";
+import { Brain, Cpu, Plus, Settings, SquareKanban, SquareTerminal, Users } from "lucide-react";
 import { AGENTS, getStatus } from "../agents";
 import { toggleBoard, useBoardOpen } from "../board/store";
 import { openPanel, openShell } from "../layout/panels";
@@ -71,8 +71,8 @@ export function OfficeBar({ teamId, active, onFocus }: { teamId: string; active:
       <button className="office-bar-btn" onClick={() => void openTeamMenu("new")} title="Yeni takım" aria-label="Yeni takım">
         <Plus />
       </button>
-      <button className="office-bar-btn" onClick={() => void openPanel(teamId, "team")} title="Takım ayarları ve üyeler" aria-label="Takım ayarları ve üyeler">
-        <Settings2 />
+      <button className="office-bar-btn" onClick={() => void openPanel(teamId, "team")} title="Takım ayarları" aria-label="Takım ayarları">
+        <Users />
       </button>
       <button className="office-bar-btn" onClick={() => void openPanel(teamId, "memory")} title="Hafıza haritası" aria-label="Hafıza haritası">
         <Brain />

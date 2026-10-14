@@ -1,6 +1,7 @@
 // A panel that throws while rendering must not take the whole window with it: the dock restores the
 // same panels at every start, so an unguarded throw (#103) would blank Dex on every launch.
 import { Component, type ReactNode } from "react";
+import "../settings/settings.css";
 
 interface State {
   error: unknown;

@@ -1,4 +1,4 @@
-// #290: Ayarlar → Ajanlar → GPU kaynağı ve patronun GPU izin kartı. Broker'a hiç çıkılmaz: dexd'nin
+// #290: Ayarlar → Sunucu → GPU (bağlantı, durum, limitler, modeller) ve patronun GPU izin kartı. Broker’a hiç çıkılmaz: dexd’nin
 // gpu_* cevapları köprüde hazır (__dexFake); gpu-requests-changed olayı uygulamanın soketine sahte verilir.
 import type { Page } from "@playwright/test";
 import { test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
@@ -54,7 +54,7 @@ const releaseHeld = (app: Page) => app.evaluate(async () => {
 test("GPU broker adresi değişince limitler yenilenir ve yalnız değişen Kuyruk gönderilir", async ({ app, dexd }) => {
   const team = await newTeam(dexd, "GPU broker değişimi");
   await app.addInitScript((url) => {
-    localStorage.setItem("dex.settingsTab", "agents");
+    localStorage.setItem("dex.settingsTab", "gpu");
     window.__dexFake = {
       gpu_config_get: { primary: url, fallback: "", tokenSet: true },
       gpu_config_set: { primary: "http://broker-b:8100", fallback: "", tokenSet: true },
@@ -67,15 +67,15 @@ test("GPU broker adresi değişince limitler yenilenir ve yalnız değişen Kuyr
   await app.reload();
   await openTeam(app, team.name);
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
-  const gpu = app.getByRole("region", { name: "GPU kaynağı" });
-  const limits = gpu.getByRole("group", { name: "Limitler" });
+  const conn = app.getByRole("region", { name: "GPU bağlantısı" });
+  const limits = app.getByRole("region", { name: "GPU limitleri" });
   await expect(limits.getByLabel("Günlük görsel")).toHaveValue("120");
   await limits.getByLabel("Kuyruk").fill("6");
   await limits.getByRole("button", { name: "Kaydet", exact: true }).click();
   await limits.getByLabel("Yönetici şifresi").fill("1234567");
-  await gpu.getByLabel("Birincil adres").fill("http://broker-b:8100");
+  await conn.getByLabel("Birincil adres").fill("http://broker-b:8100");
   await holdNext(app, "gpu_config_set");
-  await gpu.getByRole("button", { name: "Kaydet", exact: true }).first().click();
+  await conn.getByRole("button", { name: "Kaydet ve bağlan", exact: true }).click();
   await expect(limits.getByRole("button", { name: "Onayla" })).toBeDisabled();
   await app.evaluate(() => { window.__dexFake!.gpu_limits_get = { daily_image_limit: 300, max_pending_jobs: 8, max_count_per_request: 2 }; });
   await releaseHeld(app);
@@ -133,7 +133,7 @@ test("GPU geciken limit yanıtı kaldırılan hostun kartını geri getirmez", a
   await expect(cards).toHaveCount(1);
 });
 
-test("GPU kaynağı: token kaydedilince bağlı + modeller; lider isteği kartla onaylanır", async ({ app, dexd }) => {
+test("GPU bağlantısı: anahtar kaydedilince bağlı + modeller; lider isteği kartla onaylanır", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `GPU ${test.info().workerIndex}`);
   const request = { ...asked, teamId: team.id };
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
@@ -146,45 +146,47 @@ test("GPU kaynağı: token kaydedilince bağlı + modeller; lider isteği kartla
     gpu_request_list: [],
     gpu_request_decide: { ...request, status: "approved", grantId: 3 },
   });
-  await app.evaluate(() => localStorage.setItem("dex.settingsTab", "agents"));
+  await app.evaluate(() => localStorage.setItem("dex.settingsTab", "gpu"));
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
 
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
-  const gpu = app.getByRole("region", { name: "GPU kaynağı" });
-  await expect(gpu.getByRole("status").filter({ hasText: "token yok" })).toBeVisible();
-  await expect(gpu.getByRole("list", { name: "GPU modelleri" })).toHaveCount(0);
+  const conn = app.getByRole("region", { name: "GPU bağlantısı" });
+  const status = app.getByRole("region", { name: "GPU durumu" });
+  const models = app.getByRole("region", { name: "GPU modelleri" });
+  await expect(status.getByRole("status").filter({ hasText: "token yok" })).toBeVisible();
+  await expect(app.getByRole("list", { name: "GPU modelleri" })).toHaveCount(0);
 
-  await gpu.getByLabel("Yedek adres").fill("http://198.51.100.11:8100");
-  const token = gpu.getByLabel("Token");
+  await conn.getByLabel("Yedek adres").fill("http://198.51.100.11:8100");
+  const token = conn.getByLabel("GPU anahtarı");
   await expect(token).toHaveAttribute("type", "password");
   await token.fill("gizli-token");
   await app.evaluate((o) => { window.__dexFake!.gpu_overview = o; }, live);
-  await gpu.getByRole("button", { name: "Kaydet", exact: true }).first().click();
+  await conn.getByRole("button", { name: "Kaydet ve bağlan", exact: true }).click();
 
-  await expect(gpu.getByRole("status").filter({ hasText: "bağlı (yedek: http://198.51.100.11:8100)" })).toBeVisible();
+  await expect(status.getByRole("status").filter({ hasText: "bağlı (yedek: http://198.51.100.11:8100)" })).toBeVisible();
   const set = (await calls(app)).filter((c) => c.cmd === "gpu_config_set").map((c) => c.args);
   expect(set).toEqual([{ config: { fallback: "http://198.51.100.11:8100", token: "gizli-token" } }]);
   // Üç grup: ajana açık, servis (patronun), yalnız disk (kapalı, sayılı).
-  await expect(gpu.getByRole("heading", { name: /^Ajana açık \(2\)/ })).toBeVisible();
-  await expect(gpu.getByRole("list", { name: "Ajana açık" }).getByRole("listitem")).toHaveText([/FLUX\.2-dev\s*t2i/, /RMBG-2\.0\s*bg-removal/]);
-  await expect(gpu.getByRole("heading", { name: /^Servis ediliyor \(1\)/ })).toBeVisible();
-  await expect(gpu.getByRole("list", { name: "Servis ediliyor" }).getByRole("listitem")).toHaveText([/qwen3-coder-next\s*llm/]);
-  const disk = gpu.locator("summary").filter({ hasText: "Yalnız diskte (40)" });
+  await expect(models.getByRole("heading", { name: /^Ajana açık \(2\)/ })).toBeVisible();
+  await expect(models.getByRole("list", { name: "Ajana açık" }).getByRole("listitem")).toHaveText([/FLUX\.2-dev\s*t2i/, /RMBG-2\.0\s*bg-removal/]);
+  await expect(models.getByRole("heading", { name: /^Servis ediliyor \(1\)/ })).toBeVisible();
+  await expect(models.getByRole("list", { name: "Servis ediliyor" }).getByRole("listitem")).toHaveText([/qwen3-coder-next\s*llm/]);
+  const disk = models.locator("summary").filter({ hasText: "Yalnız diskte (40)" });
   await expect(disk).toBeVisible();
-  await expect(gpu.getByRole("list", { name: "Yalnız diskte" })).toBeHidden();
+  await expect(models.getByRole("list", { name: "Yalnız diskte" })).toBeHidden();
   await disk.focus();
   await app.keyboard.press("Enter");
-  await expect(gpu.getByRole("list", { name: "Yalnız diskte" }).getByRole("listitem")).toHaveCount(40);
-  await expect(gpu.getByRole("list", { name: "Yalnız diskte" }).getByRole("listitem").first()).toHaveText(/disk-0\s*image/);
-  await expect(gpu).toContainText("bugün 12/120");
+  await expect(models.getByRole("list", { name: "Yalnız diskte" }).getByRole("listitem")).toHaveCount(40);
+  await expect(models.getByRole("list", { name: "Yalnız diskte" }).getByRole("listitem").first()).toHaveText(/disk-0\s*image/);
+  await expect(status).toContainText("bugün 12/120");
   // Token kayıtlı: alan kapanır, "Değiştir" yeniden açar.
-  await expect(gpu.getByText("kayıtlı", { exact: true })).toBeVisible();
-  await gpu.getByRole("button", { name: "Değiştir" }).click();
-  await expect(gpu.getByLabel("Token")).toHaveValue("");
+  await expect(conn.getByText("kayıtlı", { exact: true })).toBeVisible();
+  await conn.getByRole("button", { name: "Değiştir" }).click();
+  await expect(conn.getByLabel("GPU anahtarı")).toHaveValue("");
 
-  const limits = gpu.getByRole("group", { name: "Limitler" });
+  const limits = app.getByRole("region", { name: "GPU limitleri" });
   await expect(limits.getByLabel("Günlük görsel")).toHaveValue("300");
   await limits.getByLabel("İstek başına").fill("2");
   await limits.getByLabel("Sebep").fill("Deneme");
@@ -217,11 +219,11 @@ test("GPU kaynağı: token kaydedilince bağlı + modeller; lider isteği kartla
   // #305: broker yanıt veriyor ama model listesi 500 → "token yanlış" değil, broker hatası görünür.
   await app.evaluate((o) => { window.__dexFake!.gpu_overview = o; },
     { ...live, authorized: false, models: [], status: null, error: "internal: vllm yanıt vermedi", errorKind: "service" });
-  await gpu.getByRole("button", { name: "Yenile", exact: true }).click();
-  const line = gpu.getByRole("status").filter({ hasText: "modeller alınamadı" });
+  await conn.getByRole("button", { name: "Yenile", exact: true }).click();
+  const line = status.getByRole("status").filter({ hasText: "modeller alınamadı" });
   await expect(line).toContainText("internal: vllm yanıt vermedi");
   await expect(line).not.toContainText("token");
-  await expect(gpu.getByRole("list", { name: "Ajana açık" })).toHaveCount(0);
+  await expect(app.getByRole("list", { name: "Ajana açık" })).toHaveCount(0);
 
   // Lider gpu_request yaptı: sağ altta kart; bütçe değişir, klavyeyle Onayla.
   await app.setViewportSize({ width: 420, height: 800 });

@@ -1,53 +1,61 @@
-// DEX-17: "Motor zinciri" — kota/kredi bitince otomatik sağlayıcı geçişi + resume.
-// Sıra Ayarlar'da (`chain_set_order`), sağlayıcı zincirden kapatılabilir (`chain_set_disabled`),
-// ajan başına kapatılabilir (üye satırında).
-// Tükenen sağlayıcılar burada görünür (sıfırlanma saatiyle); sıfırlanınca ajan otomatik geri döner.
+// Sunucu › Kota zinciri: kota/kredi bitince ajan aynı işe listedeki sıradaki
+// sağlayıcıyla devam eder. Sıra ve aç/kapa anında uygulanır.
 import { useEffect, useRef, useState } from "react";
 import { chainGet, chainSetDisabled, chainSetOrder, type ChainView } from "../team/api";
 import { listProviders, type ProviderInfo } from "../team/api";
 import { onEvent } from "../api/hosts";
+import { Row, Pad } from "./kit/Row";
+import { Section } from "./kit/Section";
+import { Switch } from "./kit/Switch";
+import { ErrorBand, FieldMsg, LoadingRows, SavedFlash } from "./kit/states";
 
 export function ChainSection({ host }: { host: string }) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [view, setView] = useState<ChainView | null>(null);
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [flash, setFlash] = useState(0);
   const lock = useRef(false);
-  const labels: Record<string, string> = Object.fromEntries(providers.map(p => [p.id, p.label]));
+  const labels: Record<string, string> = Object.fromEntries(providers.map((p) => [p.id, p.label]));
 
+  const refresh = () => chainGet(host).then(
+    (next) => { setView(next); setError(null); },
+    (e) => setError(String(e)),
+  );
   useEffect(() => {
     let mounted = true;
     let catalogRequest = 0;
-    const refresh = () => chainGet(host).then(
-      (next) => { if (mounted) setView(next); },
-      (e) => { if (mounted) setMsg({ ok: false, text: String(e) }); },
-    );
+    setView(null);
+    setError(null);
     void refresh();
     const catalog = () => {
-      const request = ++catalogRequest;
+      const n = ++catalogRequest;
       return listProviders(host).then(
-        ps => { if (mounted && request === catalogRequest) setProviders(ps); },
-        e => { if (mounted && request === catalogRequest) setMsg({ ok: false, text: String(e) }); },
+        (ps) => { if (mounted && n === catalogRequest) setProviders(ps); },
+        (e) => { if (mounted && n === catalogRequest) setError(String(e)); },
       );
     };
     void catalog();
-    const off = onEvent("dex-chain-available", (_, eventHost) => {
-      if (eventHost === host) void refresh();
-    });
+    const off = onEvent("dex-chain-available", (_, eventHost) => { if (eventHost === host) void refresh(); });
     const offProviders = onEvent("providers-changed", (_, eventHost) => { if (eventHost === host) void catalog(); });
-    return () => {
-      mounted = false;
-      off();
-      offProviders();
-    };
+    return () => { mounted = false; off(); offProviders(); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [host]);
 
-  async function change(action: () => Promise<ChainView>, text: string) {
+  async function change(action: () => Promise<ChainView>) {
     if (lock.current) return;
-    lock.current = true; setBusy(true);
-    try { setView(await action()); setMsg({ ok: true, text }); }
-    catch (e) { setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) }); }
-    finally { lock.current = false; setBusy(false); }
+    lock.current = true;
+    setBusy(true);
+    try {
+      setView(await action());
+      setFlash((n) => n + 1);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      void refresh();
+    } finally {
+      lock.current = false;
+      setBusy(false);
+    }
   }
 
   async function move(id: string, dir: -1 | 1) {
@@ -57,7 +65,7 @@ export function ChainSection({ host }: { host: string }) {
     const j = i + dir;
     if (i < 0 || j < 0 || j >= order.length) return;
     [order[i], order[j]] = [order[j], order[i]];
-    await change(() => chainSetOrder(host, order), "Zincir sırası kaydedildi.");
+    await change(() => chainSetOrder(host, order));
   }
 
   async function toggle(id: string) {
@@ -65,51 +73,62 @@ export function ChainSection({ host }: { host: string }) {
     const disabled = view.disabled.includes(id)
       ? view.disabled.filter((d) => d !== id)
       : [...view.disabled, id];
-    await change(() => chainSetDisabled(host, disabled), "Zincir güncellendi.");
+    await change(() => chainSetDisabled(host, disabled));
   }
 
   const fmtReset = (ms: number) => {
     const d = new Date(ms);
-    return Number.isNaN(d.getTime())
-      ? "?"
-      : d.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" });
+    return Number.isNaN(d.getTime()) ? "?" : d.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" });
   };
 
   return (
-    <details className="settings-section settings-fold" aria-label="Motor zinciri">
-      <summary>
-        <b>Kota bitince sağlayıcı değiştir</b>
-        <span>Bir sağlayıcının kotası biterse ajan aynı işe listedeki sıradaki sağlayıcıyla devam eder.</span>
-      </summary>
-      <p className="settings-note">
-        Kota/kredi bitince devreye girer; zincirdeki geçici sağlayıcıda ağ/timeout olursa o sağlayıcı 15 dk atlanır. Sunucu hataları tetiklemez.
-        Kapalı sağlayıcı atlanır; sıfırlanan sağlayıcıya ajan
-        otomatik geri döner (çalışıyorsa oturumu kapanınca).
-      </p>
-      {view && (
-        <ol>
-          {view.order.map((id, index) => {
-            const off = view.disabled.includes(id);
-            return (
-              <li key={id} aria-disabled={off}>
-                {off ? <s>{labels[id] ?? id}</s> : (labels[id] ?? id)}{" "}
-                <button disabled={busy || index === 0} onClick={() => void move(id, -1)} aria-label={`${labels[id] ?? id} yukarı`}>↑</button>
-                <button disabled={busy || index === view.order.length - 1} onClick={() => void move(id, 1)} aria-label={`${labels[id] ?? id} aşağı`}>↓</button>
-                <button disabled={busy} onClick={() => void toggle(id)} aria-label={`${labels[id] ?? id} zinciri ${off ? "aç" : "kapat"}`}>
-                  {off ? "aç" : "kapat"}
-                </button>
-              </li>
-            );
-          })}
-        </ol>
-      )}
-      {!view && !msg && <p className="settings-note" role="status">Zincir yükleniyor…</p>}
+    <Section
+      label="Kota zinciri"
+      description="Bir sağlayıcının kotası biterse ajan aynı işe listedeki sıradaki sağlayıcıyla devam eder. Kapalı sağlayıcı atlanır; sıfırlanan sağlayıcıya ajan otomatik geri döner."
+    >
+      {error && <Pad><ErrorBand text={`Zincir okunamadı: ${error}`} onRetry={() => void refresh()} /></Pad>}
+      {!view && !error && <LoadingRows />}
+      {view && view.order.map((id) => {
+        const off = view.disabled.includes(id);
+        return (
+          <Row
+            key={id}
+            label={off ? `${labels[id] ?? id} (kapalı)` : (labels[id] ?? id)}
+            control={
+              <>
+                <span className="set-field-btns">
+                  <button
+                    type="button" className="set-icon-btn" aria-label={`${labels[id] ?? id} yukarı`}
+                    disabled={busy || view.order.indexOf(id) === 0} onClick={() => void move(id, -1)}>↑</button>
+                  <button
+                    type="button" className="set-icon-btn" aria-label={`${labels[id] ?? id} aşağı`}
+                    disabled={busy || view.order.indexOf(id) === view.order.length - 1} onClick={() => void move(id, 1)}>↓</button>
+                </span>
+                <Switch
+                  label={`${labels[id] ?? id} zincirde`}
+                  checked={!off}
+                  disabled={busy}
+                  onChange={() => void toggle(id)}
+                />
+                <SavedFlash stamp={flash} />
+              </>
+            }
+          />
+        );
+      })}
       {view && view.exhausted.length > 0 && (
-        <p className="settings-note">
-          Tükenen: {view.exhausted.map((e) => `${labels[e.provider] ?? e.provider} (${fmtReset(e.resetAt)}'ye kadar)`).join(", ")}.
-        </p>
+        <Pad>
+          <p className="set-note" role="status">
+            Tükenen: {view.exhausted.map((e) => `${labels[e.provider] ?? e.provider} (${fmtReset(e.resetAt)}'ye kadar)`).join(", ")}.
+          </p>
+        </Pad>
       )}
-      {msg && <p className={msg.ok ? "settings-note" : "settings-err"} role={msg.ok ? "status" : "alert"}>{msg.text}</p>}
-    </details>
+      {view && (
+        <Pad>
+          <p className="set-note">Tek tek ajanlar için: Takım ayarları › Üyeler.</p>
+          {view.order.length === 0 && <FieldMsg ok text="Zincir boş." />}
+        </Pad>
+      )}
+    </Section>
   );
 }
