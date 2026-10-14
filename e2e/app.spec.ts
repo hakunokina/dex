@@ -331,6 +331,32 @@ for (const provider of ["anthropic", "local"]) {
   });
 }
 
+test("takımı kopyala: eski hosttan gelen Codex üyesi Claude'a çevrilir", async ({ app, dexd }) => {
+  const source = await newTeam(dexd, "Codex Kaynak");
+  await app.addInitScript(() => {
+    window.__dexFake = {
+      provider_list: [{ id: "anthropic", label: "Anthropic", baseUrl: null, hasToken: false, tokenMask: null, models: [{ id: "claude-sonnet-5-5", label: "Sonnet" }] }],
+      team_clone_template: { kind: "main", profile: "dev", members: [{ name: "Eski", kind: "leader", engine: "codex", provider: null, model: "gpt-5.5" }] },
+    };
+  });
+  await app.reload();
+  await openTeam(app, source.name);
+  await app.setViewportSize({ width: 390, height: 780 });
+  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
+  const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+  await expect(form.getByText("Codex üyeleri Claude'a çevrildi")).toBeVisible();
+  await expect(form.getByRole("combobox", { name: "Üye 1 sağlayıcısı", exact: true })).toHaveValue("anthropic");
+  await expect(form.getByRole("combobox", { name: "Üye 1 modeli", exact: true })).toHaveValue("claude-sonnet-5-5");
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Codex Kopya");
+  await form.getByRole("button", { name: "Oluştur", exact: true }).focus();
+  await app.keyboard.press("Enter");
+  await expect(form).toHaveCount(0);
+  expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args).toMatchObject({ team: {
+    members: [{ name: "Eski", engine: null, provider: "anthropic", model: "claude-sonnet-5-5" }],
+  } });
+});
+
 test("kopya şablonu hatası görünür ve yeniden denenebilir", async ({ app, dexd }) => {
   const source = await newTeam(dexd, "Kopya Hata");
   await app.addInitScript(() => {

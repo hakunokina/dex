@@ -73,7 +73,6 @@ function Row({ a, onOpen, leader }: { a: AgentRec; onOpen: (id: string) => void;
         </span>
       )}
       <span className="m-agent-side">
-        <span className="m-engine">Claude</span>
         <span className="m-status-text">{STATUS_TEXT[status]}</span>
       </span>
       <ChevronRight size={16} className="m-chev-agent" />
