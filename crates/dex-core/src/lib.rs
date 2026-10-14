@@ -22,6 +22,7 @@ mod local_http;
 mod claude_turn;
 mod team_turn;
 pub mod instance;
+pub mod inbox;
 pub mod layout;
 pub mod leader_reset;
 pub mod mcp;
@@ -109,6 +110,7 @@ pub struct Core {
     /// S5-B: live transcript watches (one per agent) + queued chat texts per agent.
     pub(crate) chat_watches: chat::Watches,
     pub(crate) chat_queues: Mutex<HashMap<String, VecDeque<String>>>,
+    inbox_gate: Mutex<()>,
     /// Görev #12: workers with a pending queue retry — at most one live retry thread per worker.
     /// #18: keyed to the thread's generation; a newer retry makes an older sleeping thread stale.
     queue_retry: Mutex<HashMap<String, u64>>,
@@ -226,6 +228,7 @@ impl Core {
             }),
             chat_watches: chat::Watches::default(),
             chat_queues: Mutex::default(),
+            inbox_gate: Mutex::default(),
             queue_retry: Mutex::default(),
             turns: delegate::Turns::default(),
             permits: permit::Permits::default(),
@@ -289,6 +292,7 @@ impl Core {
                 core.worktree_sweep();
             }
         });
+        core.inbox_resume()?;
         hooks::accept(listener, core.clone());
         Ok(core)
     }
@@ -427,6 +431,7 @@ impl Core {
         let pending = (event == "Stop" && self.agent_states.get(agent).engine.as_deref() != Some("codex"))
             .then(hook_delivery::Pending::default);
         if event == "UserPromptSubmit" {
+            self.inbox_prompt_received(agent, body.get("prompt").and_then(Value::as_str).unwrap_or(""));
             self.reported_workers.lock().unwrap().remove(agent);
             if !self.leader_paste_accepted(agent, body.get("prompt").and_then(Value::as_str).unwrap_or("")) {
                 // A failed acknowledgement leaves the payload pending for a later hook.
@@ -488,6 +493,7 @@ impl Core {
     /// Stop that never comes. Once idle, the oldest queued job goes in. A pending chat queue goes
     /// first (`chat_on_stop`): its paste starts a turn whose Stop delivers the job.
     fn delegation_after_stop(&self, agent: &str) {
+        self.inbox_wake(agent);
         self.delegation_idle(agent, false);
     }
 
@@ -1479,6 +1485,17 @@ impl Core {
             return Ok(None);
         }
         let mut ctx = permit::Ctx { leader: a.kind == "leader", team_root: home.clone(), qa: a.role_slug.as_deref() == Some("qa"), read_only: worker && a.role_slug.as_deref() == Some(review::ROLE), ..Default::default() };
+        if a.role_slug.as_deref() == Some("assistant") {
+            ctx.assistant = true;
+            ctx.read_only = true;
+            ctx.leader = false;
+            ctx.read.extend(home);
+            let pc = hooks::session_context(c, &self.paths.data_dir, agent, true).map_err(|e| e.to_string())?;
+            let memory = hooks::memory_scope(c, &pc)?;
+            ctx.read.extend(memory.write);
+            ctx.cwd = pc.project_root.or_else(|| ctx.team_root.clone());
+            return Ok(Some((ctx, claude, true)));
+        }
         // #222: izinli push hedef desenleri — settings satırı (ajan yazamaz), boş = kapalı.
         ctx.push_allow = settings::push_allow(c);
         // The debug build's source root is trusted build metadata, never hook input.

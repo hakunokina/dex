@@ -3,6 +3,19 @@ use tauri::State;
 use crate::host::CoreState;
 
 #[tauri::command]
+pub async fn inbox_submit(
+    core: State<'_, CoreState>,
+    team_id: String,
+    client_id: Option<String>,
+    text: Option<String>,
+    image: Option<dex_core::inbox::Image>,
+) -> Result<dex_core::inbox::Reply, dex_core::inbox::Error> {
+    let core = core.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || core.inbox_submit(dex_core::inbox::Submit { team_id, client_id, text, image }))
+        .await.map_err(|_| dex_core::inbox::Error { code: "inbox_unavailable", message: "gelen kutusu görevi tamamlanamadı".into() })?
+}
+
+#[tauri::command]
 pub fn agent_start(
     core: State<CoreState>,
     id: String,

@@ -412,6 +412,9 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
             {
                 let _ = core.events.emit("agent-idle", &agent_id);
             }
+            if chain.is_none() && state.status == crate::agents::Status::Idle && current_stop {
+                core.inbox_wake(&agent_id);
+            }
             // FIX-3: UserPromptSubmit arms the first-reply watch, any later event ends it.
             if current_stop { core.first_reply_on_hook(&agent_id, &event_name); }
             // Finish the response before usage ingestion, context refresh or watch setup.

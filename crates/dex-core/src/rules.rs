@@ -147,6 +147,12 @@ fn build_system_prompt(
         .flatten()
         .unwrap_or((None, None, "full".into(), "dev".into()));
     let education = team_profile == "edu";
+    let assistant = role.as_deref() == Some("assistant");
+    if assistant {
+        let mut rules = assistant_rules(memory);
+        if let Some(ctx) = ctx { rules.push_str(&context_block(ctx)); }
+        return format!("{}\n\n{rules}", crate::roles::prompt_for_agent(conn, agent).unwrap_or_default());
+    }
     let roles = if kind.as_deref() == Some("leader") { crate::roles::catalog_text_for_profile(conn, &team_profile) } else { String::new() };
     let mut rules = dex_rules(kind.as_deref(), role.as_deref(), memory, &roles);
     if education { rules = education_rules(&rules); }
@@ -239,6 +245,19 @@ fn education_rules(rules: &str) -> String {
     out.join("\n")
 }
 
+fn assistant_rules(memory: Option<(&Path, &Path)>) -> String {
+    let mut out = vec!["# Dex çalışma kuralları".to_string(), "Patron: insan, son söz onun.".into(), "".into(), "## Çalışma".into()];
+    for line in DEX_RULES.lines().filter(|l| l.starts_with("- Sırrı") || l.starts_with("- Geri alınamaz")) { out.push(line.into()); }
+    out.push("- Cevabını kendi panelinde doğrudan patrona ver; onayı ve belirsizliği patrona sor.".into());
+    out.push("- Salt okursun: dosya yazma, kabuk/kod/betik çalıştırma, git ve kurulum yok. Web üzerinden kaynakları oku.".into());
+    if let Some((shared, own)) = memory {
+        out.push(format!("\n## Hafıza\nTakım ortak: {} · Sana özel: {}. İndeks oturum başında gelir; ayrıntı için dosyayı oku.", shared.display(), own.display()));
+        out.push("- İşe başlarken ilgili konuda `memory_search` ile ara.".into());
+        out.push("- Hafıza salt okunur; kalıcı tercihi patrona söyle.".into());
+    }
+    out.join("\n")
+}
+
 fn bound_projects(conn: &Connection, team: &str) -> usize {
     crate::projects::list(conn, team, false).map_or(0, |l| l.iter().filter(|p| p.root_path.is_some()).count())
 }
@@ -305,6 +324,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn assistant_prompt_is_direct_and_read_only_without_developer_process() {
+        let c = db();
+        c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).unwrap();
+        let (s, o) = mem();
+        let root = project("assistant", &[(crate::stack::FILE, "DEV STACK")]);
+        let t = build_system_prompt(&c, "ayla", Some((&s, &o)), Some(&root), None);
+        assert!(t.starts_with("Rolün: Patronun kişisel asistanı."), "{t}");
+        for excluded in ["report", "ask_leader", "patronWords", "Test bütçesi", "Proje yığını", "DEV STACK", "worktree", "commit", "Hafızaya yaz", "Bir bilgi ="] {
+            assert!(!t.contains(excluded), "{excluded}: {t}");
+        }
+        for kept in ["Patron: insan", "Sırrı", "riskli adım", "## Hafıza", "memory_search", "kendi panelinde", "belirsizliği patrona"] { assert!(t.contains(kept), "{kept}: {t}"); }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn education_prompts_keep_roles_memory_and_mechanics_without_dev_rules() {
         let c = db();
         c.execute("UPDATE teams SET profile='edu' WHERE id='default'", []).unwrap();
@@ -339,6 +373,20 @@ mod tests {
         for (agent, expected) in [("timur", "a83b5668a70fa745e0f9736904ee7268e919a4f3d2b9edf7b28f803a89852d52"), ("ayla", "ffcfeaacfc3db1de3c35e91f3a9b0bcf824d04169fe3de7d125692f74d33adb1")] {
             let t = system_prompt(&c, agent, Some((&s, &o)));
             assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
+        }
+    }
+
+    #[test]
+    fn education_prompt_bytes_match_pre_assistant_baseline() {
+        use sha2::{Digest, Sha256};
+        let c=db();
+        c.execute("UPDATE teams SET profile='edu' WHERE id='default'",[]).unwrap();
+        c.execute("UPDATE agents SET role_slug='teacher' WHERE id='timur'",[]).unwrap();
+        c.execute("UPDATE agents SET role_slug='visual-explainer' WHERE id='ayla'",[]).unwrap();
+        let (s,o)=mem();
+        // Hashes rendered from HEAD's DEX_RULES and education_rules before #1697.
+        for (agent,expected) in [("timur","9eba00ea42973623fea350f314078e53cba7a0d59e99af034006966cc90498db"),("ayla","09d6819e537792dbb81eefb48566ddf1576302f34cbbd59276ca8466fb9eb648")] {
+            assert_eq!(format!("{:x}",Sha256::digest(system_prompt(&c,agent,Some((&s,&o))).as_bytes())),expected,"{agent}");
         }
     }
 
@@ -602,7 +650,7 @@ mod tests {
         let t = system_prompt(&c, "timur", Some((&s, &o)));
         let all = crate::roles::list(&c).unwrap();
         assert!(all.len() > 10);
-        for r in all.iter().filter(|r| r.category != "education") {
+        for r in all.iter().filter(|r| r.category != "education" && r.slug != "assistant") {
             assert!(t.contains(&format!("{} — {}", r.slug, r.name)), "{} yok\n{t}", r.slug);
         }
         assert!(t.contains("mobile — Mobile Engineer"), "{t}");

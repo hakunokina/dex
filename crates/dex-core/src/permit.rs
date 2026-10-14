@@ -30,6 +30,8 @@ pub enum Verdict {
 /// What the policy knows about the worker.
 #[derive(Default)]
 pub struct Ctx {
+    /// Personal assistant: web and scoped file reads only; no shell or mutation.
+    pub assistant: bool,
     /// Trusted agent kind and team root, supplied by the database, not the tool input.
     pub leader: bool,
     pub team_root: Option<PathBuf>,
@@ -65,6 +67,7 @@ const READ_ONLY_TESTS: &str = "salt okuma: inceleyici test koşmaz, worker rapor
 const READ_ONLY_DYNAMIC: &str = "salt okuma: değişken/ikame/döngü/atama yok — komutları literal argümanlarla ayrı yaz";
 
 pub fn decide(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
+    if ctx.assistant { return assistant_decide(tool, input, ctx); }
     let v = judge(tool, input, ctx);
     if !ctx.read_only {
         return v;
@@ -89,6 +92,22 @@ pub fn decide(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
                 (Verdict::Leader(what), _) => Verdict::Deny(format!("{READ_ONLY} — `{}`", if what.is_empty() { tool } else { &what })),
             }
         }
+    }
+}
+
+fn assistant_decide(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
+    match tool {
+        "WebFetch" | "WebSearch" | "AskUserQuestion" | "ToolSearch" | "mcp__dex__memory_search" => Verdict::Allow,
+        "Read" | "Glob" | "Grep" | "LS" => {
+            let raw = input.get("file_path").or_else(|| input.get("path")).and_then(Value::as_str);
+            let path = raw.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone());
+            let real = path.as_ref().and_then(|p| p.canonicalize().ok());
+            let roots = ctx.read.iter().filter_map(|p| p.canonicalize().ok()).collect::<Vec<_>>();
+            if matches!(judge(tool, input, ctx), Verdict::Allow) && real.is_some_and(|p| !secret(&p) && within(&p, &roots)) {
+                Verdict::Allow
+            } else { Verdict::Deny("asistan yalnız kendi takımının izinli dosyalarını okur".into()) }
+        },
+        _ => Verdict::Deny("asistan salt okur: yazma, kabuk/kod/betik, git ve diğer MCP araçları kapalı".into()),
     }
 }
 
@@ -3652,6 +3671,38 @@ mod tests {
         assert!(matches!(decide("Read", &json!({ "file_path": abs("/elsewhere/a") }), &reviewer), Verdict::Deny(_)));
         // Hard noes keep their own reason.
         assert!(matches!(run("rm -rf src", &reviewer), Verdict::Deny(ref w) if w.starts_with("toplu")));
+    }
+
+    #[test]
+    fn assistant_allows_web_and_inbox_reads_but_no_shell_mutation_or_mcp_write() {
+        let f = crate::projects::tests::Fixture::new();
+        let root=f.0.canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".dex/inbox")).unwrap();
+        std::fs::write(root.join(".dex/inbox/image.png"),b"fixture").unwrap();
+        let assistant = Ctx { assistant: true, read_only: true, read:vec![root.clone()],cwd:Some(root), ..Default::default() };
+        for tool in ["WebFetch", "WebSearch", "AskUserQuestion", "ToolSearch", "mcp__dex__memory_search"] {
+            assert_eq!(decide(tool, &serde_json::json!({}), &assistant), Verdict::Allow, "{tool}");
+        }
+        let inbox = assistant.cwd.as_ref().unwrap().join(".dex/inbox/image.png");
+        assert_eq!(decide("Read", &serde_json::json!({"file_path":inbox}), &assistant), Verdict::Allow);
+        for tool in ["Write", "Edit", "apply_patch", "Bash", "exec_command", "mcp__dex__task_create", "mcp__dex__report", "Skill", "Agent"] {
+            assert!(matches!(decide(tool, &serde_json::json!({"command":"git status","file_path":inbox}), &assistant), Verdict::Deny(_)), "{tool}");
+        }
+    }
+
+    #[test]
+    fn assistant_denies_symlink_escape_reads() {
+        let f=crate::projects::tests::Fixture::new();
+        let own=f.0.join("own"); let outside=f.0.join("outside");
+        std::fs::create_dir_all(&own).unwrap(); std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("private.txt"),"private").unwrap();
+        #[cfg(windows)]
+        let link=std::os::windows::fs::symlink_dir(&outside,own.join("link"));
+        #[cfg(unix)]
+        let link=std::os::unix::fs::symlink(&outside,own.join("link"));
+        if link.is_err() { return; }
+        let ctx=Ctx {assistant:true,read_only:true,read:vec![own.clone()],cwd:Some(own.clone()),..Default::default()};
+        assert!(matches!(decide("Read",&serde_json::json!({"file_path":own.join("link/private.txt")}),&ctx),Verdict::Deny(_)));
     }
 
     #[test]
