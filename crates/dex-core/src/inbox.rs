@@ -139,7 +139,14 @@ impl crate::Core {
             self.agent_spawn(agent, crate::agents::StartOptions::default())?;
             return Ok(None); // SessionStart/settled screen opens the Idle gate, never initial argv.
         }
-        if self.agent_states.get(agent).status != crate::agents::Status::Idle || self.agent_states.typing(agent) || self.agent_states.pre_session(agent) {
+        if self.agent_states.get(agent).status != crate::agents::Status::Idle {
+            return Ok(None); // The next Idle hook owns the wakeup while busy.
+        }
+        if self.agent_states.typing(agent) {
+            self.inbox_wake(agent); // Also re-arm when input extended a sleeping timer's deadline.
+            return Ok(None);
+        }
+        if self.agent_states.pre_session(agent) {
             return Ok(None);
         }
         with(&self.db, |c| c.execute("UPDATE inbox_messages SET pasted=1 WHERE receipt_id=?1", [id]).map(|_| ()).map_err(|e| e.to_string()))?;
@@ -176,10 +183,12 @@ impl crate::Core {
     pub(crate) fn inbox_wake(&self, agent: &str) {
         let pending = with(&self.db, |c| c.query_row("SELECT EXISTS(SELECT 1 FROM inbox_messages WHERE agent_id=?1)", [agent], |r| r.get::<_,bool>(0)).map_err(|e| e.to_string())).unwrap_or(false);
         if !pending { return; }
+        let Some(delay) = self.agent_states.typing_retry_delay(agent) else { return };
+        let delay = delay.max(std::time::Duration::from_millis(700));
         let weak = self.weak_self.clone();
         let agent = agent.to_string();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(700));
+            std::thread::sleep(delay);
             let Some(core) = weak.upgrade() else { return };
             let Ok(_gate) = core.inbox_gate.lock() else { return };
             let _ = core.inbox_deliver_locked(&agent);
@@ -233,6 +242,54 @@ fn store_image(root: &Path, bytes: &[u8], ext: &str) -> Result<PathBuf, String> 
 mod tests {
     use super::*;
     use base64::Engine;
+
+    fn typing_window_delivery(extend: bool) {
+        use std::{io::Write, sync::{Arc, mpsc}, time::Duration};
+        struct Stop(Arc<crate::Core>);
+        impl Drop for Stop {
+            fn drop(&mut self) { self.0.ptys.kill("ayla"); self.0.shutdown(); }
+        }
+        struct Input(mpsc::Sender<Vec<u8>>);
+        impl Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-typing-{extend}-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        let _stop = Stop(core.clone());
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        core.agent_states.hook("ayla", Some(crate::agents::Status::Idle), Some("inbox-typing"));
+        let (tx, rx) = mpsc::channel();
+        core.ptys.input_writer_for_test("ayla", |original| crate::agents::input_probe_for_test(original, Input(tx)));
+        core.agent_input("ayla", false);
+        assert!(core.inbox_submit(input()).unwrap().queued);
+        if extend {
+            assert!(rx.recv_timeout(Duration::from_secs(3)).is_err(), "must not paste inside the initial typing window");
+            // Extend only the input deadline: no Idle or inbox wake event follows.
+            core.agent_input("ayla", false);
+            assert!(rx.recv_timeout(Duration::from_secs(3)).is_err(), "the old deadline must not paste inside the extended window");
+        } else {
+            assert!(rx.recv_timeout(Duration::from_secs(4)).is_err(), "must not paste while patron is typing");
+        }
+        let pasted = rx.recv_timeout(Duration::from_secs(4)).expect("typing expiry must deliver without another Idle event");
+        assert_eq!(String::from_utf8(pasted).unwrap(), "\x1b[200~Patron paylaştı:\nbir\niki[201~\x1b[201~");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), b"\r");
+        assert!(rx.recv_timeout(Duration::from_millis(800)).is_err(), "share must paste only once");
+        core.inbox_prompt_received("ayla", "Patron paylaştı:\nbir\niki[201~");
+    }
+
+    #[test]
+    fn typing_expiry_delivers_without_another_idle_event() { typing_window_delivery(false); }
+
+    #[test]
+    fn extended_typing_window_defers_delivery_until_the_new_deadline() { typing_window_delivery(true); }
+
     #[test]
     fn assistant_reads_real_store_image_with_unprefixed_team_context() {
         let f = crate::projects::tests::Fixture::new();
