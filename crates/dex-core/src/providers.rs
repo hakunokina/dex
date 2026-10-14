@@ -459,28 +459,21 @@ pub fn on_stop_failure(db: &crate::Db, ev: &crate::Events, agent: &str, body: &s
 }
 
 /// `error` = CLI'nin StopFailure sınıfı; `message` = CLI'nin yazdığı hata satırı (uç gövdesini taşır).
+/// Tür kararı tek kaynaktan ([`crate::chain::classify`]) — burada yalnız türe göre cümle seçilir.
 pub fn failure(agent: &str, provider: Option<&str>, error: &str, message: &str) -> AgentError {
+    use crate::chain::{Kind, classify};
     let label = provider.and_then(get).map_or("Claude", |p| p.label);
-    let m = message.to_ascii_lowercase();
-    // z.ai iş kodları (gövdede `[kod]`): 1113 bakiye yok, 1308/1310 kullanım sınırı.
-    // Kota yanıtı örneği: 429 + "[1308][Usage limit reached for 5 hour. Your limit will reset at …]".
-    let credit = error == "billing_error"
-        || m.contains("[1113]")
-        || m.contains("insufficient balance")
-        || m.contains("credit balance");
-    let quota = m.contains("usage limit") || m.contains("[1308]") || m.contains("[1310]") || m.contains("quota");
-    let text = if credit {
-        format!("{label} kredisi bitti — sağlayıcı hesabına bakiye yükle.")
-    } else {
-        match error {
-            "rate_limit" if quota => format!("{label} kullanım kotası doldu."),
-            "rate_limit" => format!("{label} hız sınırına takıldı — biraz bekleyip tekrar dene."),
-            "authentication_failed" => format!("{label} jetonu reddedildi — Takım → Sağlayıcılar'dan jetonu yenile."),
-            "overloaded" | "server_error" => format!("{label} ucu şu an yanıt vermiyor — sonra tekrar dene."),
-            "model_not_found" => format!("{label} bu modeli tanımıyor — üyenin modelini değiştir."),
-            "max_output_tokens" => format!("{label} cevabı çıktı sınırında kesildi."),
-            _ => format!("{label} ucu hata verdi, tur tamamlanamadı."),
-        }
+    let text = match classify(error, message) {
+        // z.ai iş kodları (gövdede `[kod]`): 1113 bakiye yok, 1308/1310 kullanım sınırı.
+        // Kota yanıtı örneği: 429 + "[1308][Usage limit reached for 5 hour. Your limit will reset at …]".
+        Kind::Credit => format!("{label} kredisi bitti — sağlayıcı hesabına bakiye yükle."),
+        Kind::Quota => format!("{label} kullanım kotası doldu."),
+        Kind::Auth => format!("{label} jetonu reddedildi — Takım → Sağlayıcılar'dan jetonu yenile."),
+        Kind::Transient if error == "rate_limit" => format!("{label} hız sınırına takıldı — biraz bekleyip tekrar dene."),
+        Kind::Transient | Kind::Network => format!("{label} ucu şu an yanıt vermiyor — sonra tekrar dene."),
+        Kind::Truncated => format!("{label} cevabı çıktı sınırında kesildi."),
+        Kind::Protocol if error == "model_not_found" => format!("{label} bu modeli tanımıyor — üyenin modelini değiştir."),
+        Kind::Protocol | Kind::Unknown => format!("{label} ucu hata verdi, tur tamamlanamadı."),
     };
     let reset_at = (provider == Some("glm")).then(|| zai_reset(message)).flatten();
     AgentError { agent_id: agent.to_string(), text, reset_at }
