@@ -130,11 +130,10 @@ fn catalog(engine: &str, provider: &str, model: &str) -> Result<(), String> {
     } else if provider == "local" {
         crate::providers::local_status()?.models.iter().any(|m| m.id == model)
     } else {
-        crate::providers::get(provider)
-            .ok_or_else(|| format!("geçersiz sağlayıcı: {provider}"))?
-            .models
-            .iter()
-            .any(|m| m.id == model)
+        crate::providers::has_model(
+            crate::providers::get(provider).ok_or_else(|| format!("geçersiz sağlayıcı: {provider}"))?,
+            model,
+        )
     };
     if valid {
         Ok(())
@@ -385,7 +384,7 @@ pub fn apply(conn: &Connection, agent: &mut crate::teams::Agent, job: Option<i64
     {
         return Ok(false);
     }
-    if engine == "claude" && crate::providers::get(&provider).is_some_and(|p| !p.live && !p.models.iter().any(|m| m.id == model)) {
+    if engine == "claude" && crate::providers::get(&provider).is_some_and(|p| !p.live && !crate::providers::has_model(p, &model)) {
         return Ok(false);
     }
     agent.active_model = Some(model);

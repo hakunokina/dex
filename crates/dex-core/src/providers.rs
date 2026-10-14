@@ -101,7 +101,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
         label: "Muse",
         base_url: Some("https://api.meta.ai"),
         // CLAUDE_CODE_MAX_CONTEXT_TOKENS ŞART: CLI bu modeli katalogda tanımıyor, 200k sanıp
-        // auto-compact yapıyor; sağlayıcının bağlam penceresi 1.048.576.
+        // auto-compact yapıyor; pencere model başına `CONTEXT` tablosundan.
+        // Sabit liste yedek + etiket kaynağı; sağlayıcının sunduğu yeni modeller `models()`'te eklenir.
         models: &[
             m("muse-spark-1.3", "Muse Spark 1.3"),
             m("muse-spark-1.3-contributor", "Muse Spark 1.3 — contributor (veriniz ürün geliştirmede kullanılır)"),
@@ -113,7 +114,7 @@ pub static PROVIDERS: &[ProviderDef] = &[
             ("ANTHROPIC_DEFAULT_SONNET_MODEL", "{model}"),
             ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "{model}"),
             ("CLAUDE_CODE_SUBAGENT_MODEL", "{model}"),
-            ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "1048576"),
+            ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "{context}"),
             // #839: Muse, Artifact aracının file_paths JSON Schema dalını 400 ile reddediyor;
             // bayrak o aracı kapatır (Dex'te Artifact kullanılmıyor). Geri alma: satırı sil.
             ("CLAUDE_CODE_DISABLE_ARTIFACT", "1"),
@@ -140,6 +141,62 @@ pub static PROVIDERS: &[ProviderDef] = &[
         live: true,
     },
 ];
+
+/// Bağlam penceresi (`{context}`) — (sağlayıcı, model öneki, token). `/v1/models` pencere vermiyor
+/// (GLM/Muse cevabında alan yok). Eşleşmeyen modelde env basılmaz: CLI 200k varsayar, erken
+/// auto-compact olur ama sağlayıcı penceresini aşmaz. Muse Wonder 1M: Meta duyurusu/aracı kataloglar.
+const CONTEXT: &[(&str, &str, &str)] = &[("muse", "muse-spark-", "1048576"), ("muse", "muse-wonder-", "1048576")];
+
+fn context_tokens(provider: &str, model: &str) -> Option<&'static str> {
+    let model = model.to_ascii_lowercase();
+    CONTEXT.iter().find(|(p, pre, _)| *p == provider && model.starts_with(pre)).map(|c| c.2)
+}
+
+// ── Canlı katalog (GLM/Muse) ─────────────────────────────────────────────────
+
+/// Sağlayıcının sunduğu, sabit listede olmayan sohbet modeli (`model_news::live_catalog` süzer).
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, Serialize)]
+pub struct LiveModel {
+    pub id: String,
+    pub label: String,
+    pub legacy: bool,
+}
+
+/// DB önbelleğinin (`settings.models_catalog`) bellek görüntüsü: doğrulama noktaları (ajan, plan,
+/// öneri) bağlantısız ve kilit dışında okur. Açılışta ve her başarılı tazelemede değiştirilir.
+static LIVE: std::sync::RwLock<std::collections::BTreeMap<String, Vec<LiveModel>>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// Değiştiyse `true` (UI'a `providers-changed` gider).
+pub fn set_live(catalog: std::collections::BTreeMap<String, Vec<LiveModel>>) -> bool {
+    let mut live = LIVE.write().unwrap_or_else(|e| e.into_inner());
+    let changed = *live != catalog;
+    *live = catalog;
+    changed
+}
+
+/// Seçilebilir katalog: sabit liste (sıra/etiket korunur; ilki varsayılan) + canlı listedeki yeniler.
+pub fn models(def: &ProviderDef) -> Vec<ModelInfo> {
+    let live = LIVE.read().unwrap_or_else(|e| e.into_inner());
+    merge(def, live.get(def.id).map(Vec::as_slice).unwrap_or_default())
+}
+
+fn merge(def: &ProviderDef, live: &[LiveModel]) -> Vec<ModelInfo> {
+    let mut out: Vec<ModelInfo> =
+        def.models.iter().map(|m| ModelInfo { id: m.id.into(), label: m.label.into(), legacy: m.legacy }).collect();
+    for m in live {
+        if !out.iter().any(|o| o.id.eq_ignore_ascii_case(&m.id)) {
+            out.push(ModelInfo { id: m.id.clone(), label: m.label.clone(), legacy: m.legacy });
+        }
+    }
+    out
+}
+
+/// Model bu sağlayıcıda geçerli mi (sabit + canlı; legacy dahil). Canlı sağlayıcıda (yerel) sunucu karar verir.
+pub fn has_model(def: &ProviderDef, model: &str) -> bool {
+    def.models.iter().any(|m| m.id == model)
+        || LIVE.read().unwrap_or_else(|e| e.into_inner()).get(def.id).is_some_and(|l| l.iter().any(|m| m.id == model))
+}
 
 // ── Çocuk env'i ──────────────────────────────────────────────────────────────
 
@@ -181,6 +238,12 @@ fn spawn_env_with(
         ("ANTHROPIC_AUTH_TOKEN".to_string(), token),
     ];
     for (k, v) in def.env {
+        if *v == "{context}" {
+            if let Some(n) = model.as_deref().and_then(|m| context_tokens(id, m)) {
+                env.push((k.to_string(), n.to_string()));
+            }
+            continue;
+        }
         let v = model.as_deref().map(|m| v.replace("{model}", m)).unwrap_or_else(|| v.to_string());
         env.push((k.to_string(), v));
     }
@@ -439,7 +502,7 @@ fn zai_reset(message: &str) -> Option<String> {
 
 // ── Arayüz uçları (host komutları) ───────────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
     pub id: String,
@@ -472,8 +535,9 @@ pub fn list() -> Result<Vec<ProviderInfo>, String> {
                 id: p.id.to_string(),
                 label: p.label.to_string(),
                 base_url: if p.live { base_url_from(&keyring_secret).ok() } else { p.base_url.map(str::to_string) },
-                // Canlı sağlayıcının modelleri `local_status`'tan gelir (liste açılışını ağa bağlamaz).
-                models: p.models.iter().map(|m| ModelInfo { id: m.id.into(), label: m.label.into(), legacy: m.legacy }).collect(),
+                // Yerel sağlayıcının modelleri `local_status`'tan gelir; GLM/Muse'nin canlı kataloğu
+                // önbellekten (liste açılışını ağa bağlamaz).
+                models: models(p),
                 has_token: token.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
                 token_mask: token.as_deref().map(mask),
             }
@@ -777,6 +841,30 @@ mod tests {
         }
         assert_eq!(env.iter().find(|(ek, _)| ek == "CLAUDE_CODE_MAX_CONTEXT_TOKENS").unwrap().1, "1048576");
         assert_eq!(env.iter().find(|(ek, _)| ek == "CLAUDE_CODE_DISABLE_ARTIFACT").unwrap().1, "1");
+    }
+
+    #[test]
+    fn context_window_per_model() {
+        let env = |m: &str| spawn_env_with(&vault(&[("muse", "musetoken123456")]), Some("muse"), Some(m)).unwrap().unwrap();
+        let ctx = |m: &str| env(m).into_iter().find(|(k, _)| k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS").map(|e| e.1);
+        assert_eq!(ctx("muse-wonder-1.0").as_deref(), Some("1048576"));
+        assert_eq!(ctx("muse-wonder-full-1.0-contributor").as_deref(), Some("1048576"));
+        assert_eq!(ctx("muse-nova-1.0"), None, "bilinmeyen modelde pencere basılmaz (CLI varsayılanı)");
+        assert!(!env("muse-nova-1.0").iter().any(|(_, v)| v.contains('{')), "yer tutucu sızmaz");
+    }
+
+    #[test]
+    fn live_models_append_after_static_and_keep_labels() {
+        let muse = get("muse").unwrap();
+        let live = |id: &str, legacy| LiveModel { id: id.into(), label: id.to_uppercase(), legacy };
+        let got = merge(muse, &[live("MUSE-SPARK-1.3", false), live("muse-wonder-1.0", false), live("muse-spark-1.1", true)]);
+        let ids: Vec<(&str, bool)> = got.iter().map(|m| (m.id.as_str(), m.legacy)).collect();
+        assert_eq!(
+            ids,
+            [("muse-spark-1.3", false), ("muse-spark-1.3-contributor", false), ("muse-spark-1.2", false), ("muse-wonder-1.0", false), ("muse-spark-1.1", true)]
+        );
+        assert_eq!(got[0].label, "Muse Spark 1.3", "sabit etiket korunur");
+        assert_eq!(merge(muse, &[]).len(), muse.models.len(), "önbellek yoksa sabit liste");
     }
 
     #[test]

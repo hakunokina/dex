@@ -287,12 +287,12 @@ fn check_provider(v: &str) -> Result<String, String> {
 }
 
 /// DEX-13: model, sağlayıcının kataloğundan olmalı (anthropic → sürümlü claude-* + eski takma adlar;
-/// glm → GLM alias/native adları; muse → muse-spark-*).
+/// glm/muse → sabit liste + sağlayıcının canlı listesi, #1728).
 fn check_model(engine: &str, provider: &str, model: &str) -> Result<(), String> {
     one_of(engine, ENGINES, "motor")?;
     let def = crate::providers::get(provider).ok_or_else(|| format!("geçersiz sağlayıcı: {provider}"))?;
     // DEX-25: canlı sağlayıcının kataloğu sunucuda; ad boş değilse sunucu karar verir.
-    let ok = if def.live { !model.trim().is_empty() } else { def.models.iter().any(|m| m.id == model) };
+    let ok = if def.live { !model.trim().is_empty() } else { crate::providers::has_model(def, model) };
     ok.then_some(()).ok_or_else(|| format!("geçersiz model: {model}"))
 }
 

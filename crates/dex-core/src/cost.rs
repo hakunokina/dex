@@ -485,7 +485,7 @@ pub struct Price {
 fn prices(c: &Connection) -> Result<Vec<Price>, String> {
     let mut table: BTreeMap<(String, String), Option<Rates>> = crate::providers::PROVIDERS
         .iter()
-        .flat_map(|p| p.models.iter().map(move |m| ((p.id.to_string(), m.id.to_string()), None)))
+        .flat_map(|p| crate::providers::models(p).into_iter().map(move |m| ((p.id.to_string(), m.id), None)))
         .collect();
     // Models seen only in transcripts are listed without inventing prices.
     let mut st = c
