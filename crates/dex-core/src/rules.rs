@@ -213,6 +213,14 @@ fn build_system_prompt(
     if let Some(p) = &profile {
         rules = format!("{}\n\n{rules}", crate::stack::section(p));
     }
+    // Plan #99 mapgen: harita dosyası varsa tek satır (edu/asistan hariç); yoksa istem baytı değişmez.
+    if !education && !assistant {
+        if let Some(root) = cwd {
+            if let Some(line) = crate::repomap::prompt_line(root) {
+                rules = format!("{rules}\n\n{line}");
+            }
+        }
+    }
     if let Some(ctx) = ctx {
         rules.push_str(&context_block(ctx));
     }
@@ -783,6 +791,29 @@ Bu projede `.dex/stack.md` yok; tespit edilen: Godot. Patronla birlikte taslağ�
         c.execute("UPDATE teams SET cwd = NULL", []).unwrap();
         c.execute("UPDATE projects SET root_path=NULL,root_key=NULL", []).unwrap();
         assert!(!system_prompt(&c, "timur", None).contains("## Proje yığını"));
+    }
+
+    #[test]
+    fn map_line_appears_only_for_dev_with_map_file() {
+        let c = db();
+        let (s, o) = mem();
+        let d = project("map", &[]);
+        set_cwd(&c, &d);
+        for id in ["timur", "ayla"] {
+            assert!(!system_prompt(&c, id, Some((&s, &o))).contains("Proje haritası:"), "{id}");
+        }
+        std::fs::create_dir_all(d.join(".dex")).unwrap();
+        std::fs::write(d.join(crate::repomap::MAP_FILE), "x").unwrap();
+        let expected = format!("Proje haritası: `{}/.dex/map.md` — işe başlamadan ilgili bölümü oku.", d.display());
+        for id in ["timur", "ayla"] {
+            assert!(system_prompt(&c, id, Some((&s, &o))).contains(&expected), "{id}");
+        }
+        c.execute("UPDATE teams SET profile='edu' WHERE id='default'", []).unwrap();
+        assert!(!system_prompt(&c, "timur", Some((&s, &o))).contains("Proje haritası:"));
+        c.execute("UPDATE teams SET profile='dev' WHERE id='default'", []).unwrap();
+        c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).unwrap();
+        assert!(!system_prompt(&c, "ayla", Some((&s, &o))).contains("Proje haritası:"));
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

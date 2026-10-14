@@ -6,6 +6,7 @@
 //! dexd pair [--data-dir DIR]                  one-time pairing code (10 min)
 //! dexd devices list [--data-dir DIR]
 //! dexd devices revoke <ID> [--data-dir DIR]
+//! dexd map-refresh [--root DIR]…              refresh <root>/.dex/map.md skeleton (default: cwd)
 
 use dex_core::Paths;
 use dexd::auth::{Auth, CODE_TTL};
@@ -20,7 +21,8 @@ const USAGE: &str = "kullanım:
   dexd --desktop-data-dir KİMLİK
   dexd pair [--data-dir DİZİN]
   dexd devices list [--data-dir DİZİN]
-  dexd devices revoke <ID> [--data-dir DİZİN]";
+  dexd devices revoke <ID> [--data-dir DİZİN]
+  dexd map-refresh [--root DİZİN]…";
 
 struct Opts {
     words: Vec<String>,
@@ -135,6 +137,7 @@ fn main() -> ExitCode {
         ["pair"] => pair(&o),
         ["devices", "list"] | ["devices"] => devices(&o),
         ["devices", "revoke", id] => revoke(&o, id),
+        ["map-refresh"] => map_refresh(&o),
         _ => Err(format!("bilinmeyen komut\n{USAGE}")),
     };
     match r {
@@ -170,6 +173,29 @@ fn revoke(o: &Opts, id: &str) -> Result<(), String> {
         return Err(format!("böyle bir cihaz yok: {id}"));
     }
     println!("iptal edildi: {id} (açık bağlantısı {} sn içinde kapanır)", dexd::server::RECHECK.as_secs());
+    Ok(())
+}
+
+/// Plan #99 mapgen: elle tetikleme — `<root>/.dex/map.md` iskeletini tazeler.
+/// `--root` verilmezse çalışılan dizin; Core/DB gerekmez, salt dosya işi.
+fn map_refresh(o: &Opts) -> Result<(), String> {
+    let roots = if o.roots.is_empty() {
+        vec![std::env::current_dir().map_err(|e| e.to_string())?]
+    } else {
+        o.roots.clone()
+    };
+    for root in &roots {
+        let started = std::time::Instant::now();
+        let out = dex_core::repomap::refresh(root)?;
+        println!(
+            "{}: {} dosya, {} simge, {} bayt, {} ms",
+            out.path.display(),
+            out.files,
+            out.symbols,
+            out.bytes,
+            started.elapsed().as_millis()
+        );
+    }
     Ok(())
 }
 

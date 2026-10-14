@@ -46,6 +46,7 @@ pub mod pty_stream;
 pub mod questions;
 mod worker_notes;
 pub mod quota;
+pub mod repomap;
 pub mod restart;
 pub mod review;
 pub mod roles;
@@ -736,6 +737,9 @@ impl Core {
     /// Dex's next start.
     /// #286: a tip with no review and none running gets one now.
     pub fn delegation_merge(&self, c: &delegate::Caller, id: i64, force_policy: bool, force_review: bool) -> Result<Value, String> {
+        // Repo haritası (#99): birleştirme sonrası tazeleme bu köke gider; merge'den önce alınır
+        // (başarılı merge worktree satırını temizleyebilir).
+        let map_root = with(&self.db, |conn| worktree::get(conn, id)).ok().flatten().map(|w| w.root);
         let mut out = worktree::merge(&self.db, c, id, force_policy, force_review, &|w| self.worktree_release(w))?;
         if out["review"]["state"] == "yok" {
             out["note"] = match self.review_open(id) {
@@ -750,6 +754,14 @@ impl Core {
         }
         if out["merged"] == true {
             self.changed("teams-changed");
+            // Repo haritası (#99): birleştirmeyi yavaşlatmadan arka planda tazele.
+            if let Some(root) = map_root {
+                std::thread::spawn(move || {
+                    if let Err(err) = repomap::refresh(&root) {
+                        eprintln!("dex: repo haritası tazelenemedi: {err}");
+                    }
+                });
+            }
         }
         Ok(out)
     }

@@ -24,6 +24,11 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 base64 = "0.22"
 # #1718: FCM servis hesabı JWT imzası (RS256). ureq/rustls üzerinden zaten ağaçta; yeni crate yok.
 ring = "0.17"
+# Plan #99 mapgen: repo haritası — tree-sitter ayrıştırma (MIT lisanslı gramerler).
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.25"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Wdk_System_Threading"] }
