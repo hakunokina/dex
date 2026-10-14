@@ -1881,7 +1881,7 @@ pub(crate) mod tests {
         assert_eq!(state(&out), "yok", "{out}");
         let r = open_review(&db, &d);
         assert_eq!((&r.project_id, &r.project_root, &r.merge_branch), (&d.project_id, &d.project_root, &d.merge_branch));
-        assert!(r.prompt.contains(&format!("git -C {} diff team...", two.display())), "{}", r.prompt);
+        assert!(r.prompt.contains(&format!("git -C \"{}\" diff team...", two.to_string_lossy().replace('\\', "/"))), "{}", r.prompt);
         let task: Option<String> = with(&db, |c| c.query_row("SELECT project_id FROM tasks WHERE id = ?1", [r.task_id.unwrap()], |row| row.get(0)).map_err(e)).unwrap();
         assert_eq!(task.as_deref(), Some(p2.as_str()));
         // Its report belongs to the reviewed job's project.

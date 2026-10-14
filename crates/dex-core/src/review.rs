@@ -399,7 +399,10 @@ fn origin_words(conn: &Connection, target: &Delegation) -> Result<Option<String>
 }
 
 fn prompt(conn: &Connection, target: &Delegation, w: &Wt, sha: &str, team: &str) -> Result<String, String> {
-    let root = w.root.display();
+    // #1756: Bash drops unquoted backslashes (`C:\w` → `C:w`), so a Windows `display()` path in
+    // `-C` is read — by the shell and the read-only parser alike — as a relative path outside the
+    // reviewer's roots and the command is denied. Forward slashes, quoted for spaces.
+    let root = format!("\"{}\"", w.root.to_string_lossy().replace('\\', "/"));
     let author = delegate::caller(conn, &target.to_agent).map(|c| c.name).unwrap_or_else(|_| target.to_agent.clone());
     let report = match &target.result_path {
         Some(p) => p.clone(),
