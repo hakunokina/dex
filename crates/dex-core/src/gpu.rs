@@ -284,8 +284,9 @@ impl Broker<'_> {
     /// Senkron metin çağrısı (`/v1/embeddings`, `/v1/rerank`): ilk istekte 60 sn zaman aşımı.
     /// 503 (GPU patronun LLM oturumunda) `Retry-After` kadar beklenip yeniden denenir; toplam
     /// 10 dakikayı aşarsa açık hata. Başka kodlar ilk yanıtta biter (yedek adrese geçilmez:
-    /// 503 yapışkan yanıttır, aynı adres yeniden denenir).
-    fn post_sync(&self, path: &str, task: Option<&str>, body: &Value) -> Result<Value, String> {
+    /// 503 yapışkan yanıttır, aynı adres yeniden denenir). `alive`: sleep'ten uyanınca yoklanır —
+    /// izin bu arada başka işe geçti/biterse POST atılmadan vazgeçilir (ayrılanı çağıran iade eder).
+    fn post_sync(&self, path: &str, task: Option<&str>, body: &Value, alive: &dyn Fn() -> bool) -> Result<Value, String> {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             let (_, r) = self.send("POST", path, task, Some(body), Duration::from_secs(60))?;
@@ -300,6 +301,9 @@ impl Broker<'_> {
                     return Err("GPU 10 dakikadır patronun LLM oturumunda; daha sonra yeniden dene".into());
                 }
                 std::thread::sleep(Duration::from_secs(wait));
+                if !alive() {
+                    return Err("GPU izni beklerken başka işe geçti ya da iş bitti; broker'a gönderilmedi".into());
+                }
                 if Instant::now() >= deadline {
                     return Err("GPU 10 dakikadır patronun LLM oturumunda; daha sonra yeniden dene".into());
                 }
@@ -565,6 +569,17 @@ pub fn budget_unit(types: &[String]) -> &'static str {
     if types.iter().any(|t| TEXT_TYPES.contains(&t.as_str())) { "metin" } else { "görsel" }
 }
 
+/// Metin ve görsel türleri aynı izinde karışamaz: sayaç tek, birim tür başına — karışık
+/// kümede "50.000 metin" diye onaylanan izinle görsel üretilebilirdi. Ayrı izin gerekir.
+fn check_mixed(types: &[String]) -> Result<(), String> {
+    let text = types.iter().any(|t| TEXT_TYPES.contains(&t.as_str()));
+    let visual = types.iter().any(|t| !TEXT_TYPES.contains(&t.as_str()));
+    if text && visual {
+        return Err("metin ve görsel türleri ayrı izin ister (tek istekte karışmaz)".into());
+    }
+    Ok(())
+}
+
 fn check_budget(conn: &Connection, b: i64, types: &[String]) -> Result<i64, String> {
     let unit = budget_unit(types);
     let max = if unit == "metin" {
@@ -598,6 +613,7 @@ pub fn request(conn: &Connection, lead: &Caller, args: &Value, available: &[Stri
     if let Some(t) = types.iter().find(|t| !available.contains(t)) {
         return Err(format!("tür ajan erişimine açık değil: {t}. Açık türler: {}", available.join(", ")));
     }
+    check_mixed(&types)?;
     let key = args.get("workerId").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).ok_or("workerId gerekli")?;
     let worker: String = conn
         .query_row(
@@ -629,6 +645,9 @@ pub fn decide(conn: &Connection, id: i64, approve: bool, budget: Option<i64>) ->
     let r = get_request(conn, id)?;
     if r.status != "pending" {
         return Err(format!("GPU isteği #{id} zaten karara bağlandı ({})", r.status));
+    }
+    if approve {
+        check_mixed(&r.types)?;
     }
     let tx = conn.unchecked_transaction().map_err(e)?;
     let ts = now();
@@ -869,11 +888,13 @@ fn rerank_args(args: &Value) -> Result<(String, Vec<String>, Option<i64>), Strin
     Ok((query, documents, top_n))
 }
 
-/// `data:[{index, embedding}]` → `index` sırasına dizilmiş vektörler.
-fn parse_embeddings(v: &Value) -> Result<Vec<Vec<f64>>, String> {
+/// `data:[{index, embedding}]` → `index` sırasına dizilmiş vektörler. Çağıran gönderdiği
+/// metin sayısını (`n`) verir: `data` tam `n` eleman, index'ler tekrarsız `0..n` olmalı —
+/// eksik/tekrar/aralık dışı yanıtta vektörler yanlış metne eşlenirdi. Hata + iade (çağıranda).
+fn parse_embeddings(v: &Value, n: usize) -> Result<Vec<Vec<f64>>, String> {
     let data = v.get("data").and_then(Value::as_array).ok_or("GPU broker yanıtı okunamadı (data yok)")?;
-    if data.is_empty() {
-        return Err("GPU broker yanıtı okunamadı (data boş)".into());
+    if data.len() != n {
+        return Err(format!("GPU broker yanıtı okunamadı (data {}/{}: protokol hatası)", data.len(), n));
     }
     let mut out: Vec<(u64, Vec<f64>)> = Vec::with_capacity(data.len());
     for item in data {
@@ -887,18 +908,32 @@ fn parse_embeddings(v: &Value) -> Result<Vec<Vec<f64>>, String> {
         out.push((index, vec));
     }
     out.sort_by_key(|(i, _)| *i);
+    for (i, (index, _)) in out.iter().enumerate() {
+        if *index != i as u64 {
+            return Err("GPU broker yanıtı okunamadı (index eksik/tekrar/aralık dışı: protokol hatası)".into());
+        }
+    }
     Ok(out.into_iter().map(|(_, v)| v).collect())
 }
 
-/// `results:[{index, relevance_score|score}]` → broker sırasını korur.
+/// `results:[{index, relevance_score|score}]` → broker sırasını korur. Boş sonuç, belge
+/// dışı index ya da tekrar protokol hatasıdır (hata + iade çağıranda).
 fn parse_rerank(v: &Value, n_docs: usize) -> Result<Vec<(u64, f64)>, String> {
     let results = v.get("results").and_then(Value::as_array).ok_or("GPU broker yanıtı okunamadı (results yok)")?;
+    if results.is_empty() {
+        return Err("GPU broker yanıtı okunamadı (results boş: protokol hatası)".into());
+    }
+    let mut seen = vec![false; n_docs];
     let mut out = Vec::with_capacity(results.len());
     for r in results {
         let index = r.get("index").and_then(Value::as_u64).ok_or("GPU broker yanıtı okunamadı (index yok)")?;
         if index as usize >= n_docs {
             return Err("GPU broker yanıtı okunamadı (index belge dışında)".into());
         }
+        if seen[index as usize] {
+            return Err("GPU broker yanıtı okunamadı (index tekrar: protokol hatası)".into());
+        }
+        seen[index as usize] = true;
         let score = r
             .get("relevance_score")
             .or_else(|| r.get("score"))
@@ -1469,7 +1504,8 @@ impl Core {
                     body["dimensions"] = json!(d);
                 }
                 let task = format!("{}/{delegation}", c.id);
-                let v = match b.post_sync("/v1/embeddings", Some(&task), &body) {
+                let alive = || with(&self.db, |conn| still_bound(conn, g, delegation)).unwrap_or(false);
+                let v = match b.post_sync("/v1/embeddings", Some(&task), &body, &alive) {
                     Ok(v) => v,
                     Err(err) => {
                         with(&self.db, |conn| {
@@ -1479,7 +1515,7 @@ impl Core {
                         return Err(err);
                     }
                 };
-                let vecs = match parse_embeddings(&v) {
+                let vecs = match parse_embeddings(&v, texts.len()) {
                     Ok(vecs) => vecs,
                     Err(err) => {
                         with(&self.db, |conn| {
@@ -1508,7 +1544,8 @@ impl Core {
                     body["top_n"] = json!(t);
                 }
                 let task = format!("{}/{delegation}", c.id);
-                let v = match b.post_sync("/v1/rerank", Some(&task), &body) {
+                let alive = || with(&self.db, |conn| still_bound(conn, g, delegation)).unwrap_or(false);
+                let v = match b.post_sync("/v1/rerank", Some(&task), &body, &alive) {
                     Ok(v) => v,
                     Err(err) => {
                         with(&self.db, |conn| {
@@ -1573,9 +1610,12 @@ mod tests {
         extra_models: Mutex<Vec<Value>>,
         /// POST /v1/embeddings başında bu kadar 503 (`Retry-After: 1`), sonra başarı.
         embed_503: std::sync::atomic::AtomicUsize,
+        /// Embedding yanıt biçimi: "" (normal) | "dup" (index tekrar) | "short" (eksik eleman).
+        embed_style: Mutex<String>,
         /// Son embedding isteği (model/input_type/instruction/dimensions denetimi).
         last_embed: Mutex<Option<Value>>,
-        /// Rerank sonuç biçimi: "relevance" | "score" | "empty" (skorsuz → protokol hatası).
+        /// Rerank sonuç biçimi: "relevance" | "score" | "empty" (skorsuz) | "noresults" (boş) |
+        /// "dup" (index tekrar) | "oob" (index belge dışında) — hepsi protokol hatası.
         rerank_style: Mutex<String>,
         /// Bu yol (yetkiyle) 200 + verilen gövdeyi döner; başlıktaki uzunluk gövdeden büyükse yarım kalır.
         mangled: Mutex<Option<(String, Vec<u8>, usize)>>,
@@ -1729,12 +1769,20 @@ mod tests {
                     (400, "application/json", br#"{"error":"invalid","message":"metin cok uzun"}"#.to_vec())
                 } else {
                     // Sıra karışık verilir; Dex `index`'e göre dizer.
-                    let data: Vec<Value> = inputs
+                    let mut data: Vec<Value> = inputs
                         .iter()
                         .enumerate()
                         .rev()
                         .map(|(i, _)| json!({ "index": i, "embedding": [0.1 * i as f64, 0.2] }))
                         .collect();
+                    match f.embed_style.lock().unwrap().as_str() {
+                        // 2 metne [0, 0, 2]: 1. vektör iki kez, 2.'ninki kayıp.
+                        "dup" => data.insert(1, json!({ "index": 0, "embedding": [0.0, 0.2] })),
+                        "short" => {
+                            data.pop();
+                        }
+                        _ => {}
+                    }
                     (200, "application/json", json!({ "object": "list", "model": v.get("model"), "data": data }).to_string().into_bytes())
                 }
             }
@@ -1746,6 +1794,12 @@ mod tests {
                     (400, "application/json", br#"{"error":"invalid","message":"sorgu bos"}"#.to_vec())
                 } else if style == "empty" {
                     (200, "application/json", br#"{"results":[{"index":0}]}"#.to_vec())
+                } else if style == "noresults" {
+                    (200, "application/json", br#"{"results":[]}"#.to_vec())
+                } else if style == "dup" {
+                    (200, "application/json", br#"{"results":[{"index":0,"relevance_score":0.9},{"index":0,"relevance_score":0.8}]}"#.to_vec())
+                } else if style == "oob" {
+                    (200, "application/json", br#"{"results":[{"index":99,"relevance_score":0.9}]}"#.to_vec())
                 } else {
                     let key = if style == "score" { "score" } else { "relevance_score" };
                     // Broker sırası (tersten); Dex aynen korur.
@@ -2511,6 +2565,53 @@ mod tests {
     }
 
     #[test]
+    fn mixed_text_and_image_types_need_separate_grants() {
+        let (core, root) = core("mixed");
+        let (base, f) = fake();
+        configure(&core, &base, &dead());
+        f.extra_models.lock().unwrap().extend(text_models());
+        // Karışık küme istekte reddedilir.
+        let v = mcp(&core, "timur", "gpu_request", json!({ "types": ["t2i", "embedding"], "workerId": "ayla", "reason": "x" }));
+        assert!(text(&v).contains("ayrı izin"), "{v}");
+        // Onay aşaması da savunur (istek API'sini atlayıp yazılmış eski satır).
+        let id = with(&core.db, |c| {
+            c.execute(
+                "INSERT INTO gpu_requests (team_id, leader, worker, types, reason, budget, created_at) VALUES ('default', 'timur', 'ayla', '[\"t2i\",\"embedding\"]', 'eski', 8, 1)",
+                [],
+            )
+            .map_err(e)?;
+            Ok(c.last_insert_rowid())
+        })
+        .unwrap();
+        assert!(core.gpu_request_decide(id, true, None).unwrap_err().contains("ayrı izin"));
+        // Aynı birimden kümeler bugünkü gibi: metin+metin, görsel+görsel.
+        for types in [json!(["embedding", "rerank"]), json!(["t2i", "bg-removal"])] {
+            let v = mcp(&core, "timur", "gpu_request", json!({ "types": types, "workerId": "ayla", "reason": "x" }));
+            assert!(v.get("isError").is_none(), "{types}: {v}");
+        }
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn image_budget_falls_back_to_240_without_a_broker_limit() {
+        let (core, root) = core("img-fallback");
+        // `gpu_limits` ayarı yok: broker limiti okunmadı → geri dönüş 240 (UI ile aynı).
+        let (ok, over): (bool, bool) = with(&core.db, |c| {
+            let lead = crate::delegate::caller(c, "timur")?;
+            let ok = request(c, &lead, &json!({"workerId":"ayla", "types":["t2i"], "reason":"test", "budget":240}), &["t2i".into()], None).is_ok();
+            let over = request(c, &lead, &json!({"workerId":"ayla", "types":["t2i"], "reason":"test", "budget":241}), &["t2i".into()], None)
+                .unwrap_err()
+                .contains("240 görsel");
+            Ok((ok, over))
+        })
+        .unwrap();
+        assert!(ok && over, "{ok} {over}");
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn embed_roundtrip_sorts_by_index_and_spends_texts() {
         let (core, root) = core("embed");
         let (base, f) = fake();
@@ -2584,6 +2685,31 @@ mod tests {
     }
 
     #[test]
+    fn embed_protocol_errors_refund_and_spend_nothing() {
+        let (core, root) = core("embed-proto");
+        let (base, f) = fake();
+        configure(&core, &base, &dead());
+        f.extra_models.lock().unwrap().extend(text_models());
+        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(6));
+        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
+        // 2 metne [0, 0] (tekrar; 2. vektör kayıp) ve [1] (eksik): ikisi de protokol hatası.
+        for style in ["dup", "short"] {
+            *f.embed_style.lock().unwrap() = style.into();
+            let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["bir-zz", "iki-zz"] }));
+            assert!(text(&v).contains("protokol hatası"), "{style}: {v}");
+        }
+        assert_eq!(posts(), 2);
+        assert_eq!(used_of(&core, g), 0, "bozuk yanıtın bütçesi iade edilir");
+        // Sağlam yanıt yine çalışır.
+        *f.embed_style.lock().unwrap() = String::new();
+        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["bir-zz", "iki-zz"] }));
+        assert!(v.get("isError").is_none(), "{v}");
+        assert_eq!(used_of(&core, g), 2);
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn embed_503_waits_retry_after_and_retries() {
         let (core, root) = core("embed-retry");
         let (base, f) = fake();
@@ -2595,6 +2721,31 @@ mod tests {
         assert!(r.get("isError").is_none(), "{r}");
         assert_eq!(f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count(), 3);
         assert_eq!(used_of(&core, g), 1);
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embed_gives_up_after_sleep_if_the_grant_moved_on() {
+        let (core, root) = core("embed-cancel");
+        let (base, f) = fake();
+        configure(&core, &base, &dead());
+        f.extra_models.lock().unwrap().extend(text_models());
+        f.embed_503.store(1, Ordering::SeqCst);
+        let (g, d) = approved_text_job(&core, "ayla", &["embedding"], Some(4));
+        with(&core.db, |c| crate::delegate::set_status(c, d, "running")).unwrap();
+        // İlk POST 503 → 1 sn uyku; uyku sırasında iş biterse uyanınca POST atılmaz.
+        let r = std::thread::scope(|s| {
+            let h = s.spawn(|| mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["yari-zz"] })));
+            while f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count() < 1 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            with(&core.db, |c| crate::delegate::set_status(c, d, "done")).unwrap();
+            h.join().unwrap()
+        });
+        assert!(text(&r).contains("başka işe geçti ya da iş bitti"), "{r}");
+        assert_eq!(f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count(), 1, "uyanışta POST yok");
+        assert_eq!(used_of(&core, g), 0, "ayrılan iade edilir");
         core.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2626,6 +2777,13 @@ mod tests {
         *f.rerank_style.lock().unwrap() = "empty".into();
         let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d1"] }));
         assert!(text(&v).contains("protokol hatası"), "{v}");
+        assert_eq!(used_of(&core, g), 4);
+        // Boş sonuç, tekrar index ve belge dışı index de öyle.
+        for style in ["noresults", "dup", "oob"] {
+            *f.rerank_style.lock().unwrap() = style.into();
+            let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d1"] }));
+            assert!(text(&v).contains("protokol hatası") || text(&v).contains("belge dışında"), "{style}: {v}");
+        }
         assert_eq!(used_of(&core, g), 4);
         // Yerel doğrulama broker'a gitmez.
         let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/rerank")).count();

@@ -101,8 +101,8 @@ export function limitsPatch(form: GpuLimitsForm, saved: GpuLimits = {}): Partial
   return limits;
 }
 
-/** Broker'dan okunamayan günlük limit için geri dönüş (görsel). */
-export const GPU_BUDGET_MAX = 120;
+/** Broker'dan okunamayan günlük limit için geri dönüş (görsel; dex-core gpu.rs MAX_BUDGET ile aynı). */
+export const GPU_BUDGET_MAX = 240;
 /** Metin birimli türler (dex-core gpu.rs TEXT_TYPES ile aynı küme) ve tek tavan. */
 export const GPU_TEXT_TYPES = ["embedding", "rerank"];
 export const GPU_TEXT_BUDGET_MAX = 50000;

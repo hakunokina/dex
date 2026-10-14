@@ -37,11 +37,11 @@ test("modelGroups: ajana açık / servis (patronun) / yalnız disk, ayrık", () 
   assert.deepEqual([g.agent, g.served, g.diskOnly].map((x) => x.map((y) => y.name)), [["a"], ["s"], ["d1", "d2"]]);
 });
 
-test("parseBudget: 1–120, boş ya da bozuk → liderin istediği", () => {
+test("parseBudget: 1–240, boş ya da bozuk → liderin istediği", () => {
   assert.equal(parseBudget("", 24), 24);
   assert.equal(parseBudget("abc", 24), 24);
   assert.equal(parseBudget("0", 24), 1);
-  assert.equal(parseBudget("500", 24), 120);
+  assert.equal(parseBudget("500", 24), 240);
   assert.equal(parseBudget("12.4", 24), 12);
 });
 
@@ -57,6 +57,7 @@ test("budgetUnit: metin türü varsa metin, yoksa görsel; metin tavanı broker 
   assert.equal(budgetUnit(["t2i", "rerank"]), "metin");
   assert.equal(budgetMax(120, ["embedding"]), 50000);
   assert.equal(budgetMax(8, ["t2i"]), 8);
+  assert.equal(budgetMax(undefined, ["t2i"]), 240);
   assert.equal(parseBudget("999999", 24, 120, ["embedding"]), 50000);
   assert.equal(parseBudget("999999", 24, 120, ["t2i"]), 120);
 });
