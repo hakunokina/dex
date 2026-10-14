@@ -1099,7 +1099,7 @@ impl crate::Core {
         let current = a.active_provider.as_deref().unwrap_or(&a.provider).to_string();
         let msg = field("last_assistant_message");
         // Geçici sağlayıcıda ağ/timeout: unreachable say + ilerle (asıl sağlayıcıda değişmez).
-        let (kind, reason) = if crate::chain::classify(field("error"), msg) == crate::chain::Kind::Permanent {
+        let (kind, reason) = if crate::chain::classify(field("error"), msg).chains() {
             (true, "kota")
         } else if on_temp && crate::chain::unreachable_signal(field("error"), msg) {
             (true, "unreachable")
