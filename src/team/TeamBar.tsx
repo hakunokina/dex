@@ -27,6 +27,7 @@ import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../
 import { isActive } from "../layout/rackOrder";
 import { teamAccent } from "./accent";
 import { providerModels } from "./providerModels";
+import { fitConvertedModels, normalizeCloneTemplate } from "./cloneTemplate";
 import { TestLevelToggle } from "./TestLevelToggle";
 import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 
@@ -238,6 +239,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   const [catalogRetry, setCatalogRetry] = useState(0);
   const [busy, setBusy] = useState(false);
   const [template, setTemplate] = useState<TeamCloneTemplate | null>(null);
+  const [codexConverted, setCodexConverted] = useState<number[]>([]);
   const [loading, setLoading] = useState(!!sourceId);
   const [retry, setRetry] = useState(0);
   const formRef = useRef<HTMLFormElement>(null);
@@ -254,7 +256,12 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
     if (!sourceId) return;
     let live = true;
     setLoading(true); setTemplateError(null);
-    void teamCloneTemplate(sourceId).then(t => { if (live) { setTemplate(t); setKind(t.kind); setLoading(false); } },
+    void teamCloneTemplate(sourceId).then(t => {
+      if (!live) return;
+      // Normalize on arrival: the catalog may still be loading when the user submits.
+      const r = normalizeCloneTemplate(t, []);
+      setTemplate(r.template); setCodexConverted(r.converted); setKind(t.kind); setLoading(false);
+    },
       e => { if (live) { setTemplateError(String(e)); setLoading(false); } });
     return () => { live = false; };
   }, [sourceId, retry]);
@@ -271,6 +278,11 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
     }, e => { if (live) { setCatalogError(`Model kataloğu alınamadı: ${String(e)}`); setCatalogLoading(false); } });
     return () => { live = false; };
   }, [host, sourceId, catalogRetry]);
+  useEffect(() => {
+    if (!template || catalogLoading || !codexConverted.length) return;
+    const t = fitConvertedModels(template, codexConverted, providers);
+    if (t !== template) setTemplate(t);
+  }, [template, providers, catalogLoading, codexConverted]);
   // Modern hosts create the team/Main folders when cwd is omitted; old hosts still need a picker.
   const projects = hostSupports(host, "project_list");
   const educationSupport = education?.host === host ? education.supported : null;
@@ -292,7 +304,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
         return;
       }
       await createTeam(host, { name: name.trim(), kind, profile: template?.profile ?? profile, cwd: kind === "main" ? cwd : null,
-        ...(template ? { members: template.members } : profile === "dev" ? { workerRoles } : {}) });
+        ...(template ? { members: normalizeCloneTemplate(template, providers).template.members } : profile === "dev" ? { workerRoles } : {}) });
       onDone();
     } catch (err) {
       setError(String(err));
@@ -393,6 +405,7 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
       {loading && <p className="team-note" role="status">Takım üyeleri yükleniyor…</p>}
       {templateError && <p className="team-err" role="alert">{templateError}</p>}
       {sourceId && !loading && !template && <button type="button" onClick={() => setRetry(r => r + 1)}>Yeniden dene</button>}
+      {codexConverted.length > 0 && <p className="team-note" role="status">Codex üyeleri Claude'a çevrildi</p>}
       {template && !template.members.length && <p className="team-note">Kaynak takımda üye yok; yeni takım boş başlayacak.</p>}
       {sourceId && <p className="team-note">Hafıza, oturumlar ve projeler yeni takımda sıfırdan başlar.</p>}
       {educationSelected && (educationSupport === null

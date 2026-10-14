@@ -217,7 +217,8 @@ export function installBridge(cfg: BridgeConfig) {
           if (err) return void setTimeout(() => answer(this, { id: m.id, error: err }));
           if (m.method === "core_life") return void setTimeout(() => answer(this, { id: m.id, result: fakeLife }));
           const fake = window.__dexFake;
-          if (fake && m.method in fake) return void setTimeout(() => answer(this, { id: m.id, result: fake[m.method] }));
+          // A Promise fake answers when it settles (a never-settling one keeps the call pending).
+          if (fake && m.method in fake) return void setTimeout(() => void Promise.resolve(fake[m.method]).then(result => answer(this, { id: m.id, result })));
           if (!asked.has(this)) asked.set(this, new Map());
           asked.get(this)!.set(m.id, m.method);
         }
