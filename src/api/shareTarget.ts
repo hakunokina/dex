@@ -19,5 +19,11 @@ const tauri = new TauriTransport();
 /** Bekleyen paylaşım; yoksa `{}`. */
 export const takeShare = () => tauri.call<RawShare>("share_take");
 
+/**
+ * #1762 geri düşüş: hızlı gönderim olmayıp gönderim ekranı açılacaksa pencere + WebView
+ * opaklığa döner (yalnız Android; köprü yoksa sessizce geç).
+ */
+export const shareOpaque = () => tauri.call<void>("share_opaque");
+
 /** #1717 hızlı gönderim bitti: Android Toast (`message`, içerik taşımaz) + Dex kapanır/arkaya alınır. */
 export const shareDone = (message: string) => tauri.call<void>("share_done", { message });

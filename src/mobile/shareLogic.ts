@@ -200,6 +200,26 @@ export function shouldReloadTargets(upHost: string, selectedHost: string | null,
   return lookupFailed && upHost === selectedHost;
 }
 
+/**
+ * #1762 pencere kuralı (tek karar yeri; Kotlin `ShareTargetPlugin.setWindow` uygulayıcısıdır):
+ * pencere YALNIZ hızlı gönderim sürerken saydamdır — `share` saydamlaştırır, diğer her olay
+ * (`fallback`: gönderim ekranına düşüş, `done`: hızlı gönderim bitti, `plain`: paylaşım
+ * olmayan açılış/niyet) opaklığa döndürür.
+ */
+export type ShareWindowEvent = "share" | "fallback" | "done" | "plain";
+
+export function nextShareWindow(event: ShareWindowEvent): "transparent" | "opaque" {
+  return event === "share" ? "transparent" : "opaque";
+}
+
+/**
+ * #1759 paylaşım modu: hızlı gönderim sürerken kök saydam çizilir (kullanıcı paylaştığı uygulamayı
+ * görür) ve arka plan işleri (push kaydı) durur. Ekran açılınca ya da paylaşım yoksa normal.
+ */
+export function isShareFastMode(share: { fast: boolean } | null): boolean {
+  return share?.fast === true;
+}
+
 /** `inbox_submit` cevabı → kısa sonuç metni. */
 export function resultText(r: { queued?: boolean } | null | undefined): string {
   return r?.queued ? "Sıraya alındı" : "Asistana gönderildi";

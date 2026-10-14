@@ -6,7 +6,7 @@
 // which the PCB canvas and the terminal both follow (ResizeObserver / visualViewport).
 import { useEffect, useState } from "react";
 import { LOCAL, onEvent, useHosts } from "../api/hosts";
-import { SHARE_EVENT, shareDone, takeShare, type RawShare } from "../api/shareTarget";
+import { SHARE_EVENT, shareDone, shareOpaque, takeShare, type RawShare } from "../api/shareTarget";
 import { REPLY_LINK_EVENT, takeReplyLink } from "../api/push";
 import { INBOX_REPLY_EVENT, type ReplyId } from "../api/replies";
 import { initTeams, selectTeam, useTeams } from "../team/store";
@@ -16,7 +16,7 @@ import { AddServer } from "./AddServer";
 import { AgentsView } from "./AgentsView";
 import { AgentScreen } from "./AgentScreen";
 import { ShareScreen } from "./ShareScreen";
-import { hasShare, shareTask, type ShareTask } from "./shareLogic";
+import { hasShare, isShareFastMode, shareTask, type ShareTask } from "./shareLogic";
 import { tryFastShare } from "./shareFast";
 import { RepliesList, ReplyScreen } from "./Replies";
 import { parseReplyLink } from "./replyLogic";
@@ -68,7 +68,8 @@ export default function MobileApp() {
   }, []);
 
   // #1719: FCM jetonu → eşlenmiş hostlara `push_register`; bildirime dokunma → o cevabın ekranı.
-  useEffect(() => startPush(), []);
+  // #1759: push kaydı paylaşım çekişmesinden sonra başlar (aşağıdaki etki) — hızlı gönderimde arka
+  // plan işi (push_register) hiç başlamaz; ikinci WebView olmadığı için çift kayıt da olmaz.
   useEffect(() => {
     const pull = () =>
       void takeReplyLink().then(
@@ -98,11 +99,14 @@ export default function MobileApp() {
     fast: boolean;
     error: string | null;
   } | null>(null);
+  /** Açılıştaki ilk `takeShare` yanıtı geldi mi (yok / köprü yok dahil). */
+  const [shareChecked, setShareChecked] = useState(false);
   useEffect(() => {
     let seq = 0;
     const pull = () =>
       void takeShare().then(
         (raw) => {
+          setShareChecked(true);
           if (!hasShare(raw)) return;
           const mine = ++seq;
           const task = shareTask(raw.task);
@@ -115,16 +119,31 @@ export default function MobileApp() {
               // İlk paylaşımda bildirim izni (Echo cevap verince haber vermek için), sonra arka plana.
               void askNotifyOnce().finally(() => shareDone(r.toast).catch(() => {}));
             } else {
+              // #1762 geri düşüş: gönderim ekranı opak açılır (pencere + WebView opaklığa döner).
+              void shareOpaque().catch(() => {});
               setShare((s) => (s?.seq === mine ? { ...s, fast: false, error: r.error } : s));
             }
           });
         },
-        () => {}, // paylaş köprüsü yok (eski APK / masaüstü önizleme): sessizce geç
+        // paylaş köprüsü yok (eski APK / masaüstü önizleme): sessizce geç, push normal başlar
+        () => setShareChecked(true),
       );
     pull();
     window.addEventListener(SHARE_EVENT, pull);
     return () => window.removeEventListener(SHARE_EVENT, pull);
   }, []);
+
+  // #1759: push kaydı çekişmeden sonra; hızlı gönderimde (saydam kök) hiç başlamaz.
+  const shareFast = isShareFastMode(share);
+  useEffect(() => {
+    if (!shareChecked || shareFast) return;
+    return startPush();
+  }, [shareChecked, shareFast]);
+  // #1759: hızlı gönderimde kök saydam — kullanıcı paylaştığı uygulamayı görmeye devam eder.
+  useEffect(() => {
+    document.documentElement.classList.toggle("share-fast", shareFast);
+    return () => document.documentElement.classList.remove("share-fast");
+  }, [shareFast]);
 
   const remoteTeams = teams.filter((t) => t.host !== LOCAL);
   const team = remoteTeams.find((t) => t.id === activeId) ?? remoteTeams[0] ?? null;
@@ -132,9 +151,7 @@ export default function MobileApp() {
     if (team && team.id !== activeId) selectTeam(team.id);
   }, [team, activeId]);
 
-  const shareScreen = share && (share.fast ? (
-    <p className="m-share-sending" role="status">Gönderiliyor…</p>
-  ) : (
+  const shareScreen = share && !share.fast && (
     <ShareScreen
       key={share.seq}
       share={share.raw}
@@ -145,9 +162,13 @@ export default function MobileApp() {
       error={share.error}
       onClose={() => setShare(null)}
     />
-  ));
+  );
 
   // No paired server yet → the first-open pairing screen (also reached from the top bar).
+  // #1759: hızlı gönderim sürerken Dex hiç çizilmez — boş saydam kök; toast + kapanış Kotlin'de.
+  // (`fast` bitince ya paylaşım silinir ya da gönderim ekranı (`fast: false`) açılır. Bütün kancalar
+  // yukarıda koşulsuz çalıştı.)
+  if (shareFast) return null;
   if (!serverSheet && hosts.length === 0) {
     return (
       <>
