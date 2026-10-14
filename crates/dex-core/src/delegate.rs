@@ -1176,9 +1176,11 @@ fn failure_reason(conn: &Connection, changed: Vec<Delegation>, body: &Value) -> 
         .find_map(|k| body.get(*k).and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty()))
         .unwrap_or("");
     let hint = match crate::chain::classify(error, message) {
-        crate::chain::Kind::Transient => "geçici; aynı worker'a yeniden ver ya da başka worker seç",
-        crate::chain::Kind::Permanent => "kota/kredi bitti; başka sağlayıcıdaki worker'a ver",
+        crate::chain::Kind::Transient | crate::chain::Kind::Network => "geçici; aynı worker'a yeniden ver ya da başka worker seç",
+        crate::chain::Kind::Quota | crate::chain::Kind::Credit => "kota/kredi bitti; başka sağlayıcıdaki worker'a ver",
         crate::chain::Kind::Auth => "jeton reddedildi; patron sağlayıcı jetonunu yenilemeli",
+        crate::chain::Kind::Truncated => "yanıt yarıda kesildi; işi daha küçük parçalara böl",
+        crate::chain::Kind::Protocol => "istek/protokol sorunu; pane'e bak, modeli ya da isteği düzelt",
         crate::chain::Kind::Unknown => "worker'ın pane'ine bak",
     };
     let short: String = message.chars().take(400).collect();

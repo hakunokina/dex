@@ -32,18 +32,37 @@ pub const DEFAULT_EXHAUST_MS: i64 = 5 * 3_600_000;
 /// Geçici sağlayıcı yanıt vermezse (ağ/timeout) "unreachable" sayıldığı süre: 15 dk, sabit.
 pub const UNREACHABLE_EXHAUST_MS: i64 = 15 * 60_000;
 
-/// Hata sınıfı: zincir yalnız kalıcıda çalışır.
+/// Hata türü: zincir yalnız kota/kredi bitiminde çalışır. Tek kaynak: [`classify`].
+/// xsai deseni (`network-error`, `truncated-stream`, `protocol-error` gibi makine-okunur
+/// kodlar): yapılandırılmış sinyal (CLI `error` alanı, HTTP durumu, sağlayıcı kodu) her zaman
+/// metin aramasını ezer; metin yalnız son çaredir.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Kind {
-    /// Kota/kredi bitti → zincir çalışır.
-    Permanent,
-    /// 5xx, ağ, timeout → zincir çalışmaz, normal retry/StopFailure akışı.
-    Transient,
-    /// Jeton reddedildi → zincir çalışmaz (başka sağlayıcının jetonu sorunu çözmez değil ama
-    /// yanlış jetonla sessizce başka hesaba geçmek istenmez; kullanıcı jetonu yeniler).
+    /// Kullanım kotası doldu → zincir çalışır.
+    Quota,
+    /// Bakiye/kredi bitti → zincir çalışır (bildirim metni kotadan ayrıdır).
+    Credit,
+    /// Jeton reddedildi → zincir çalışmaz (yanlış jetonla sessizce başka hesaba geçilmez;
+    /// kullanıcı jetonu yeniler).
     Auth,
+    /// 5xx, aşırı yük, hız sınırı → zincir çalışmaz, normal retry/StopFailure akışı.
+    Transient,
+    /// Ağ/timeout/bağlantı → asıl sağlayıcıda zincir çalışmaz; ZİNCİR GEÇİCİ sağlayıcıdaysa
+    /// o sağlayıcı kısa süreyle "unreachable" sayılır, zincir ilerler.
+    Network,
+    /// Yanıt çıktı sınırında kesildi → zincir çalışmaz.
+    Truncated,
+    /// İstem/protokol sorunu (bilinmeyen model, hatalı istek) → zincir çalışmaz.
+    Protocol,
     /// Bilinmeyen → güvenli tarafta kal, zincir çalışmaz.
     Unknown,
+}
+
+impl Kind {
+    /// Zinciri çalıştıran türler: kota ya da kredi bitimi.
+    pub fn chains(self) -> bool {
+        matches!(self, Kind::Quota | Kind::Credit)
+    }
 }
 
 /// CLI'nin StopFailure metnindeki `⎿`/`●` gibi terminal öneklerini temizler. Dex'te hook
@@ -59,75 +78,129 @@ fn clean(message: &str) -> String {
 }
 
 /// `error` = CLI'nin StopFailure sınıfı; `message` = hata satırı (uç gövdesini taşır).
+/// Öncelik: (1) yapılandırılmış `error` alanı, (2) sözcük-sınırlı HTTP durum kodu,
+/// (3) sağlayıcıya özel kodlar (z.ai `[1113]`/`[1308]`/`[1310]`; Muse'un belgeli
+/// köşeli-parantez kodu yok — durum/metin katmanına düşer), (4) metin araması son çare.
 pub fn classify(error: &str, message: &str) -> Kind {
-    let m = clean(message).to_ascii_lowercase();
-    // Kalıcı: faturalandırma/kota sinyalleri.
-    if error == "billing_error"
-        || m.contains("[1113]")
-        || m.contains("insufficient balance")
-        || m.contains("credit balance")
-        || m.contains("balance is too low")
-        || m.contains("usage limit")
-        || m.contains("quota exhaust")
-        || m.contains("quota_exhaust")
-        || m.contains("quota exceeded")
-        || m.contains("[1308]")
-        || m.contains("[1310]")
-        || m.contains("limit will reset")
-        || m.contains("limit reset")
-    {
-        return Kind::Permanent;
+    // (1) Yapılandırılmış alan: kodda/testlerde/kayıtlarda görülen gerçek CLI sınıfları.
+    match error {
+        "billing_error" => return Kind::Credit,
+        "authentication_failed" => return Kind::Auth,
+        "overloaded" | "server_error" => return Kind::Transient,
+        "timeout" | "network_error" | "api_connection" | "api_timeout" => return Kind::Network,
+        "max_output_tokens" => return Kind::Truncated,
+        "model_not_found" => return Kind::Protocol,
+        _ => {}
     }
-    // Auth: jeton sorunu.
-    if error == "authentication_failed"
-        || m.contains("invalid api key")
+    let m = clean(message).to_ascii_lowercase();
+    // `rate_limit` tek başına belirsizdir (kota ya da hız sınırı): kodlu katmanlar karar verir.
+    let rate_limited = error == "rate_limit";
+    // (2) HTTP durum kodu — rakam-sınırlı: "4010", "15003", istek kimliği ya da saat
+    // ("2002-01-01 17:42:19") içinde eşleşmez; "(503)", " 503", "503:" eşleşir.
+    if has_status(&m, "402") {
+        return Kind::Credit;
+    }
+    if has_status(&m, "401") || has_status(&m, "403") {
+        return Kind::Auth;
+    }
+    if has_status(&m, "404") || has_status(&m, "400") {
+        return Kind::Protocol;
+    }
+    if has_status(&m, "408") || has_status(&m, "500") || has_status(&m, "502") || has_status(&m, "503") || has_status(&m, "529") {
+        return Kind::Transient;
+    }
+    // (3) Sağlayıcıya özel kodlar.
+    if m.contains("[1113]") {
+        return Kind::Credit;
+    }
+    if m.contains("[1308]") || m.contains("[1310]") {
+        return Kind::Quota;
+    }
+    // 429 + kota sinyali = kota; yalnız 429 = hız sınırı (geçici).
+    if has_status(&m, "429") {
+        return if quota_text(&m) { Kind::Quota } else { Kind::Transient };
+    }
+    if rate_limited {
+        if credit_text(&m) {
+            return Kind::Credit;
+        }
+        return if quota_text(&m) { Kind::Quota } else { Kind::Transient };
+    }
+    // (4) Metin araması — yalnız son çare (sağlayıcı cümleyi değiştirirse sessizce
+    // yanlış türe düşmek yerine bu katmanın daralması gerekir).
+    if credit_text(&m) {
+        return Kind::Credit;
+    }
+    if quota_text(&m) {
+        return Kind::Quota;
+    }
+    if m.contains("invalid api key")
         || m.contains("invalid_api_key")
         || m.contains("authentication failed")
         || m.contains("incorrect api key")
         || m.contains("unauthorized")
-        || m.contains(" 401")
-        || m.contains("(401)")
     {
         return Kind::Auth;
     }
-    // Geçici: sunucu/ağ/timeout.
-    if ["overloaded", "server_error", "timeout", "network_error", "api_connection", "api_timeout"]
-        .contains(&error)
-        || m.contains("overloaded")
-        || m.contains("server error")
-        || m.contains(" 500")
-        || m.contains(" 502")
-        || m.contains(" 503")
-        || m.contains("(500)")
-        || m.contains("(502)")
-        || m.contains("(503)")
+    if m.contains("timed out")
         || m.contains("timeout")
-        || m.contains("timed out")
         || m.contains("econnreset")
+        || m.contains("econnrefused")
         || m.contains("enotfound")
         || m.contains("network")
+        || m.contains("connection refused")
+        || m.contains("connection reset")
+        || m.contains("failed to connect")
     {
+        return Kind::Network;
+    }
+    if m.contains("overloaded") || m.contains("server error") {
         return Kind::Transient;
     }
-    // `rate_limit` kota sinyali taşımıyorsa hız sınırıdır (geçici); kalan her şey bilinmeyen.
-    if error == "rate_limit" {
-        return Kind::Transient;
+    if m.contains("truncated") || m.contains("cut off") || m.contains("max_output_tokens") || m.contains("max_tokens") {
+        return Kind::Truncated;
+    }
+    if m.contains("model not found") || m.contains("unknown model") || m.contains("invalid request") || m.contains("bad request") {
+        return Kind::Protocol;
     }
     Kind::Unknown
 }
 
-/// Ajan ZİNCİR GEÇİCİ sağlayıcıdayken (asıl sağlayıcısı değil) bu sinyal gelirse sağlayıcı
-/// kısa süreyle "unreachable" sayılır ve zincir ilerler. Yalnız ağ/timeout/connection
-/// sınıfı — 5xx/aşırı yük/zaman sınırı (rate_limit) dahil DEĞİL: onlar normal retry akışında
-/// kalır. Ölçüm/poll/health check yok, yalnız mevcut StopFailure sinyali.
-pub fn unreachable_signal(error: &str, message: &str) -> bool {
-    if ["timeout", "network_error", "api_connection", "api_timeout"].contains(&error) {
-        return true;
+/// Kota cümleleri (kredi/bakiye hariç — o [`credit_text`]'te).
+fn quota_text(m: &str) -> bool {
+    m.contains("usage limit")
+        || m.contains("quota exhaust")
+        || m.contains("quota_exhaust")
+        || m.contains("quota exceeded")
+        || m.contains("limit will reset")
+        || m.contains("limit reset")
+}
+
+/// Kredi/bakiye cümleleri.
+fn credit_text(m: &str) -> bool {
+    m.contains("insufficient balance") || m.contains("credit balance") || m.contains("balance is too low")
+}
+
+/// Rakam-sınırlı durum kodu: komşu karakter rakam değilse eşleşir ("(503)", " 503,").
+/// Böylece "4010", "15003", "2002-01-01 17:42:19" yanlış-pozitif vermez.
+fn has_status(hay: &str, code: &str) -> bool {
+    let (h, c) = (hay.as_bytes(), code.as_bytes());
+    if c.len() > h.len() {
+        return false;
     }
-    let m = clean(message).to_ascii_lowercase();
-    ["timed out", "timeout", "econnreset", "enotfound", "econnrefused", "network", "connection refused", "connection reset", "failed to connect"]
-        .iter()
-        .any(|s| m.contains(s))
+    (0..=h.len() - c.len()).any(|i| {
+        &h[i..i + c.len()] == c
+            && !i.checked_sub(1).is_some_and(|p| h[p].is_ascii_digit())
+            && !h.get(i + c.len()).is_some_and(|b| b.is_ascii_digit())
+    })
+}
+
+/// Ajan ZİNCİR GEÇİCİ sağlayıcıdayken (asıl sağlayıcısı değil) bu sinyal gelirse sağlayıcı
+/// kısa süreyle "unreachable" sayılır ve zincir ilerler. Yalnız [`Kind::Network`] —
+/// 5xx/aşırı yük/hız sınırı (`rate_limit`) dahil DEĞİL: onlar normal retry akışında kalır.
+/// Ölçüm/poll/health check yok, yalnız mevcut StopFailure sinyali.
+pub fn unreachable_signal(error: &str, message: &str) -> bool {
+    classify(error, message) == Kind::Network
 }
 
 fn now_ms() -> i64 {
@@ -532,24 +605,63 @@ mod tests {
 
     #[test]
     fn classify_permanent_transient_auth() {
-        // Sentetik kota yanıtı; hata kodu ve mesaj biçimi korunur.
-        let glm = "API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2002-01-01 17:42:19][example-request]";
-        assert_eq!(classify("rate_limit", glm), Kind::Permanent);
-        // `⎿` önekli satır da yakalanmalı.
-        assert_eq!(classify("rate_limit", &format!("⎿  {glm}")), Kind::Permanent);
-        assert_eq!(classify("rate_limit", "● [1310][Usage limit reached]"), Kind::Permanent);
-        assert_eq!(classify("billing_error", "Credit balance is too low"), Kind::Permanent);
-        assert_eq!(classify("rate_limit", "API Error 429 [1113][Insufficient balance]"), Kind::Permanent);
-        assert_eq!(classify("rate_limit", "429 quota exhausted, limit reset soon"), Kind::Permanent);
-        // Geçiciler zinciri ÇALIŞTIRMAZ.
-        assert_eq!(classify("overloaded", "Overloaded"), Kind::Transient);
-        assert_eq!(classify("server_error", "API Error: 503 Service Unavailable"), Kind::Transient);
-        assert_eq!(classify("rate_limit", "429 Too Many Requests — slow down"), Kind::Transient);
-        assert_eq!(classify("timeout", "request timed out"), Kind::Transient);
-        // Auth zinciri ÇALIŞTIRMAZ.
-        assert_eq!(classify("authentication_failed", "401 Unauthorized"), Kind::Auth);
-        assert_eq!(classify("", "Invalid API key"), Kind::Auth);
-        assert_eq!(classify("model_not_found", "model not found"), Kind::Unknown);
+        // (sağlayıcı, error, message) → beklenen tür. Sentetik tarih/saat ve istek
+        // kimlikleri korunur; ham gövde bildirimlere sızmaz (providers.rs testi).
+        let table: &[(&str, &str, &str, Kind)] = &[
+            // GLM / z.ai: 429 + köşeli-parantez iş kodu.
+            ("glm", "rate_limit", "API Error: Request rejected (429) · [1308][Usage limit reached for 5 hour. Your limit will reset at 2002-01-01 17:42:19][example-request]", Kind::Quota),
+            ("glm", "rate_limit", "⎿  API Error: Request rejected (429) · [1308][Usage limit reached]", Kind::Quota),
+            ("glm", "rate_limit", "● [1310][Usage limit reached]", Kind::Quota),
+            ("glm", "rate_limit", "API Error 429 [1113][Insufficient balance]", Kind::Credit),
+            ("glm", "billing_error", "Credit balance is too low", Kind::Credit),
+            // Anthropic: 429 + kota cümlesi; yalnız 429 = hız sınırı.
+            ("anthropic", "rate_limit", "429 quota exhausted, limit reset soon", Kind::Quota),
+            ("anthropic", "rate_limit", "429 Too Many Requests — slow down", Kind::Transient),
+            ("anthropic", "overloaded", "Overloaded", Kind::Transient),
+            ("anthropic", "", "API Error 529 Overloaded", Kind::Transient),
+            // Muse (Meta): 503 aşırı yük — CLI ~3 dk retry sonrası StopFailure.
+            ("muse", "server_error", "API Error: 503 The service is temporarily overloaded. Please retry shortly.", Kind::Transient),
+            ("muse", "authentication_failed", "401 Unauthorized", Kind::Auth),
+            ("muse", "", "Invalid API key", Kind::Auth),
+            // Ağ/timeout sınıfı (geçici sağlayıcıda unreachable).
+            ("local", "timeout", "request timed out", Kind::Network),
+            ("local", "network_error", "API Error", Kind::Network),
+            ("local", "", "connect ECONNRESET 1.2.3.4", Kind::Network),
+            // Yarım akış / protokol.
+            ("anthropic", "max_output_tokens", "response stopped at max tokens", Kind::Truncated),
+            ("anthropic", "model_not_found", "model not found", Kind::Protocol),
+            ("anthropic", "", "404 Not Found: model xyz", Kind::Protocol),
+            ("anthropic", "", "some weird thing", Kind::Unknown),
+        ];
+        for (prov, error, msg, want) in table {
+            assert_eq!(classify(error, msg), *want, "{prov} | {error} | {msg}");
+            assert_eq!(want.chains(), matches!(want, Kind::Quota | Kind::Credit), "{prov} | {error}");
+        }
+    }
+
+    #[test]
+    fn classify_structured_field_beats_message() {
+        // Yapılandırılmış alan her zaman metni ezer.
+        assert_eq!(classify("server_error", "[1308][Usage limit reached]"), Kind::Transient);
+        assert_eq!(classify("authentication_failed", "Overloaded, try again later"), Kind::Auth);
+        assert_eq!(classify("billing_error", "timeout while charging"), Kind::Credit);
+        assert_eq!(classify("timeout", "429 quota exhausted"), Kind::Network);
+    }
+
+    #[test]
+    fn classify_status_codes_need_digit_boundaries() {
+        // Eski " 401"/" 500" içerir-arama bu girdileri yanlış sınıflandırırdı.
+        assert_eq!(classify("", "Error 4010: upstream rejected the batch"), Kind::Unknown);
+        assert_eq!(classify("", "job 14019 failed at 2002-01-01 10:00:00"), Kind::Unknown);
+        assert_eq!(classify("", "bulk 5001 items queued for retry"), Kind::Unknown);
+        // Saat/reset satırı durum kodu sanılmaz; kotasız hız sınırı geçici kalır.
+        assert_eq!(classify("", "retry at 2002-01-01 17:42:19"), Kind::Unknown);
+        assert_eq!(classify("rate_limit", "reset at 2002-01-01 08:00:00"), Kind::Transient);
+        // Gerçek kodlar sınır karakterleriyle eşleşir.
+        assert_eq!(classify("", "API Error: 503 Service Unavailable"), Kind::Transient);
+        assert_eq!(classify("", "request failed (401)"), Kind::Auth);
+        assert_eq!(classify("", "HTTP 403: Forbidden"), Kind::Auth);
+        assert_eq!(classify("", "402 Payment Required: top up balance"), Kind::Credit);
     }
 
     #[test]
