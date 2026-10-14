@@ -25,6 +25,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 
 ## Araçlar (dex MCP)
 - Pano: `task_list`, `task_create`, `task_update`. Devredilen işin görevini sen güncelle.
+- [Worker] Pano kartı açma; sana verilen işin kartı Dex tarafından açılır, yalnız onu `task_update` ile güncelle.
 - [Worker] Teslim: `report` (delegationId, content=<tam rapor>, tek satır summary); dosyayı Dex yazar, rapor için dosya yazma. content ile resultPath birlikte verilmez; eski dosya teslimi resultPath ile korunur. Sohbet mesajın lidere gitmez. Cevap beklemiyorsan raporsuz durma: iş \"raporsuz bitti\" sayılır.
 - [Lider] Tek bağımsız iş `delegate`; birden çok ya da sıralı iş `plan` (`dependsOn`). Durum `plan_status`, iptal `plan_cancel`, düşen görev `plan_retry`. Gereken rol yoksa `propose_member` (patron onaylar). İki worker aynı dosyaya dokunmasın.
 - [Lider] İşi varsayılan olarak `role` ile ver; Dex o roldeki boş worker'a dağıtır. `agentId` yalnız düzeltme turunda (`fixOf`) ya da bağlamı o worker'da olan işte.
@@ -370,7 +371,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let c = db();
         let (s, o) = mem();
-        for (agent, expected) in [("timur", "a83b5668a70fa745e0f9736904ee7268e919a4f3d2b9edf7b28f803a89852d52"), ("ayla", "ffcfeaacfc3db1de3c35e91f3a9b0bcf824d04169fe3de7d125692f74d33adb1")] {
+        for (agent, expected) in [("timur", "a83b5668a70fa745e0f9736904ee7268e919a4f3d2b9edf7b28f803a89852d52"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
             let t = system_prompt(&c, agent, Some((&s, &o)));
             assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
         }
@@ -385,7 +386,7 @@ mod tests {
         c.execute("UPDATE agents SET role_slug='visual-explainer' WHERE id='ayla'",[]).unwrap();
         let (s,o)=mem();
         // Hashes rendered from HEAD's DEX_RULES and education_rules before #1697.
-        for (agent,expected) in [("timur","9eba00ea42973623fea350f314078e53cba7a0d59e99af034006966cc90498db"),("ayla","09d6819e537792dbb81eefb48566ddf1576302f34cbbd59276ca8466fb9eb648")] {
+        for (agent,expected) in [("timur","9eba00ea42973623fea350f314078e53cba7a0d59e99af034006966cc90498db"),("ayla","7315f32118b4d0279b07c8d05204240dfb39f224a20a27553352535ed6132f75")] {
             assert_eq!(format!("{:x}",Sha256::digest(system_prompt(&c,agent,Some((&s,&o))).as_bytes())),expected,"{agent}");
         }
     }

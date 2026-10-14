@@ -657,6 +657,7 @@ pub(crate) fn report_with_content(conn: &Connection, c: &Caller, id: i64, summar
         params![id, summary, result_path, now()],
     )
     .map_err(e)?;
+    sync_task(conn, id)?;
     crate::diagnostics::event("delegation", serde_json::json!({"id": id, "agent": c.id, "status": "done", "bytes": summary.len()}));
     get(conn, id)
 }
@@ -732,6 +733,89 @@ pub(crate) fn first_line(s: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// #1768: `delegate` `taskId` verilmeden çağrılınca pano kartını Dex açar. Başlık:
+/// liderin `title`'ı, yoksa istemin ilk anlamlı satırı (#1747 yardımcısı), o da
+/// yoksa ilk satır. Kart `doing` açılır ve worker'a atanır; `insert`'in geri
+/// kalan bağlama işi (proje, patron sözü) çağrıda yapılır.
+pub(crate) fn auto_task(
+    conn: &Connection,
+    to_agent: &str,
+    team_id: &str,
+    title: Option<&str>,
+    prompt: &str,
+    patron_words: Option<&str>,
+    snapshot: &ProjectSnapshot,
+) -> Result<crate::db::tasks::Task, String> {
+    let title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            let meaningful = crate::review::first_meaningful_line(prompt, 80);
+            if meaningful.is_empty() { first_line(prompt) } else { meaningful }
+        });
+    let mut description = patron_section(patron_words);
+    description.push_str(prompt.trim());
+    let mut task = crate::db::tasks::create(
+        conn,
+        crate::db::tasks::NewTask {
+            title,
+            description,
+            status: Some("doing".into()),
+            agent_id: Some(to_agent.into()),
+            team_id: Some(team_id.into()),
+        },
+    )?;
+    conn.execute("UPDATE tasks SET project_id=?2 WHERE id=?1", params![task.id, snapshot.project_id])
+        .map_err(e)?;
+    task.project_id = snapshot.project_id.clone();
+    Ok(task)
+}
+
+/// #1768: sıradan bir devretme (inceleme ya da plan öğesi değil) kapandığında
+/// bağlı pano kartını günceller: `done` + (dalsız ya da birleşmiş) → `done`;
+/// `failed` / `done_no_report` → `todo`. Açık dal varken `done` kartı `doing`
+/// bırakır (birleştirmede `done` olur). Kart yoksa/silinmişse no-op.
+pub(crate) fn sync_task(conn: &Connection, id: i64) -> Result<(), String> {
+    let d = get(conn, id)?;
+    let Some(task) = d.task_id else { return Ok(()) };
+    if crate::review::is_review(conn, id)? {
+        return Ok(()); // inceleme kartını finish_task kapatır
+    }
+    let plan_owned: bool = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM plan_items WHERE delegation_id=?1)", [id], |r| r.get(0))
+        .map_err(e)?;
+    if plan_owned {
+        return Ok(()); // plan kartını plan::step yönetir
+    }
+    if crate::db::tasks::get(conn, task).is_err() {
+        return Ok(());
+    }
+    let done = match d.status.as_str() {
+        "done" => {
+            let open_branch: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM delegation_worktrees WHERE delegation_id=?1 AND merged_at IS NULL AND removed_at IS NULL)",
+                    [id],
+                    |r| r.get(0),
+                )
+                .map_err(e)?;
+            if open_branch {
+                return Ok(());
+            }
+            true
+        }
+        "failed" | "done_no_report" => false,
+        _ => return Ok(()),
+    };
+    conn.execute(
+        "UPDATE tasks SET status=?2, updated_at=?3 WHERE id=?1",
+        params![task, if done { "done" } else { "todo" }, now()],
+    )
+    .map_err(e)?;
+    Ok(())
 }
 
 /// Result lines the leader reads (prompt context, Stop-block reason, SessionStart context).
@@ -1055,6 +1139,7 @@ fn on_stop_pending(conn: &Connection, turns: &Turns, agent: &str, failure: bool,
     for id in running {
         set_status(conn, id, if failure { "failed" } else { "done_no_report" })?;
         crate::review::finish_task(conn, id)?;
+        sync_task(conn, id)?;
         if let Some(m) = &last {
             conn.execute(
                 "UPDATE delegations SET summary = IFNULL(summary, ?2) WHERE id = ?1",
@@ -1335,6 +1420,7 @@ pub(crate) fn start_failed(db: &Db, ev: &Events, id: i64, error: &str) -> Result
             params![id, format!("başlatılamadı: {error}"), now()],
         )
         .map_err(e)?;
+        sync_task(conn, id)?;
         get(conn, id)
     })?;
     emit_changed(ev, Some(&d));
@@ -1396,6 +1482,7 @@ pub fn ack(db: &Db, ev: &Events, id: i64, error: Option<String>, queued: bool) -
                 params![id, format!("başlatılamadı: {err}"), now()],
             )
             .map_err(e)?;
+            sync_task(c, id)?;
         } else if !queued {
             set_status(c, id, "running")?;
         }
@@ -1435,6 +1522,7 @@ fn on_exit(conn: &Connection, agent: &str) -> Result<(Vec<Delegation>, Option<De
         )
         .map_err(e)?;
         crate::review::finish_task(conn, id)?;
+        sync_task(conn, id)?;
         changed.push(get(conn, id)?);
     }
     if waiting {
@@ -1464,6 +1552,16 @@ pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize,
         "UPDATE tasks SET status = 'done', updated_at = ?1 WHERE status = 'doing' AND id IN (
              SELECT d.task_id FROM delegations d JOIN delegation_reviews r ON r.review_id = d.id
              WHERE d.task_id IS NOT NULL AND (d.status IN ('done','done_no_report','failed') OR r.verdict IS NOT NULL))",
+        [now()],
+    )
+    .map_err(e)?;
+    // #1768: sıradan devretmelerin kartları da kapanışta güncellenir (başarısız/raporsuz → `todo`).
+    // İnceleme ve plan kartları yukarıda ve plan::step'te yönetilir, burada dışlanır.
+    conn.execute(
+        "UPDATE tasks SET status = 'todo', updated_at = ?1 WHERE status = 'doing' AND id IN (
+             SELECT d.task_id FROM delegations d WHERE d.task_id IS NOT NULL AND d.status IN ('done_no_report','failed')
+             AND NOT EXISTS(SELECT 1 FROM delegation_reviews r WHERE r.review_id = d.id)
+             AND NOT EXISTS(SELECT 1 FROM plan_items i WHERE i.delegation_id = d.id))",
         [now()],
     )
     .map_err(e)?;
@@ -2473,5 +2571,122 @@ mod tests {
         report(&c, &ece, d.id, "s", Some(&research.join("a.md").to_string_lossy())).unwrap();
         assert!(on_pre_tool(&c, "ece", &shell).unwrap().0.is_some(), "report must not unlock the same PTY");
         let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // #1768: otomatik pano kartı + kapanış eşitleme.
+    fn snap() -> ProjectSnapshot {
+        ProjectSnapshot { project_id: None, project_root: None, merge_branch: None, repo_key: None }
+    }
+
+    fn doing_task(c: &Connection) -> i64 {
+        crate::db::tasks::create(
+            c,
+            crate::db::tasks::NewTask {
+                title: "kart".into(),
+                description: String::new(),
+                status: Some("doing".into()),
+                agent_id: Some("kaan".into()),
+                team_id: Some("default".into()),
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    fn job_with_task(c: &Connection, task: i64) -> Delegation {
+        insert(
+            c,
+            NewDelegation {
+                from: &leader(c),
+                to_agent: "kaan".into(),
+                team_id: "default".into(),
+                service_team_id: None,
+                prompt: "x".into(),
+                task_id: Some(task),
+                patron_words: None,
+                effort: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn auto_task_title_prefers_given_then_meaningful_line() {
+        let c = mem();
+        let t = auto_task(&c, "kaan", "default", Some("  Kart  "), "x", None, &snap()).unwrap();
+        assert_eq!((t.title, t.status, t.agent_id), ("Kart".into(), "doing".into(), Some("kaan".into())));
+        let t = auto_task(&c, "kaan", "default", None, "## Amaç\n\nPatronun sözü\nAsıl iş", None, &snap()).unwrap();
+        assert_eq!(t.title, "Asıl iş");
+        let t = auto_task(&c, "kaan", "default", None, "## Sadece başlık", None, &snap()).unwrap();
+        assert_eq!(t.title, "## Sadece başlık");
+        let t = auto_task(&c, "kaan", "default", None, "iş yap", Some("patron sözü"), &snap()).unwrap();
+        assert!(t.description.starts_with("## Patronun sözü\npatron sözü\n\n"), "{}", t.description);
+    }
+
+    #[test]
+    fn sync_task_marks_done_only_without_an_open_branch() {
+        let c = mem();
+        let t = doing_task(&c);
+        let d = job_with_task(&c, t);
+        set_status(&c, d.id, "done").unwrap();
+        sync_task(&c, d.id).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "done");
+        let t = doing_task(&c);
+        let d = job_with_task(&c, t);
+        c.execute(
+            "INSERT INTO delegation_worktrees (delegation_id, agent_id, root, path, branch, base, created_at)
+             VALUES (?1, 'kaan', 'r', 'wt', 'dex/1', 'x', 1)",
+            [d.id],
+        )
+        .unwrap();
+        set_status(&c, d.id, "done").unwrap();
+        sync_task(&c, d.id).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "doing", "open branch keeps the card");
+        c.execute("UPDATE delegation_worktrees SET merged_at = 2 WHERE delegation_id = ?1", [d.id]).unwrap();
+        sync_task(&c, d.id).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "done");
+    }
+
+    #[test]
+    fn sync_task_returns_failed_or_unreported_cards_to_todo() {
+        for end in ["failed", "done_no_report"] {
+            let c = mem();
+            let t = doing_task(&c);
+            let d = job_with_task(&c, t);
+            set_status(&c, d.id, end).unwrap();
+            sync_task(&c, d.id).unwrap();
+            assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "todo", "{end}");
+        }
+    }
+
+    #[test]
+    fn sync_task_leaves_review_and_plan_cards_to_their_owners() {
+        let c = mem();
+        let t = doing_task(&c);
+        let d = job_with_task(&c, t);
+        c.execute(
+            "INSERT INTO delegation_reviews (review_id, target_id, sha, created_at) VALUES (?1, ?1, 'abc', 1)",
+            [d.id],
+        )
+        .unwrap();
+        set_status(&c, d.id, "failed").unwrap();
+        sync_task(&c, d.id).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "doing", "review card belongs to finish_task");
+        let t = doing_task(&c);
+        let d = job_with_task(&c, t);
+        c.execute(
+            "INSERT INTO plans (team_id, leader, title, status, created_at, updated_at) VALUES ('default', 'timur', 'p', 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let plan = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO plan_items (plan_id, key, title, prompt, target, delegation_id) VALUES (?1, 'A', 'a', 'yap', 'backend', ?2)",
+            params![plan, d.id],
+        )
+        .unwrap();
+        set_status(&c, d.id, "done").unwrap();
+        sync_task(&c, d.id).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "doing", "plan card belongs to plan::step");
     }
 }

@@ -1173,6 +1173,34 @@ mod auth_tests {
     }
 
     #[test]
+    fn delegate_without_task_id_opens_and_binds_a_board_card() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let lead = delegate::caller(&c, "timur").unwrap();
+        let context = delegate::resolve_context(&c, Path::new(""), &lead, None, None).unwrap();
+        let new = |prompt: &str| delegate::NewDelegation {
+            from: &lead,
+            to_agent: "kaan".into(),
+            team_id: "default".into(),
+            service_team_id: None,
+            prompt: prompt.into(),
+            task_id: None,
+            patron_words: None,
+            effort: None,
+        };
+        let d = create_targeted_job(&c, new("## Amaç\n\nKartlık iş"), &context, None, (None, None), None, (None, None, None), Some("Kart"))
+            .unwrap();
+        let t = tasks::get(&c, d.task_id.unwrap()).unwrap();
+        assert_eq!((t.title, t.status, t.agent_id), ("Kart".into(), "doing".into(), Some("kaan".into())));
+        let d = create_targeted_job(&c, new("## Amaç\n\nİlk satır işi"), &context, None, (None, None), None, (None, None, None), None)
+            .unwrap();
+        assert_eq!(tasks::get(&c, d.task_id.unwrap()).unwrap().title, "İlk satır işi");
+        // Otomatik kart da işle birlikte geri alınır.
+        c.execute_batch("CREATE TRIGGER reject_auto BEFORE INSERT ON delegations BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        assert!(create_targeted_job(&c, new("x"), &context, None, (None, None), None, (None, None, None), None).is_err());
+        assert_eq!(c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
+    }
+
+    #[test]
     fn delegate_role_enters_pool_but_agent_id_stays_pinned() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.dex/tmp")
@@ -1658,9 +1686,10 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "required": ["id"], "properties": {
               "id": { "type": "integer" }, "status": status, "agentId": { "type": ["string", "null"] },
               "title": { "type": "string" }, "description": { "type": "string" } } } },
-        { "name": "delegate", "description": "YALNIZ LİDER. Takımındaki bir worker'a iş verir (agentId: id ya da ad; ya da role: rol/unvan). Worker kapalıysa başlar, meşgulse işi kuyruğa alınır. Bittiğinde sonraki mesajında bağlamına eklenir.",
+        { "name": "delegate", "description": "YALNIZ LİDER. Takımındaki bir worker'a iş verir (agentId: id ya da ad; ya da role: rol/unvan). Pano kartı otomatik açılır (taskId verilirse o görev bağlanır). Worker kapalıysa başlar, meşgulse işi kuyruğa alınır. Bittiğinde sonraki mesajında bağlamına eklenir.",
           "inputSchema": { "type": "object", "required": ["prompt"], "properties": {
               "agentId": { "type": "string" }, "role": { "type": "string", "description": "Katalogdaki rol slug'ı ya da adı; liste lider kurallarında" }, "prompt": { "type": "string" },
+              "title": { "type": "string", "description": "Pano kartının başlığı; yoksa istemin ilk anlamlı satırı kullanılır." },
               "taskId": { "type": "integer", "description": "Panodaki ilgili görev; worker'a atanır ve 'doing'e alınır." },
               "patronWords": { "type": "string", "description": "İş patronun bir isteğinden doğuyorsa patronun ilgili sözü, birebir alıntı; worker'a liderin açıklamasından (prompt) önce ve üstün gider" },
               "effort": crate::effort::schema(),
@@ -1788,23 +1817,30 @@ fn create_job(
     fix_of: Option<i64>,
     gpu_grant: Option<i64>,
 ) -> Result<delegate::Delegation, String> {
-    create_targeted_job(conn, d, context, ready, (fix_of, gpu_grant), None, (None, None, None))
+    create_targeted_job(conn, d, context, ready, (fix_of, gpu_grant), None, (None, None, None), None)
 }
 
 fn create_targeted_job(
     conn: &rusqlite::Connection,
-    d: delegate::NewDelegation,
+    mut d: delegate::NewDelegation,
     context: &crate::project_context::ProjectContext,
     ready: Option<&crate::projects::PreparedRoot>,
     fix_and_grant: (Option<i64>, Option<i64>),
     role: Option<&str>,
     model: (Option<&str>, Option<&str>, Option<&crate::job_model::Snapshot>),
+    title: Option<&str>,
 ) -> Result<delegate::Delegation, String> {
     let (fix_of, gpu_grant) = fix_and_grant;
     let (model, model_reason, model_snapshot) = model;
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let context = delegate::revalidate_context(&tx, d.from, context, ready)?;
     if let Some(snapshot) = model_snapshot { snapshot.revalidate(&tx)?; }
+    // #1768: taskId yoksa pano kartını Dex açar (servis işleri hariç: onların panosu ayrı takımda).
+    if d.task_id.is_none() && d.service_team_id.is_none() {
+        let snapshot = delegate::ProjectSnapshot::from(&context);
+        let task = delegate::auto_task(&tx, &d.to_agent, &d.team_id, title, &d.prompt, d.patron_words.as_deref(), &snapshot)?;
+        d.task_id = Some(task.id);
+    }
     if let Some(f) = fix_of {
         crate::review::check_fix_of(&tx, &d.team_id, f)?;
     }
@@ -2022,6 +2058,7 @@ fn delegate_call(core: &Core, c: &Caller, args: &Value, service: bool) -> Result
         (fix_of, args.get("gpuGrant").and_then(Value::as_i64)),
         role.as_deref(),
         (model, model_reason, model_snapshot.as_ref()),
+        s(args, "title"),
     )
 }
 

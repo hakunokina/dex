@@ -796,6 +796,7 @@ pub fn merge(db: &Db, c: &Caller, id: i64, force_policy: bool, force_review: boo
         return Ok(refusal);
     }
     with(db, |conn| conn.execute("UPDATE delegation_worktrees SET merged_at = ?2 WHERE delegation_id = ?1", params![id, now()]).map_err(e))?;
+    with(db, |conn| delegate::sync_task(conn, id))?;
     let mut out = json!({ "merged": true, "branch": w.branch, "files": changed.len(), "notes": notes });
     if let Some(err) = tidy(db, id, &w, release) {
         out["cleanup"] = err.into();
@@ -809,6 +810,7 @@ pub fn merge(db: &Db, c: &Caller, id: i64, force_policy: bool, force_review: boo
             let exists = git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", pw.branch)]).is_ok();
             if !exists || git(root, &["merge-base", "--is-ancestor", &pw.branch, &into]).is_ok() {
                 with(db, |conn| conn.execute("UPDATE delegation_worktrees SET merged_at = ?2 WHERE delegation_id = ?1", params![p, now()]).map_err(e))?;
+                with(db, |conn| delegate::sync_task(conn, p))?;
                 let closed = release(&pw);
                 if let Err(err) = clean(db, p, if closed { 8 } else { 1 }) {
                     out[format!("cleanup#{p}")] = format!("#{p} worktree kaldırılamadı ({}): {err} — bekleyen temizlik", pw.path.display()).into();
