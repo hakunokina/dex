@@ -1,0 +1,53 @@
+        <!-- dex-share-aliases:begin — build-apk.sh bu bloğu her derlemede silip yeniden ekler. -->
+        <!-- Paylaş hedefi (ShareTargetPlugin.kt): üç giriş, aynı MainActivity; alias adı görevi seçer
+             (ShareRepo → repo, ShareVerify → verify, ShareAsk → ask). Metin/bağlantı ve tek görsel;
+             SEND_MULTIPLE MVP dışı. Simge uygulamanınki. -->
+        <activity-alias
+            android:name=".ShareRepo"
+            android:targetActivity=".MainActivity"
+            android:label="Dex · Repo incele"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".ShareVerify"
+            android:targetActivity=".MainActivity"
+            android:label="Dex · Kaynak doğrula"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".ShareAsk"
+            android:targetActivity=".MainActivity"
+            android:label="Dex · Asistana sor"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity-alias>
+        <!-- dex-share-aliases:end -->

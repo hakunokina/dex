@@ -7,6 +7,8 @@ export interface RawShare {
   subject?: string;
   image?: { mime: string; base64: string };
   error?: string;
+  /** #1717: gelinen Paylaş girişi (repo | verify | ask). */
+  task?: string;
 }
 
 /** Uygulamaya yeni paylaşım geldiğinde (uygulama açıkken) Kotlin'in WebView'a gönderdiği olay. */
@@ -16,3 +18,6 @@ const tauri = new TauriTransport();
 
 /** Bekleyen paylaşım; yoksa `{}`. */
 export const takeShare = () => tauri.call<RawShare>("share_take");
+
+/** #1717 hızlı gönderim bitti: Android Toast (`message`, içerik taşımaz) + uygulama arka plana. */
+export const shareDone = (message: string) => tauri.call<void>("share_done", { message });

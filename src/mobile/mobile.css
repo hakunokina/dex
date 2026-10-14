@@ -419,6 +419,8 @@ code { color: var(--text-2); }
 .m-share-img { max-width: 100%; max-height: 40vh; object-fit: contain; border-radius: var(--r-md); border: 1px solid var(--line); align-self: center; }
 .m-share-done { color: var(--text); font-size: 16px; text-align: center; padding: var(--sp-4) 0; }
 .m-share-cancel { padding: 12px; background: none; border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--text-2); font: inherit; }
+/* #1717 hızlı gönderim sürerken (ekran açılmadan) kısa durum hapı. */
+.m-share-sending { position: fixed; left: 50%; bottom: calc(var(--sp-4) * 4); transform: translateX(-50%); z-index: calc(var(--z-m-screen) + 1); margin: 0; padding: 8px 16px; border-radius: 999px; background: var(--surface-pop); border: 1px solid var(--line-strong); color: var(--text); font-size: 14px; }
 
 /* Notes editor already sizes itself (layout/notes.css). */
 .m-body .notes { flex: 1; min-height: 0; }

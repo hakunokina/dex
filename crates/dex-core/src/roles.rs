@@ -139,12 +139,22 @@ mod tests {
     #[test]
     fn assistant_seed_upserts_without_adding_members_and_is_not_delegatable() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let prompt = || c.query_row("SELECT system_prompt FROM roles WHERE slug='assistant'", [], |r| r.get::<_, String>(0)).unwrap();
+        let task_line = "\nMesaj `Görev:` satırıyla başlarsa: Repo incele → repoyu bul ve açıkla; Kaynak doğrula → iddiaları kaynakla kontrol et; Soru → serbest cevap.";
+        let format_line = "\nCevabı markdown yaz: ilk satır tek cümlelik sonuç; sonra kısa bölümler (repo için: Ne yapar / Bağlantı / Lisans / Bakım / Öne çıkanlar; doğrulama için: İddia → Kaynak → Sonuç); her iddiaya link; HTML kullanma.";
+        let current = prompt();
+        assert!(current.contains(task_line) && current.ends_with(format_line));
+        // #1717: an existing DB with the pre-task prompt gets the share-task and markdown lines on the next seed.
+        c.execute("UPDATE roles SET system_prompt=?1 WHERE slug='assistant'", [current.replace(task_line, "").replace(format_line, "")]).unwrap();
+        seed(&c).unwrap();
+        assert_eq!(prompt(), current);
         c.execute("DELETE FROM roles WHERE slug='assistant'",[]).unwrap(); // existing 22-role DB
         assert_eq!(list(&c).unwrap().len(),22);
         let before: i64 = c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0)).unwrap();
         for _ in 0..2 {
             seed(&c).unwrap();
             assert_eq!(name_of(&c, "assistant").unwrap(), "Assistant");
+            assert_eq!(prompt(), current);
             assert_eq!(list(&c).unwrap().len(), 23);
             assert_eq!(c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get::<_, i64>(0)).unwrap(), before);
             for profile in ["dev", "edu"] { assert!(!catalog_text_for_profile(&c, profile).contains("assistant")); }

@@ -142,3 +142,24 @@ pub async fn share_take<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Val
     .await
     .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
 }
+
+/// #1717 hızlı gönderim bitti: Kotlin kısa bir Toast gösterir (`message`, en fazla 80 karakter; kişisel
+/// içerik taşımaz) ve görevi arka plana alır — kullanıcı paylaştığı uygulamaya döner.
+#[tauri::command]
+pub async fn share_done<R: Runtime>(app: AppHandle<R>, message: String) -> Result<(), String> {
+    let handle = app
+        .try_state::<ShareTarget<R>>()
+        .ok_or("paylaş köprüsü yüklenemedi (Android eklentisi yok)")?
+        .inner()
+        .0
+        .clone();
+    let message: String = message.chars().take(80).collect();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .run_mobile_plugin::<serde_json::Value>("done", serde_json::json!({ "message": message }))
+            .map(|_| ())
+            .map_err(|e| format!("paylaşım kapatılamadı: {e}"))
+    })
+    .await
+    .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
+}

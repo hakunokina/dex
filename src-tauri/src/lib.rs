@@ -252,7 +252,8 @@ pub fn run() {
         mobile_hosts::host_token_get,
         mobile_hosts::host_token_set,
         mobile_hosts::host_token_delete,
-        mobile_hosts::share_take
+        mobile_hosts::share_take,
+        mobile_hosts::share_done
     ]);
     let app = builder.build(context).expect("error while running tauri application");
     app.run(|_app, _e| {

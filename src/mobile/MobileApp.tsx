@@ -6,7 +6,7 @@
 // which the PCB canvas and the terminal both follow (ResizeObserver / visualViewport).
 import { useEffect, useState } from "react";
 import { LOCAL, useHosts } from "../api/hosts";
-import { SHARE_EVENT, takeShare, type RawShare } from "../api/shareTarget";
+import { SHARE_EVENT, shareDone, takeShare, type RawShare } from "../api/shareTarget";
 import { initTeams, selectTeam, useTeams } from "../team/store";
 import { Office } from "../office/Office";
 import { START_EVENT, type StartRequest } from "../launcher";
@@ -14,7 +14,8 @@ import { AddServer } from "./AddServer";
 import { AgentsView } from "./AgentsView";
 import { AgentScreen } from "./AgentScreen";
 import { ShareScreen } from "./ShareScreen";
-import { hasShare } from "./shareLogic";
+import { hasShare, shareTask, type ShareTask } from "./shareLogic";
+import { tryFastShare } from "./shareFast";
 import { BoardView } from "../board/Board";
 import { NotesEditor } from "../layout/Notes";
 import { ChevronLeft, CircuitBoard, KanbanSquare, NotebookPen, Server, Users } from "lucide-react";
@@ -55,11 +56,35 @@ export default function MobileApp() {
 
   // Android Paylaş → Dex: uygulama kapalıyken açılışta bekleyen paylaşım alınır; açıkken Kotlin
   // `dex-share` olayını atar. `seq` her yeni paylaşımda ekranı sıfırdan kurar.
-  const [share, setShare] = useState<{ raw: RawShare; seq: number } | null>(null);
+  // #1717: önce hızlı gönderim (`fast`); hedef belirsizse ya da hata olursa ShareScreen açılır.
+  const [share, setShare] = useState<{
+    raw: RawShare;
+    seq: number;
+    task: ShareTask;
+    clientId: string;
+    fast: boolean;
+    error: string | null;
+  } | null>(null);
   useEffect(() => {
+    let seq = 0;
     const pull = () =>
       void takeShare().then(
-        (raw) => hasShare(raw) && setShare((s) => ({ raw, seq: (s?.seq ?? 0) + 1 })),
+        (raw) => {
+          if (!hasShare(raw)) return;
+          const mine = ++seq;
+          const task = shareTask(raw.task);
+          const clientId = crypto.randomUUID();
+          setShare({ raw, seq: mine, task, clientId, fast: true, error: null });
+          void tryFastShare(raw, task, clientId).then((r) => {
+            if (mine !== seq) return; // arada yeni paylaşım geldi
+            if (r.sent) {
+              setShare(null);
+              void shareDone(r.toast).catch(() => {});
+            } else {
+              setShare((s) => (s?.seq === mine ? { ...s, fast: false, error: r.error } : s));
+            }
+          });
+        },
         () => {}, // paylaş köprüsü yok (eski APK / masaüstü önizleme): sessizce geç
       );
     pull();
@@ -73,15 +98,20 @@ export default function MobileApp() {
     if (team && team.id !== activeId) selectTeam(team.id);
   }, [team, activeId]);
 
-  const shareScreen = share && (
+  const shareScreen = share && (share.fast ? (
+    <p className="m-share-sending" role="status">Gönderiliyor…</p>
+  ) : (
     <ShareScreen
       key={share.seq}
       share={share.raw}
       ready={ready}
       defaultHost={team?.host ?? null}
+      task={share.task}
+      clientId={share.clientId}
+      error={share.error}
       onClose={() => setShare(null)}
     />
-  );
+  ));
 
   // No paired server yet → the first-open pairing screen (also reached from the top bar).
   if (!serverSheet && hosts.length === 0) {

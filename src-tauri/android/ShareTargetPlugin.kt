@@ -4,6 +4,9 @@
 //   - uygulama açık (singleTask): TauriActivity.onNewIntent → burası → WebView'a "dex-share" olayı.
 // Yük (metin + görsel) JS'e olayla değil `take` komutuyla (Rust: mobile_hosts.rs `share_take`) bir kez
 // verilir; olay yalnız "bekleyen var" der. İçerik loglanmaz.
+// #1717: Paylaş menüsünde üç giriş (manifest activity-alias'ları, aynı MainActivity): hangi alias'tan
+// gelindiği yükte `task` olur (repo | verify | ask). Hızlı gönderim sonrası `done` kısa bir Toast
+// gösterip görevi arka plana alır; kullanıcı paylaştığı uygulamaya döner.
 
 package com.hakunokina.dex.hosttokens
 
@@ -12,11 +15,18 @@ import android.content.Intent
 import android.net.Uri
 import android.util.Base64
 import android.webkit.WebView
+import android.widget.Toast
 import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
+
+@InvokeArg
+class DoneArgs {
+    var message: String = ""
+}
 
 @TauriPlugin
 class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
@@ -44,6 +54,22 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(p ?: JSObject())
     }
 
+    /** Hızlı gönderim bitti: kısa Toast (WebView arka planda görünmez) + görevi arka plana al. */
+    @Command
+    fun done(invoke: Invoke) {
+        val args = try {
+            invoke.parseArgs(DoneArgs::class.java)
+        } catch (e: Exception) {
+            null
+        }
+        val msg = args?.message.orEmpty().take(MAX_TOAST)
+        activity.runOnUiThread {
+            if (msg.isNotEmpty()) Toast.makeText(activity.applicationContext, msg, Toast.LENGTH_SHORT).show()
+            activity.moveTaskToBack(true)
+        }
+        invoke.resolve(JSObject())
+    }
+
     private fun capture(intent: Intent?): Boolean {
         if (intent == null || intent.action != Intent.ACTION_SEND) return false
         val out = JSObject()
@@ -66,8 +92,16 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
         // Aynı intent yeniden okunmasın (döndürme / aktivite yeniden yaratma).
         activity.intent = Intent(Intent.ACTION_MAIN)
         if (out.length() == 0) return false
+        out.put("task", taskOf(intent))
         synchronized(this) { pending = out }
         return true
+    }
+
+    /** Gelinen Paylaş girişi (activity-alias adı, build-apk.sh manifest yaması) → görev. */
+    private fun taskOf(intent: Intent): String = when (intent.component?.className?.substringAfterLast('.')) {
+        "ShareRepo" -> "repo"
+        "ShareVerify" -> "verify"
+        else -> "ask"
     }
 
     private class TooBig : Exception()
@@ -91,5 +125,6 @@ class ShareTargetPlugin(private val activity: Activity) : Plugin(activity) {
     companion object {
         // JNI/WebView köprüsünü şişirmemek için ham okuma üst sınırı; istemci zaten ~700 KB'a küçültür.
         private const val MAX_READ = 20 * 1024 * 1024
+        private const val MAX_TOAST = 80
     }
 }
