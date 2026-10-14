@@ -6,12 +6,15 @@
 // which the PCB canvas and the terminal both follow (ResizeObserver / visualViewport).
 import { useEffect, useState } from "react";
 import { LOCAL, useHosts } from "../api/hosts";
+import { SHARE_EVENT, takeShare, type RawShare } from "../api/shareTarget";
 import { initTeams, selectTeam, useTeams } from "../team/store";
 import { Office } from "../office/Office";
 import { START_EVENT, type StartRequest } from "../launcher";
 import { AddServer } from "./AddServer";
 import { AgentsView } from "./AgentsView";
 import { AgentScreen } from "./AgentScreen";
+import { ShareScreen } from "./ShareScreen";
+import { hasShare } from "./shareLogic";
 import { BoardView } from "../board/Board";
 import { NotesEditor } from "../layout/Notes";
 import { ChevronLeft, CircuitBoard, KanbanSquare, NotebookPen, Server, Users } from "lucide-react";
@@ -50,15 +53,44 @@ export default function MobileApp() {
     void initTeams();
   }, []);
 
+  // Android Paylaş → Dex: uygulama kapalıyken açılışta bekleyen paylaşım alınır; açıkken Kotlin
+  // `dex-share` olayını atar. `seq` her yeni paylaşımda ekranı sıfırdan kurar.
+  const [share, setShare] = useState<{ raw: RawShare; seq: number } | null>(null);
+  useEffect(() => {
+    const pull = () =>
+      void takeShare().then(
+        (raw) => hasShare(raw) && setShare((s) => ({ raw, seq: (s?.seq ?? 0) + 1 })),
+        () => {}, // paylaş köprüsü yok (eski APK / masaüstü önizleme): sessizce geç
+      );
+    pull();
+    window.addEventListener(SHARE_EVENT, pull);
+    return () => window.removeEventListener(SHARE_EVENT, pull);
+  }, []);
+
   const remoteTeams = teams.filter((t) => t.host !== LOCAL);
   const team = remoteTeams.find((t) => t.id === activeId) ?? remoteTeams[0] ?? null;
   useEffect(() => {
     if (team && team.id !== activeId) selectTeam(team.id);
   }, [team, activeId]);
 
+  const shareScreen = share && (
+    <ShareScreen
+      key={share.seq}
+      share={share.raw}
+      ready={ready}
+      defaultHost={team?.host ?? null}
+      onClose={() => setShare(null)}
+    />
+  );
+
   // No paired server yet → the first-open pairing screen (also reached from the top bar).
   if (!serverSheet && hosts.length === 0) {
-    return <AddServer onDone={() => {}} first />;
+    return (
+      <>
+        <AddServer onDone={() => {}} first />
+        {shareScreen}
+      </>
+    );
   }
 
   return (
@@ -150,6 +182,7 @@ export default function MobileApp() {
           onStarted={() => setPendingStart(null)}
         />
       )}
+      {shareScreen}
     </div>
   );
 }

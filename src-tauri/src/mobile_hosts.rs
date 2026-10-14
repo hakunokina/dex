@@ -24,6 +24,12 @@ const PLUGIN_CLASS: &str = "HostTokensPlugin";
 
 pub struct HostTokens<R: Runtime>(PluginHandle<R>);
 
+const SHARE_IDENTIFIER: &str = "com.hakunokina.dex.hosttokens";
+const SHARE_CLASS: &str = "ShareTargetPlugin";
+
+/// Android "Paylaş" hedefi (`ShareTargetPlugin.kt`): bekleyen paylaşımı verir.
+pub struct ShareTarget<R: Runtime>(PluginHandle<R>);
+
 fn check(id: &str) -> Result<(), String> {
     let ok = !id.is_empty() && id.len() <= 32 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
     ok.then_some(()).ok_or_else(|| format!("geçersiz sunucu kimliği: {id}"))
@@ -40,6 +46,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                     app.manage(HostTokens::<R>(handle));
                 }
                 Err(e) => eprintln!("dex-host-tokens: Kotlin köprüsü yüklenemedi: {e}"),
+            }
+            // Paylaş hedefi de aynı şekilde isteğe bağlı: yoksa yalnız paylaşım alınamaz.
+            match api.register_android_plugin(SHARE_IDENTIFIER, SHARE_CLASS) {
+                Ok(handle) => {
+                    app.manage(ShareTarget::<R>(handle));
+                }
+                Err(e) => eprintln!("dex-host-tokens: paylaş köprüsü yüklenemedi: {e}"),
             }
             Ok(())
         })
@@ -99,4 +112,23 @@ pub async fn host_token_set<R: Runtime>(
 pub async fn host_token_delete<R: Runtime>(app: AppHandle<R>, id: String) -> Result<(), String> {
     check(&id)?;
     call(&app, "delete", &id, None).await.map(|_| ())
+}
+
+/// Bekleyen Android paylaşımı (`{ text?, subject?, image?: { mime, base64 }, error? }`); yoksa `{}`.
+/// Bir kez verir, sonra temizler. İçerik loglanmaz.
+#[tauri::command]
+pub async fn share_take<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    let handle = app
+        .try_state::<ShareTarget<R>>()
+        .ok_or("paylaş köprüsü yüklenemedi (Android eklentisi yok)")?
+        .inner()
+        .0
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .run_mobile_plugin::<serde_json::Value>("take", ())
+            .map_err(|e| format!("paylaşım alınamadı: {e}"))
+    })
+    .await
+    .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
 }

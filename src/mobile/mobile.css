@@ -402,6 +402,24 @@ code { color: var(--text-2); }
 }
 .m-danger { align-self: flex-start; color: var(--red-hi); border-color: var(--red-line); }
 
+/* ---- Paylaş hedefi (ShareScreen): agent screen'in üstünde ---- */
+.m-share { z-index: calc(var(--z-m-screen) + 1); }
+.m-share-body { flex: 1; min-height: 0; overflow: auto; padding: var(--sp-4); display: flex; flex-direction: column; gap: var(--sp-3); }
+.m-share-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--text-2); }
+.m-share-field :is(textarea, select) {
+  padding: 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+}
+.m-share-field textarea { resize: vertical; min-height: 120px; }
+.m-share-img { max-width: 100%; max-height: 40vh; object-fit: contain; border-radius: var(--r-md); border: 1px solid var(--line); align-self: center; }
+.m-share-done { color: var(--text); font-size: 16px; text-align: center; padding: var(--sp-4) 0; }
+.m-share-cancel { padding: 12px; background: none; border: 1px solid var(--line-strong); border-radius: var(--r-md); color: var(--text-2); font: inherit; }
+
 /* Notes editor already sizes itself (layout/notes.css). */
 .m-body .notes { flex: 1; min-height: 0; }
 
