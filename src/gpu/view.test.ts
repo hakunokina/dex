@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configPatch, connectionLine, gpuStripCell, limitsPatch, modelGroups, parseBudget, waitingToastText, type GpuModel, type GpuOverview } from "./view.ts";
+import { budgetMax, budgetUnit, configPatch, connectionLine, gpuStripCell, limitsPatch, modelGroups, parseBudget, waitingToastText, type GpuModel, type GpuOverview } from "./view.ts";
 
 const o = (p: Partial<GpuOverview>): GpuOverview => ({
   tokenSet: true, connected: true, authorized: true, via: "primary", url: "http://10.0.0.1:8100",
@@ -37,11 +37,11 @@ test("modelGroups: ajana açık / servis (patronun) / yalnız disk, ayrık", () 
   assert.deepEqual([g.agent, g.served, g.diskOnly].map((x) => x.map((y) => y.name)), [["a"], ["s"], ["d1", "d2"]]);
 });
 
-test("parseBudget: 1–120, boş ya da bozuk → liderin istediği", () => {
+test("parseBudget: 1–240, boş ya da bozuk → liderin istediği", () => {
   assert.equal(parseBudget("", 24), 24);
   assert.equal(parseBudget("abc", 24), 24);
   assert.equal(parseBudget("0", 24), 1);
-  assert.equal(parseBudget("500", 24), 120);
+  assert.equal(parseBudget("500", 24), 240);
   assert.equal(parseBudget("12.4", 24), 12);
 });
 
@@ -49,6 +49,17 @@ test("parseBudget: broker limiti, boş ve bozuk değerler de sınırı aşamaz",
   assert.equal(parseBudget("500", 24, 300), 300);
   assert.equal(parseBudget("", 24, 8), 8);
   assert.equal(parseBudget("abc", 24, 8), 8);
+});
+
+test("budgetUnit: metin türü varsa metin, yoksa görsel; metin tavanı broker limitinden bağımsız", () => {
+  assert.equal(budgetUnit(["t2i"]), "görsel");
+  assert.equal(budgetUnit(["embedding"]), "metin");
+  assert.equal(budgetUnit(["t2i", "rerank"]), "metin");
+  assert.equal(budgetMax(120, ["embedding"]), 50000);
+  assert.equal(budgetMax(8, ["t2i"]), 8);
+  assert.equal(budgetMax(undefined, ["t2i"]), 240);
+  assert.equal(parseBudget("999999", 24, 120, ["embedding"]), 50000);
+  assert.equal(parseBudget("999999", 24, 120, ["t2i"]), 120);
 });
 
 test("limitsPatch: boş alan gönderilmez, pozitif tam sayı ve istek başına ≤4", () => {
