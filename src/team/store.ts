@@ -13,7 +13,7 @@ import * as layout from "../layout/store";
 import { killPty } from "../pty";
 import * as api from "./api";
 import { sortAgents } from "./order";
-import { loadRoles } from "./roles";
+import { roleSync } from "./roles";
 import type { AgentRec, Role, TeamRec } from "./api";
 
 export interface TeamsState {
@@ -82,12 +82,14 @@ async function reload() {
   // S5-A: the Android build has no in-process core — its teams/commands don't exist there.
   const hosts = [...(hasLocalCore ? [LOCAL] : []), ...remoteHosts().map(h => h.id)];
   const cache = readCache();
-  const rolesStale = init.rolesStale;
-  init.rolesStale = false;
-  const [parts, roles] = await Promise.all([
-    Promise.all(hosts.map(h => hostPart(h, cache))),
-    hasLocalCore ? loadRoles(state.roles, rolesStale, api.listRoles, () => hostStatus(LOCAL) === "down") : Promise.resolve<Role[]>([]),
-  ]);
+  // Roles are read at emit time, not captured here: a newer list written meanwhile is never undone.
+  const rolesTry =
+    hasLocalCore && (!state.roles.length || roles.stale)
+      ? roles.refresh().catch((e) => {
+          if (!state.roles.length && hostStatus(LOCAL) !== "down") throw e;
+        })
+      : undefined;
+  const [parts] = await Promise.all([Promise.all(hosts.map(h => hostPart(h, cache))), rolesTry]);
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(hosts.map((h, i) => [h, parts[i]]))));
   } catch {
@@ -95,7 +97,7 @@ async function reload() {
   }
   const teams = parts.flatMap(p => p.teams);
   // Görev #81: one display order (leaders, role groups, natural names) for every list of members.
-  const agents = sortAgents(parts.flatMap(p => p.agents), roles.map(r => r.slug));
+  const agents = sortAgents(parts.flatMap(p => p.agents), state.roles.map(r => r.slug));
   const known = new Set(teams.map(t => t.id));
   let activeId = state.activeId || layout.getSnapshot().active || "";
   if (!known.has(activeId)) activeId = teams[0]?.id ?? "";
@@ -109,10 +111,15 @@ async function reload() {
   layout.syncSessionEngines(new Map(agents.map(a => [a.id, a.engine])));
   if (activeId) layout.setActiveTeam(activeId);
 
-  emit({ ready: true, teams, agents, roles, activeId });
+  emit({ ready: true, teams, agents, roles: state.roles, activeId });
 }
 
-const init = kept(hot, "init", () => ({ started: null as Promise<void> | null, rolesStale: false, localSeen: false }));
+// #1720: the newest role fetch wins; writing re-sorts the members by the new role order. Not `kept`:
+// its writer must be this module's `emit`.
+const roles = roleSync(api.listRoles, (list: Role[]) =>
+  emit({ ...state, roles: list, agents: sortAgents(state.agents, list.map(r => r.slug)) }),
+);
+const init = kept(hot, "init", () => ({ started: null as Promise<void> | null, localSeen: false }));
 const reloadLatest = latest(hot, "reload", () => reload());
 export const refreshTeams = () => reloadLatest();
 
@@ -129,7 +136,7 @@ export function initTeams(): Promise<void> {
         // The first call is this subscription's own (roles were just loaded); later ones are a
         // reconnect — maybe to a new build with new roles (#1720).
         if (!init.localSeen) return void (init.localSeen = true);
-        init.rolesStale = true;
+        void roles.refresh().catch(() => {}); // failed: `stale`, the next reload retries
       }
       void reloadLatest().catch(() => {});
     });
