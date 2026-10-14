@@ -55,6 +55,9 @@ function storedTab(): Tab {
 export function SettingsView({ host, teamId }: { host: string; teamId: string }) {
   const [tab, setTab] = useState<Tab>(storedTab);
   const [server, setServer] = useState(host);
+  const [serverTick, setServerTick] = useState(0);
+  const hosts = useHosts();
+  const serverDown = server !== LOCAL && hosts.find((h) => h.rec.id === server)?.status !== "connected";
   const tabs = useRef<(HTMLButtonElement | null)[]>([]);
   const bodyRef = useRef<HTMLDivElement>(null);
   // Panel başka bir takımın dock'unda açıldıysa sunucu seçimini sıfırla.
@@ -172,18 +175,24 @@ export function SettingsView({ host, teamId }: { host: string; teamId: string })
         </>)}
         {page("chain", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
           <ServerPicker server={server} onPick={setServer} />
-          <ServerDownBand server={server} />
-          <ChainSection host={server} />
+          <ServerDownBand server={server} onRetry={() => setServerTick((n) => n + 1)} />
+          <div key={`chain:${server}:${serverTick}`} {...(serverDown ? { inert: true } : {})} aria-disabled={serverDown}>
+            <ChainSection host={server} />
+          </div>
         </>)}
         {page("resources", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
           <ServerPicker server={server} onPick={setServer} />
-          <ServerDownBand server={server} />
-          <LimitsSection host={server} />
+          <ServerDownBand server={server} onRetry={() => setServerTick((n) => n + 1)} />
+          <div key={`limits:${server}:${serverTick}`} {...(serverDown ? { inert: true } : {})} aria-disabled={serverDown}>
+            <LimitsSection host={server} />
+          </div>
         </>)}
         {page("gpu", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
           <ServerPicker server={server} onPick={setServer} />
-          <ServerDownBand server={server} />
-          <GpuSection host={server} />
+          <ServerDownBand server={server} onRetry={() => setServerTick((n) => n + 1)} />
+          <div key={`gpu:${server}:${serverTick}`} {...(serverDown ? { inert: true } : {})} aria-disabled={serverDown}>
+            <GpuSection host={server} />
+          </div>
         </>)}
       </div>
     </div>
@@ -211,12 +220,13 @@ function ServerPicker({ server, onPick }: { server: string; onPick: (h: string) 
   );
 }
 
-function ServerDownBand({ server }: { server: string }) {
+function ServerDownBand({ server, onRetry }: { server: string; onRetry: () => void }) {
   const status = server === LOCAL ? "connected" : hostStatus(server);
   if (status === "connected") return null;
   return (
     <div className="set-band" role="status">
-      {hostName(server)} sunucusuna bağlantı yok — ayarlar okunamadı. Ajanlar sunucuda çalışmaya devam ediyor.
+      {hostName(server)} sunucusuna bağlantı yok — ayarlar okunamadı. Ajanlar sunucuda çalışmaya devam ediyor.{" "}
+      <button type="button" onClick={onRetry}>Yeniden dene</button>
     </div>
   );
 }

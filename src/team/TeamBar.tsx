@@ -20,7 +20,7 @@ import {
   setAgentChain, setWorkersModel, useTeams,
 } from "./store";
 import "./team.css";
-import { Server, Trash2, X } from "lucide-react";
+import { Server, X } from "lucide-react";
 import { getSnapshot as getLayoutSnapshot, subscribe as subscribeLayout } from "../layout/store";
 import { applyFavoriteLayout, applyFavoriteToAll, openSettings, saveFavoriteLayout } from "../layout/panels";
 import { isActive } from "../layout/rackOrder";
@@ -29,6 +29,7 @@ import { providerModels } from "./providerModels";
 import { fitConvertedModels, normalizeCloneTemplate } from "./cloneTemplate";
 import { TestLevelToggle } from "./TestLevelToggle";
 import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
+import { ConfirmDialog } from "../settings/kit/ConfirmDialog";
 
 /** DEX-25: swap the local provider's (empty) static catalog for the live server list. */
 function withLocalModels(providers: ProviderInfo[], st: LocalStatus | null): ProviderInfo[] {
@@ -420,6 +421,73 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   );
 }
 
+type Member = ReturnType<typeof membersOf>[number];
+
+/** Üye işlemleri: yıkıcı "sil" ⋯ menüde ve ConfirmDialog'la (yanlış satırda tek tıkla silme yok). */
+function MemberMenu({ member, running, onRemove }: {
+  member: Member;
+  running: boolean;
+  onRemove: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const itemRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => { if (open) itemRef.current?.focus(); }, [open]);
+  const close = () => { setOpen(false); triggerRef.current?.focus(); };
+  return (
+    <span className="team-member-menu">
+      <button
+        type="button"
+        className="icon-btn"
+        ref={triggerRef}
+        disabled={running}
+        title={running ? "Çalışan ajan silinemez" : `${member.name} işlemleri`}
+        aria-label={`${member.name} işlemleri`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        ⋯
+      </button>
+      {open && (
+        <div
+          className="team-menu"
+          role="menu"
+          aria-label={`${member.name} işlemleri`}
+          onBlur={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setOpen(false); }}
+          onKeyDown={(e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } }}
+        >
+          <button
+            type="button"
+            ref={itemRef}
+            role="menuitem"
+            className="danger"
+            onClick={() => { setOpen(false); setConfirm(true); }}
+          >
+            Üyeyi sil
+          </button>
+        </div>
+      )}
+      {confirm && (
+        <ConfirmDialog
+          title={`"${member.name}" takımdan çıkarılsın mı?`}
+          lines={[
+            running
+              ? `${member.name} çalışıyor — oturumu kapanacak.`
+              : `${member.name} takımdan çıkarılacak.`,
+            ...(member.kind === "leader" ? ["Bu üye lider; takımsız kalan oturum olmaz."] : []),
+            "Bu işlem geri alınamaz.",
+          ]}
+          confirmLabel="Üyeyi sil"
+          onCancel={() => { setConfirm(false); triggerRef.current?.focus(); }}
+          onConfirm={() => { setConfirm(false); onRemove(); }}
+        />
+      )}
+    </span>
+  );
+}
+
 export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClose: () => void; onReset: () => void }) {
   const { teams } = useTeams();
   const team = teams.find((t) => t.id === teamId);
@@ -440,6 +508,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
     return m;
   };
   const [baseProviders, setProviders] = useState<ProviderInfo[]>([]);  const [local, setLocal] = useState<LocalStatus | null>(null);
+  const [confirmAll, setConfirmAll] = useState(false);
   const [providerError, setProviderError] = useState<string | null>(null);
   const providerRequest = useRef(0);
   const reloadProviders = async () => {
@@ -586,8 +655,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
                   )}
                 </td>
                 <td data-label="İşlem">
-                  <button className="icon-btn" disabled={busy} title={busy ? "Çalışan ajan silinemez" : "Üyeyi sil"}
-                    onClick={() => run(() => removeAgent(a.id))}><Trash2 /></button>
+                  <MemberMenu member={a} running={busy} onRemove={() => run(() => removeAgent(a.id))} />
                 </td>
               </tr>
             );
@@ -622,7 +690,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
       </form>
       {role === "assistant" && assistantTaken(members) && <p className="team-warn" role="status">Takımda zaten bir asistan var</p>}
 
-      <ProvidersMovedNote teamId={team.id} hostLabel={hostName(host)} />
+      <ProvidersMovedNote teamId={team.id} host={team.host} hostLabel={hostName(host)} />
       {providerError && <p className="team-err" role="alert">{providerError}</p>}
 
       {error && <p className="team-err" role="alert">{error}</p>}
@@ -652,11 +720,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
               Favoriyi bu takıma uygula
             </button>
             <button
-              onClick={() => {
-                const n = applyFavoriteToAll(teams.map((t) => t.id));
-                if (!n) setError("Favori uygulanamadı");
-                else setError(null);
-              }}
+              onClick={() => setConfirmAll(true)}
               title="Favori düzeni tüm takımlara uygula (her takımın kendi ajanlarıyla, oturumlar sürer)"
             >
               Favoriyi tüm takımlara uygula
@@ -691,6 +755,23 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
           Takımı sil
         </button>
       </div>
+      {confirmAll && (
+        <ConfirmDialog
+          title="Favori tüm takımlara uygulansın mı?"
+          lines={[
+            `${teams.length} takımın panelleri favori düzene döner.`,
+            "Oturumlar sürer; her takım kendi ajanlarıyla açılır.",
+          ]}
+          confirmLabel="Tümüne uygula"
+          onCancel={() => setConfirmAll(false)}
+          onConfirm={() => {
+            const n = applyFavoriteToAll(teams.map((t) => t.id));
+            if (!n) setError("Favori uygulanamadı");
+            else setError(null);
+            setConfirmAll(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -784,7 +865,18 @@ function WorkersBulk({ teamId, providers }: {
           </button>
         )}
       </div>
-      {warn && <p className="team-warn" role="status">{warn}</p>}
+      {warn && (
+        <p className="team-warn" role="status">
+          {warn}{" "}
+          <button
+            type="button"
+            className="team-link"
+            onClick={() => void openSettings(teamId, "providers", `provider-${provider}`)}
+          >
+            Ayarlar › Sağlayıcılar'da ilgili karta git →
+          </button>
+        </p>
+      )}
       {noModels && <p className="team-warn" role="status">{noModels}</p>}
       {note && <p className="team-note" role="status">{note}</p>}
       {error && <p className="team-err" role="alert">{error}</p>}
@@ -793,12 +885,14 @@ function WorkersBulk({ teamId, providers }: {
 }
 
 /** Sağlayıcı anahtarları sunucu düzeyinde: Ayarlar › Sunucu › Sağlayıcılar'da. */
-function ProvidersMovedNote({ teamId, hostLabel }: { teamId: string; hostLabel: string }) {
+function ProvidersMovedNote({ teamId, host, hostLabel }: { teamId: string; host: string; hostLabel: string }) {
   return (
     <section className="team-providers" aria-label="Sağlayıcılar">
       <h4>Sağlayıcılar</h4>
       <p className="team-note">
-        Anahtarlar {hostLabel} sunucusunda saklanır; bu takıma özel değildir.{" "}
+        {host === LOCAL
+          ? "Anahtarlar bu bilgisayarın kilit deposunda (OS keyring) saklanır; bu takıma özel değildir."
+          : `Anahtarlar ${hostLabel} sunucusunda saklanır; bu bilgisayara inmez, bu takıma özel değildir.`}{" "}
         <button type="button" className="team-link" onClick={() => void openSettings(teamId, "providers")}>
           Ayarlar › Sağlayıcılar'da yönet →
         </button>

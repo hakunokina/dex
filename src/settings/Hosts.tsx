@@ -113,7 +113,7 @@ function LocalCoreItem() {
   const status = useLocalStatus();
   const [life, setLife] = useState<CoreLife | null>(null);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [update, setUpdate] = useState(false);
   const [choose, setChoose] = useState(false);
   const [confirmShutdown, setConfirmShutdown] = useState(false);
@@ -127,7 +127,7 @@ function LocalCoreItem() {
       (l) => setLife(l),
       (e) => {
         setLife(null);
-        if (status === "connected") setMsg(String(e));
+        if (status === "connected") setMsg({ ok: false, text: String(e) });
       },
     );
   };
@@ -144,9 +144,9 @@ function LocalCoreItem() {
     try {
       const s = await callHost<CoreStatus>(LOCAL, "core_status");
       await navigator.clipboard.writeText(JSON.stringify(s, null, 2));
-      setMsg("Durum dökümü kopyalandı.");
+      setMsg({ ok: true, text: "Durum dökümü kopyalandı." });
     } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setBusy(false);
     }
@@ -158,7 +158,7 @@ function LocalCoreItem() {
     try {
       await callHost(LOCAL, "logs_open");
     } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setBusy(false);
     }
@@ -172,7 +172,7 @@ function LocalCoreItem() {
       setChoose(false);
       void refresh();
     } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setBusy(false);
     }
@@ -184,7 +184,7 @@ function LocalCoreItem() {
     try {
       await callHost(LOCAL, "local_shutdown");
     } catch (e) {
-      setMsg(e instanceof Error ? e.message : String(e));
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
     } finally {
       setBusy(false);
       setConfirmShutdown(false);
@@ -209,7 +209,7 @@ function LocalCoreItem() {
         <b>Bu bilgisayar (yerel çekirdek)</b>
         <p className="set-item-meta" role="status">{dot(up ? "connected" : "down")}{meta}</p>
         {life?.draining && <p className="set-note">Yeniden başlatma boşalınca gerçekleşecek{life.drainBlockers?.length ? ` (${life.drainBlockers.join(", ")})` : ""}.</p>}
-        {msg && <FieldMsg ok={!/hata|başarısız|Error/i.test(msg) && msg === "Durum dökümü kopyalandı."} text={msg} />}
+        {msg && <FieldMsg ok={msg.ok} text={msg.text} />}
       </div>
       <div className="set-item-actions">
         {up ? (

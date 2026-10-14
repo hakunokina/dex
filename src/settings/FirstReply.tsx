@@ -7,17 +7,22 @@ import { FieldMsg, SavedFlash } from "./kit/states";
 
 type Secs = Record<string, number>;
 
-export function FirstReplyField({ host, provider, label }: { host: string; provider: string; label: string }) {
+export function FirstReplyField({ host, provider, label, initial }: { host: string; provider: string; label: string; initial?: number | null }) {
   const [saved, setSaved] = useState<number | null>(null);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [flash, setFlash] = useState(0);
 
   useEffect(() => {
+    // Bölüm haritayı bir kez alıp kartlara dağıtır; hazırsa kart tek tek sormaz.
+    if (initial !== undefined && initial !== null) {
+      setSaved(initial);
+      return;
+    }
     callHost<Secs>(host, "first_reply_get").then(
       (v) => setSaved(v[provider] ?? 0),
       (e) => setMsg({ ok: false, text: String(e) }),
     );
-  }, [host, provider]);
+  }, [host, provider, initial]);
 
   async function save(next: string) {
     const secs = Math.round(Number(next) || 0);

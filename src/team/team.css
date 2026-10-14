@@ -80,6 +80,13 @@
   .team-pop:not(.team-settings) .team-dir span { flex-basis: 100%; }
 }
 .team-members select { max-width: 170px; }
+.team-member-menu { position: relative; display: inline-block; }
+.team-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: var(--z-team-pop);
+  min-width: 140px; padding: 4px; display: flex; flex-direction: column; gap: 2px;
+  background: var(--surface-pop); border: 1px solid var(--line); border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+}
 .team-err { margin: 0; font-size: var(--fs-xs); color: var(--red); }
 .team-actions { display: flex; justify-content: flex-end; gap: var(--sp-2); }
 

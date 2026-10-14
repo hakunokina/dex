@@ -3,7 +3,7 @@
 // aynı sunucudaki her takım aynı anahtarları paylaşır, takıma özel anahtar yok.
 import { useEffect, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
-import { onEvent } from "../api/hosts";
+import { callHost, LOCAL, onEvent } from "../api/hosts";
 import {
   importProviders, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
   setProviderToken, type LocalStatus, type ProviderImportRow, type ProviderInfo,
@@ -14,11 +14,15 @@ import { Section } from "./kit/Section";
 import { SecretField } from "./kit/SecretField";
 import { TextField } from "./kit/TextField";
 import { ConfirmDialog } from "./kit/ConfirmDialog";
+import { providerScopeKey } from "./providerScope";
 import { ErrorBand, FieldMsg, LoadingRows } from "./kit/states";
+
+type Secs = Record<string, number>;
 
 export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel: string }) {
   const [providers, setProviders] = useState<ProviderInfo[] | null>(null);
   const [local, setLocal] = useState<LocalStatus | null>(null);
+  const [firstReply, setFirstReply] = useState<Secs | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [rows, setRows] = useState<ProviderImportRow[] | null>(null);
   const [importMsg, setImportMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -27,9 +31,14 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
   const reload = async () => {
     const n = ++request.current;
     try {
-      const ps = await listProviders(host);
+      // Gecikme uyarısı haritası kart başına değil bir kez alınır (N+1 yok).
+      const [ps, secs] = await Promise.all([
+        listProviders(host),
+        callHost<Secs>(host, "first_reply_get").catch(() => null),
+      ]);
       if (request.current !== n) return;
       setProviders(ps);
+      setFirstReply(secs);
       setError(null);
       const lp = ps.find((p) => p.id === "local");
       const st = lp?.baseUrl && lp.hasToken ? await localStatus(host).catch(() => null) : null;
@@ -41,6 +50,7 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
   useEffect(() => {
     setProviders(null);
     setLocal(null);
+    setFirstReply(null);
     void reload();
     const off = onEvent("providers-changed", (_, eventHost) => { if (eventHost === host) void reload(); });
     return () => { off(); request.current++; };
@@ -64,7 +74,9 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
   return (
     <Section
       label="Sağlayıcılar"
-      description={`Anahtarlar ${hostLabel} sunucusunda saklanır; bu bilgisayara inmez.`}
+      description={host === LOCAL
+        ? "Anahtarlar bu bilgisayarın kilit deposunda (OS keyring) saklanır."
+        : `Anahtarlar ${hostLabel} sunucusunda saklanır; bu bilgisayara inmez.`}
     >
       <Pad>
         <span className="set-field-btns">
@@ -83,14 +95,16 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
       </Pad>
       {error && <Pad><ErrorBand text={`Sağlayıcılar okunamadı: ${error}`} onRetry={() => void reload()} /></Pad>}
       {!providers && !error && <LoadingRows />}
-      {anthropic && <ProviderCard host={host} p={anthropic} builtIn onSaved={() => void reload()} />}
-      {rest.map((p) => <ProviderCard key={p.id} host={host} p={p} onSaved={() => void reload()} />)}
+      {anthropic && <ProviderCard key={providerScopeKey(host, "anthropic")} host={host} p={anthropic} builtIn initialSecs={firstReply?.anthropic} onSaved={() => void reload()} />}
+      {rest.map((p) => <ProviderCard key={providerScopeKey(host, p.id)} host={host} p={p} initialSecs={firstReply?.[p.id]} onSaved={() => void reload()} />)}
       {localProvider && (
         <LocalCard
+          key={providerScopeKey(host, "local")}
           host={host}
           provider={localProvider}
           status={local}
           setStatus={setLocal}
+          initialSecs={firstReply?.local}
           reload={() => void reload()}
         />
       )}
@@ -98,10 +112,11 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
   );
 }
 
-function ProviderCard({ host, p, builtIn, onSaved }: {
+function ProviderCard({ host, p, builtIn, initialSecs, onSaved }: {
   host: string;
   p: ProviderInfo;
   builtIn?: boolean;
+  initialSecs?: number | null;
   onSaved: () => void;
 }) {
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -132,17 +147,18 @@ function ProviderCard({ host, p, builtIn, onSaved }: {
       <Row
         label="Yanıt gecikmesi uyarısı"
         description="Ajan bu süre sessiz kalırsa 'yanıt gecikiyor' işareti çıkar."
-        control={<FirstReplyField host={host} provider={p.id} label={p.label} />}
+        control={<FirstReplyField host={host} provider={p.id} label={p.label} initial={initialSecs} />}
       />
     </div>
   );
 }
 
-function LocalCard({ host, provider, status, setStatus, reload }: {
+function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
   host: string;
   provider: ProviderInfo;
   status: LocalStatus | null;
   setStatus: (s: LocalStatus | null) => void;
+  initialSecs?: number | null;
   reload: () => void;
 }) {
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -271,7 +287,7 @@ function LocalCard({ host, provider, status, setStatus, reload }: {
       <Row
         label="Yanıt gecikmesi uyarısı"
         description="Ajan bu süre sessiz kalırsa 'yanıt gecikiyor' işareti çıkar."
-        control={<FirstReplyField host={host} provider="local" label="Yerel LLM" />}
+        control={<FirstReplyField host={host} provider="local" label="Yerel LLM" initial={initialSecs} />}
       />
       {confirmModel && (
         <Pad>
