@@ -2368,6 +2368,39 @@ mod queue_tests {
         fn exit(&mut self) {}
     }
 
+    /// PSReadLine echoes the paste with syntax colors and redraws; strip the
+    /// escape sequences so the echoed text is comparable.
+    fn visible(out: &str) -> String {
+        let mut s = String::with_capacity(out.len());
+        let mut chars = out.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\x1b' {
+                s.push(c);
+                continue;
+            }
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\x07' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        s
+    }
+
     fn core(tag: &str) -> (Arc<Core>, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("dex-queue-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -2648,8 +2681,9 @@ mod queue_tests {
         let d = delegate(&core, "UZUNGOREVMETNI");
         assert_eq!(d.status, "running", "pasted");
         std::thread::sleep(Duration::from_millis(800)); // echo
-        let out = String::from_utf8_lossy(&seen.lock().unwrap()).into_owned();
-        assert!(out.contains(&format!("#{}", d.id)) && out.contains("[Dex]"), "trigger echoed: {out}");
+        let out = visible(&String::from_utf8_lossy(&seen.lock().unwrap()));
+        let trigger = delegate::trigger_line(d.id, "Kaan");
+        assert!(out.contains(&trigger), "trigger echoed: {out}");
         assert!(!out.contains("UZUNGOREVMETNI"), "job text stayed out of the pane");
         done(core, root);
     }
