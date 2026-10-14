@@ -18,7 +18,7 @@ anahtarıdır, ayrı bir kullanıcı yetkisi değildir.
 Tipler: `src/usage/costTypes.ts`. Özet, `total`, ajan kimliğine göre `agents`,
 devretme kimliğine göre `delegations`, `costLabel` ve `warnings` içerir.
 Her toplam `{tokens: {input, output, cacheRead, cacheWrite}, usd}` biçimindedir.
-Cache read, input'a ikinci kez eklenmez; Codex reasoning output zaten output içindedir.
+Cache read, input'a ikinci kez eklenmez.
 `costLabel` daima **API eşdeğer maliyeti**: abonelik faturası veya kalan kota değildir.
 
 Fiyatlar **$/Mtok** biriminde, tam `provider` + transcript `model` anahtarıyladır.
@@ -29,14 +29,14 @@ fiyatlar ve yinelenmiş anahtarlar reddedilir. Bir toplamın herhangi bir modeli
 fiyatı bilinmiyorsa toplam `usd: null`; bilinen parçalar sıfır sayılmaz.
 
 Varsayılan katalog `providers::PROVIDERS` ve ölçülmüş transcript modellerinden
-oluşur; **bütün fiyatlar bilinmiyor (`null`)**. Codex fiyat sağlayıcısı `openai`,
-Claude yönlendirmelerinde `anthropic`, `glm`, `muse` veya `local` kullanılır.
+oluşur; **bütün fiyatlar bilinmiyor (`null`)**. Fiyat sağlayıcısı Claude yönlendirmesinindir:
+`anthropic`, `glm`, `muse` veya `local`.
 Takma ada girilen fiyat gerçek model adına aktarılmaz. Doğrulanmış liste
 fiyatlarını lider/patron girmelidir.
 
 ## Kayıt ve sınırlar
 
-- `cost_sources`: motor/oturum kimliği, transcript yolu, byte ofseti ve Codex sayaç/model durumu.
+- `cost_sources`: motor/oturum kimliği, transcript yolu, byte ofseti ve ayrıştırıcı durumu.
 - `cost_sessions`: aynı dosyada bile sağlayıcı/model/devretme değişiminde yeni
   dönem; ajan, takım, devretme, sağlayıcı, yapılandırılmış model ve başlangıç/bitiş.
 - `cost_messages`: mesajın gerçek modeli, zaman damgası ve dört token sayacı.
@@ -45,8 +45,7 @@ fiyatlarını lider/patron girmelidir.
   Raporun ardından yazılan son cevap, yeni prompt başlayana kadar biten işe aittir.
 - Özet isteği kayıtlı dosyaları kaldığı ofsetten okur; sohbetin açık olması gerekmez.
   Tamamlanmamış son satır sonraki okumaya kalır. Ofset, ayrıştırıcı durumu ve mesajlar
-  aynı transaction ile kaydedilir. Claude mesaj kimliği tekrarlarını tekilleştirir;
-  Codex kümülatif sayaç farkını alır, aynı sayaç tekrarını atlar.
+  aynı transaction ile kaydedilir. Claude mesaj kimliği tekrarlarını tekilleştirir.
 - Kayıt başlangıcından önceki mesajlar yeni işe yüklenmez. Kurulum öncesinde kaybolmuş
   ajan/devretme ilişkileri tahmin edilmez. Bu özellik ileriye dönük ölçümdür.
 - Eksik, okunamayan, küçülmüş veya bozuk dosya `warnings` üretir; önceki kalıcı
@@ -61,9 +60,7 @@ Context maliyet toplamı değildir. Claude için son assistant mesajının
 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` toplamıdır.
 Output, ölçülen isteğin giriş penceresinde henüz bulunmadığından eklenmez; bu,
 `/context` için transcript'ten elde edilebilen son giriş ölçümüdür (canlı tokenizer
-hesabı değildir). Codex kendi `last_token_usage.total_tokens` ölçümünü kullanır;
-yoksa input + output alınır. Cached input zaten input içinde, ikinci kez eklenmez.
-Codex pencere boyutu aynı `token_count.info.model_context_window` alanından gelir.
+hesabı değildir).
 
 Opus 5.5 / Sonnet 5.5 / Fable 5.1: 1M, Haiku 4.5: 200K; Muse 1.x için mevcut
 provider tanımındaki 1.048.576 kullanılır. Bilinmeyen modeller (GLM dahil) `window:null`

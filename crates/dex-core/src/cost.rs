@@ -17,8 +17,6 @@ pub struct Tokens {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct ParserState {
-    model: String,
-    total: Tokens,
     context: Option<AgentContext>,
 }
 
@@ -49,67 +47,9 @@ struct UsageRow {
 }
 
 fn parse_usage(v: &Value, engine: &str, state: &mut ParserState) -> Option<UsageRow> {
-    if (engine == "claude" && v["type"] == "system" && v["subtype"] == "compact_boundary")
-        || (engine == "codex" && v["type"] == "compacted")
-    {
+    if engine == "claude" && v["type"] == "system" && v["subtype"] == "compact_boundary" {
         state.context = None;
         return None;
-    }
-    if engine == "codex" {
-        let p = &v["payload"];
-        if v["type"] == "turn_context" {
-            state.model = p["model"].as_str().unwrap_or("").into();
-            return None;
-        }
-        if v["type"] != "event_msg" || p["type"] != "token_count" {
-            return None;
-        }
-        let info = &p["info"];
-        if let Some(last) = info.get("last_token_usage").filter(|u| u.is_object()) {
-            // Codex reports occupancy after the turn. Cached input is already in input_tokens.
-            state.context = Some(AgentContext {
-                tokens: last["total_tokens"]
-                    .as_u64()
-                    .unwrap_or_else(|| last["input_tokens"].as_u64().unwrap_or(0) + last["output_tokens"].as_u64().unwrap_or(0)),
-                window: info["model_context_window"].as_u64(),
-                model: state.model.clone(),
-                session_id: None,
-                updated_at: crate::chat::parse_ts(&v["timestamp"]),
-            });
-        }
-        let u = p.get("info")?.get("total_token_usage")?;
-        if !u.is_object() {
-            return None;
-        }
-        let total = Tokens {
-            input: u["input_tokens"].as_u64().unwrap_or(0),
-            output: u["output_tokens"].as_u64().unwrap_or(0),
-            cache_read: u["cached_input_tokens"].as_u64().unwrap_or(0),
-            cache_write: 0,
-        };
-        if total == state.total {
-            return None;
-        }
-        // Some CLI versions reset totals after compaction; start a new counter epoch.
-        let prior = if total.input < state.total.input || total.output < state.total.output {
-            Tokens::default()
-        } else {
-            state.total
-        };
-        let cache_read = total.cache_read.saturating_sub(prior.cache_read);
-        let tokens = Tokens {
-            input: total.input.saturating_sub(prior.input).saturating_sub(cache_read),
-            output: total.output.saturating_sub(prior.output),
-            cache_read,
-            cache_write: 0,
-        };
-        state.total = total;
-        return Some(UsageRow {
-            key: String::new(),
-            model: state.model.clone(),
-            ts: crate::chat::parse_ts(&v["timestamp"]),
-            tokens,
-        });
     }
     if engine != "claude" || v["type"] != "assistant" {
         return None;
@@ -212,7 +152,7 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .map_err(err)?;
-        if let Some(path) = crate::chat::transcript_of(&engine, Some(&session), known.as_deref()) {
+        if let Some(path) = crate::chat::transcript_of(Some(&session), known.as_deref()) {
             ingest(c, source, &engine, &path)?;
         }
         let parser: String = c
@@ -259,11 +199,7 @@ pub(crate) fn end_agent(c: &Connection, agent: &str) -> Result<(), String> {
 /// agents/delegations: deleting an office row must not erase already measured usage.
 pub(crate) fn observe(c: &Connection, agent: &str, session: &str, engine: &str, path: Option<&str>, event: &str) -> Result<(), String> {
     let a = crate::teams::get_agent(c, agent)?;
-    let provider = if engine == "codex" {
-        "openai".to_string()
-    } else {
-        a.active_provider.unwrap_or(a.provider)
-    };
+    let provider = a.active_provider.unwrap_or(a.provider);
     let model = a.active_model.unwrap_or(a.model);
     let delegation: Option<i64> = c.query_row(
         "SELECT id FROM delegations WHERE to_agent=?1 AND (status='running' OR (status='queued' AND ?2)) ORDER BY status='running' DESC,id LIMIT 1",
@@ -325,10 +261,6 @@ pub(crate) fn observe(c: &Connection, agent: &str, session: &str, engine: &str, 
 #[derive(Deserialize)]
 struct StoredState {
     #[serde(default)]
-    model: String,
-    #[serde(default)]
-    total: Tokens,
-    #[serde(default)]
     context: Option<AgentContext>,
 }
 
@@ -341,17 +273,13 @@ fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> 
         })
         .map_err(err)?;
     let saved: StoredState = serde_json::from_str(&state).map_err(err)?;
-    // Pre-context cursors get one replay. Existing message keys make it idempotent,
-    // including Codex byte-offset keys. Afterwards even a null context is persisted.
+    // Pre-context cursors get one replay. Existing message keys make it idempotent.
+    // Afterwards even a null context is persisted.
     let legacy = !serde_json::from_str::<Value>(&state)
         .map_err(err)?
         .as_object()
         .is_some_and(|o| o.contains_key("context"));
-    let mut state = ParserState {
-        model: saved.model,
-        total: saved.total,
-        context: saved.context,
-    };
+    let mut state = ParserState { context: saved.context };
     let offset = if legacy {
         state = ParserState::default();
         0
@@ -389,7 +317,6 @@ fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> 
                 .optional()
                 .map_err(err)?;
             if let Some(segment) = segment {
-                let key = if row.key.is_empty() { format!("offset:{pos}") } else { row.key };
                 tx.execute(
                     "INSERT INTO cost_messages(source_id,message_key,segment_id,model,ts,input,output,cache_read,cache_write)
                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -398,7 +325,7 @@ fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> 
                     cache_read=MAX(cache_read,excluded.cache_read),cache_write=MAX(cache_write,excluded.cache_write)",
                     params![
                         source,
-                        key,
+                        row.key,
                         segment,
                         row.model,
                         ts,
@@ -481,7 +408,7 @@ fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i6
         warnings: Vec::new(),
     };
     for (id, engine, session, known) in sources {
-        match crate::chat::transcript_of(&engine, Some(&session), known.as_deref()) {
+        match crate::chat::transcript_of(Some(&session), known.as_deref()) {
             Some(path) => {
                 if let Err(e) = ingest(c, id, &engine, &path) {
                     out.warnings.push(e);
@@ -554,7 +481,7 @@ fn prices(c: &Connection) -> Result<Vec<Price>, String> {
         .iter()
         .flat_map(|p| p.models.iter().map(move |m| ((p.id.to_string(), m.id.to_string()), None)))
         .collect();
-    // Codex has a live catalog; discovered transcript models are listed without inventing prices.
+    // Models seen only in transcripts are listed without inventing prices.
     let mut st = c
         .prepare("SELECT DISTINCT s.provider,m.model FROM cost_messages m JOIN cost_sessions s ON s.id=m.segment_id")
         .map_err(err)?;
@@ -734,44 +661,15 @@ mod tests {
     }
 
     #[test]
-    fn codex_context_uses_last_usage_including_cached_input_once() {
-        let mut state = ParserState::default();
-        parse_usage(
-            &serde_json::json!({"type":"turn_context","payload":{"model":"gpt-test"}}),
-            "codex",
-            &mut state,
-        );
-        for tokens in [120, 20] {
-            parse_usage(
-                &serde_json::json!({"type":"event_msg","timestamp":"2026-10-05T10:00:00Z",
-                "payload":{"type":"token_count","info":{"model_context_window":272000,
-                    "total_token_usage":{"input_tokens":1000,"output_tokens":100},
-                    "last_token_usage":{"input_tokens":tokens,"cached_input_tokens":10,"output_tokens":5,"total_tokens":tokens+5}}}}),
-                "codex",
-                &mut state,
-            );
-            let saved = serde_json::to_value(&state).unwrap();
-            assert_eq!(saved["context"]["tokens"], tokens + 5);
-            assert_eq!(saved["context"]["window"], 272000);
-        }
-    }
-
-    #[test]
     fn context_compaction_invalidates_old_measurement() {
-        for (engine, boundary) in [
-            ("claude", serde_json::json!({"type":"system","subtype":"compact_boundary"})),
-            ("codex", serde_json::json!({"type":"compacted"})),
-        ] {
-            let mut state = ParserState {
-                context: Some(AgentContext {
-                    tokens: 1234,
-                    ..Default::default()
-                }),
+        let mut state = ParserState {
+            context: Some(AgentContext {
+                tokens: 1234,
                 ..Default::default()
-            };
-            parse_usage(&boundary, engine, &mut state);
-            assert!(state.context.is_none(), "{engine}");
-        }
+            }),
+        };
+        parse_usage(&serde_json::json!({"type":"system","subtype":"compact_boundary"}), "claude", &mut state);
+        assert!(state.context.is_none());
     }
 
     #[test]
@@ -812,7 +710,7 @@ mod tests {
     fn process_exit_closes_only_its_agents_session() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         observe(&c, "kaan", "exit-a", "claude", None, "SessionStart").unwrap();
-        observe(&c, "ayla", "exit-b", "codex", None, "SessionStart").unwrap();
+        observe(&c, "ayla", "exit-b", "claude", None, "SessionStart").unwrap();
         end_agent(&c, "kaan").unwrap();
         assert_eq!(
             c.query_row("SELECT agent_id FROM cost_sessions WHERE ended_at IS NULL", [], |r| r
@@ -828,27 +726,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_incremental_state_survives_reopen_and_truncation_is_visible() {
+    fn incremental_state_survives_reopen_and_truncation_is_visible() {
         use std::io::Write;
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("cost-codex-{}.jsonl", std::process::id()));
+        let path = dir.join(format!("cost-incremental-{}.jsonl", std::process::id()));
         let mut f = std::fs::File::create(&path).unwrap();
-        observe(&c, "kaan", "codex-test", "codex", Some(path.to_str().unwrap()), "SessionStart").unwrap();
+        observe(&c, "kaan", "inc-test", "claude", Some(path.to_str().unwrap()), "SessionStart").unwrap();
         c.execute("UPDATE cost_sessions SET started_at=0", []).unwrap();
-        let count = |i, o| {
-            serde_json::json!({"type":"event_msg","timestamp":"2026-10-05T10:00:00Z","payload":{
-            "type":"token_count","info":{"model_context_window":272000,
-                "last_token_usage":{"input_tokens":i,"output_tokens":o,"cached_input_tokens":5},
-                "total_token_usage":{"input_tokens":i,"output_tokens":o,"cached_input_tokens":5}}}})
+        let row = |id: &str, model: &str, i: u64, o: u64| {
+            serde_json::json!({"type":"assistant","timestamp":"2026-10-05T10:00:00Z","message":{"id":id,"model":model,
+                "usage":{"input_tokens":i,"output_tokens":o,"cache_read_input_tokens":5}}})
         };
-        writeln!(f, "{}", serde_json::json!({"type":"turn_context","payload":{"model":"gpt-a"}})).unwrap();
-        writeln!(f, "{}", count(100, 10)).unwrap();
+        writeln!(f, "{}", row("m1", "claude-opus-5-5", 95, 10)).unwrap();
         assert_eq!(summary(&c, "default", None, None).unwrap().total.tokens.input, 95);
-        writeln!(f, "{}", count(100, 10)).unwrap();
-        writeln!(f, "{}", serde_json::json!({"type":"turn_context","payload":{"model":"gpt-b"}})).unwrap();
-        writeln!(f, "{}", count(150, 20)).unwrap();
+        writeln!(f, "{}", row("m1", "claude-opus-5-5", 95, 10)).unwrap();
+        writeln!(f, "{}", row("m2", "claude-sonnet-5-5", 50, 10)).unwrap();
         let out = summary(&c, "default", None, None).unwrap();
         assert!(out.warnings.is_empty());
         assert_eq!(
@@ -856,7 +750,7 @@ mod tests {
             Tokens {
                 input: 145,
                 output: 20,
-                cache_read: 5,
+                cache_read: 10,
                 cache_write: 0
             }
         );
@@ -870,13 +764,13 @@ mod tests {
         assert_eq!(summary(&c, "default", None, None).unwrap().total.tokens.input, 145);
         c.execute("UPDATE cost_sources SET parser='{}'", []).unwrap();
         let snapshot = context(&c, "kaan").unwrap().0;
-        assert_eq!(snapshot.tokens, 170);
-        assert_eq!(snapshot.window, Some(272000));
+        assert_eq!(snapshot.tokens, 55);
+        assert_eq!(snapshot.window, Some(1_000_000));
         assert_eq!(summary(&c, "default", None, None).unwrap().total.tokens.input, 145);
-        observe(&c, "kaan", "codex-fresh", "codex", None, "SessionStart").unwrap();
+        observe(&c, "kaan", "inc-fresh", "claude", None, "SessionStart").unwrap();
         let fresh = context(&c, "kaan").unwrap().0;
         assert_eq!(fresh.tokens, 0);
-        assert_eq!(fresh.session_id.as_deref(), Some("codex-fresh"));
+        assert_eq!(fresh.session_id.as_deref(), Some("inc-fresh"));
         f.set_len(0).unwrap();
         let truncated = summary(&c, "default", None, None).unwrap();
         assert_eq!(truncated.total.tokens.input, 145);
@@ -1018,42 +912,6 @@ mod tests {
         assert_eq!(second.total.tokens.input, 10, "duplicate message and partial append count once");
         assert_eq!(summary(&c, "other", None, None).unwrap().total.tokens.input, 0);
         std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn codex_cumulative_usage_deduplicates_and_changes_model() {
-        let mut state = ParserState::default();
-        let context = |model| serde_json::json!({"type":"turn_context","payload":{"model":model}});
-        let count = |input, output, cache| {
-            serde_json::json!({"type":"event_msg","timestamp":"2026-10-05T10:00:00.000Z",
-            "payload":{"type":"token_count","info":{"total_token_usage":{
-                "input_tokens":input,"output_tokens":output,"cached_input_tokens":cache}}}})
-        };
-        assert!(parse_usage(&context("gpt-first"), "codex", &mut state).is_none());
-        let row = parse_usage(&count(100, 20, 30), "codex", &mut state).unwrap();
-        assert_eq!(
-            row.tokens,
-            Tokens {
-                input: 70,
-                output: 20,
-                cache_read: 30,
-                cache_write: 0
-            }
-        );
-        assert_eq!(row.model, "gpt-first");
-        assert!(parse_usage(&count(100, 20, 30), "codex", &mut state).is_none());
-        parse_usage(&context("gpt-second"), "codex", &mut state);
-        let row = parse_usage(&count(150, 30, 40), "codex", &mut state).unwrap();
-        assert_eq!(row.model, "gpt-second");
-        assert_eq!(
-            row.tokens,
-            Tokens {
-                input: 40,
-                output: 10,
-                cache_read: 10,
-                cache_write: 0
-            }
-        );
     }
 
     #[test]

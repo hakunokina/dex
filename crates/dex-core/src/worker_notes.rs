@@ -177,28 +177,6 @@ fn context_texts<'a>(engine: &str, row: &'a Value) -> Vec<&'a str> {
             .filter_map(Value::as_str)
             .collect();
     }
-    let p = &row["payload"];
-    if engine == "codex"
-        && row["type"] == "response_item"
-        && p["type"] == "message"
-        && p["role"] == "developer"
-    {
-        if let (Some(content), Some(kinds)) = (
-            p["content"].as_array(),
-            p["internal_chat_message_metadata_passthrough"]["content_item_kinds"].as_array(),
-        ) {
-            if content.len() == kinds.len() {
-                return content
-                    .iter()
-                    .zip(kinds)
-                    .filter(|(c, kind)| {
-                        c["type"] == "input_text" && **kind == "hooks.additional_context"
-                    })
-                    .filter_map(|(c, _)| c["text"].as_str())
-                    .collect();
-            }
-        }
-    }
     Vec::new()
 }
 
@@ -580,228 +558,209 @@ mod tests {
 
     #[test]
     fn transcript_receipt_accepts_only_the_exact_note_and_stops_repeating_it() {
-        for engine in ["claude", "codex"] {
-            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-                "../../.dex/tmp/note-receipt-{engine}-{}-{}",
-                std::process::id(),
-                crate::agents::next_seq()
-            ));
-            let core = crate::Core::start(
-                crate::Paths {
-                    data_dir: root.join("data"),
-                    config_dir: root.join("config"),
-                },
-                Events::new(NullSink),
-            )
-            .unwrap();
-            core.pty_spawn(
-                crate::pty::Spawn {
-                    id: "kaan".into(),
-                    cmd: crate::shell::SHELL_CMD.into(),
-                    cols: 80,
-                    rows: 24,
-                    ..Default::default()
-                },
-                crate::agents::shell_sink_for_test(&core, "kaan", Sink),
-            )
-            .unwrap();
-            core.agent_states.started("kaan", engine, true);
-            core.agent_states.hook(
-                "kaan",
-                Some(crate::agents::Status::Working),
-                Some("note-session"),
-            );
-            let transcript = root.join("rollout-note-session.jsonl");
-            std::fs::write(&transcript, "").unwrap();
-            core.agent_states
-                .set_transcript("kaan", transcript.to_str().unwrap());
-            let (id, rendered) = with(&core.db, |c| {
-                let d = job(c, "kaan");
-                delegate::set_status(c, d.id, "running")?;
-                let lead = delegate::caller(c, "timur")?;
-                send(c, &lead, d.id, "same-text")?;
-                send(c, &lead, d.id, "same-text")?;
-                let notes = pending(c, "kaan")?;
-                Ok((notes[0].id, render(&notes[0])))
-            })
-            .unwrap();
-            let out = core
-                .delegation_on_hook(
-                    "kaan",
-                    "PostToolUse",
-                    &json!({"session_id":"note-session"}),
-                    false,
-                )
-                .unwrap();
-            assert!(out.contains("same-text"));
-            core.chat_watches
-                .ensure(core.weak_self.clone(), "kaan", engine, &transcript);
-            let row = if engine == "claude" {
-                json!({"type":"attachment","sessionId":"note-session","timestamp":"9999-01-01T00:00:00.000Z",
-                    "attachment":{"type":"hook_additional_context","hookEvent":"PostToolUse","content":[rendered]}})
-            } else {
-                json!({"type":"response_item","timestamp":"9999-01-01T00:00:00.000Z","payload":{
-                    "type":"message","role":"developer","content":[{"type":"input_text","text":rendered}],
-                    "internal_chat_message_metadata_passthrough":{"content_item_kinds":["hooks.additional_context"]}}})
-            };
-            let process = core.ptys.generation("kaan");
-            let mut invalid = Vec::new();
-            let mut old = row.clone();
-            old["timestamp"] = json!("2000-01-01T00:00:00.000Z");
-            invalid.push(old);
-            let mut missing_time = row.clone();
-            missing_time["timestamp"] = Value::Null;
-            invalid.push(missing_time);
-            let mut untrusted = row.clone();
-            if engine == "claude" {
-                untrusted["attachment"]["type"] = json!("hook_success");
-                let mut other_session = row.clone();
-                other_session["sessionId"] = json!("other-session");
-                invalid.push(other_session);
-            } else {
-                untrusted["payload"]["internal_chat_message_metadata_passthrough"] = Value::Null;
-                let mut user = row.clone();
-                user["payload"]["role"] = json!("user");
-                invalid.push(user);
-            }
-            invalid.push(untrusted);
-            let mut wrong_content = row.clone();
-            if engine == "claude" {
-                wrong_content["attachment"]["content"] =
-                    json!([rendered.replace("same-text", "changed-text")]);
-            } else {
-                wrong_content["payload"]["content"][0]["text"] =
-                    json!(rendered.replace("same-text", "changed-text"));
-            }
-            invalid.push(wrong_content);
-            for record in invalid {
-                core.worker_notes_observed("kaan", engine, &transcript, &record, process);
-                assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 2);
-            }
-            core.worker_notes_observed("kaan", engine, &transcript, &row, process.map(|p| p + 1));
-            core.worker_notes_observed(
-                "kaan",
-                engine,
-                &root.join("rollout-other-session.jsonl"),
-                &row,
-                process,
-            );
-            core.agent_states.hook(
-                "kaan",
-                Some(crate::agents::Status::Working),
-                Some("other-session"),
-            );
-            core.worker_notes_observed("kaan", engine, &transcript, &row, process);
-            assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 2);
-            core.agent_states.hook(
-                "kaan",
-                Some(crate::agents::Status::Working),
-                Some("note-session"),
-            );
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&transcript)
-                .unwrap();
-            writeln!(file, "{row}").unwrap();
-            file.flush().unwrap();
-            drop(file);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while with(&core.db, |c| pending(c, "kaan")).unwrap().len() == 2
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            let notes = with(&core.db, |c| pending(c, "kaan")).unwrap();
-            let stamp: i64 = with(&core.db, |c| {
-                c.query_row(
-                    "SELECT delivered_at FROM worker_notes WHERE id=?1",
-                    [id],
-                    |r| r.get(0),
-                )
-                .map_err(|e| e.to_string())
-            })
-            .unwrap();
-            core.worker_notes_observed("kaan", engine, &transcript, &row, process);
-            assert_eq!(
-                with(&core.db, |c| c
-                    .query_row(
-                        "SELECT delivered_at FROM worker_notes WHERE id=?1",
-                        [id],
-                        |r| r.get::<_, i64>(0)
-                    )
-                    .map_err(|e| e.to_string()))
-                .unwrap(),
-                stamp
-            );
-            let retry = core.delegation_on_hook(
+        let engine = "claude";
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../.dex/tmp/note-receipt-{engine}-{}-{}",
+            std::process::id(),
+            crate::agents::next_seq()
+        ));
+        let core = crate::Core::start(
+            crate::Paths {
+                data_dir: root.join("data"),
+                config_dir: root.join("config"),
+            },
+            Events::new(NullSink),
+        )
+        .unwrap();
+        core.pty_spawn(
+            crate::pty::Spawn {
+                id: "kaan".into(),
+                cmd: crate::shell::SHELL_CMD.into(),
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            },
+            crate::agents::shell_sink_for_test(&core, "kaan", Sink),
+        )
+        .unwrap();
+        core.agent_states.started("kaan", engine, true);
+        core.agent_states.hook(
+            "kaan",
+            Some(crate::agents::Status::Working),
+            Some("note-session"),
+        );
+        let transcript = root.join("rollout-note-session.jsonl");
+        std::fs::write(&transcript, "").unwrap();
+        core.agent_states
+            .set_transcript("kaan", transcript.to_str().unwrap());
+        let (id, rendered) = with(&core.db, |c| {
+            let d = job(c, "kaan");
+            delegate::set_status(c, d.id, "running")?;
+            let lead = delegate::caller(c, "timur")?;
+            send(c, &lead, d.id, "same-text")?;
+            send(c, &lead, d.id, "same-text")?;
+            let notes = pending(c, "kaan")?;
+            Ok((notes[0].id, render(&notes[0])))
+        })
+        .unwrap();
+        let out = core
+            .delegation_on_hook(
                 "kaan",
                 "PostToolUse",
                 &json!({"session_id":"note-session"}),
                 false,
-            );
-            core.chat_watches.drop_watch("kaan");
-            let submitted = render(&notes[0]);
-            core.worker_notes_prompt_received(
-                "kaan",
-                &json!({"session_id":"other-session","prompt":submitted}),
-            );
-            assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 1);
-            core.worker_notes_prompt_received(
-                "kaan",
-                &json!({"session_id":"note-session","prompt":submitted}),
-            );
-            assert!(with(&core.db, |c| pending(c, "kaan")).unwrap().is_empty());
-            let partial_note = with(&core.db, |c| {
-                send(
-                    c,
-                    &delegate::caller(c, "timur")?,
-                    notes[0].delegation_id,
-                    "partial-canary",
-                )?;
-                Ok(render(&pending(c, "kaan")?[0]))
-            })
+            )
             .unwrap();
-            let mut partial_row = row.clone();
-            if engine == "claude" {
-                partial_row["attachment"]["content"] = json!([partial_note]);
-            } else {
-                partial_row["payload"]["content"][0]["text"] = json!(partial_note);
-            }
-            let serialized = partial_row.to_string();
-            let split = serialized.len() / 2;
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&transcript)
-                .unwrap();
-            file.write_all(&serialized.as_bytes()[..split]).unwrap();
-            file.flush().unwrap();
-            core.worker_notes_reconcile("kaan");
-            assert_eq!(
-                with(&core.db, |c| pending(c, "kaan")).unwrap().len(),
-                1,
-                "partial record cannot acknowledge a note"
-            );
-            file.write_all(&serialized.as_bytes()[split..]).unwrap();
-            file.write_all(b"\n").unwrap();
-            file.flush().unwrap();
-            core.worker_notes_reconcile("kaan");
-            assert!(
-                with(&core.db, |c| pending(c, "kaan")).unwrap().is_empty(),
-                "completed receipt is reconciled before the next response"
-            );
-            drop(file);
-            core.ptys.kill("kaan");
-            core.shutdown();
-            assert_eq!(
-                notes.len(),
-                1,
-                "{engine}: an exact receipt acknowledges only one note"
-            );
-            assert_ne!(notes[0].id, id);
-            let retry = retry.unwrap();
-            assert!(!retry.contains(&format!("[Dex lider notu #{id}]")));
-            assert!(retry.contains(&format!("[Dex lider notu #{}]", notes[0].id)));
+        assert!(out.contains("same-text"));
+        core.chat_watches
+            .ensure(core.weak_self.clone(), "kaan", engine, &transcript);
+        let row = json!({"type":"attachment","sessionId":"note-session","timestamp":"9999-01-01T00:00:00.000Z",
+            "attachment":{"type":"hook_additional_context","hookEvent":"PostToolUse","content":[rendered]}});
+        let process = core.ptys.generation("kaan");
+        let mut invalid = Vec::new();
+        let mut old = row.clone();
+        old["timestamp"] = json!("2000-01-01T00:00:00.000Z");
+        invalid.push(old);
+        let mut missing_time = row.clone();
+        missing_time["timestamp"] = Value::Null;
+        invalid.push(missing_time);
+        let mut untrusted = row.clone();
+        untrusted["attachment"]["type"] = json!("hook_success");
+        let mut other_session = row.clone();
+        other_session["sessionId"] = json!("other-session");
+        invalid.push(other_session);
+        invalid.push(untrusted);
+        let mut wrong_content = row.clone();
+        wrong_content["attachment"]["content"] =
+            json!([rendered.replace("same-text", "changed-text")]);
+        invalid.push(wrong_content);
+        for record in invalid {
+            core.worker_notes_observed("kaan", engine, &transcript, &record, process);
+            assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 2);
         }
+        core.worker_notes_observed("kaan", engine, &transcript, &row, process.map(|p| p + 1));
+        core.worker_notes_observed(
+            "kaan",
+            engine,
+            &root.join("rollout-other-session.jsonl"),
+            &row,
+            process,
+        );
+        core.agent_states.hook(
+            "kaan",
+            Some(crate::agents::Status::Working),
+            Some("other-session"),
+        );
+        core.worker_notes_observed("kaan", engine, &transcript, &row, process);
+        assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 2);
+        core.agent_states.hook(
+            "kaan",
+            Some(crate::agents::Status::Working),
+            Some("note-session"),
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        writeln!(file, "{row}").unwrap();
+        file.flush().unwrap();
+        drop(file);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while with(&core.db, |c| pending(c, "kaan")).unwrap().len() == 2
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let notes = with(&core.db, |c| pending(c, "kaan")).unwrap();
+        let stamp: i64 = with(&core.db, |c| {
+            c.query_row(
+                "SELECT delivered_at FROM worker_notes WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        core.worker_notes_observed("kaan", engine, &transcript, &row, process);
+        assert_eq!(
+            with(&core.db, |c| c
+                .query_row(
+                    "SELECT delivered_at FROM worker_notes WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, i64>(0)
+                )
+                .map_err(|e| e.to_string()))
+            .unwrap(),
+            stamp
+        );
+        let retry = core.delegation_on_hook(
+            "kaan",
+            "PostToolUse",
+            &json!({"session_id":"note-session"}),
+            false,
+        );
+        core.chat_watches.drop_watch("kaan");
+        let submitted = render(&notes[0]);
+        core.worker_notes_prompt_received(
+            "kaan",
+            &json!({"session_id":"other-session","prompt":submitted}),
+        );
+        assert_eq!(with(&core.db, |c| pending(c, "kaan")).unwrap().len(), 1);
+        core.worker_notes_prompt_received(
+            "kaan",
+            &json!({"session_id":"note-session","prompt":submitted}),
+        );
+        assert!(with(&core.db, |c| pending(c, "kaan")).unwrap().is_empty());
+        let partial_note = with(&core.db, |c| {
+            send(
+                c,
+                &delegate::caller(c, "timur")?,
+                notes[0].delegation_id,
+                "partial-canary",
+            )?;
+            Ok(render(&pending(c, "kaan")?[0]))
+        })
+        .unwrap();
+        let mut partial_row = row.clone();
+        if engine == "claude" {
+            partial_row["attachment"]["content"] = json!([partial_note]);
+        } else {
+            partial_row["payload"]["content"][0]["text"] = json!(partial_note);
+        }
+        let serialized = partial_row.to_string();
+        let split = serialized.len() / 2;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&serialized.as_bytes()[..split]).unwrap();
+        file.flush().unwrap();
+        core.worker_notes_reconcile("kaan");
+        assert_eq!(
+            with(&core.db, |c| pending(c, "kaan")).unwrap().len(),
+            1,
+            "partial record cannot acknowledge a note"
+        );
+        file.write_all(&serialized.as_bytes()[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.flush().unwrap();
+        core.worker_notes_reconcile("kaan");
+        assert!(
+            with(&core.db, |c| pending(c, "kaan")).unwrap().is_empty(),
+            "completed receipt is reconciled before the next response"
+        );
+        drop(file);
+        core.ptys.kill("kaan");
+        core.shutdown();
+        assert_eq!(
+            notes.len(),
+            1,
+            "{engine}: an exact receipt acknowledges only one note"
+        );
+        assert_ne!(notes[0].id, id);
+        let retry = retry.unwrap();
+        assert!(!retry.contains(&format!("[Dex lider notu #{id}]")));
+        assert!(retry.contains(&format!("[Dex lider notu #{}]", notes[0].id)));
     }
 
     #[test]

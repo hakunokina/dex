@@ -22,7 +22,7 @@ Tauri context hazırlanırken seçim yapılır; `AppPaths` state'i core_proc, in
 
 macOS WKWebView'de Windows/Linux `data_directory` ayarı mevcut değildir. Bu iş Windows WebView2 profil seçimini doğrular; macOS native WebView profil davranışı cihazda doğrulanmadı.
 
-Eski kök adı yalnız `desktop_storage::LEGACY_IDENTIFIER` sabitinde, kabul edilmiş uyumluluk istisnasını açıklayan yorumla tutulur. Kimlikten bağımsız keyring servisleri (`dex-provider`, `dex-host`, `dex-tm-hub`, `dex-siwc`, `dex-gpu`) sabittir.
+Eski kök adı yalnız `desktop_storage::LEGACY_IDENTIFIER` sabitinde, kabul edilmiş uyumluluk istisnasını açıklayan yorumla tutulur. Kimlikten bağımsız keyring servisleri (`dex-provider`, `dex-host`, `dex-tm-hub`, `dex-gpu`) sabittir.
 
 NSIS'in eski kurulum konumunu yeni publisher kaydına aktaran hook'u değişmedi; uygulama verisi göçü değildir. Tek `Dex` uninstall kaydı ve eski kurulum yolu korunur. `scripts/test-identity-installer.ps1` gerçek uygulamayı kurmadan izole registry anahtarlarıyla beş kontrol yapar. Tauri CLI yükseltilirken bu kontrol tekrar çalıştırılmalıdır. NSIS'in eski publisher'lı MSI'ı tanımaması önceki lider kararında kabul edildi.
 

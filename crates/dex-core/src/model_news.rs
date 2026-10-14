@@ -7,12 +7,7 @@
 //! GLM Anthropic biçimi döner (`data[].id/display_name/created_at`), Muse OpenAI biçimi (`data[].id`).
 //! Claude: CLI'da liste alt komutu yok; Claude Code'un abonelik OAuth jetonu YALNIZ
 //! `GET api.anthropic.com/v1/models` için kullanılır. Jeton yalnız bellekte; süresi
-//! geçmişse yenilenmez (dosyaya yazmayız), Claude o açılışta atlanır. Codex: seçici `codex debug
-//! models`'tan canlı, ama sunucu kataloğu istemcinin `client_version`'ına göre süzer (gpt-6.1-sol
-//! 0.154'e dönmez, 0.160'a döner). Haber = codex'in kendi bildiği son sürümün (`version.json`
-//! `latest_version`) kataloğunda olup kurulu CLI'ın listesinde olmayan model; `auth.json`'daki
-//! ChatGPT jetonuyla (YALNIZ models GET'i, bellekte, yenilenmez)
-//! `GET chatgpt.com/backend-api/codex/models?client_version=<son>`. Etiket `codex update`'i söyler.
+//! geçmişse yenilenmez (dosyaya yazmayız), Claude o açılışta atlanır.
 //!
 //! Sıklık: sağlayıcı başına 24 saatte en çok bir kez. Son BAŞARILI kontrol
 //! `settings.models_checked`'te (sağlayıcı → ms); cevapsız sağlayıcı zamanı güncellemez, sonraki
@@ -29,11 +24,7 @@ const CHECKED: &str = "models_checked";
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Sağlayıcı → sorulacak uç + yalnız sohbet modellerini bırakan önek (Muse ses/görsel de listeler).
-const SOURCES: &[(&str, &str)] = &[("anthropic", "claude-"), ("glm", "glm-"), ("muse", "muse-spark-"), (CODEX, "")];
-
-/// Codex providers.rs'te bir sağlayıcı değil (ayrı motor); haber anahtarı yine `codex:<id>`.
-const CODEX: &str = "codex";
-const CODEX_MODELS: &str = "https://chatgpt.com/backend-api/codex/models";
+const SOURCES: &[(&str, &str)] = &[("anthropic", "claude-"), ("glm", "glm-"), ("muse", "muse-spark-")];
 
 const ANTHROPIC_MODELS: &str = "https://api.anthropic.com/v1/models?limit=1000";
 
@@ -93,50 +84,7 @@ pub fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// Codex'in kendi güncelleme denetiminin bildiği son sürüm (`$CODEX_HOME/version.json`).
-fn codex_latest(home: &std::path::Path) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("version.json")).ok()?).ok()?;
-    let latest = v.get("latest_version")?.as_str()?;
-    latest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')).then(|| latest.to_string())
-}
-
-/// `auth.json` ChatGPT girişi: (erişim jetonu, hesap kimliği). API anahtarlı girişte yok → atlanır.
-fn codex_auth(home: &std::path::Path) -> Option<(String, Option<String>)> {
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(home.join("auth.json")).ok()?).ok()?;
-    let t = v.get("tokens")?;
-    let token = t.get("access_token")?.as_str().filter(|s| !s.is_empty())?.to_string();
-    Some((token, t.get("account_id").and_then(|a| a.as_str()).map(String::from)))
-}
-
-/// Son sürümün kataloğunda olup kurulu CLI'ın listesinde olmayanlar; etiket güncellemeyi söyler.
-fn codex_missing(latest: Vec<crate::codex::ModelInfo>, installed: &[crate::codex::ModelInfo], version: &str) -> Vec<(String, String)> {
-    latest
-        .into_iter()
-        .filter(|m| !installed.iter().any(|i| i.id == m.id))
-        .map(|m| (m.id, format!("{} — codex-cli {version} gerekir (`codex update`)", m.label)))
-        .collect()
-}
-
-fn fetch_codex(agent: &ureq::Agent) -> Option<Vec<(String, String)>> {
-    let home = crate::codex::home();
-    let installed = crate::codex::models().ok()?;
-    let version = codex_latest(&home)?;
-    let (token, account) = codex_auth(&home)?;
-    let mut req = agent
-        .get(CODEX_MODELS)
-        .query("client_version", &version)
-        .set("Authorization", &format!("Bearer {token}"));
-    if let Some(a) = &account {
-        req = req.set("ChatGPT-Account-Id", a);
-    }
-    let body = req.call().ok()?.into_string().ok()?;
-    Some(codex_missing(crate::codex::parse_models(&body).ok()?, &installed, &version))
-}
-
 fn fetch_one(provider: &str) -> Option<Vec<(String, String)>> {
-    if provider == CODEX {
-        return fetch_codex(&http());
-    }
     let (url, token, oauth) = if provider == "anthropic" {
         (ANTHROPIC_MODELS.to_string(), claude_token()?, true)
     } else {
@@ -196,16 +144,6 @@ fn family_version(id: &str) -> (String, Option<(u32, u32)>) {
 pub fn news(offered: &[(String, Vec<(String, String)>)], seen: &BTreeSet<String>) -> Vec<NewModel> {
     let mut out = Vec::new();
     for (provider, models) in offered {
-        if provider == CODEX {
-            // fetch_codex zaten kurulu listeyle süzdü; Codex sürümleri Dex kataloğunda değil.
-            out.extend(
-                models
-                    .iter()
-                    .map(|(id, label)| NewModel { provider: CODEX.into(), provider_label: "Codex".into(), id: id.clone(), label: label.clone() })
-                    .filter(|m| !seen.contains(&m.key())),
-            );
-            continue;
-        }
         let (Some(def), Some((_, prefix))) = (providers::get(provider), SOURCES.iter().find(|(p, _)| p == provider)) else {
             continue;
         };
@@ -292,7 +230,7 @@ pub fn mark_seen(conn: &Connection, keys: &[String]) -> Result<(), String> {
     let mut all = seen(conn);
     for k in keys {
         let k = k.trim().to_ascii_lowercase();
-        if k.split_once(':').is_some_and(|(p, id)| (p == CODEX || providers::get(p).is_some()) && !id.is_empty()) {
+        if k.split_once(':').is_some_and(|(p, id)| providers::get(p).is_some() && !id.is_empty()) {
             all.insert(k);
         }
     }
@@ -364,38 +302,16 @@ mod tests {
     fn checks_at_most_once_a_day_and_retries_failures() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
         let t0 = 1_000_000_000_000;
-        assert_eq!(due(&c, t0), ["anthropic", "glm", "muse", "codex"], "hiç kontrol yok → hepsi");
+        assert_eq!(due(&c, t0), ["anthropic", "glm", "muse"], "hiç kontrol yok → hepsi");
         // Yalnız GLM cevap verdi: Claude ve Muse bir sonraki açılışta yeniden denenir.
         mark_checked(&c, &["glm".into()], t0).unwrap();
-        assert_eq!(due(&c, t0 + 1000), ["anthropic", "muse", "codex"]);
+        assert_eq!(due(&c, t0 + 1000), ["anthropic", "muse"]);
         // Hiçbiri cevap vermedi (ağ yok): zaman değişmez.
         mark_checked(&c, &[], t0 + 2000).unwrap();
-        assert_eq!(due(&c, t0 + DAY_MS - 1), ["anthropic", "muse", "codex"], "24 saat dolmadan GLM atlanır");
-        assert_eq!(due(&c, t0 + DAY_MS), ["anthropic", "glm", "muse", "codex"], "24 saat dolunca yeniden");
+        assert_eq!(due(&c, t0 + DAY_MS - 1), ["anthropic", "muse"], "24 saat dolmadan GLM atlanır");
+        assert_eq!(due(&c, t0 + DAY_MS), ["anthropic", "glm", "muse"], "24 saat dolunca yeniden");
         // Saat geri alındıysa (kayıt gelecekte) kontrol kilitlenmesin.
-        assert_eq!(due(&c, t0 - 1), ["anthropic", "glm", "muse", "codex"]);
-    }
-
-    #[test]
-    fn codex_news_is_latest_catalog_minus_installed() {
-        let m = |id: &str| crate::codex::ModelInfo { id: id.into(), label: id.to_uppercase(), upgrade: None };
-        let missing = codex_missing(vec![m("gpt-6.1-sol"), m("gpt-6-astra")], &[m("gpt-6-astra")], "0.160.0");
-        assert_eq!(missing, [("gpt-6.1-sol".to_string(), "GPT-6.1-SOL — codex-cli 0.160.0 gerekir (`codex update`)".to_string())]);
-        let n = news(&[(CODEX.into(), missing)], &BTreeSet::new());
-        assert_eq!(n.iter().map(NewModel::key).collect::<Vec<_>>(), ["codex:gpt-6.1-sol"]);
-        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
-        mark_seen(&c, &[n[0].key()]).unwrap();
-        assert!(news(&[(CODEX.into(), vec![("gpt-6.1-sol".into(), "x".into())])], &seen(&c)).is_empty());
-
-        let home = std::env::temp_dir().join(format!("dex-news-codex-{}", std::process::id()));
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("version.json"), r#"{"latest_version":"0.160.0","last_checked_at":"x"}"#).unwrap();
-        std::fs::write(home.join("auth.json"), r#"{"tokens":{"access_token":"t","account_id":"a"}}"#).unwrap();
-        assert_eq!(codex_latest(&home).as_deref(), Some("0.160.0"));
-        assert_eq!(codex_auth(&home), Some(("t".into(), Some("a".into()))));
-        std::fs::write(home.join("version.json"), r#"{"latest_version":"1&x=y"}"#).unwrap();
-        assert_eq!(codex_latest(&home), None, "sorgu dizesine giden değer süzülür");
-        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(due(&c, t0 - 1), ["anthropic", "glm", "muse"]);
     }
 
     #[test]

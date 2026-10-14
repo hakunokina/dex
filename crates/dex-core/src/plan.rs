@@ -601,7 +601,7 @@ pub(crate) fn create_bound(
     contexts: &[crate::project_context::ProjectContext],
 ) -> Result<i64, String> {
     crate::job_model::snapshot_plan(conn, &lead.team_id, &mut p)?;
-    crate::job_model::validate_plan_catalog(&p, None)?;
+    crate::job_model::validate_plan_catalog(&p)?;
     create_prepared(conn, lead, p, contexts, &vec![None; contexts.len()])
 }
 
@@ -1750,9 +1750,9 @@ mod tests {
     }
 
     #[test]
-    fn dependent_model_plan_preserves_validated_route_for_codex_and_gateway() {
+    fn dependent_model_plan_preserves_validated_route_for_chain_providers() {
         for pinned in [false, true] {
-            for (engine, provider, model) in [("codex", "anthropic", "gpt-chain"), ("claude", "gateway", "gateway-chain")] {
+            for (engine, provider, model) in [("claude", "glm", "GLM-5.3"), ("claude", "muse", "muse-spark-1.3")] {
                 let c = mem();
                 let lead = delegate::caller(&c, "timur").unwrap();
                 let mut b = task("B", "backend", &["A"]);
@@ -1791,15 +1791,15 @@ mod tests {
         let id = create(&c, &lead, new_plan(vec![item])).unwrap();
         // Reproduce a pre-migration waiting plan; no safe historical route can be inferred.
         c.execute("UPDATE plan_items SET model_engine=NULL,model_provider=NULL WHERE plan_id=?1", [id]).unwrap();
-        c.execute("UPDATE agents SET active_engine='codex',active_model='gpt-chain' WHERE id='ayla'", []).unwrap();
+        c.execute("UPDATE agents SET active_provider='glm',active_model='GLM-5.3' WHERE id='ayla'", []).unwrap();
         let d = step(&c).unwrap().0.remove(0);
         let p = crate::proposals::list_pending(&c).unwrap().remove(0);
         crate::proposals::decide(&c, std::path::Path::new("."), p.id, true, None).unwrap();
         let mut a = crate::teams::get_agent(&c, "ayla").unwrap();
         assert!(!crate::job_model::apply(&c, &mut a, Some(d.id)).unwrap());
-        assert_eq!(a.active_model.as_deref(), Some("gpt-chain"));
+        assert_eq!(a.active_model.as_deref(), Some("GLM-5.3"));
         let note = take_notes(&c, "timur").unwrap().unwrap();
-        assert!(note.contains("opus") && note.contains("gpt-chain") && note.contains("rotası kayıtlı değil"), "{note}");
+        assert!(note.contains("opus") && note.contains("GLM-5.3") && note.contains("rotası kayıtlı değil"), "{note}");
     }
 
     /// Model retries receive a new approval; cancellation withdraws a pending proposal.

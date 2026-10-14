@@ -46,8 +46,7 @@ const PRE_SESSION_SETTLE: Duration = Duration::from_millis(2_000);
 /// FIX-1: Claude's folder-trust dialog comes before any hook (SessionStart follows it), so no
 /// hook can report it. The marker is structural, not its wording: no hook yet + a drawn screen +
 /// silence → the process waits on the patron. It goes out like a PermissionRequest (status and
-/// notification); the first real hook, or the exit, ends the phase. Codex is not watched: its
-/// SessionStart may come only with the first turn, and Dex marks its workdir trusted anyway.
+/// notification); the first real hook, or the exit, ends the phase.
 pub(crate) fn watch_pre_session(core: std::sync::Weak<Core>, agent: String, stream: std::sync::Arc<crate::pty_stream::PtyStream>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_millis(250));
@@ -371,7 +370,7 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
             };
             let deferred_session = session_id.clone();
             let chain_engine = chain.as_ref().map(|_| "claude");
-            let current_stop = if event == "Stop" && session_id.is_some() && state.engine.as_deref() != Some("codex") {
+            let current_stop = if event == "Stop" && session_id.is_some() {
                 stop.as_ref().is_some_and(|stop| core.claude_stop_is_current(&agent, stop))
             } else { true };
             let status = status.map(|_| match state.status {
@@ -403,10 +402,7 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
             }
             // Reevaluate an expired leader after a final idle transition, including transient
             // StopFailure. A chain transition owns its session instead; workers still need Stop.
-            // Codex Stop is final; Claude waits for its turn-matched transcript evidence.
-            if event_name == "Stop" && state.engine.as_deref() == Some("codex") && !blocked {
-                let _ = core.team_turn_ended(&state);
-            }
+            // Claude waits for its turn-matched transcript evidence.
             if chain.is_none() && state.status == crate::agents::Status::Idle
                 && matches!(event_name.as_str(), "Stop" | "StopFailure")
             {

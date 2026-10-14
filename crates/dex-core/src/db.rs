@@ -413,7 +413,46 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE teams ADD COLUMN profile TEXT NOT NULL DEFAULT 'dev' CHECK(profile IN ('dev','edu'));",
     // 36 (#1697): host-only inbox; receipt metadata has no shared content.
     crate::inbox::SCHEMA,
+    // 37 (#1710): the Codex engine and the gateway provider are gone. Data only: no column, table
+    // or CHECK changes (the old CHECKs still admit 'codex'; the app refuses it). Versioned
+    // transaction: before commit ROLLBACK. After commit nothing to restore: the deleted rows were
+    // Codex resume pointers, the chain origins of Codex moves and quota marks of removed targets —
+    // no code reads them any more; history (delegations, usage) is untouched.
+    CODEX_REMOVAL,
 ];
+
+/// Migration 37. Agents still on Codex or the gateway move to Claude Code (anthropic,
+/// `CLAUDE_MID`, spelled out: a migration is frozen text — a test pins it); their transient chain
+/// state, Codex resume rows and Codex-move chain origins go; chain/news settings drop the removed ids;
+/// a waiting plan item or a job awaiting model approval on a removed route loses that request.
+const CODEX_REMOVAL: &str = "
+UPDATE agents SET engine = 'claude', provider = 'anthropic', model = 'claude-sonnet-5-5'
+  WHERE engine = 'codex' OR provider = 'gateway';
+UPDATE agents SET pending_engine = NULL, pending_provider = NULL, pending_model = NULL
+  WHERE pending_engine = 'codex' OR pending_provider = 'gateway';
+DELETE FROM agent_chain_origins
+  WHERE engine = 'codex' OR agent_id IN (SELECT id FROM agents WHERE active_engine = 'codex');
+UPDATE agents SET active_engine = NULL, active_provider = NULL, active_model = NULL, chain_return_pending = 0
+  WHERE active_engine = 'codex' OR active_provider = 'gateway';
+DELETE FROM agent_sessions WHERE engine = 'codex';
+DELETE FROM provider_exhausted WHERE provider IN ('codex', 'gateway');
+UPDATE settings SET value = (SELECT json_group_array(value) FROM
+    (SELECT value FROM json_each(settings.value) WHERE value NOT IN ('codex', 'gateway') ORDER BY key))
+  WHERE key IN ('chain_order', 'chain_disabled') AND json_valid(value) AND json_type(value) = 'array';
+UPDATE settings SET value = json_remove(value, '$.codex')
+  WHERE key = 'models_checked' AND json_valid(value) AND json_type(value) = 'object';
+UPDATE settings SET value = (SELECT json_group_array(value) FROM
+    (SELECT value FROM json_each(settings.value) WHERE value NOT LIKE 'codex:%' ORDER BY key))
+  WHERE key = 'models_seen' AND json_valid(value) AND json_type(value) = 'array';
+UPDATE plan_items SET model = NULL, model_reason = NULL, model_engine = NULL, model_provider = NULL
+  WHERE status IN ('waiting', 'blocked') AND (model_engine = 'codex' OR model_provider = 'gateway');
+UPDATE tasks SET status = 'todo' WHERE id IN (SELECT d.task_id FROM delegations d JOIN job_models j ON j.delegation_id = d.id
+  WHERE d.status = 'queued' AND d.model_approval = 'pending' AND (j.engine = 'codex' OR j.provider = 'gateway'));
+UPDATE delegations SET status = 'failed', summary = 'Codex/gateway kaldırıldı: model isteği geçersiz',
+    updated_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+  WHERE status = 'queued' AND model_approval = 'pending'
+    AND id IN (SELECT delegation_id FROM job_models WHERE engine = 'codex' OR provider = 'gateway');
+";
 
 const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_project_snapshot
     BEFORE UPDATE OF project_id,project_root,merge_branch,repo_key ON plan_items
@@ -424,6 +463,87 @@ const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_proje
 #[cfg(test)]
 mod job_model_migration_tests {
     use super::*;
+
+    #[test]
+    fn codex_removal_migration_moves_rows_to_claude_twice_and_clean_db() {
+        assert!(CODEX_REMOVAL.contains(&format!("model = '{}'", crate::providers::CLAUDE_MID)));
+        let mut c = Connection::open_in_memory().unwrap();
+        let before_version = MIGRATIONS.iter().position(|sql| *sql == CODEX_REMOVAL).unwrap();
+        for (i, sql) in MIGRATIONS[..before_version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch(r#"
+            UPDATE agents SET engine='codex', provider='glm', model='gpt-5.5' WHERE id='kaan';
+            UPDATE agents SET provider='gateway', model='gpt-gw' WHERE id='ayla';
+            UPDATE agents SET active_engine='codex', active_model='gpt-chain', chain_return_pending=1,
+                pending_engine='codex', pending_model='gpt-x' WHERE id='bora';
+            INSERT INTO agent_sessions(agent_id,session_id,engine,updated_at) VALUES('kaan','rollout-1','codex',1),('timur','claude-1','claude',1);
+            INSERT INTO agent_chain_origins(agent_id,engine,session_id) VALUES('bora','claude','c-origin'),('timur','claude','keep');
+            INSERT INTO provider_exhausted(provider,reset_at,reason) VALUES('codex',1,'kota'),('gateway',1,'kota'),('glm',1,'kota');
+            INSERT INTO settings(key,value) VALUES('chain_order','["glm","codex","anthropic","gateway","muse"]'),
+                ('chain_disabled','["codex","local"]'),('models_checked','{"codex":1,"glm":2}'),('models_seen','["codex:gpt-6","glm:glm-6"]');
+            INSERT INTO plans(id,team_id,leader,created_at,updated_at) VALUES(1,'default','timur',1,1);
+            INSERT INTO plan_items(plan_id,key,title,prompt,target,status,model,model_reason,model_engine,model_provider) VALUES
+                (1,'A','A','p','kaan','waiting','gpt-5.5','r','codex','codex'),
+                (1,'B','B','p','kaan','waiting','opus','r','claude','anthropic'),
+                (1,'C','C','p','kaan','done','gpt-5.5','r','codex','codex');
+            INSERT INTO tasks(id,title,status,created_at,updated_at,team_id) VALUES(7,'model job','doing',1,1,'default');
+            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at) VALUES(5,'default','timur','backend','gpt-5.5','codex','r',1);
+            INSERT INTO delegations(id,from_agent,to_agent,team_id,prompt,created_at,updated_at,task_id,model,model_approval)
+                VALUES(9,'timur','kaan','default','is',1,1,7,'gpt-5.5','pending'),(10,'timur','ayla','default','keep',1,1,NULL,NULL,NULL);
+            INSERT INTO job_models(delegation_id,proposal_id,engine,provider) VALUES(9,5,'codex','codex');
+        "#).unwrap();
+        let agent = |c: &Connection, id: &str| -> (String, String, String, Option<String>, Option<String>, i64) {
+            c.query_row("SELECT engine,provider,model,active_engine,pending_engine,chain_return_pending FROM agents WHERE id=?1", [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))).unwrap()
+        };
+        let setting = |c: &Connection, k: &str| -> String { c.query_row("SELECT value FROM settings WHERE key=?1", [k], |r| r.get(0)).unwrap() };
+        let count = |c: &Connection, sql: &str| -> i64 { c.query_row(sql, [], |r| r.get(0)).unwrap() };
+        let agents_before = count(&c, "SELECT COUNT(*) FROM agents");
+        migrate(&mut c).unwrap();
+        for run in 0..2 {
+            if run == 1 {
+                migrate(&mut c).unwrap();
+                c.execute_batch(CODEX_REMOVAL).unwrap();
+            }
+            let mid = crate::providers::CLAUDE_MID.to_string();
+            assert_eq!(agent(&c, "kaan"), ("claude".into(), "anthropic".into(), mid.clone(), None, None, 0));
+            assert_eq!(agent(&c, "ayla"), ("claude".into(), "anthropic".into(), mid, None, None, 0));
+            assert_eq!(agent(&c, "bora"), ("claude".into(), "anthropic".into(), "sonnet".into(), None, None, 0));
+            assert_eq!(agent(&c, "timur").2, "opus", "untouched");
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM agents"), agents_before);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM agent_sessions WHERE engine='codex'"), 0);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM agent_sessions WHERE agent_id='timur'"), 1);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM agent_chain_origins WHERE agent_id='bora'"), 0, "Codex move origin");
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM agent_chain_origins WHERE agent_id='timur'"), 1);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM provider_exhausted"), 1);
+            assert_eq!(setting(&c, "chain_order"), r#"["glm","anthropic","muse"]"#);
+            assert_eq!(setting(&c, "chain_disabled"), r#"["local"]"#);
+            assert_eq!(setting(&c, "models_checked"), r#"{"glm":2}"#);
+            assert_eq!(setting(&c, "models_seen"), r#"["glm:glm-6"]"#);
+            let item = |k: &str| -> (Option<String>, Option<String>) {
+                c.query_row("SELECT model,model_engine FROM plan_items WHERE key=?1", [k], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+            };
+            assert_eq!(item("A"), (None, None), "waiting Codex route dropped");
+            assert_eq!(item("B"), (Some("opus".into()), Some("claude".into())));
+            assert_eq!(item("C"), (Some("gpt-5.5".into()), Some("codex".into())), "history stays");
+            let job: (String, String) = c.query_row("SELECT status,model_approval FROM delegations WHERE id=9", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert_eq!(job, ("failed".into(), "rejected".into()));
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM member_proposals WHERE id=5 AND status='rejected'"), 1);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM tasks WHERE id=7 AND status='todo'"), 1);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM delegations WHERE id=10 AND status='queued'"), 1);
+            assert_eq!(count(&c, "SELECT COUNT(*) FROM pragma_foreign_key_check"), 0);
+        }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 {
+            migrate(&mut clean).unwrap();
+            clean.execute_batch(CODEX_REMOVAL).unwrap();
+        }
+        assert_eq!(count(&clean, "SELECT COUNT(*) FROM agents"), 0);
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+    }
 
     #[test]
     fn inbox_migration_is_additive_idempotent_and_keeps_pending_rows() {

@@ -116,7 +116,7 @@ pub fn label(tool: &str, input: &Value) -> String {
         "ExitPlanMode" | "EnterPlanMode" => "plan".to_string(),
         "AskUserQuestion" => "soru soruyor".to_string(),
         t if t.starts_with("mcp__") => mcp(t, input),
-        // Codex's names and anything new: only an identifier-shaped tool name is shown.
+        // Anything new: only an identifier-shaped tool name is shown.
         t => with("araç", ident(t)),
     };
     finish(&text)

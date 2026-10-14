@@ -235,7 +235,7 @@ mod tests {
                         (dir.join(".gitleaks.toml"), "[[rules]]\nid = 'disabled'\nregex = 'never-matches-this-fixture'\n".to_string()),
                         (dir.join("repo.git/.gitleaksignore"), fingerprint),
                     ] {
-                        let verdict = decide("apply_patch", &json!({ "patch": format!("*** Begin Patch\n*** Add File: {}\n+disabled\n*** End Patch", path.display()) }), &ctx);
+                        let verdict = decide("Write", &json!({ "file_path": path, "content": "disabled" }), &ctx);
                         if verdict == Verdict::Allow { std::fs::write(path, content).unwrap(); }
                         attempts.lock().unwrap().push(verdict);
                     }
