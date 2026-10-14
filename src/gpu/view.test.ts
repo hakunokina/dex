@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { configPatch, connectionLine, gpuStripCell, limitsPatch, modelGroups, parseBudget, waitingToastText, type GpuModel, type GpuOverview } from "./view.ts";
+import { budgetMax, budgetUnit, configPatch, connectionLine, gpuStripCell, limitsPatch, modelGroups, parseBudget, waitingToastText, type GpuModel, type GpuOverview } from "./view.ts";
 
 const o = (p: Partial<GpuOverview>): GpuOverview => ({
   tokenSet: true, connected: true, authorized: true, via: "primary", url: "http://10.0.0.1:8100",
@@ -49,6 +49,16 @@ test("parseBudget: broker limiti, boş ve bozuk değerler de sınırı aşamaz",
   assert.equal(parseBudget("500", 24, 300), 300);
   assert.equal(parseBudget("", 24, 8), 8);
   assert.equal(parseBudget("abc", 24, 8), 8);
+});
+
+test("budgetUnit: metin türü varsa metin, yoksa görsel; metin tavanı broker limitinden bağımsız", () => {
+  assert.equal(budgetUnit(["t2i"]), "görsel");
+  assert.equal(budgetUnit(["embedding"]), "metin");
+  assert.equal(budgetUnit(["t2i", "rerank"]), "metin");
+  assert.equal(budgetMax(120, ["embedding"]), 50000);
+  assert.equal(budgetMax(8, ["t2i"]), 8);
+  assert.equal(parseBudget("999999", 24, 120, ["embedding"]), 50000);
+  assert.equal(parseBudget("999999", 24, 120, ["t2i"]), 120);
 });
 
 test("limitsPatch: boş alan gönderilmez, pozitif tam sayı ve istek başına ≤4", () => {
