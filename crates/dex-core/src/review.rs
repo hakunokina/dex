@@ -249,6 +249,23 @@ pub(crate) fn record_with_content(conn: &Connection, d: &Delegation, summary: &s
         params![d.id, verdict, (!findings.is_empty()).then_some(findings)],
     )
     .map_err(e)?;
+    // Biten inceleme panoda "Sürüyor"da kalmaz.
+    finish_task(conn, d.id)?;
+    Ok(())
+}
+
+/// İnceleme devretmesi kapandı (raporlu, raporsuz ya da başarısız): bağlı pano görevi
+/// hâlâ `doing` ise `done` olur. İnceleme değilse ya da görev yoksa/silinmişse no-op.
+pub(crate) fn finish_task(conn: &Connection, review_id: i64) -> Result<(), String> {
+    if !is_review(conn, review_id)? {
+        return Ok(());
+    }
+    let task = delegate::get(conn, review_id)?.task_id;
+    let Some(task) = task else { return Ok(()) };
+    let Ok(t) = crate::db::tasks::get(conn, task) else { return Ok(()) };
+    if t.status == "doing" {
+        crate::db::tasks::update(conn, task, crate::db::tasks::TaskPatch { status: Some("done".into()), ..Default::default() })?;
+    }
     Ok(())
 }
 
@@ -278,10 +295,7 @@ pub fn open(conn: &Connection, target: &Delegation, w: &Wt, sha: &str, team: &st
     // projects would need one) nor the team's project of today. Resolved before any write.
     let context = delegate::resolve_context(conn, std::path::Path::new(""), &leader, None, Some(target.id))?;
     let prompt = prompt(conn, target, w, sha, team)?;
-    let title = match target.task_id.and_then(|t| crate::db::tasks::get(conn, t).ok()) {
-        Some(t) => format!("İnceleme #{}: {}", target.id, t.title),
-        None => format!("İnceleme #{}: {}", target.id, first_line(&target.prompt, 80)),
-    };
+    let title = review_title(conn, target);
     // Board task, review job and its record land together or not at all.
     let tx = conn.unchecked_transaction().map_err(e)?;
     let conn = &tx;
@@ -321,9 +335,49 @@ pub fn open(conn: &Connection, target: &Delegation, w: &Wt, sha: &str, team: &st
     Ok(Opened::Started(d))
 }
 
-fn first_line(s: &str, max: usize) -> String {
-    let l = s.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
-    let l = l.trim_start_matches('#').trim();
+/// İnceleme kartının başlığı: incelenen işin pano görev başlığı, yoksa plan/delegate
+/// `title`'ı, o da yoksa istemin ilk ANLAMLI satırı. Numara her durumda baştadır.
+pub(crate) fn review_title(conn: &Connection, target: &Delegation) -> String {
+    let name = target
+        .task_id
+        .and_then(|t| crate::db::tasks::get(conn, t).ok())
+        .map(|t| t.title)
+        .or_else(|| plan_item_title(conn, target.id))
+        .unwrap_or_else(|| first_meaningful_line(&target.prompt, 80));
+    format!("İnceleme #{}: {}", target.id, name)
+}
+
+/// İncelenen devretmeyi başlatan plan öğesinin `title`'ı (planlı işler).
+fn plan_item_title(conn: &Connection, delegation: i64) -> Option<String> {
+    conn.query_row("SELECT title FROM plan_items WHERE delegation_id = ?1 ORDER BY id DESC LIMIT 1", [delegation], |r| {
+        r.get::<_, String>(0)
+    })
+    .ok()
+}
+
+/// İstemden ilk anlamlı satır: boş satırlar, markdown başlıkları (`#`, `## Amaç` gibi
+/// biçim başlıkları) ve "Patronun sözü" satırı atlanır. Bulunamazsa boş döner.
+fn first_meaningful_line(s: &str, max: usize) -> String {
+    let l = s
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            if l.is_empty() {
+                return false;
+            }
+            let low = l.to_lowercase();
+            if low.contains("patronun sözü") {
+                return false;
+            }
+            let bare = l.trim_start_matches('#').trim();
+            // `#…` başlığı ya da `#` kırpılınca boşalan satır (örn. `##`).
+            if bare.len() != l.len() || bare.is_empty() {
+                return false;
+            }
+            true
+        })
+        .next()
+        .unwrap_or("");
     if l.chars().count() > max { l.chars().take(max).collect::<String>() + "…" } else { l.to_string() }
 }
 
@@ -466,6 +520,97 @@ mod tests {
             (assigned.id, assigned.to_agent.as_str()),
             (review.id, "ayla")
         );
+    }
+
+    #[test]
+    fn finished_review_closes_its_board_task_and_titles_from_the_job() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        c.execute("UPDATE agents SET role_slug=?1 WHERE id='ayla'", [ROLE]).unwrap();
+        let lead = delegate::caller(&c, "timur").unwrap();
+        let task = crate::db::tasks::create(
+            &c,
+            crate::db::tasks::NewTask {
+                title: "Gerçek iş adı".into(),
+                description: String::new(),
+                status: None,
+                agent_id: None,
+                team_id: Some("default".into()),
+            },
+        )
+        .unwrap();
+        let target = delegate::insert(
+            &c,
+            delegate::NewDelegation {
+                from: &lead,
+                to_agent: "kaan".into(),
+                team_id: "default".into(),
+                service_team_id: None,
+                prompt: "## Amaç\nGerçek iş adı\nayrıntı".into(),
+                task_id: Some(task.id),
+                patron_words: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+        delegate::set_status(&c, target.id, "done").unwrap();
+        let w = Wt {
+            delegation_id: target.id,
+            agent_id: "kaan".into(),
+            root: std::path::PathBuf::new(),
+            path: std::path::PathBuf::new(),
+            branch: "dex/kaan/1".into(),
+            base: "base".into(),
+            junction: false,
+            merged_at: None,
+            removed_at: None,
+            merge_branch: None,
+        };
+        let Opened::Started(review) = open(&c, &target, &w, "abc12345", "team").unwrap() else {
+            panic!("review not opened")
+        };
+        let rt = crate::db::tasks::get(&c, review.task_id.unwrap()).unwrap();
+        assert_eq!(rt.title, format!("İnceleme #{}: Gerçek iş adı", target.id));
+        assert_eq!(rt.status, "doing");
+        let lens = delegate::caller(&c, "ayla").unwrap();
+        delegate::report(&c, &lens, review.id, "karar: onay\n## önemli\nyok\n", None).unwrap();
+        assert_eq!(crate::db::tasks::get(&c, rt.id).unwrap().status, "done");
+        assert_eq!(get(&c, review.id).unwrap().unwrap().verdict.as_deref(), Some("onay"));
+    }
+
+    #[test]
+    fn review_title_skips_format_headings_and_falls_back_to_plan_title() {
+        assert_eq!(first_meaningful_line("## Amaç\n\n# Başlık\n  \nson satır", 80), "son satır");
+        assert_eq!(first_meaningful_line("## Patronun sözü\nbi şey yap\n\n## Liderin açıklaması\nasıl iş", 80), "bi şey yap");
+        assert_eq!(first_meaningful_line("## Amaç", 80), "");
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        c.execute("UPDATE agents SET role_slug=?1 WHERE id='ayla'", [ROLE]).unwrap();
+        let lead = delegate::caller(&c, "timur").unwrap();
+        let target = delegate::insert(
+            &c,
+            delegate::NewDelegation {
+                from: &lead,
+                to_agent: "kaan".into(),
+                team_id: "default".into(),
+                service_team_id: None,
+                prompt: "## Amaç\nPlanlı işin satırı".into(),
+                task_id: None,
+                patron_words: None,
+                effort: None,
+            },
+        )
+        .unwrap();
+        c.execute("INSERT INTO plans(team_id,leader,title,status,created_at,updated_at) VALUES('default','timur','p','active',1,1)", [])
+            .unwrap();
+        c.execute(
+            "INSERT INTO plan_items(plan_id,key,title,prompt,target,depends_on,status,delegation_id) VALUES(1,'A','Plan iş başlığı','p','kaan','[]','running',?1)",
+            [target.id],
+        )
+        .unwrap();
+        // Plan başlığı, istemin ilk anlamlı satırından önce gelir.
+        assert_eq!(review_title(&c, &target), format!("İnceleme #{}: Plan iş başlığı", target.id));
+        c.execute("DELETE FROM plan_items", []).unwrap();
+        // Biçim başlıkları atlanır: "## Amaç" değil, altındaki satır.
+        assert_eq!(review_title(&c, &target), format!("İnceleme #{}: Planlı işin satırı", target.id));
     }
 
     #[test]
