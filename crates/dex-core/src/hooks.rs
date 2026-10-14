@@ -85,7 +85,7 @@ pub(crate) fn turn_ended(core: &Core, agent: &str, event: &str) {
     after_turn_ended(core, agent, event, &state);
 }
 
-/// Also used after an atomic, turn-matched rollout completion has already set Idle.
+/// Also used after an atomic, turn-matched transcript completion has already set Idle.
 pub(crate) fn after_turn_ended(core: &Core, agent: &str, event: &str, state: &crate::agents::State) {
     if matches!(event, "Stop" | "Settled") {
         let _ = core.team_turn_ended(state);

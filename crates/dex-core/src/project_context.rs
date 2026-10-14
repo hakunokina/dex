@@ -14,7 +14,6 @@ pub enum ContextMode {
     Team,
     /// Resume the saved binding; pre-project sessions use the legacy team context.
     Session,
-    ChainOrigin,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct ResolveRequest<'a> {
@@ -93,18 +92,10 @@ pub fn resolve(
     } else {
         None
     };
-    let saved: Option<Session> = if matches!(
-        request.mode,
-        ContextMode::Session | ContextMode::ChainOrigin
-    ) {
+    let saved: Option<Session> = if request.mode == ContextMode::Session {
         if let Some(id) = request.agent_id {
-            let table = if request.mode == ContextMode::Session {
-                "agent_sessions"
-            } else {
-                "agent_chain_origins"
-            };
             conn.query_row(
-                &format!("SELECT project_id,delegation_id,cwd FROM {table} WHERE agent_id=?1"),
+                "SELECT project_id,delegation_id,cwd FROM agent_sessions WHERE agent_id=?1",
                 [id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -527,21 +518,18 @@ mod tests {
             crate::slug::agent(&c, &worker.id).unwrap()
         )));
         c.execute("INSERT INTO agent_sessions(agent_id,session_id,engine,updated_at,project_id,delegation_id,cwd) VALUES(?1,'s','claude',1,?2,1,?3)",rusqlite::params![worker.id,p.id,ctx.cwd.to_string_lossy()]).unwrap();
-        c.execute("INSERT INTO agent_chain_origins(agent_id,engine,project_id,delegation_id,cwd) VALUES(?1,'claude',?2,1,?3)",rusqlite::params![worker.id,p.id,ctx.cwd.to_string_lossy()]).unwrap();
-        for mode in [ContextMode::Session, ContextMode::ChainOrigin] {
-            let resumed = resolve(
-                &c,
-                &f.0,
-                ResolveRequest {
-                    delegation_id: None,
-                    mode,
-                    ..req
-                },
-            )
-            .unwrap();
-            assert_eq!(resumed.project_id, ctx.project_id);
-            assert_eq!(resumed.cwd, ctx.cwd);
-        }
+        let resumed = resolve(
+            &c,
+            &f.0,
+            ResolveRequest {
+                delegation_id: None,
+                mode: ContextMode::Session,
+                ..req
+            },
+        )
+        .unwrap();
+        assert_eq!(resumed.project_id, ctx.project_id);
+        assert_eq!(resumed.cwd, ctx.cwd);
         assert_eq!(
             resolve(
                 &c,
