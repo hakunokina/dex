@@ -419,6 +419,9 @@ const MIGRATIONS: &[&str] = &[
     // Codex resume pointers, the chain origins of Codex moves and quota marks of removed targets —
     // no code reads them any more; history (delegations, usage) is untouched.
     CODEX_REMOVAL,
+    // 38 (#1718): share replies + FCM device tokens, both host-only. Additive, IF NOT EXISTS.
+    // Before commit: ROLLBACK. After commit: keep the tables; revert only the application.
+    crate::inbox_reply::SCHEMA,
 ];
 
 /// Migration 37. Agents still on Codex or the gateway move to Claude Code (anthropic,

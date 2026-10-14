@@ -21,6 +21,7 @@ mod claude_turn;
 mod team_turn;
 pub mod instance;
 pub mod inbox;
+pub mod inbox_reply;
 pub mod layout;
 pub mod leader_reset;
 pub mod mcp;
@@ -34,6 +35,7 @@ pub mod permit;
 pub mod plan;
 pub mod proc;
 pub mod proposals;
+pub mod push;
 pub mod projects;
 pub mod project_context;
 pub mod providers;
@@ -109,6 +111,9 @@ pub struct Core {
     /// Per-agent paste transaction: readiness through the final Enter, shared by chat/inbox.
     delivery_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     inbox_gate: Mutex<()>,
+    /// #1718: share turns awaiting their final answer; FCM token cache.
+    inbox_marks: inbox_reply::Marks,
+    pub(crate) push: push::Push,
     /// Görev #12: workers with a pending queue retry — at most one live retry thread per worker.
     /// #18: keyed to the thread's generation; a newer retry makes an older sleeping thread stale.
     queue_retry: Mutex<HashMap<String, u64>>,
@@ -221,6 +226,8 @@ impl Core {
             chat_watches: chat::Watches::default(),
             chat_queues: Mutex::default(),
             inbox_gate: Mutex::default(),
+            inbox_marks: inbox_reply::Marks::default(),
+            push: push::Push::default(),
             delivery_gates: Mutex::default(),
             queue_retry: Mutex::default(),
             turns: delegate::Turns::default(),
@@ -285,6 +292,8 @@ impl Core {
             }
         });
         core.inbox_resume()?;
+        core.inbox_reply_resume()?;
+        core.push_status_line();
         hooks::accept(listener, core.clone());
         Ok(core)
     }
@@ -467,6 +476,7 @@ impl Core {
         }
         // S5-B: a Stop that continued nothing ends the turn — the chat queue goes in.
         if event == "Stop" && !is_blocked(&out) {
+            self.inbox_reply_on_stop(agent, body["last_assistant_message"].as_str());
             self.chat_on_stop(agent);
             self.delegation_idle(agent, true);
         }
