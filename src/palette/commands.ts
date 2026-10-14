@@ -1,5 +1,4 @@
 // Palette commands (DEX-6). Built fresh on every render from the team store + live run state.
-import { hostOf } from "../api/hosts";
 import { getStatus } from "../agents";
 import { STALL_CHOICES, setStallMinutes, stallMinutes } from "../stall";
 import { createTask } from "../board/api";
@@ -9,7 +8,7 @@ import { requestStart, startAgent } from "../launcher";
 import { killPty } from "../pty";
 import { getTeamsSnapshot, selectTeam, setWorkersModel } from "../team/store";
 import { openTeamMenu } from "../team/TeamBar";
-import { listCodexModels, type AgentRec } from "../team/api";
+import type { AgentRec } from "../team/api";
 import { leaveTerminal } from "../termKeys";
 import type { Group, Rankable } from "./rank";
 
@@ -138,19 +137,7 @@ export function buildCommands(bridge: Bridge): Command[] {
     { id: "team.panel", title: "Takım paneli", hint: `Takım · ${teamName(activeId)}`, keywords: "takım ayarları üyeler settings", run: () => openTeamMenu("team") },
     // Hafıza haritası (Kademe 1, salt okuma): Kart araç çubuğundaki düğmeyle aynı panel.
     { id: "memory.open", title: "Hafıza haritasını aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "hafıza memory harita graph obsidyen", run: () => void openPanel(activeId, "memory"), restoreFocus: true },
-    // DEX-30: bulk engine switch for the active team's workers (leaders stay); running ones wait.
-    {
-      id: "workers.codex",
-      title: "Worker'ları Codex yap",
-      hint: `Takım · ${teamName(activeId)}`,
-      keywords: "motor engine codex model toplu hepsi",
-      restoreFocus: true,
-      run: async () => {
-        const model = (await listCodexModels(hostOf(activeId)).catch(() => []))[0]?.id;
-        if (!model) throw new Error("Codex model listesi alınamadı — Codex CLI kurulu ve giriş yapılmış mı?");
-        await setWorkersModel(activeId, { engine: "codex", model });
-      },
-    },
+    // DEX-30: bulk model switch for the active team's workers (leaders stay); running ones wait.
     {
       id: "workers.claude",
       title: "Worker'ları Claude yap",

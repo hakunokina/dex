@@ -56,7 +56,7 @@ export interface AgentRec {
   skin: string;
   sort: number;
   provider: string;
-  /** DEX-26: `claude` | `codex`. */
+  /** DEX-26: the CLI the agent runs; only `claude` since #1710. */
   engine: string;
   /** DEX-30: bulk change waiting for the running session to end. */
   pending: PendingModel | null;
@@ -167,7 +167,7 @@ export interface TeamMemberTemplate {
   title?: string;
   model: string;
   provider?: string | null;
-  engine?: "claude" | "codex" | null;
+  engine?: "claude" | null;
   roleSlug?: string | null;
   chainOff?: boolean;
   effort?: null;
@@ -254,10 +254,6 @@ export function teamViewed(id: string, viewed: boolean) {
     throw err;
   });
 }
-
-/** DEX-26: engines an agent can run; codex models come live from the codex login. */
-export const ENGINES = [{ id: "claude", label: "Claude Code" }, { id: "codex", label: "Codex" }];
-export const listCodexModels = (host: string) => callHost<ProviderModel[]>(host, "codex_models");
 
 /** The catalog ships with the build; the local core's copy stands for every host. */
 export const listRoles = () => callHost<Role[]>(LOCAL, "role_list");

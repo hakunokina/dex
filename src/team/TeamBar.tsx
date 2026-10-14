@@ -11,9 +11,9 @@ import { FolderPreview } from "./FolderPreview";
 import { useTeamProjects } from "../project/store";
 import { getStatus } from "../agents";
 import {
-  DEFAULT_WORKER_ROLES, ENGINES, importProviders, listCodexModels, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
+  DEFAULT_WORKER_ROLES, importProviders, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
   setProviderToken, teamDeleteInfo, teamCloneTemplate, supportsEducation,
-  type AgentKind, type LocalStatus, type PendingModel, type ProviderImportRow, type ProviderInfo, type ProviderModel, type Role,
+  type AgentKind, type LocalStatus, type PendingModel, type ProviderImportRow, type ProviderInfo, type Role,
   type TeamKind, type TeamProfile, type TeamCloneTemplate,
 } from "./api";
 import {
@@ -27,8 +27,6 @@ import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../
 import { isActive } from "../layout/rackOrder";
 import { teamAccent } from "./accent";
 import { providerModels } from "./providerModels";
-import { openSettings } from "../layout/panels";
-import { onGatewayCatalogChanged } from "../settings/gatewayApi";
 import { TestLevelToggle } from "./TestLevelToggle";
 import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 
@@ -36,11 +34,6 @@ import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 function withLocalModels(providers: ProviderInfo[], st: LocalStatus | null): ProviderInfo[] {
   if (!st) return providers;
   return providers.map((p) => p.id === "local" ? { ...p, models: st.models.map((m) => ({ id: m.id, label: m.id })) } : p);
-}
-/** DEX-26: a codex agent picks from the codex login's live catalog; its provider is not used. */
-function engineModels(codex: ProviderModel[], providers: ProviderInfo[], engine: string, provider: string | null | undefined, current?: string): ProviderModel[] {
-  if (engine !== "codex") return providerModels(providers, provider, current);
-  return current && !codex.some((m) => m.id === current) ? [...codex, { id: current, label: `${current} (listede yok)` }] : codex;
 }
 
 /** Re-render periodically: run state lives outside React (hooks → agents.ts). */
@@ -250,7 +243,6 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
   const formRef = useRef<HTMLFormElement>(null);
   const [returnFocus] = useState(() => document.activeElement as HTMLElement | null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
-  const [codexModels, setCodexModels] = useState<ProviderModel[]>([]);
   useEffect(() => {
     return () => { if (returnFocus?.isConnected) returnFocus.focus(); };
   }, [returnFocus]);
@@ -270,12 +262,12 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
     if (!sourceId) return;
     let live = true;
     setCatalogLoading(true); setCatalogError(null);
-    void Promise.all([listProviders(host).then(async ps => {
+    void listProviders(host).then(async ps => {
       const lp = ps.find(p => p.id === "local");
       const st = lp?.baseUrl && lp.hasToken ? await localStatus(host).catch(() => null) : null;
       return withLocalModels(ps, st);
-    }), listCodexModels(host)]).then(([ps, ms]) => {
-      if (live) { setProviders(ps); setCodexModels(ms); setCatalogLoading(false); }
+    }).then(ps => {
+      if (live) { setProviders(ps); setCatalogLoading(false); }
     }, e => { if (live) { setCatalogError(`Model kataloğu alınamadı: ${String(e)}`); setCatalogLoading(false); } });
     return () => { live = false; };
   }, [host, sourceId, catalogRetry]);
@@ -370,17 +362,13 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
             <legend>Üye {i + 1} · {m.kind === "leader" ? "lider" : "worker"}</legend>
             <label>Ad<input aria-label={`Üye ${i + 1} adı`} value={m.name} onChange={e => update({ name: e.target.value })} /></label>
             <label>Rol<RoleSelect profile={template.profile} label={`Üye ${i + 1} rolü`} value={m.roleSlug ?? ""} onChange={roleSlug => update({ roleSlug, title: "" })} /></label>
-            <label>Motor<select aria-label={`Üye ${i + 1} motoru`} value={m.engine ?? "claude"} onChange={e => {
-              const engine = e.target.value as "claude" | "codex";
-              update({ engine, model: engineModels(codexModels, providers, engine, m.provider)[0]?.id ?? "" });
-            }}>{ENGINES.map(x => <option key={x.id} value={x.id}>{x.label}</option>)}</select></label>
-            {m.engine !== "codex" && <label>Sağlayıcı<select aria-label={`Üye ${i + 1} sağlayıcısı`} value={m.provider ?? "anthropic"} onChange={e => update({ provider: e.target.value, model: providerModels(providers, e.target.value)[0]?.id ?? "" })}>
+            <label>Sağlayıcı<select aria-label={`Üye ${i + 1} sağlayıcısı`} value={m.provider ?? "anthropic"} onChange={e => update({ provider: e.target.value, model: providerModels(providers, e.target.value)[0]?.id ?? "" })}>
               {!providers.some(p => p.id === (m.provider ?? "anthropic")) && <option value={m.provider ?? "anthropic"}>{m.provider ?? "anthropic"}</option>}
               {providers.map(p => <option key={p.id} value={p.id}>{p.label}</option>)}
-            </select></label>}
+            </select></label>
             <label>Model<select aria-label={`Üye ${i + 1} modeli`} value={m.model} onChange={e => update({ model: e.target.value })}>
               {!m.model && <option value="">Model seç</option>}
-              {engineModels(codexModels, providers, m.engine ?? "claude", m.provider, m.model).map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
+              {providerModels(providers, m.provider, m.model).map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
             </select></label>
           </fieldset>;
         })}
@@ -431,16 +419,12 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
   const [role, setRole] = useState(team?.profile === "edu" ? "visual-explainer" : "frontend");
   const [model, setModel] = useState<string>("claude-sonnet-5-5");
   const [provider, setProvider] = useState("anthropic");
-  const [engine, setEngine] = useState("claude");
-  const [codexModels, setCodexModels] = useState<ProviderModel[]>([]);
   // S4: models, providers and tokens are the team's host's (a remote team → its server).
   const host = team?.host ?? LOCAL;
-  useEffect(() => { void listCodexModels(host).then(setCodexModels, () => setCodexModels([])); }, [host]);
-  /** Engine switch sends engine+model together (like provider): the model must fit the engine. */
-  const firstModel = (eng: string, prov: string) => {
-    if (eng !== "codex" && prov === "gateway" && !providers.find(p => p.id === prov)?.hasToken) throw new Error("ChatGPT girişi yok — Ayarlar → Sağlayıcılar’dan giriş yapın");
-    const m = engineModels(codexModels, providers, eng, prov)[0]?.id;
-    if (!m) throw new Error(eng === "codex" ? "Codex model listesi alınamadı — Codex CLI kurulu ve giriş yapılmış mı?" : "Model listesi boş");
+  /** Provider switch sends provider+model together: the model must fit the provider. */
+  const firstModel = (prov: string) => {
+    const m = providerModels(providers, prov)[0]?.id;
+    if (!m) throw new Error("Model listesi boş");
     return m;
   };
   const [baseProviders, setProviders] = useState<ProviderInfo[]>([]);  const [local, setLocal] = useState<LocalStatus | null>(null);
@@ -465,13 +449,11 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
     const off = onEvent("providers-changed", (_, eventHost) => {
       if (eventHost === host) void reloadProviders();
     });
-    const offCatalog = onGatewayCatalogChanged(eventHost => { if (eventHost === host) void reloadProviders(); });
-    return () => { off(); offCatalog(); providerRequest.current++; };
+    return () => { off(); providerRequest.current++; };
   }, [host]);
   const providers = withLocalModels(baseProviders, local);
-  const newModels = engineModels(codexModels, providers, engine, provider);
+  const newModels = providerModels(providers, provider);
   const chosenNewModel = newModels.some(m => m.id === model) ? model : newModels[0]?.id ?? "";
-  const newGatewayUnavailable = engine !== "codex" && provider === "gateway" && !providers.find(p => p.id === "gateway")?.hasToken;
   const projects = useTeamProjects(teamId);
   useTick();
 
@@ -487,10 +469,10 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
 
   async function add(e: React.FormEvent) {
     e.preventDefault();
-    if (!chosenNewModel || newGatewayUnavailable) return;
+    if (!chosenNewModel) return;
     await run(async () => {
       if (role === "assistant" && assistantTaken(membersOf(teamId))) throw new Error("Takımda zaten bir asistan var");
-      await addAgent({ teamId, name, kind, model: chosenNewModel, provider, roleSlug: role, engine });
+      await addAgent({ teamId, name, kind, model: chosenNewModel, provider, roleSlug: role });
       setName("");
     });
   }
@@ -532,16 +514,16 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
 
       {hostSupports(host, "team_clone_template") && <button type="button" onClick={() => void openTeamMenu("new", host, team.id).catch(e => setError(String(e)))}>Takımı kopyala</button>}
 
-      <WorkersBulk teamId={team.id} providers={providers} codexModels={codexModels} />
+      <WorkersBulk teamId={team.id} providers={providers} />
 
       <table className="team-members">
         <thead>
-          <tr><th>Ad</th><th>Rol</th><th>Motor</th><th>Sağlayıcı</th><th>Model</th><th>Zincir</th><th /></tr>
+          <tr><th>Ad</th><th>Rol</th><th>Sağlayıcı</th><th>Model</th><th>Zincir</th><th /></tr>
         </thead>
         <tbody>
           {members.map((a) => {
             const busy = isRunning(a.id);
-            const activeTarget = a.activeEngine === "codex" ? "Codex" : a.activeProvider ? labelOf(providers, a.activeProvider) : null;
+            const activeTarget = a.activeProvider ? labelOf(providers, a.activeProvider) : null;
             const originalProvider = labelOf(providers, a.provider);
             return (
               <tr key={a.id} className={a.kind === "leader" ? "is-leader" : undefined}>
@@ -554,31 +536,20 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
                       return patchAgent(a.id, { roleSlug: v });
                     })} />
                 </td>
-                <td data-label="Motor">
-                  <select value={a.engine || "claude"} disabled={busy} aria-label={`${a.name} motoru`}
-                    onChange={(e) => {
-                      const eng = e.target.value;
-                      run(async () => patchAgent(a.id, { engine: eng, model: firstModel(eng, a.provider) }));
-                    }}>
-                    {ENGINES.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
-                  </select>
-                </td>
                 {/* DEX-13: provider switch sends provider+model together — the pair must stay catalog-valid. */}
                 <td data-label="Sağlayıcı">
-                  {a.engine === "codex" ? <span title="Codex kendi girişiyle çalışır; sağlayıcı yönlendirmesi yalnız Claude Code'da">—</span> : (
                   <select value={a.provider || "anthropic"} disabled={busy} aria-label={`${a.name} sağlayıcısı`}
                     onChange={(e) => {
                       const p = e.target.value;
-                      run(() => patchAgent(a.id, { provider: p, model: firstModel("claude", p) }));
+                      run(() => patchAgent(a.id, { provider: p, model: firstModel(p) }));
                     }}>
-                    {providers.map((p) => <option key={p.id} value={p.id} disabled={p.id === "gateway" && (!p.hasToken || !p.models.length)}>{p.label}</option>)}
+                    {providers.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
                   </select>
-                  )}
                 </td>
                 <td data-label="Model">
-                  <select value={a.model} disabled={busy || (a.engine !== "codex" && a.provider === "gateway" && !providers.find(p => p.id === "gateway")?.hasToken)} aria-label={`${a.name} modeli`}
+                  <select value={a.model} disabled={busy} aria-label={`${a.name} modeli`}
                     onChange={(e) => run(() => patchAgent(a.id, { model: e.target.value }))}>
-                    {engineModels(codexModels, providers, a.engine, a.provider, a.model).map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
+                    {providerModels(providers, a.provider, a.model).map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
                   </select>
                   {a.pending && (
                     <span className="team-pending" title={`Oturum kapanınca: ${pendingText(a.pending, providers)}`}>bekliyor</span>
@@ -586,26 +557,20 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
                 </td>
                 {/* DEX-17: zincir — ajan başına aç/kapa; geçici sağlayıcı rozeti + "geri dön". */}
                 <td data-label="Zincir">
-                  {a.engine === "codex" ? (
-                    <span title="Codex motorunda StopFailure yok — zincir kapsamı dışında">—</span>
-                  ) : (
-                    <>
-                      <button className="icon-btn" title={a.chainOff ? "Zinciri aç" : "Zinciri kapat (bu ajan limitte bekler)"}
-                        aria-label={`${a.name} zinciri ${a.chainOff ? "kapalı" : "açık"}`}
-                        onClick={() => run(() => setAgentChain(a.id, !a.chainOff))}>
-                        {a.chainOff ? "⛓️‍💥" : "⛓️"}
-                      </button>
-                      {activeTarget && (
-                        <span className="team-pending" title={`Asıl sağlayıcı: ${originalProvider}. Zincirle geçici: ${activeTarget}`}>
-                          →{activeTarget}{" "}
-                          {a.chainReturnReady ? (
-                            <button className="icon-btn" title={`${originalProvider} yeniden kullanılabilir — geri dön`}
-                              aria-label={`${a.name} asıl sağlayıcıya dön`}
-                              onClick={() => run(() => chainBack(a.id))}>↩</button>
-                          ) : <span title={`${originalProvider} sıfırlanma saati bekleniyor`}>⏱</span>}
-                        </span>
-                      )}
-                    </>
+                  <button className="icon-btn" title={a.chainOff ? "Zinciri aç" : "Zinciri kapat (bu ajan limitte bekler)"}
+                    aria-label={`${a.name} zinciri ${a.chainOff ? "kapalı" : "açık"}`}
+                    onClick={() => run(() => setAgentChain(a.id, !a.chainOff))}>
+                    {a.chainOff ? "⛓️‍💥" : "⛓️"}
+                  </button>
+                  {activeTarget && (
+                    <span className="team-pending" title={`Asıl sağlayıcı: ${originalProvider}. Zincirle geçici: ${activeTarget}`}>
+                      →{activeTarget}{" "}
+                      {a.chainReturnReady ? (
+                        <button className="icon-btn" title={`${originalProvider} yeniden kullanılabilir — geri dön`}
+                          aria-label={`${a.name} asıl sağlayıcıya dön`}
+                          onClick={() => run(() => chainBack(a.id))}>↩</button>
+                      ) : <span title={`${originalProvider} sıfırlanma saati bekleniyor`}>⏱</span>}
+                    </span>
                   )}
                 </td>
                 <td data-label="İşlem">
@@ -631,29 +596,19 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
         </select>
         <RoleSelect profile={team.profile} value={role} onChange={setRole} label="Yeni üyenin rolü"
           allowAssistant={kind === "worker"} assistantUnavailable={assistantTaken(members)} />
-        <select value={engine} aria-label="Yeni üyenin motoru"
-          onChange={(e) => {
-            setEngine(e.target.value);
-            setModel(engineModels(codexModels, providers, e.target.value, provider)[0]?.id ?? "");
-          }}>
-          {ENGINES.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
-        </select>
-        {engine !== "codex" && <select value={provider} aria-label="Yeni üyenin sağlayıcısı"
+        <select value={provider} aria-label="Yeni üyenin sağlayıcısı"
           onChange={(e) => {
             setProvider(e.target.value);
             setModel(providerModels(providers, e.target.value)[0]?.id ?? "");
           }}>
           {providers.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-        </select>}
+        </select>
         <select value={chosenNewModel} disabled={!newModels.length} aria-label="Yeni üyenin modeli" onChange={(e) => setModel(e.target.value)}>
           {newModels.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
         </select>
-        <button type="submit" className="primary" disabled={!chosenNewModel || newGatewayUnavailable || role === "assistant" && assistantTaken(members)}>Ekle</button>
+        <button type="submit" className="primary" disabled={!chosenNewModel || role === "assistant" && assistantTaken(members)}>Ekle</button>
       </form>
       {role === "assistant" && assistantTaken(members) && <p className="team-warn" role="status">Takımda zaten bir asistan var</p>}
-      {engine !== "codex" && provider === "gateway" && (newGatewayUnavailable || !newModels.length) && <p className="team-warn" role="status">
-        {newGatewayUnavailable ? "ChatGPT girişi yok — Ayarlar → Sağlayıcılar’dan giriş yapın" : "Hesabın model listesi boş — Ayarlar → Sağlayıcılar’dan durumu yenileyin"}
-      </p>}
 
       <ProviderSettings host={host} providers={providers} reload={reloadProviders} local={local} setLocal={setLocal} />
       {providerError && <p className="team-err" role="alert">{providerError}</p>}
@@ -729,10 +684,9 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
 }
 
 /** DEX-30: DEX-13's wording — without a token the session fails at start, so say it before. */
-function tokenWarning(providers: ProviderInfo[], engine: string, provider: string): string | null {
-  if (engine === "codex" || provider === "anthropic") return null;
+function tokenWarning(providers: ProviderInfo[], provider: string): string | null {
+  if (provider === "anthropic") return null;
   const p = providers.find((x) => x.id === provider);
-  if (provider === "gateway" && !p?.hasToken) return "ChatGPT girişi yok — Ayarlar → Sağlayıcılar’dan giriş yapın";
   return p && !p.hasToken ? `${p.label} jetonu yok — Takım → Sağlayıcılar'dan içe aktar ya da gir` : null;
 }
 
@@ -741,39 +695,33 @@ function labelOf(providers: ProviderInfo[], id: string): string {
   return providers.find((x) => x.id === id)?.label ?? id;
 }
 
-function pendingText(p: PendingModel, providers: ProviderInfo[]): string {  const engine = ENGINES.find((e) => e.id === p.engine)?.label ?? p.engine;
-  if (p.engine === "codex") return `${engine} · ${p.model}`;
+function pendingText(p: PendingModel, providers: ProviderInfo[]): string {
   const prov = providers.find((x) => x.id === (p.provider || "anthropic"))?.label ?? p.provider;
-  return `${engine} · ${prov} · ${p.model}`;
+  return `${prov} · ${p.model}`;
 }
 
 const RESTART_CONFIRM = (n: number) =>
   `${n} çalışan worker durdurulup yeni ayarla yeniden başlatılsın mı?\n\n` +
-  "Motoru değişenler (Claude ↔ Codex) YENİ oturumla açılır: önceki konuşma bağlamı taşınmaz — " +
-  "iki motorun oturum kayıtları birbirine aktarılamaz. Yalnız model/sağlayıcısı değişenler aynı oturumu yeni modelle sürdürür.\n" +
+  "Model/sağlayıcısı değişenler aynı oturumu yeni modelle sürdürür.\n" +
   "Yarıdaki devredilmiş işleri raporsuz kapanır; lider bunu görür.";
 
-/** DEX-30: one engine/provider/model for every worker of the team; leaders are never touched. */
-function WorkersBulk({ teamId, providers, codexModels }: {
+/** DEX-30: one provider/model for every worker of the team; leaders are never touched. */
+function WorkersBulk({ teamId, providers }: {
   teamId: string;
   providers: ProviderInfo[];
-  codexModels: ProviderModel[];
 }) {
-  const [engine, setEngine] = useState("claude");
   const [provider, setProvider] = useState("anthropic");
   const [model, setModel] = useState("claude-sonnet-5-5");
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const models = engineModels(codexModels, providers, engine, provider);
+  const models = providerModels(providers, provider);
   // The list can change under the choice (live catalogs); never send a model it doesn't hold.
   const chosen = models.some((m) => m.id === model) ? model : models[0]?.id ?? "";
   const workers = membersOf(teamId).filter((a) => a.kind === "worker" && isAssignable(a));
   const waiting = workers.filter((a) => a.pending && isRunning(a.id));
-  const warn = tokenWarning(providers, engine, provider);
-  const noModels = !chosen
-    ? engine === "codex" ? "Codex model listesi alınamadı — Codex CLI kurulu ve giriş yapılmış mı?" : "Bu sağlayıcının model listesi boş"
-    : null;
+  const warn = tokenWarning(providers, provider);
+  const noModels = !chosen ? "Bu sağlayıcının model listesi boş" : null;
 
   const act = async (f: () => Promise<string>) => {
     setBusy(true);
@@ -792,24 +740,18 @@ function WorkersBulk({ teamId, providers, codexModels }: {
     <section className="team-bulk" aria-label="Tüm worker'lar">
       <div className="team-bulk-row">
         <b>Tüm worker'lar</b>
-        <select value={engine} aria-label="Worker'ların motoru" disabled={busy}
-          onChange={(e) => { setEngine(e.target.value); setModel(""); }}>
-          {ENGINES.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
+        <select value={provider} aria-label="Worker'ların sağlayıcısı" disabled={busy}
+          onChange={(e) => { setProvider(e.target.value); setModel(""); }}>
+          {providers.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
         </select>
-        {engine !== "codex" && (
-          <select value={provider} aria-label="Worker'ların sağlayıcısı" disabled={busy}
-            onChange={(e) => { setProvider(e.target.value); setModel(""); }}>
-            {providers.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-          </select>
-        )}
         <select value={chosen} aria-label="Worker'ların modeli" disabled={busy || !models.length}
           onChange={(e) => setModel(e.target.value)}>
           {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
         </select>
-        <button className="primary" disabled={busy || !chosen || !workers.length || (engine !== "codex" && provider === "gateway" && !!warn)}
+        <button className="primary" disabled={busy || !chosen || !workers.length}
           title={noModels ?? (workers.length ? "Yalnız worker'lar değişir; lider(ler)e dokunulmaz" : "Takımda worker yok")}
           onClick={() => void act(async () => {
-            const out = await setWorkersModel(teamId, { engine, provider: engine === "codex" ? null : provider, model: chosen });
+            const out = await setWorkersModel(teamId, { engine: "claude", provider, model: chosen });
             return `${out.applied.length} worker değişti` +
               (out.pending.length ? ` · ${out.pending.length} çalışan worker oturumu kapanınca geçecek` : "");
           })}>
@@ -850,7 +792,6 @@ function ProviderSettings({ host, providers, reload, local, setLocal }: {
   const [edit, setEdit] = useState<string | null>(null);
   const [token, setToken] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const { activeId } = useTeams();
 
   async function save(id: string) {
     try {
@@ -873,11 +814,11 @@ function ProviderSettings({ host, providers, reload, local, setLocal }: {
           {providers.map((p) => (
             <tr key={p.id}>
               <th scope="row">{p.label}</th>
-              <td title={p.id === "gateway" ? "ChatGPT hesabı (SIWC)" : p.baseUrl ?? "yerleşik Anthropic"}>
-                {p.id === "gateway" ? (p.hasToken ? "bağlı" : "giriş yok") : p.id !== "anthropic" ? (p.hasToken ? `jeton ${p.tokenMask}` : "jeton yok") : "—"}
+              <td title={p.baseUrl ?? "yerleşik Anthropic"}>
+                {p.id !== "anthropic" ? (p.hasToken ? `jeton ${p.tokenMask}` : "jeton yok") : "—"}
               </td>
               <td>
-                {p.id === "gateway" ? <button onClick={() => openSettings(activeId, "providers")}>Girişi yönet</button> : p.id !== "anthropic" && (edit === p.id ? (
+                {p.id !== "anthropic" && (edit === p.id ? (
                   <span className="token-edit">
                     <input type="password" value={token} placeholder="jeton" aria-label={`${p.label} jetonu`}
                       onChange={(e) => setToken(e.target.value)}

@@ -25,7 +25,7 @@ export interface PcbTheme {
   faint: string; red: string; redHi: string; redGlow: string; green: string; amber: string;
   /** Modern §7: the team accent — traces, the Core / leader ring. Red stays for status and errors. */
   team: string; teamHi: string; teamGlow: string;
-  provider: string; font: string; mono: string; radius: number;
+  font: string; mono: string; radius: number;
 }
 
 export interface WorldData {
@@ -643,10 +643,8 @@ function drawProviderBadge(ctx: CanvasRenderingContext2D, chip: Chip, p: PcbThem
 }
 
 function providerOf(agent: Agent, p: PcbTheme) {
-  const engine = agent.activeEngine ?? agent.engine;
   const provider = agent.activeProvider ?? agent.provider;
-  const [label, color] = engine === "codex" ? ["CODEX", p.provider]
-    : !provider || provider === "anthropic" ? ["ANTHROPIC", p.muted]
+  const [label, color] = !provider || provider === "anthropic" ? ["ANTHROPIC", p.muted]
     : [provider === "local" ? "LOCAL" : provider.toUpperCase(), p.amber];
   return { label, color };
 }

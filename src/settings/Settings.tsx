@@ -12,7 +12,6 @@ import { UsageStripSection } from "./UsageStrip";
 import { DiagnosticsSection } from "./Diagnostics";
 import { CoreSection } from "./Core";
 import { GpuSection } from "./Gpu";
-import { GatewaySection } from "./Gateway";
 import { SoundsSection } from "./Sounds";
 import { MOBILE } from "../api/platform";
 import { useTeams } from "../team/store";
@@ -46,7 +45,6 @@ type Tab = SettingsTab;
 const TABS: { id: Tab; label: string }[] = [
   { id: "general", label: "Genel" },
   { id: "agents", label: "Ajanlar" },
-  { id: "providers", label: "Sağlayıcılar" },
   { id: "hosts", label: "Sunucular" },
   { id: "advanced", label: "Gelişmiş" },
 ];
@@ -120,7 +118,6 @@ export function SettingsView({ host }: { host: string }) {
         <GpuSection host={host} />
       </>)}
       {panel("hosts", <HostsSection />)}
-      {panel("providers", <GatewaySection host={host} />)}
       {panel("advanced", <>
         {remote}
         <p className="settings-note">Nadiren gerekenler; varsayılanlar çoğu kullanım için yeterli.</p>

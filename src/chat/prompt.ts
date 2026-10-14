@@ -1,5 +1,5 @@
 // Waiting agent → structured prompt, parsed from the PTY screen text (`chat_screen`). Pure.
-// Claude and Codex both draw numbered select menus ("❯ 1. Yes") and y/n questions.
+// Claude draws numbered select menus ("❯ 1. Yes") and y/n questions.
 
 export interface PromptOption {
   label: string;

@@ -12,7 +12,8 @@ const LIVE = {
   todayCostUsd: 94.04,
   providers: [
     { id: "claude", remainingPercent: 66, window: "session", resetsAt: "2099-01-01T12:00:00.000Z" },
-    { id: "codex", remainingPercent: 97, window: "weekly", resetsAt: null },
+    { id: "openai", remainingPercent: 97, window: "weekly", resetsAt: null },
+    { id: "codex", remainingPercent: 50, window: "weekly", resetsAt: null },
     { id: "muse", remainingPercent: null, window: null, resetsAt: null },
     { id: "zai", remainingPercent: 100, window: "session", resetsAt: null },
     { id: "acme-code", remainingPercent: 40, window: "daily", resetsAt: null },
@@ -121,7 +122,8 @@ test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ay
       size: Math.round(box.width),
     };
   }));
-  expect(marks.map((m) => m.id)).toEqual(["claude", "codex", "muse", "zai", "acme-code"]);
+  // #1713: TM'nin Codex kaydı şeritte gösterilmez.
+  expect(marks.map((m) => m.id)).toEqual(["claude", "openai", "muse", "zai", "acme-code"]);
   for (const m of marks.slice(0, 4)) {
     expect(m.mask, m.id).toMatch(/^url\(/);
     expect(m.size, m.id).toBe(15);

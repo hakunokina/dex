@@ -6,7 +6,6 @@ import { useEffect, useRef, useState } from "react";
 import { chainGet, chainSetDisabled, chainSetOrder, type ChainView } from "../team/api";
 import { listProviders, type ProviderInfo } from "../team/api";
 import { onEvent } from "../api/hosts";
-import { onGatewayCatalogChanged } from "./gatewayApi";
 
 export function ChainSection({ host }: { host: string }) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -14,8 +13,7 @@ export function ChainSection({ host }: { host: string }) {
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const lock = useRef(false);
-  const labels: Record<string, string> = { codex: "Codex", ...Object.fromEntries(providers.map(p => [p.id, p.label])) };
-  const gateway = providers.find(p => p.id === "gateway");
+  const labels: Record<string, string> = Object.fromEntries(providers.map(p => [p.id, p.label]));
 
   useEffect(() => {
     let mounted = true;
@@ -37,11 +35,10 @@ export function ChainSection({ host }: { host: string }) {
       if (eventHost === host) void refresh();
     });
     const offProviders = onEvent("providers-changed", (_, eventHost) => { if (eventHost === host) void catalog(); });
-    const offCatalog = onGatewayCatalogChanged(eventHost => { if (eventHost === host) void catalog(); });
     return () => {
       mounted = false;
       off();
-      offProviders(); offCatalog();
+      offProviders();
     };
   }, [host]);
 
@@ -85,8 +82,8 @@ export function ChainSection({ host }: { host: string }) {
         <span>Bir sağlayıcının kotası biterse ajan aynı işe listedeki sıradaki sağlayıcıyla devam eder.</span>
       </summary>
       <p className="settings-note">
-        Kota/kredi bitince devreye girer; zincirdeki geçici sağlayıcıda ağ/timeout olursa o sağlayıcı 15 dk atlanır. Sunucu hataları tetiklemez. Sırada Codex varsa konuşmanın özetiyle yeni
-        oturum açılır. Codex'in kendi kotası biterse zincir çalışmaz. Kapalı sağlayıcı atlanır; sıfırlanan sağlayıcıya ajan
+        Kota/kredi bitince devreye girer; zincirdeki geçici sağlayıcıda ağ/timeout olursa o sağlayıcı 15 dk atlanır. Sunucu hataları tetiklemez.
+        Kapalı sağlayıcı atlanır; sıfırlanan sağlayıcıya ajan
         otomatik geri döner (çalışıyorsa oturumu kapanınca).
       </p>
       {view && (
@@ -101,20 +98,12 @@ export function ChainSection({ host }: { host: string }) {
                 <button disabled={busy} onClick={() => void toggle(id)} aria-label={`${labels[id] ?? id} zinciri ${off ? "aç" : "kapat"}`}>
                   {off ? "aç" : "kapat"}
                 </button>
-                {id === "gateway" && <button disabled={busy} aria-label={`${labels[id] ?? id} zincirden çıkar`}
-                  onClick={() => void change(() => chainSetOrder(host, view.order.filter(p => p !== id)), "Gateway zincirden çıkarıldı.")}>Çıkar</button>}
               </li>
             );
           })}
         </ol>
       )}
       {!view && !msg && <p className="settings-note" role="status">Zincir yükleniyor…</p>}
-      {gateway && <div className="chain-gateway">
-        <p className="settings-note">{gateway.label}: {!gateway.hasToken ? "Giriş yok — Ayarlar → Sağlayıcılar’dan giriş yapın." : gateway.models.length ? `Hesaptaki modeller: ${gateway.models.map(m => m.label).join(", ")}` : "Model listesi boş — Ayarlar → Sağlayıcılar’dan durumu yenileyin."}</p>
-        {view && !view.order.includes("gateway") && <button disabled={busy || !gateway.hasToken || !gateway.models.length}
-          aria-label={`${gateway.label} zincire ekle`}
-          onClick={() => void change(() => chainSetOrder(host, [...view.order, "gateway"]), "Gateway zincire eklendi.")}>Zincire ekle</button>}
-      </div>}
       {view && view.exhausted.length > 0 && (
         <p className="settings-note">
           Tükenen: {view.exhausted.map((e) => `${labels[e.provider] ?? e.provider} (${fmtReset(e.resetAt)}'ye kadar)`).join(", ")}.

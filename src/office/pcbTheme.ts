@@ -11,7 +11,7 @@ export function readPcbTheme(el: Element = document.documentElement): PcbTheme {
     pin: token("--pcb-pin"), via: token("--pcb-via"), text: token("--text"), muted: token("--muted"),
     faint: token("--faint"), red: token("--red"), redHi: token("--red-hi"), redGlow: token("--red-glow"),
     team: token("--team"), teamHi: token("--team-hi"), teamGlow: token("--team-glow"),
-    amber: token("--amber"), green: token("--green"), provider: token("--pcb-provider"),
+    amber: token("--amber"), green: token("--green"),
     font: token("--font-ui"), mono: token("--font-mono"), radius: parseFloat(token("--pcb-radius")) || 12,
   };
 }

@@ -1,6 +1,6 @@
 // #44: which Ayarlar tab is shown. Kept apart from `Settings.tsx` so the topbar and the palette can
 // open Ayarlar on a given tab without pulling the settings view into the first-open chunk.
-export type SettingsTab = "general" | "agents" | "providers" | "hosts" | "advanced";
+export type SettingsTab = "general" | "agents" | "hosts" | "advanced";
 
 export const TAB_KEY = "dex.settingsTab";
 export const TAB_EVENT = "dex:settings-tab";

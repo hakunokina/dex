@@ -393,7 +393,6 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
   const leaderUnknown = agent?.kind === "leader" && !offline && !sessions[agent.id] && getTeamProjects(teamId).list.filter(p => p.archivedAt === null).length > 1;
   const blocked = agent?.kind === "worker" ? blockedJob(sessions[agent.id], delegations, agent.id, !offline) : null;
   const projectNameOf = (id: string | null | undefined) => projectName(getTeamProjects(projectTeam).list, id) ?? "başka proje";
-  const startLabel = agent?.engine === "codex" ? "Codex'i başlat" : "Claude'u başlat";
   // S5-B: Terminal ↔ Sohbet. The terminal never unmounts (CSS-hide only) so the xterm
   // session survives tab switches; the chat mounts on first open.
   const [picked, setView] = useState<"term" | "chat">("term");
@@ -516,7 +515,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
             )}
             {offline && view === "term" && (
               <button className="launch" onClick={start}>
-                <span><Play /></span> {startLabel}
+                <span><Play /></span> Claude'u başlat
               </button>
             )}
           </>

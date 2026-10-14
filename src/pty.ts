@@ -14,8 +14,6 @@ export interface SpawnOptions {
   memoryDir?: string;
   /** DEX-13: provider id (`glm`/`muse`); null/`anthropic` → env untouched. */
   provider?: string | null;
-  /** DEX-26: codex job (`cmd: "codex"`); dex-core builds the argv from it. */
-  codex?: { model: string; addDirs: string[]; resume: string | null; prompt: string | null } | null;
   cols: number;
   rows: number;
   /** The session ended (not replaced by a newer spawn), whether or not a view is attached. */
@@ -71,7 +69,6 @@ export async function spawnPty(o: SpawnOptions, sink: PtySink) {
       cwd: o.cwd ?? null,
       memoryDir: o.memoryDir ?? null,
       provider: o.provider ?? null,
-      codex: o.codex ?? null,
       cols: o.cols,
       rows: o.rows,
     };
