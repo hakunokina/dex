@@ -49,6 +49,11 @@ macro_rules! handlers {
 }
 
 handlers! {
+        "inbox_submit" => |core,p| {
+            let input = serde_json::from_value(p.clone()).map_err(|e| Error::bad_request(format!("inbox_submit: {e}")))?;
+            let reply = core.inbox_submit(input).map_err(|e| Error::new(e.code, e.message))?;
+            serde_json::to_value(reply).map_err(|e| Error::failed(e.to_string()))
+        },
         "agent_context" => |core,p| ok(core.agent_context(&arg::<String>(p,"agentId")?)),
         "team_context" => |core,p| ok(core.team_context(&arg::<String>(p,"teamId")?)),
         "usage_summary" => |core,p| ok(core.usage_summary(&arg::<String>(p,"teamId")?,arg(p,"since")?)),
@@ -270,6 +275,17 @@ mod tests {
     use crate::server::LOCAL_METHODS;
     use dex_core::events::NullSink;
     use dex_core::{Events, Paths};
+
+    #[test]
+    fn inbox_host_rpc_is_advertised_and_has_stable_validation_errors() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/inbox-rpc-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let core=Core::start_bare(Paths{data_dir:root.join("data"),config_dir:root.join("config")},Events::new(NullSink)).unwrap();
+        assert!(METHODS.contains(&"inbox_submit"));
+        for (params,code) in [(serde_json::json!({}),"bad_request"),(serde_json::json!({"teamId":"default"}),"inbox_empty"),(serde_json::json!({"teamId":"default","text":"x"}),"inbox_no_assistant"),(serde_json::json!({"teamId":"default","text":"x","path":"evil"}),"bad_request")] {
+            assert_eq!(call(&core,"inbox_submit",&params).unwrap_err().code,code);
+        }
+        core.shutdown();
+    }
 
     #[test]
     fn gateway_auth_rpcs_are_advertised_and_remote_hosts_refuse_local_login() {

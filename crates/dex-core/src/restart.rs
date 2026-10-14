@@ -1277,6 +1277,9 @@ impl Core {
         if was && !on {
             self.dispatch_queued();
             self.deliver_held();
+            if self.inbox_wake_pending().is_err() {
+                log::error!("gelen kutusu kuyruğu uyandırılamadı");
+            }
         }
     }
 

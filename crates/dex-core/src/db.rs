@@ -411,6 +411,8 @@ const MIGRATIONS: &[&str] = &[
     // makes reopening idempotent; existing teams keep dev behavior. Before commit: ROLLBACK.
     // After commit: retain column/education roles, revert only application (no data deletion).
     "ALTER TABLE teams ADD COLUMN profile TEXT NOT NULL DEFAULT 'dev' CHECK(profile IN ('dev','edu'));",
+    // 36 (#1697): host-only inbox; receipt metadata has no shared content.
+    crate::inbox::SCHEMA,
 ];
 
 const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_project_snapshot
@@ -422,6 +424,25 @@ const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_proje
 #[cfg(test)]
 mod job_model_migration_tests {
     use super::*;
+
+    #[test]
+    fn inbox_migration_is_additive_idempotent_and_keeps_pending_rows() {
+        let mut c=Connection::open_in_memory().unwrap();
+        for (i,sql) in MIGRATIONS.iter().take(35).enumerate() { c.execute_batch(sql).unwrap(); c.pragma_update(None,"user_version",i+1).unwrap(); }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        let counts=|c:&Connection| (c.query_row("SELECT COUNT(*) FROM teams",[],|r|r.get::<_,i64>(0)).unwrap(),c.query_row("SELECT COUNT(*) FROM agents",[],|r|r.get::<_,i64>(0)).unwrap());
+        let before=counts(&c);
+        migrate(&mut c).unwrap();
+        c.execute_batch("INSERT INTO inbox_receipts(id,team_id,agent_id,client_id,reply) VALUES(1,'default','ayla','share','{}'); INSERT INTO inbox_messages(receipt_id,agent_id,prompt) VALUES(1,'ayla','pending');").unwrap();
+        for _ in 0..2 {
+            migrate(&mut c).unwrap(); c.execute_batch(crate::inbox::SCHEMA).unwrap();
+            assert_eq!(counts(&c),before);
+            assert_eq!(c.query_row("SELECT prompt FROM inbox_messages",[],|r|r.get::<_,String>(0)).unwrap(),"pending");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        }
+        let mut clean=Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); clean.execute_batch(crate::inbox::SCHEMA).unwrap(); assert_eq!(counts(&clean),(0,0)); }
+    }
 
     #[test]
     fn education_profile_migration_twice_preserves_existing_and_clean_db() {
@@ -448,7 +469,7 @@ mod job_model_migration_tests {
         for _ in 0..2 {
             migrate(&mut clean).unwrap();
             crate::roles::seed(&clean).unwrap();
-            assert_eq!(clean.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get::<_, i64>(0)).unwrap(), 22);
+            assert_eq!(clean.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get::<_, i64>(0)).unwrap(), 23);
             assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
         }
         assert_eq!(counts(&clean), (0, 0));
@@ -1352,7 +1373,7 @@ pub mod tasks {
             let before: Vec<String> = c
                 .prepare("SELECT slug||name||category||description||system_prompt||sort FROM roles ORDER BY sort, slug")
                 .unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
-            assert_eq!(before.len(), 22);
+            assert_eq!(before.len(), 23);
 
             super::super::migrate(&mut c).unwrap();
 
@@ -1368,7 +1389,7 @@ pub mod tasks {
             assert_eq!(after, before, "role rows survive the column drop");
             // Fresh seed still upserts into the narrower table.
             crate::roles::seed(&c).unwrap();
-            assert_eq!(crate::roles::list(&c).unwrap().len(), 22);
+            assert_eq!(crate::roles::list(&c).unwrap().len(), 23);
         }
     }
 }

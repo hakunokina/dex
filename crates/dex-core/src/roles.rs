@@ -74,7 +74,7 @@ pub fn catalog_text(conn: &Connection) -> String {
 
 /// Education and development leaders see only their own profile's roles.
 pub fn catalog_text_for_profile(conn: &Connection, profile: &str) -> String {
-    conn.prepare("SELECT slug || ' — ' || name FROM roles WHERE (category='education') = ?1 ORDER BY sort, slug")
+    conn.prepare("SELECT slug || ' — ' || name FROM roles WHERE slug <> 'assistant' AND (category='education') = ?1 ORDER BY sort, slug")
         .and_then(|mut st| st.query_map([profile == "edu"], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>())
         .unwrap_or_default()
         .join(", ")
@@ -137,11 +137,30 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn assistant_seed_upserts_without_adding_members_and_is_not_delegatable() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        c.execute("DELETE FROM roles WHERE slug='assistant'",[]).unwrap(); // existing 22-role DB
+        assert_eq!(list(&c).unwrap().len(),22);
+        let before: i64 = c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0)).unwrap();
+        for _ in 0..2 {
+            seed(&c).unwrap();
+            assert_eq!(name_of(&c, "assistant").unwrap(), "Assistant");
+            assert_eq!(list(&c).unwrap().len(), 23);
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get::<_, i64>(0)).unwrap(), before);
+            for profile in ["dev", "edu"] { assert!(!catalog_text_for_profile(&c, profile).contains("assistant")); }
+        }
+        c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).unwrap();
+        assert!(crate::delegate::role_target(&c, "default", "assistant").is_err());
+        assert!(crate::delegate::role_target(&c, "default", "Ayla").is_err());
+        assert_ne!(crate::delegate::pick_worker(&c, "default", None).unwrap(), "ayla");
+    }
+
+    #[test]
     fn seed_loads_catalog_and_is_idempotent() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         seed(&c).unwrap();
         let roles = list(&c).unwrap();
-        assert_eq!(roles.len(), 22);
+        assert_eq!(roles.len(), 23);
         for s in ["lead", "frontend", "backend", "qa", "explorer", "game-designer", "technical-artist", "gameplay-programmer"] {
             assert!(roles.iter().any(|r| r.slug == s), "{s}");
         }
@@ -178,7 +197,7 @@ mod tests {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         let roles = list(&c).unwrap();
         for profile in ["dev", "edu"] {
-            let expected = roles.iter().filter(|r| (r.category == "education") == (profile == "edu"))
+            let expected = roles.iter().filter(|r| r.slug != "assistant" && (r.category == "education") == (profile == "edu"))
                 .map(|r| format!("{} — {}", r.slug, r.name)).collect::<Vec<_>>().join(", ");
             assert_eq!(catalog_text_for_profile(&c, profile), expected);
         }
