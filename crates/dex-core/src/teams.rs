@@ -791,6 +791,7 @@ pub fn delete_team(conn: &Connection, id: &str) -> Result<(), String> {
     // Rollback: any failure drops this transaction and restores every cleared reference.
     // GPU history remains; session pointers into the removed team's projects cannot resume.
     let tx=conn.unchecked_transaction().map_err(|e|e.to_string())?;
+    // agent_chain_origins: dead table; old rows must not hold the project FK.
     for table in ["agent_sessions","agent_chain_origins"] {
         tx.execute(&format!("DELETE FROM {table} WHERE agent_id IN (SELECT id FROM agents WHERE team_id=?1)
             OR project_id IN (SELECT id FROM projects WHERE team_id=?1)"),[id]).map_err(|e|e.to_string())?;
@@ -970,7 +971,6 @@ pub fn update_agent(conn: &Connection, id: &str, p: AgentPatch) -> Result<Agent,
             [id],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute("DELETE FROM agent_chain_origins WHERE agent_id = ?1", [id]).map_err(|e| e.to_string())?;
         a.active_engine = None;
         a.active_provider = None;
         a.active_model = None;
@@ -1014,7 +1014,6 @@ fn apply_target(conn: &Connection, id: &str, t: &PendingModel) -> Result<(), Str
         params![id, t.engine, t.provider, t.model],
     )
     .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM agent_chain_origins WHERE agent_id = ?1", [id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1878,7 +1877,7 @@ mod tests {
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let a: NewAgent = serde_json::from_value(serde_json::json!({"teamId": s.id, "name": "", "kind": "worker", "roleSlug": "assistant"})).unwrap();
         let echo = create_agent(&c, Path::new("/data"), a).unwrap();
-        let out = set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), |_| false).unwrap();
         assert_eq!(out.applied.len(), 4);
         assert!(!out.applied.contains(&echo.id));
         let after = crew_of(&c, &s.id).into_iter().find(|a| a.id == echo.id).unwrap();

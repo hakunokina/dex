@@ -146,12 +146,17 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
         model,
         ..Default::default()
     };
-    if let Some(source) = source {
-        let (engine, session, known): (String, String, Option<String>) = c
-            .query_row("SELECT engine,session,path FROM cost_sources WHERE id=?1", [source], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    // Only Claude transcripts are read; older engines' sources keep their history but are not re-read.
+    let source = match source {
+        Some(id) => c
+            .query_row("SELECT engine,session,path FROM cost_sources WHERE id=?1 AND engine='claude'", [id], |r| {
+                Ok((id, r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
             })
-            .map_err(err)?;
+            .optional()
+            .map_err(err)?,
+        None => None,
+    };
+    if let Some((source, engine, session, known)) = source {
         if let Some(path) = crate::chat::transcript_of(Some(&session), known.as_deref()) {
             ingest(c, source, &engine, &path)?;
         }
@@ -386,7 +391,8 @@ fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i6
     let sources = c
         .prepare(
             "SELECT DISTINCT f.id,f.engine,f.session,f.path FROM cost_sources f
-        JOIN cost_sessions s ON s.source_id=f.id WHERE s.team_id=?1 AND (?2 IS NULL OR s.delegation_id=?2)",
+        JOIN cost_sessions s ON s.source_id=f.id
+        WHERE f.engine='claude' AND s.team_id=?1 AND (?2 IS NULL OR s.delegation_id=?2)",
         )
         .map_err(err)?
         .query_map(params![team, delegation], |r| {
@@ -877,6 +883,28 @@ mod tests {
             }]
         )
         .is_err());
+    }
+
+    /// Old non-Claude sources are not re-read (no warning), yet their stored messages still count.
+    #[test]
+    fn legacy_engine_sources_skip_ingest_but_keep_totals() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        observe(&c, "ayla", "legacy-codex-session", "codex", None, "SessionStart").unwrap();
+        c.execute(
+            "INSERT INTO cost_messages SELECT source_id,'m',id,'gpt-5.5',100,7,3,0,0 FROM cost_sessions",
+            [],
+        )
+        .unwrap();
+        let messages = |c: &Connection| -> i64 { c.query_row("SELECT count(*) FROM cost_messages", [], |r| r.get(0)).unwrap() };
+        let before = messages(&c);
+        let out = summary(&c, "default", None, None).unwrap();
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert_eq!(out.total.tokens.input, 7);
+        assert_eq!(out.agents["ayla"].tokens.output, 3);
+        assert_eq!(messages(&c), before);
+        let (ctx, _) = context(&c, "ayla").unwrap();
+        assert_eq!(ctx.session_id, None);
+        assert_eq!(messages(&c), before);
     }
 
     #[test]

@@ -589,7 +589,7 @@ mod tests {
             Some(crate::agents::Status::Working),
             Some("note-session"),
         );
-        let transcript = root.join("rollout-note-session.jsonl");
+        let transcript = root.join("transcript-note-session.jsonl");
         std::fs::write(&transcript, "").unwrap();
         core.agent_states
             .set_transcript("kaan", transcript.to_str().unwrap());
@@ -642,7 +642,7 @@ mod tests {
         core.worker_notes_observed(
             "kaan",
             engine,
-            &root.join("rollout-other-session.jsonl"),
+            &root.join("transcript-other-session.jsonl"),
             &row,
             process,
         );

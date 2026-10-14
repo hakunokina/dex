@@ -4,7 +4,7 @@ minVersion = "v8.30.0"
 [extend]
 useDefault = true
 
-# The gateway fixture stores base64 DER, without a PEM header; default PEM rules miss it.
+# A key stored as base64 DER in JSON has no PEM header, so the default PEM rules miss it.
 [[rules]]
 id = "dex-json-pkcs8"
 description = "Base64 PKCS8 private key in JSON"

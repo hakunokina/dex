@@ -419,7 +419,20 @@ const MIGRATIONS: &[&str] = &[
     // Codex resume pointers, the chain origins of Codex moves and quota marks of removed targets —
     // no code reads them any more; history (delegations, usage) is untouched.
     CODEX_REMOVAL,
+    // 38 (#1730): free-standing pending proposals for Codex/gateway (not tied to a job — those
+    // 37 already closed) could never be approved and held the pending quota. Data only, versioned
+    // transaction: before commit ROLLBACK. After commit: rows stay (status/decided_at only);
+    // to reopen: UPDATE member_proposals SET status='pending', decided_at=NULL WHERE id IN (...).
+    STALE_PROPOSALS,
 ];
+
+/// Migration 38. Idempotent on its own: a second run finds no pending match.
+const STALE_PROPOSALS: &str = "
+UPDATE member_proposals SET status = 'rejected',
+    decided_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)
+  WHERE status = 'pending' AND provider IN ('codex', 'gateway')
+    AND id NOT IN (SELECT proposal_id FROM job_models WHERE proposal_id IS NOT NULL);
+";
 
 /// Migration 37. Agents still on Codex or the gateway move to Claude Code (anthropic,
 /// `CLAUDE_MID`, spelled out: a migration is frozen text — a test pins it); their transient chain
@@ -543,6 +556,49 @@ mod job_model_migration_tests {
         }
         assert_eq!(count(&clean, "SELECT COUNT(*) FROM agents"), 0);
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+    }
+
+    #[test]
+    fn stale_proposals_migration_rejects_only_free_codex_gateway_pending_twice() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let before_version = MIGRATIONS.iter().position(|sql| *sql == STALE_PROPOSALS).unwrap();
+        for (i, sql) in MIGRATIONS[..before_version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch(r#"
+            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at) VALUES
+                (1,'default','timur','backend','gw-1','gateway','r',1),
+                (2,'default','timur','backend','gpt-5.5','codex','r',1),
+                (3,'default','timur','backend','GLM-5.3','glm','r',1),
+                (4,'default','timur','backend','gw-2','gateway','r',1);
+            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at,status,decided_at)
+                VALUES(5,'default','timur','backend','gw-3','gateway','r',1,'approved',7);
+            INSERT INTO delegations(id,from_agent,to_agent,team_id,prompt,created_at,updated_at) VALUES(9,'timur','kaan','default','is',1,1);
+            INSERT INTO job_models(delegation_id,proposal_id,engine,provider) VALUES(9,4,'claude','gateway');
+        "#).unwrap();
+        let row = |c: &Connection, id: i64| -> (String, Option<i64>) {
+            c.query_row("SELECT status,decided_at FROM member_proposals WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+        };
+        let total = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM member_proposals", [], |r| r.get(0)).unwrap() };
+        let before = total(&c);
+        migrate(&mut c).unwrap();
+        let decided = row(&c, 1).1;
+        for run in 0..2 {
+            if run == 1 { c.execute_batch(STALE_PROPOSALS).unwrap(); }
+            for id in [1, 2] {
+                let (status, at) = row(&c, id);
+                assert_eq!(status, "rejected", "{id}");
+                assert!(at.is_some_and(|t| t > 1), "{id}");
+            }
+            assert_eq!(row(&c, 1).1, decided, "second run leaves decided_at");
+            assert_eq!(row(&c, 3), ("pending".into(), None), "other provider");
+            assert_eq!(row(&c, 4), ("pending".into(), None), "tied to a job");
+            assert_eq!(row(&c, 5), ("approved".into(), Some(7)));
+            assert_eq!(total(&c), before);
+        }
+        assert_eq!(c.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
     }
 
     #[test]
@@ -1101,9 +1157,7 @@ mod project_migration_tests {
         .unwrap();
         // Both leaders and workers had repo-root sessions before project bindings existed.
         c.execute_batch("INSERT INTO agent_sessions(agent_id,session_id,engine,updated_at) VALUES
-            ('timur','old-leader','claude',1),('kaan','old-worker','claude',1);
-            INSERT INTO agent_chain_origins(agent_id,engine) VALUES
-            ('timur','claude'),('kaan','claude');")
+            ('timur','old-leader','claude',1),('kaan','old-worker','claude',1);")
             .unwrap();
         drop(c);
 
@@ -1111,24 +1165,22 @@ mod project_migration_tests {
         let legacy = projects::get(&c, "default", "legacy-default").unwrap();
         let assert_resumed = |expected: Option<&str>, cwd: &std::path::Path| {
             for agent in ["timur", "kaan"] {
-                for mode in [ContextMode::Session, ContextMode::ChainOrigin] {
-                    let ctx = resolve(
-                        &c,
-                        &fixture.0,
-                        ResolveRequest {
-                            team_id: "default",
-                            agent_id: Some(agent),
-                            delegation_id: None,
-                            project_id: None,
-                            mode,
-                        },
-                    )
-                    .unwrap();
-                    assert_eq!(ctx.project_id.as_deref(), expected, "{agent} {mode:?}");
-                    assert_eq!(ctx.cwd, cwd, "{agent} {mode:?}");
-                    assert_eq!(ctx.project_root.as_deref(), expected.map(|_| cwd));
-                    assert!(ctx.delegation_id.is_none());
-                }
+                let ctx = resolve(
+                    &c,
+                    &fixture.0,
+                    ResolveRequest {
+                        team_id: "default",
+                        agent_id: Some(agent),
+                        delegation_id: None,
+                        project_id: None,
+                        mode: ContextMode::Session,
+                    },
+                )
+                .unwrap();
+                assert_eq!(ctx.project_id.as_deref(), expected, "{agent}");
+                assert_eq!(ctx.cwd, cwd, "{agent}");
+                assert_eq!(ctx.project_root.as_deref(), expected.map(|_| cwd));
+                assert!(ctx.delegation_id.is_none());
             }
         };
         assert_resumed(Some(&legacy.id), &root);
@@ -1178,14 +1230,12 @@ mod project_migration_tests {
             projects::archive(&c, "default", &p.id, |_| false).unwrap();
         }
         assert_resumed(None, std::path::Path::new(&workspace));
-        for table in ["agent_sessions", "agent_chain_origins"] {
-            let counts: (i64, i64) = c.query_row(
-                &format!("SELECT COUNT(*),SUM(project_id IS NULL AND delegation_id IS NULL AND cwd IS NULL) FROM {table}"),
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            ).unwrap();
-            assert_eq!(counts, (2, 2), "session bindings must not be backfilled");
-        }
+        let counts: (i64, i64) = c.query_row(
+            "SELECT COUNT(*),SUM(project_id IS NULL AND delegation_id IS NULL AND cwd IS NULL) FROM agent_sessions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert_eq!(counts, (2, 2), "session bindings must not be backfilled");
     }
 
     struct PathFixture(std::path::PathBuf);
