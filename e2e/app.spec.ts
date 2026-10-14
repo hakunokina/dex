@@ -357,6 +357,32 @@ test("takımı kopyala: eski hosttan gelen Codex üyesi Claude'a çevrilir", asy
   } });
 });
 
+test("takımı kopyala: katalog gecikirken de Codex üyesi gönderilmez", async ({ app, dexd }) => {
+  const source = await newTeam(dexd, "Codex Gecikme");
+  await app.addInitScript(() => {
+    window.__dexFake = {
+      team_clone_template: { kind: "main", profile: "dev", members: [{ name: "Eski", kind: "leader", engine: "codex", provider: null, model: "gpt-5.5" }] },
+    };
+  });
+  await app.reload();
+  await openTeam(app, source.name);
+  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  // The catalog never arrives for the clone form.
+  await app.evaluate(() => { window.__dexFake!.provider_list = new Promise(() => {}); });
+  await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
+  const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
+  await expect(form.getByText("Model kataloğu yükleniyor…")).toBeVisible();
+  await expect(form.getByText("Codex üyeleri Claude'a çevrildi")).toBeVisible();
+  await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Codex Gecikme Kopya");
+  await expect(form.getByText("Model kataloğu yükleniyor…")).toBeVisible();
+  await expect(form.getByRole("alert")).toHaveCount(0);
+  await form.getByRole("button", { name: "Oluştur", exact: true }).click();
+  await expect(form).toHaveCount(0);
+  expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args).toMatchObject({ team: {
+    members: [{ name: "Eski", engine: null, provider: "anthropic", model: "claude-fable-5-1" }],
+  } });
+});
+
 test("kopya şablonu hatası görünür ve yeniden denenebilir", async ({ app, dexd }) => {
   const source = await newTeam(dexd, "Kopya Hata");
   await app.addInitScript(() => {
