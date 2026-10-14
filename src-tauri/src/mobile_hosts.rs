@@ -144,7 +144,9 @@ pub async fn share_take<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Val
 }
 
 /// #1717 hızlı gönderim bitti: Kotlin kısa bir Toast gösterir (`message`, en fazla 80 karakter; kişisel
-/// içerik taşımaz) ve görevi arka plana alır — kullanıcı paylaştığı uygulamaya döner.
+/// içerik taşımaz) ve Dex'i kapatır/arkaya alır — kullanıcı paylaştığı uygulamaya döner. Soğuk paylaşım
+/// açılışında görev tamamen kaldırılır (son kullanılanlarda kopya kalmaz); uygulama zaten açıksa görev
+/// arkaya alınır. Gönderim ekranı açılırsa çağrılmaz, Dex önde kalır.
 #[tauri::command]
 pub async fn share_done<R: Runtime>(app: AppHandle<R>, message: String) -> Result<(), String> {
     let handle = app
