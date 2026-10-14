@@ -1144,6 +1144,8 @@ mod tests {
         let crew = crew_of(&c, &t.id);
         let shape: Vec<_> = crew.iter().map(|a| (a.kind.as_str(), a.role_slug.as_deref().unwrap(), a.name.as_str())).collect();
         assert_eq!(shape, [("leader", "teacher", "Sage"), ("worker", "visual-explainer", "Chalk-1")]);
+        assert_eq!((crew[0].engine.as_str(), crew[0].model.as_str()), ("claude", crate::providers::CLAUDE_STRONG));
+        assert_eq!((crew[1].engine.as_str(), crew[1].provider.as_str(), crew[1].model.as_str()), ("claude", "anthropic", crate::providers::CLAUDE_MID));
         assert!(crate::roles::browser_for_agent(&c, &crew[1].id));
         assert!(crate::skills::skills_for_agent(&c, &crew[0].id).unwrap().is_empty());
         assert!(crate::skills::skills_for_agent(&c, &crew[1].id).unwrap().is_empty());

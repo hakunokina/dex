@@ -151,6 +151,29 @@ mod tests {
     }
 
     #[test]
+    fn seed_refreshes_existing_visual_explainer_prompt_twice() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        let prompt = |slug: &str| c.query_row("SELECT system_prompt FROM roles WHERE slug=?1", [slug], |r| r.get::<_, String>(0)).unwrap();
+        let count = || c.query_row("SELECT COUNT(*) FROM roles", [], |r| r.get::<_, i64>(0)).unwrap();
+        let instruction = "Konu mimari, iş akışı, sıralama, veri akışı ya da durum makinesi ise ve `archify` skill'i kullanılabiliyorsa onu kullan; kullanılamıyorsa ya da konu bu türden değilse serbest HTML üret.";
+        let current = prompt("visual-explainer");
+        assert!(current.contains(instruction));
+        let legacy = current.replace(&format!(" {instruction}"), "");
+        assert_ne!(legacy, current);
+        c.execute("UPDATE roles SET system_prompt=?1 WHERE slug='visual-explainer'", [&legacy]).unwrap();
+        let before = count();
+        let teacher = prompt("teacher");
+        for _ in 0..2 {
+            seed(&c).unwrap();
+            assert_eq!(prompt("visual-explainer"), current);
+            assert_eq!(prompt("teacher"), teacher);
+            assert_eq!(count(), before);
+        }
+        assert!(current.contains("Takımın ortak şablonunu (`lessons/_template.html`) kullan; yoksa ilk işte oluştur, sonrakilerde ona uy."));
+        assert!(current.contains("`lessons/<sıra>-<konu>.html`"));
+    }
+
+    #[test]
     fn catalogs_filter_education_in_both_directions_and_keep_order() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         let roles = list(&c).unwrap();
