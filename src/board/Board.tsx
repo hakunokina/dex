@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { AGENTS } from "../agents";
 import { openPanel } from "../layout/panels";
 import { getActiveTeamId, useTeams } from "../team/store";
+import { isAssignable } from "../team/rolePolicy";
 import { hostOf } from "../api/hosts";
 import { useDelegations } from "../delegations";
 import { useTeamCost } from "../usage/costStore";
@@ -252,6 +253,11 @@ interface CardProps extends Pick<React.HTMLAttributes<HTMLDivElement>, "onPointe
 }
 
 function Card({ task, role, cost, editing, dragging, onPatch, onDelete, ...pointer }: CardProps) {
+  const members = useTeams().agents;
+  const assignable = AGENTS.filter(a => {
+    const member = members.find(m => m.id === a.id);
+    return member && isAssignable(member);
+  });
   const agent = AGENTS.find((a) => a.id === task.agentId);
   const project = jobProjectName(task); // #838: only where the team has several projects
   return (
@@ -285,7 +291,8 @@ function Card({ task, role, cost, editing, dragging, onPatch, onDelete, ...point
           style={agent ? { borderLeftColor: agent.shirt } : undefined}
         >
           <option value="">— atanmadı</option>
-          {AGENTS.map((a) => (
+          {agent && !assignable.some(a => a.id === agent.id) && <option value={agent.id} disabled>{agent.name}</option>}
+          {assignable.map((a) => (
             <option key={a.id} value={a.id}>
               {a.name}
             </option>

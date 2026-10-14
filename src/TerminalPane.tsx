@@ -3,6 +3,7 @@ import type { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { AGENT_ERROR_EVENT, AgentStatus, dismissAgentAlert, getAgentError, getStatus, isKeyInput, markRunning, noteInput, setAgentError } from "./agents";
 import { useTeams } from "./team/store";
+import { patronWritable } from "./team/rolePolicy";
 import { kept } from "./hot";
 import { attachPty, coreAnswered, detachPty, killPty, ptyFit, writePty, type PtySink } from "./pty";
 import { FOCUS_EVENT, START_EVENT, startAgent, type StartRequest } from "./launcher";
@@ -67,9 +68,9 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
   const [lost, setLost] = useState(false);
   // #838: the last start was refused with project_unavailable — offer a clean session.
   const [stale, setStale] = useState(false);
-  // #22: worker panes open watch-only (no stray Esc/typing into a job); leaders are always writable.
+  // #22: job workers open watch-only; the patron talks directly to leaders and the assistant.
   const [writable, setWritable] = useState(false);
-  const watch = agent?.kind === "worker" && !writable;
+  const watch = !!agent && !patronWritable(agent) && !writable;
   const watchRef = useRef(watch);
   watchRef.current = watch;
   useEffect(() => {
@@ -422,7 +423,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
         <span className="project-chip" title="Bu oturumun projesi">{project}</span>
       )}
       {ctx && agent && <ContextMeter ctx={ctx} compact={agent.kind === "worker"} />}
-      {agent?.kind === "worker" && view === "term" && (
+      {agent && !patronWritable(agent) && view === "term" && (
         <button
           className={`pane-write ${writable ? "on" : ""}`}
           aria-pressed={writable}

@@ -10,6 +10,7 @@ import { useQuestions, workerQuestion } from "../questions";
 import { stallText, stalledFor, useStalled } from "../stall";
 import { slowReply, useSlowReply } from "../firstReply";
 import { useTeams } from "../team/store";
+import { isAssignable } from "../team/rolePolicy";
 import type { AgentRec } from "../team/api";
 import { revealAgent } from "./panels";
 import { rackOrder, rackVisible } from "./rackOrder";
@@ -25,7 +26,8 @@ interface Props {
 export function Rack({ teamId, focusedId, onFocus }: Props) {
   const members = useTeams().agents.filter(a => a.teamId === teamId);
   const leaders = members.filter(a => a.kind === "leader");
-  const workers = members.filter(a => a.kind === "worker");
+  const assistants = members.filter(a => a.roleSlug === "assistant");
+  const workers = members.filter(a => a.kind === "worker" && isAssignable(a));
   const statuses = useStatuses(members.map(a => a.id));
   const delegations = useDelegations();
   const ordered = rackOrder(rackVisible(workers, statuses, id => activeCount(delegations, id, "to")), statuses);
@@ -90,6 +92,7 @@ export function Rack({ teamId, focusedId, onFocus }: Props) {
           if (e.deltaY && !e.deltaX) e.currentTarget.scrollLeft += e.deltaY;
         }}>
         {leaders.map(chip)}
+        {assistants.map(chip)}
         {leaders.length > 0 && ordered.length > 0 && <span className="rack-sep" />}
         {ordered.map(chip)}
       </div>
