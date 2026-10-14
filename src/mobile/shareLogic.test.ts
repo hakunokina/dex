@@ -9,8 +9,10 @@ import {
   hasShare,
   imageFitsAsIs,
   initialText,
+  resolveShareHost,
   resultText,
   scaleToFit,
+  shouldReloadTargets,
   validateSubmit,
 } from "./shareLogic.ts";
 
@@ -89,4 +91,24 @@ test("resultText", () => {
   assert.equal(resultText({ queued: true }), "Sıraya alındı");
   assert.equal(resultText({ queued: false }), "Asistana gönderildi");
   assert.equal(resultText(null), "Asistana gönderildi");
+});
+
+test("resolveShareHost: varsayılan sonradan gelirse seçim ona döner; açık seçim ezilmez", () => {
+  const ids = ["A", "B"];
+  // soğuk açılış: varsayılan henüz yok → ilk kayıtlı; sonra B gelince B
+  assert.equal(resolveShareHost(ids, null, null), "A");
+  assert.equal(resolveShareHost(ids, null, "B"), "B");
+  // kullanıcı A'yı açıkça seçti → varsayılan değişse de A
+  assert.equal(resolveShareHost(ids, "A", "B"), "A");
+  // seçilen host kaldırıldı / varsayılan kayıtlı değil → geri düşüş
+  assert.equal(resolveShareHost(["B"], "A", "B"), "B");
+  assert.equal(resolveShareHost(ids, null, "Z"), "A");
+  assert.equal(resolveShareHost([], "A", "B"), null);
+});
+
+test("shouldReloadTargets: yalnız başarısız aramada ve seçili host bağlanınca", () => {
+  assert.equal(shouldReloadTargets("A", "A", true), true);
+  assert.equal(shouldReloadTargets("B", "A", true), false);
+  assert.equal(shouldReloadTargets("A", "A", false), false); // ilk yükleme sürüyor/başarılı: çift istek yok
+  assert.equal(shouldReloadTargets("A", null, true), false);
 });

@@ -109,6 +109,21 @@ export function assistantTeams<T extends { id: string }>(
   return teams.filter((t) => withAssistant.has(t.id));
 }
 
+/**
+ * Paylaşım sunucusu: kullanıcının açık seçimi (hâlâ kayıtlıysa) > güncel varsayılan (aktif takımın
+ * sunucusu; soğuk açılışta sonradan gelebilir) > ilk kayıtlı. Seçim state'te tutulmaz, her render türetilir.
+ */
+export function resolveShareHost(hostIds: readonly string[], chosen: string | null, defaultHost: string | null): string | null {
+  if (chosen && hostIds.includes(chosen)) return chosen;
+  if (defaultHost && hostIds.includes(defaultHost)) return defaultHost;
+  return hostIds[0] ?? null;
+}
+
+/** Hedef araması başarısızken seçili sunucu (yeniden) bağlandıysa listeyi yeniden yükle. */
+export function shouldReloadTargets(upHost: string, selectedHost: string | null, lookupFailed: boolean): boolean {
+  return lookupFailed && upHost === selectedHost;
+}
+
 /** `inbox_submit` cevabı → kısa sonuç metni. */
 export function resultText(r: { queued?: boolean } | null | undefined): string {
   return r?.queued ? "Sıraya alındı" : "Asistana gönderildi";

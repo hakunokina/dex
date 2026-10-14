@@ -2,7 +2,7 @@
 // (`inbox_submit`, mevcut kimlik doğrulamalı dexd bağlantısı). Düzenlenebilir metin, görsel önizleme,
 // sunucu ve (birden çok asistanlı takım varsa) takım seçici. İçerik loglanmaz.
 import { useEffect, useMemo, useRef, useState } from "react";
-import { callHost, hostSupports, rawId, useHosts } from "../api/hosts";
+import { callHost, hostSupports, onHostUp, rawId, useHosts } from "../api/hosts";
 import type { RawShare } from "../api/shareTarget";
 import { listAgents, listTeams } from "../team/api";
 import { previewUrl, prepareImage } from "./shareImage";
@@ -10,7 +10,9 @@ import {
   assistantTeams,
   buildSubmit,
   initialText,
+  resolveShareHost,
   resultText,
+  shouldReloadTargets,
   validateSubmit,
   type SubmitImage,
 } from "./shareLogic";
@@ -26,10 +28,14 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
   const [text, setText] = useState(() => initialText(share));
   const [image, setImage] = useState<SubmitImage | null>(null);
   const [imageErr, setImageErr] = useState<string | null>(share.error ?? null);
-  const [hostId, setHostId] = useState<string | null>(defaultHost);
+  // Yalnız kullanıcının açık seçimi; yoksa sunucu her render güncel `defaultHost`'tan türer
+  // (soğuk açılışta takımlar sonradan yüklenir).
+  const [chosenHost, setChosenHost] = useState<string | null>(null);
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [teamId, setTeamId] = useState<string | null>(null);
   const [lookupErr, setLookupErr] = useState<string | null>(null);
+  // Hedef aramasını yeniden tetikler ("Yeniden dene" / sunucu bağlanınca).
+  const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
@@ -46,9 +52,18 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
     return () => void (live = false);
   }, [share.image]);
 
-  // Sunucu: açıkça seçilmediyse varsayılan (aktif takımın sunucusu), o da yoksa ilk kayıtlı.
-  const host = hosts.find((h) => h.rec.id === hostId) ?? hosts[0] ?? null;
-  const hostKey = host?.rec.id ?? null;
+  // Sunucu: açık seçim > varsayılan (aktif takımın sunucusu) > ilk kayıtlı.
+  const hostKey = resolveShareHost(hosts.map((h) => h.rec.id), chosenHost, defaultHost);
+  const host = hosts.find((h) => h.rec.id === hostKey) ?? null;
+  // onHostUp geri çağrısı güncel durumu okusun diye (aboneliği yeniden kurmadan).
+  const lookupFailed = useRef(false);
+  lookupFailed.current = !!lookupErr;
+
+  // Bağlantı geç gelirse (ya da kopup dönerse) başarısız arama kendiliğinden yeniden denenir.
+  useEffect(
+    () => onHostUp((up) => shouldReloadTargets(up, hostKey, lookupFailed.current) && setAttempt((n) => n + 1)),
+    [hostKey],
+  );
 
   useEffect(() => {
     if (!hostKey) return;
@@ -75,7 +90,7 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
       },
     );
     return () => void (live = false);
-  }, [hostKey]);
+  }, [hostKey, attempt]);
 
   const problem = useMemo(() => validateSubmit(text, image, teamId), [text, image, teamId]);
   const waitingImage = !!share.image && !image && !imageErr;
@@ -122,7 +137,7 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
             {hosts.length > 1 && (
               <label className="m-share-field">
                 <span>Sunucu</span>
-                <select value={hostKey ?? ""} onChange={(e) => setHostId(e.target.value)} disabled={busy}>
+                <select value={hostKey ?? ""} onChange={(e) => setChosenHost(e.target.value)} disabled={busy}>
                   {hosts.map((h) => (
                     <option key={h.rec.id} value={h.rec.id}>{h.rec.name}</option>
                   ))}
@@ -149,6 +164,9 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
             {targets === null && <p className="m-hint">Asistan aranıyor…</p>}
             {targets && targets.length === 0 && (
               <p className="m-err" role="alert">{lookupErr ?? "Bu hostta asistan yok"}</p>
+            )}
+            {targets && targets.length === 0 && (
+              <button className="m-share-cancel" onClick={() => setAttempt((n) => n + 1)} disabled={busy}>Yeniden dene</button>
             )}
             {err && <p className="m-err" role="alert">{err}</p>}
             <button className="m-primary" disabled={busy || waitingImage || !!problem} onClick={() => void send()}>

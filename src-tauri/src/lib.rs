@@ -80,7 +80,7 @@ pub fn run() {
     #[cfg(desktop)]
     let builder = builder.manage(storage);
     #[cfg(mobile)]
-    let builder = builder.plugin(mobile_hosts::init());
+    let builder = builder.plugin(mobile_hosts::init()).plugin(mobile_hosts::init_share());
     // #41: first, so a second launch exits before `host::plugin` starts a Core on the same dex.db;
     // the running window comes forward instead. (The Core's own dex.lock is the hard guard.)
     // #150: with the core in dexd a second window is harmless — `tauri dev` opens next to the

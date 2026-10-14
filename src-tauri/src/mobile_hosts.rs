@@ -47,12 +47,22 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
                 }
                 Err(e) => eprintln!("dex-host-tokens: Kotlin köprüsü yüklenemedi: {e}"),
             }
-            // Paylaş hedefi de aynı şekilde isteğe bağlı: yoksa yalnız paylaşım alınamaz.
+            Ok(())
+        })
+        .build()
+}
+
+/// Paylaş hedefi için AYRI Tauri eklentisi: Kotlin `PluginManager` eklentileri Tauri eklenti adıyla
+/// anahtarlar; ikinci kayıt `dex-host-tokens` altına yapılırsa token köprüsünü ezer. Yoksa yalnız
+/// paylaşım alınamaz (isteğe bağlı).
+pub fn init_share<R: Runtime>() -> TauriPlugin<R> {
+    Builder::new("dex-share-target")
+        .setup(|app, api: PluginApi<R, ()>| {
             match api.register_android_plugin(SHARE_IDENTIFIER, SHARE_CLASS) {
                 Ok(handle) => {
                     app.manage(ShareTarget::<R>(handle));
                 }
-                Err(e) => eprintln!("dex-host-tokens: paylaş köprüsü yüklenemedi: {e}"),
+                Err(e) => eprintln!("dex-share-target: paylaş köprüsü yüklenemedi: {e}"),
             }
             Ok(())
         })
