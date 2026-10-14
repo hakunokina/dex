@@ -325,6 +325,14 @@ impl States {
         state.draft || now().saturating_sub(state.input_at) < 5_000
     }
 
+    /// The finite input window's deadline; a persistent draft waits for input(false).
+    pub(crate) fn typing_retry_delay(&self, id: &str) -> Option<std::time::Duration> {
+        let state = self.get(id);
+        let remaining = 5_000_u64.saturating_sub(now().saturating_sub(state.input_at));
+        if state.draft && remaining == 0 { return None; }
+        Some(std::time::Duration::from_millis(remaining))
+    }
+
     pub fn exited(&self, id: &str) -> State {
         self.change(id, |state| {
             state.set_status(Status::Offline);
@@ -2143,6 +2151,20 @@ mod tests {
         assert_eq!(delivery(Status::Working, false, false), Delivery::Queue);
         assert_eq!(delivery(Status::Waiting, false, false), Delivery::Queue);
         assert_eq!(delivery(Status::Idle, false, true), Delivery::Queue);
+    }
+
+    #[test]
+    fn persistent_draft_waits_for_input_event_after_the_finite_window() {
+        let states = States::default();
+        states.input("ayla", true);
+        states.change("ayla", |s| s.input_at = now().saturating_sub(5_001));
+        assert!(states.typing("ayla"));
+        assert_eq!(states.typing_retry_delay("ayla"), None, "a persistent draft must not poll");
+        assert!(states.input("ayla", false));
+        assert!(states.typing_retry_delay("ayla").unwrap() > std::time::Duration::ZERO);
+        states.change("ayla", |s| s.input_at = now().saturating_sub(5_001));
+        assert!(!states.typing("ayla"));
+        assert_eq!(states.typing_retry_delay("ayla"), Some(std::time::Duration::ZERO));
     }
 
     /// #671: effort as the CLI's env (claude engines) — none adds nothing, a given one wins over
