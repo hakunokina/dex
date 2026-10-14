@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { delimiter, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -83,10 +83,26 @@ export function scanContext(root, config) {
           scanGit(["clone", "--bare", "--shared", "--quiet", "--template=", "--", root, source]);
         }
         if (args.includes("--staged")) {
+          // Pin the isolated copy to the worktree HEAD so --staged always diffs the
+          // staged index against the true base, never against the clone default.
+          // An unborn HEAD has no target to pin; keep the clone default as before.
+          const head = spawnSync("git", ["rev-parse", "--verify", "HEAD"],
+            { cwd: root, env: gitEnvironment(), encoding: "utf8" });
+          if (!head.error && head.status === 0) {
+            const pin = spawnSync("git", ["update-ref", "--no-deref", "HEAD", head.stdout.trim()],
+              { cwd: source, env, encoding: "utf8" });
+            if (pin.error || pin.status !== 0) throw new Error("Izole tarama deposu olusturulamadi.");
+          }
           const index = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-path", "index"],
             { cwd: root, env: gitEnvironment(), encoding: "utf8" });
           if (index.error || index.status !== 0) throw new Error("Staged index okunamadi.");
-          copyFileSync(index.stdout.trim(), resolve(source, "index"));
+          const indexPath = index.stdout.trim();
+          copyFileSync(indexPath, resolve(source, "index"));
+          // Split index (core.splitIndex) keeps base entries in a companion file; without it
+          // the isolated copy sees a partial index and --staged misses staged content.
+          for (const entry of readdirSync(dirname(indexPath))) {
+            if (entry.startsWith("sharedindex.")) copyFileSync(resolve(dirname(indexPath), entry), resolve(source, entry));
+          }
         }
         args = ["git", source, ...args.slice(1)];
       } else if (args[0] === "dir") {
