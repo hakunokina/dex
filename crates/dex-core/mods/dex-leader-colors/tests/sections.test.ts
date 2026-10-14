@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { splitFences, splitSections } from '../hooks/sections.ts'
+import { dexColor, splitDexBlocks, splitFences, splitSections } from '../hooks/sections.ts'
 
 test('splits fenced code out of framed text, nested fences stay whole', () => {
   expect(splitFences('a\n  ```sh\nx\n  ```\nb\n````\n```\ny\n````\n')).toEqual([
@@ -45,6 +45,33 @@ test('groups bold and markdown-heading forms under the plain heading', () => {
   ])
   const text = '**Biten:** bitti\n*Süren:*\n'
   expect(splitSections(text)).toEqual([{ kind: 'markdown', text }])
+})
+
+test('dexColor paints per type, failures red and fixes orange', () => {
+  expect(dexColor('Dex-Devretme', '[Dex-Devretme] K #1 · bitti — x')).toBe('#3fb950')
+  expect(dexColor('Dex-Devretme', '[Dex-Devretme] K #1 · başarısız')).toBe('#f85149')
+  expect(dexColor('Dex-Devretme', '[Dex-Devretme] K #1 · RAPORSUZ bitti')).toBe('#f85149')
+  expect(dexColor('Dex-İnceleme', '[Dex-İnceleme] #2 · onay')).toBe('#3fb950')
+  expect(dexColor('Dex-İnceleme', '[Dex-İnceleme] #2 · düzelt')).toBe('#d29922')
+  expect(dexColor('Dex-Soru', '[Dex-Soru] K #1 · soru #2 — x')).toBe('#e3b341')
+  expect(dexColor('Dex-Cevap', '[Dex-Cevap] x')).toBe('#3fb950')
+  expect(dexColor('Dex-Plan', '[Dex-Plan] Plan #1 tamamlandı.')).toBe('#58a6ff')
+  expect(dexColor('Dex-Üye', '[Dex-Üye] ONAYLANDI')).toBe('#bc8cff')
+  expect(dexColor('Dex-Üye', '[Dex-Üye] REDDEDİLDİ')).toBe('#f85149')
+  expect(dexColor('Dex-Not', '[Dex-Not] not')).toBe('#8b949e')
+  expect(dexColor('Dex-Sistem', '[Dex-Sistem] kota')).toBe('#39c5cf')
+  expect(dexColor('Dex-Bilinmez', 'x')).toBe('#8b949e')
+})
+
+test('splitDexBlocks pulls typed lines out, fences stay verbatim', () => {
+  expect(splitDexBlocks('[Dex-Devretme] Kaan #1 · bitti — iş\n  özet: detay\n- [Dex-Soru] K #1 · soru #2 — neden?\n')).toEqual([
+    { kind: 'dex', tag: 'Dex-Devretme', text: '[Dex-Devretme] Kaan #1 · bitti — iş\n' },
+    { kind: 'text', text: '  özet: detay\n' },
+    { kind: 'dex', tag: 'Dex-Soru', text: '- [Dex-Soru] K #1 · soru #2 — neden?\n' },
+  ])
+  expect(splitDexBlocks('düz metin')).toEqual([{ kind: 'text', text: 'düz metin' }])
+  expect(splitDexBlocks('```\n[Dex-Devretme] sahte\n```\n')).toEqual([{ kind: 'text', text: '```\n[Dex-Devretme] sahte\n```\n' }])
+  expect(splitDexBlocks('[Dex] eski\n[Dexter] oyun\n')).toEqual([{ kind: 'text', text: '[Dex] eski\n[Dexter] oyun\n' }])
 })
 
 test('keeps nested fences and unclosed fences within their markdown section', () => {

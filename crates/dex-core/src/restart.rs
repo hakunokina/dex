@@ -234,7 +234,7 @@ mod lifecycle_tests {
         let c = core(); open(&c, "kaan");
         with(&c.db, |db| agents::record_session(db, "kaan", "saved", "claude", None)).unwrap();
         let d = job(&c, "running");
-        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(d.id)}), false);
+        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(d.id, "kaan")}), false);
         c.agent_states.hook("kaan", Some(agents::Status::Working), None);
         let reply = crate::mcp::call_with_args_for_test(&c, "kaan", "report", serde_json::json!({"delegationId":d.id,"summary":"bitti: test"}));
         assert_ne!(reply["isError"], true, "{reply}");
@@ -300,7 +300,7 @@ mod lifecycle_tests {
         let starts = agents::CAPTURE.with(|cap| cap.borrow_mut().take().unwrap());
         assert_eq!(starts.len(), 1);
         assert!(starts[0].0.args.windows(2).any(|a| a == ["--resume", "leader-saved"]));
-        assert!(starts[0].0.args.last().unwrap().starts_with("[Dex]"));
+        assert!(starts[0].0.args.last().unwrap().starts_with("[Dex-Sistem] Bekleyen"));
         assert!(!c.sleeping_leaders.lock().unwrap().contains("timur"));
         assert!(c.team_idle.lock().unwrap()["default"].seen.elapsed() < TEAM_IDLE);
         assert!(delegate::on_session_start(&c.db, &c.events, "timur").unwrap().contains(&format!("#{}", d.id)));
@@ -501,7 +501,7 @@ mod lifecycle_tests {
         let after = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at;
         finish(&c);
         assert!(!early, "startup must not paste before readiness");
-        assert!(pasted.is_some_and(|p| p.starts_with(b"\x1b[200~[Dex]")), "SessionStart must wake the pending result without a UI timer");
+        assert!(pasted.is_some_and(|p| p.starts_with(b"\x1b[200~[Dex-")), "SessionStart must wake the pending result without a UI timer");
         assert_eq!(enter.as_deref(), Some(b"\r".as_slice()), "ready delivery includes Enter");
         assert!(before.is_none(), "a PTY write is not prompt acceptance");
         assert!(response.contains("RAPORSUZ"), "UPS must carry the pending result: {response}");
@@ -544,13 +544,13 @@ mod lifecycle_tests {
             let repeated = post(&c, "timur", &serde_json::json!({"hook_event_name":"UserPromptSubmit","prompt":prompt}));
             let after = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at;
             finish(&c);
-            assert!(text.starts_with(b"\x1b[200~[Dex]"));
+            assert!(text.starts_with(b"\x1b[200~[Dex-"));
             assert_eq!(enter, b"\r");
             assert_eq!(retry, b"\r", "retry must not append a second copy of the text");
             assert!(before.is_none());
-            assert!(reply.contains("biten devretmeler") && stamp.is_some());
+            assert!(reply.contains("[Dex-Devretme]") && stamp.is_some());
             assert!(!extra, "acceptance must cancel the acknowledgement deadline");
-            assert!(!repeated.contains("biten devretmeler"));
+            assert!(!repeated.contains("[Dex-Devretme]"));
             assert_eq!(stamp, after, "one delivery stamp");
         }
     }
@@ -570,7 +570,7 @@ mod lifecycle_tests {
             with(&c.db, |db| crate::plan::note(db, "timur", "pending note")).unwrap();
             c.leader_notes_wake("timur");
             let text = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-            assert!(text.starts_with(b"\x1b[200~[Dex]"));
+            assert!(text.starts_with(b"\x1b[200~[Dex-"));
             assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), b"\r");
             assert!(with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at.is_none());
 
@@ -589,10 +589,10 @@ mod lifecycle_tests {
             finish(&c);
             assert!(!extra_before, "{key}: patron input must cancel both paste and Enter retries");
             assert!(pending, "input must not acknowledge delivery");
-            assert!(reply.contains("biten devretmeler") && stamp.is_some());
+            assert!(reply.contains("[Dex-Devretme]") && stamp.is_some());
             assert!(reply.contains("pending decision") && reply.contains("pending note") && question_stamp.is_some());
             assert!(!extra, "acceptance must cancel further retries");
-            assert!(!repeated.contains("biten devretmeler"));
+            assert!(!repeated.contains("[Dex-Devretme]"));
             assert!(!repeated.contains("pending decision") && !repeated.contains("pending note"));
             assert_eq!(stamp, after, "one delivery stamp");
         }
@@ -613,10 +613,10 @@ mod lifecycle_tests {
         let next_text = String::from_utf8_lossy(&next);
         let stamp = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at;
         finish(&c);
-        assert!(String::from_utf8_lossy(&old).contains("Devretme sonucu"));
-        assert!(reply.contains("biten devretmeler") && stamp.is_some());
+        assert!(String::from_utf8_lossy(&old).contains("[Dex-Devretme]"));
+        assert!(reply.contains("[Dex-Devretme]") && stamp.is_some());
         assert!(next_text.contains("remaining note"), "the new session must get a new paste: {next_text:?}");
-        assert!(!next_text.contains("Devretme sonucu"), "context delivery must not be repeated");
+        assert!(!next_text.contains("[Dex-Devretme]"), "context delivery must not be repeated");
     }
 
     #[test]
@@ -642,12 +642,12 @@ mod lifecycle_tests {
         let stamp = with(&c.db, |db| crate::questions::get(db, q.id)).unwrap().leader_delivered_at;
         let delivered = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at;
         finish(&c);
-        assert!(text.starts_with(b"\x1b[200~[Dex]"));
-        assert!(reply.contains("retained note") && reply.contains("retained question") && reply.contains("biten devretmeler"));
+        assert!(text.starts_with(b"\x1b[200~[Dex-"));
+        assert!(reply.contains("retained note") && reply.contains("retained question") && reply.contains("[Dex-Devretme]"));
         assert!(!busy_write, "do not paste into the patron's working turn");
         assert!(!retried, "the replaced draft must never be pasted again");
         assert!(stamp.is_some() && delivered.is_some());
-        assert!(!repeated.contains("retained") && !repeated.contains("biten devretmeler"));
+        assert!(!repeated.contains("retained") && !repeated.contains("[Dex-Devretme]"));
     }
 
     #[test]
@@ -705,7 +705,7 @@ mod lifecycle_tests {
         let extra = rx.recv_timeout(std::time::Duration::from_millis(2300)).is_ok();
         let pending = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at.is_none();
         finish(&c);
-        assert!(text.starts_with(b"\x1b[200~[Dex]"));
+        assert!(text.starts_with(b"\x1b[200~[Dex-"));
         assert!(pending, "cancelled input must keep the result pending");
         assert!(!extra, "patron input at submission must cancel Enter and its retry");
     }
@@ -730,7 +730,7 @@ mod lifecycle_tests {
         let extra = rx.recv_timeout(std::time::Duration::from_millis(2300)).is_ok();
         let stamp = with(&c.db, |db| delegate::get(db, d.id)).unwrap().delivered_at;
         finish(&c);
-        assert!(text.starts_with(b"\x1b[200~[Dex]"));
+        assert!(text.starts_with(b"\x1b[200~[Dex-"));
         assert!(stamp.is_some());
         assert!(!extra, "a confirmed prompt must cancel both the late Enter and timeout retry");
     }
@@ -761,11 +761,11 @@ mod lifecycle_tests {
         c.claude_hook_received("timur", "PreToolUse", Some("leader-session"), agents::next_seq());
         let repeated = c.delegation_on_hook("timur", "Stop", &serde_json::json!({}), false).unwrap_or_default();
         finish(&c);
-        assert!(text.starts_with(b"\x1b[200~[Dex]"));
+        assert!(text.starts_with(b"\x1b[200~[Dex-"));
         assert!(!extra, "input during redraw cancels the late Enter and all retries");
         assert!(pending);
-        assert!(reply.contains("biten devretmeler") && reply.contains("stop note"));
-        assert!(!repeated.contains("biten devretmeler") && !repeated.contains("stop note"));
+        assert!(reply.contains("[Dex-Devretme]") && reply.contains("stop note"));
+        assert!(!repeated.contains("[Dex-Devretme]") && !repeated.contains("stop note"));
     }
 
     #[test]
@@ -838,7 +838,7 @@ mod lifecycle_tests {
             db.execute("INSERT INTO delegation_reviews(review_id,target_id,sha,created_at) VALUES(?1,?2,'fixture-sha',1)", rusqlite::params![review.id,target.id]).map_err(|e|e.to_string())?;
             Ok(())
         }).unwrap();
-        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(review.id)}), false);
+        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(review.id, "kaan")}), false);
         let report = |summary| crate::mcp::call_with_args_for_test(&c, "kaan", "report", serde_json::json!({"delegationId":review.id,"summary":summary}));
         assert_eq!(report("bitti: eksik karar")["isError"], true);
         assert!(!c.reported_workers.lock().unwrap().contains("kaan"));
@@ -1000,7 +1000,7 @@ mod lifecycle_tests {
     fn assert_reported_worker_delivers_queued_chat(prompt: &str, dex: bool) {
         let c = core(); open(&c, "kaan");
         let d = job(&c, "running");
-        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(d.id)}), false);
+        c.delegation_on_hook("kaan", "UserPromptSubmit", &serde_json::json!({"prompt":delegate::trigger_line(d.id, "kaan")}), false);
         c.agent_states.hook("kaan", Some(agents::Status::Working), None);
         assert_eq!(c.chat_send("kaan", prompt), Ok("queued"));
         with(&c.db, |db| delegate::set_status(db, d.id, "done")).unwrap();

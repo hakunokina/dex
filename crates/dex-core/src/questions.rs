@@ -327,9 +327,9 @@ fn delegated(conn: &Connection, agent: &str) -> Result<bool, String> {
 }
 
 pub(crate) fn leader_text(qs: &[Question], header: &str) -> String {
-    let mut s = format!("# Dex: worker soruları ({header})\nHer biri için `answer` (questionId, text) ile cevapla; cevaplayamıyorsan `escalate` ile patrona çıkar.\n");
+    let mut s = format!("[{}] {header}:\nHer biri için `answer` (questionId, text) ile cevapla; cevaplayamıyorsan `escalate` ile patrona çıkar.\n", crate::dexmsg::SORU);
     for q in qs {
-        s.push_str(&format!("- soru #{} — {} (devretme #{}): {}", q.id, q.worker_name, q.delegation_id, q.question.replace('\n', "\n  ")));
+        s.push_str(&format!("- [{}] {} #{} · soru #{} — {}", crate::dexmsg::SORU, q.worker_name, q.delegation_id, q.id, q.question.replace('\n', "\n  ")));
         if !q.options.is_empty() {
             s.push_str(&format!("\n  seçenekler: {}", q.options.join(" | ")));
         }
@@ -342,11 +342,12 @@ pub(crate) fn leader_text(qs: &[Question], header: &str) -> String {
 }
 
 fn answer_text(qs: &[Question]) -> String {
-    let mut s = String::from("# Dex: sorularının cevabı geldi\n");
+    let mut s = format!("[{}] sorularının cevabı geldi:\n", crate::dexmsg::CEVAP);
     for q in qs {
         let by = if q.answered_by.as_deref() == Some("patron") { "patron" } else { q.leader_name.as_str() };
         s.push_str(&format!(
-            "- soru #{} (devretme #{}): {}\n  cevap ({by}): {}\n",
+            "- [{}] soru #{} (devretme #{}): {}\n  cevap ({by}): {}\n",
+            crate::dexmsg::CEVAP,
             q.id,
             q.delegation_id,
             q.question.replace('\n', " "),
@@ -707,7 +708,7 @@ mod tests {
             let q = ask(c, &caller(c, "kaan")?, &json!({ "question": "Onay?" }))?;
             Ok((d, new_job()?, q))
         }).unwrap();
-        core.delegation_on_hook("kaan", "UserPromptSubmit", &json!({ "prompt": crate::delegate::trigger_line(d.id) }), false);
+        core.delegation_on_hook("kaan", "UserPromptSubmit", &json!({ "prompt": crate::delegate::trigger_line(d.id, "kaan") }), false);
         // No status hook was recorded: silence is already beyond the ten-minute threshold.
         assert!(core.agent_states.silent_for("kaan") >= crate::agents::IDLE_CLOSE_MS);
         for escalated in [false, true] {

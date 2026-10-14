@@ -168,13 +168,14 @@ pub fn decide(conn: &Connection, data_dir: &std::path::Path, id: i64, approve: b
         )
         .map_err(e)?;
         format!(
-            "Üye önerin #{id} ONAYLANDI: {} ({}, {}) takıma eklendi, id {}. Artık delegate/plan ile iş verebilirsin.",
+            "[{}] Üye önerin #{id} ONAYLANDI: {} ({}, {}) takıma eklendi, id {}. Artık delegate/plan ile iş verebilirsin.",
+            crate::dexmsg::UYE,
             a.name, p.role_name, a.model, a.id
         )
     } else {
         tx.execute("UPDATE member_proposals SET status = 'rejected', decided_at = ?2 WHERE id = ?1", params![id, now()])
             .map_err(e)?;
-        format!("Üye önerin #{id} ({}) patron tarafından REDDEDİLDİ; üye eklenmedi. İşi mevcut takımla yürüt.", p.role_name)
+        format!("[{}] Üye önerin #{id} ({}) patron tarafından REDDEDİLDİ; üye eklenmedi. İşi mevcut takımla yürüt.", crate::dexmsg::UYE, p.role_name)
     };
     crate::plan::note(&tx, &p.leader, &text)?;
     tx.commit().map_err(e)?;

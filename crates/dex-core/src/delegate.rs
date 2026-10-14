@@ -724,9 +724,19 @@ fn mark_read(conn: &Connection, leader: &str) -> Result<Vec<Delegation>, String>
         .collect()
 }
 
+/// Özetin ilk satırı, tek-satır başlıklar için (120 karakterde kesik).
+pub(crate) fn first_line(s: &str) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    let mut out: String = first.chars().take(120).collect();
+    if first.chars().count() > 120 {
+        out.push('…');
+    }
+    out
+}
+
 /// Result lines the leader reads (prompt context, Stop-block reason, SessionStart context).
 fn results_text(conn: &Connection, header: &str, done: &[Delegation]) -> String {
-    let mut ctx = format!("# Dex: biten devretmeler ({header})\n");
+    let mut ctx = format!("[{}] {header}:\n", crate::dexmsg::DEVRETME);
     for d in done {
         let who = caller(conn, &d.to_agent).map(|c| c.name).unwrap_or_else(|_| d.to_agent.clone());
         let status = match d.status.as_str() {
@@ -734,7 +744,12 @@ fn results_text(conn: &Connection, header: &str, done: &[Delegation]) -> String 
             "done_no_report" => "RAPORSUZ bitti (worker report çağırmadan durdu; pane'ine bak)",
             _ => "başarısız",
         };
-        ctx.push_str(&format!("- #{} → {who}: {status}", d.id));
+        let mut head = format!("- [{}] {who} #{} · {}", crate::dexmsg::DEVRETME, d.id, status);
+        if let Some(first) = d.summary.as_deref().map(first_line).filter(|s| !s.is_empty()) {
+            head.push_str(&format!(" — {first}"));
+        }
+        ctx.push_str(&head);
+        ctx.push('\n');
         if let Some(lvl) = d.effort {
             ctx.push_str(&format!(" · effort {}", lvl.as_str()));
             if d.effort_skipped {
@@ -742,7 +757,11 @@ fn results_text(conn: &Connection, header: &str, done: &[Delegation]) -> String 
             }
         }
         if let Some(s) = &d.summary {
-            ctx.push_str(&format!("\n  özet: {}", s.replace('\n', "\n  ")));
+            // İlki başlıkta; yalnız devam satırları ayrıntıda (tekrar yok).
+            let rest: Vec<&str> = s.lines().skip(1).collect();
+            if !rest.iter().all(|l| l.trim().is_empty()) {
+                ctx.push_str(&format!("\n  özet (devamı): {}", rest.join("\n  ")));
+            }
         }
         if let Some(w) = crate::worktree::get(conn, d.id).ok().flatten().filter(|w| w.merged_at.is_none()) {
             ctx.push_str(&format!("\n  {}", crate::worktree::result_line(&w)));
@@ -855,7 +874,7 @@ pub fn worker_prompt(conn: &Connection, d: &Delegation) -> Result<String, String
         Some(t) => format!(" (panodaki görev #{t}; durumunu task_update ile sen güncelle)"),
         None => String::new(),
     };
-    let mut s = format!("[Dex devretme #{}] {from} (lider) sana iş verdi{task}:\n---\n{}\n---\n", d.id, job_text(d.patron_words.as_deref(), &d.prompt));
+    let mut s = format!("[Dex-Devretme] {from} #{} · sana iş verdi{task}:\n---\n{}\n---\n", d.id, job_text(d.patron_words.as_deref(), &d.prompt));
     if d.service_team_id.is_some() {
         let research = result_dir(conn, d)?.ok_or_else(|| crate::projects::ProjectError::Unavailable.to_string())?;
         let project = research.parent().and_then(Path::parent).unwrap_or(&research);
@@ -914,7 +933,7 @@ impl Turns {
         if prompt.trim_start().starts_with("<task-notification>") {
             return;
         }
-        self.set(agent, prompt.trim_start().starts_with("[Dex]"));
+        self.set(agent, crate::dexmsg::is_dex_turn(prompt));
     }
 
     fn is_dex(&self, agent: &str) -> bool {
@@ -932,17 +951,31 @@ impl Turns {
     }
 }
 
-const TRIGGER: &str = "[Dex] yeni iş #";
-
 /// The only text Dex types into a claude pane for a job; the job itself comes as that prompt's
 /// UserPromptSubmit context (system channel: no "did the user write this?" doubt, no long paste).
-pub(crate) fn trigger_line(id: i64) -> String {
-    format!("{TRIGGER}{id} — ayrıntı bu mesajın ekinde (görmüyorsan delegation_status ile oku).")
+pub(crate) fn trigger_line(id: i64, worker: &str) -> String {
+    format!(
+        "[Dex-Devretme] {worker} #{id} · başladı — ayrıntı bu mesajın ekinde (görmüyorsan delegation_status ile oku)."
+    )
 }
 
 fn trigger_id(prompt: &str) -> Option<i64> {
-    let rest = prompt.trim_start().strip_prefix(TRIGGER)?;
-    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+    let p = prompt.trim_start();
+    if let Some(rest) = p.strip_prefix("[Dex-Devretme]") {
+        // Yalnız pano tetikleyicisi: `[Dex-Devretme] Forge-1 #1745 · başladı …`.
+        // İş gövdesi (`· sana iş verdi:`) ve sonuç satırları (`· bitti/…`) eşleşmez.
+        let hash = rest.find(" #")?;
+        let digits: String = rest[hash + 2..].chars().take_while(char::is_ascii_digit).collect();
+        let tail = &rest[hash + 2 + digits.len()..];
+        if !tail.starts_with(" · başladı") {
+            return None;
+        }
+        digits.parse().ok()
+    } else {
+        // Eski biçim (`[Dex] yeni iş #N — …`): yükseltme sırasında uçuşan tetikler için.
+        let rest = p.strip_prefix("[Dex] yeni iş #")?;
+        rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+    }
 }
 
 /// Without turn state: every turn counts as the patron's, so no Stop is refused.
@@ -1131,10 +1164,10 @@ fn on_prompt(conn: &Connection, turns: &Turns, agent: &str, body: &Value) -> Res
     let done = take_unnotified(conn, agent)?;
     let mut parts = Vec::new();
     if let Some(d) = &job {
+        let who = caller(conn, &d.to_agent).map(|c| c.name).unwrap_or_else(|_| d.to_agent.clone());
         parts.push(format!(
-            "# Dex: yeni iş #{} (Dex'in sistem kanalından geldi; onay isteme, doğrudan başla)
-{}",
-            d.id,
+            "{}\n(Dex'in sistem kanalından geldi; onay isteme, doğrudan başla)\n{}",
+            trigger_line(d.id, &who),
             worker_prompt(conn, d)?
         ));
     }
@@ -1493,7 +1526,7 @@ fn tell_leader(conn: &Connection, agent: &str, text: impl FnOnce(&str, i64) -> S
         .map_err(e)?;
     let Some(d) = d else { return Ok(None) };
     let who = caller(conn, agent).map(|c| c.name).unwrap_or_else(|_| agent.into());
-    crate::plan::note(conn, &d.from_agent, &text(&who, d.id))?;
+    crate::plan::note(conn, &d.from_agent, &crate::dexmsg::line(crate::dexmsg::SISTEM, text(&who, d.id)))?;
     Ok(Some(d.from_agent))
 }
 
@@ -1872,7 +1905,7 @@ mod tests {
         let (c, t) = (mem(), Turns::default());
         let l = leader(&c);
         let d = job(&c, &l, "şemayı güncelle");
-        prompt(&c, &t, &trigger_line(d.id));
+        prompt(&c, &t, &trigger_line(d.id, "Kaan"));
         let out = on_stop(&c, &t, "kaan", false, None).unwrap().0.expect("refused");
         assert_eq!(out["decision"], "block");
         let reason = out["reason"].as_str().unwrap();
@@ -1899,7 +1932,7 @@ mod tests {
 ",
         )).unwrap();
         let tr = tr.to_string_lossy().into_owned();
-        prompt(&c, &t, &trigger_line(d.id));
+        prompt(&c, &t, &trigger_line(d.id, "Kaan"));
         assert!(on_stop(&c, &t, "kaan", false, Some(&tr)).unwrap().0.is_some(), "first: refused");
         let (out, changed) = on_stop(&c, &t, "kaan", false, Some(&tr)).unwrap();
         assert!(out.is_none(), "second: not refused again");
@@ -1931,7 +1964,7 @@ mod tests {
         let note = |id: &str| format!("{{\"type\":\"user\",\"message\":{{\"content\":\"<task-notification>\\n<task-id>{id}</task-id>\\n<status>completed</status>\\n</task-notification>\"}}}}\n");
         std::fs::write(&tr, started).unwrap();
         let path = tr.to_string_lossy().into_owned();
-        prompt(&c, &t, &trigger_line(d.id));
+        prompt(&c, &t, &trigger_line(d.id, "Kaan"));
         for _ in 0..2 {
             let (out, changed) = on_stop(&c, &t, "kaan", false, Some(&path)).unwrap();
             assert!((out.is_none(), changed.is_empty()) == (true, true), "held: neither refused nor closed");
@@ -1950,7 +1983,7 @@ mod tests {
         // A hold older than the cap no longer counts.
         let d3 = job(&c, &l, "üçüncü");
         std::fs::write(&tr, started).unwrap();
-        prompt(&c, &t, &trigger_line(d3.id));
+        prompt(&c, &t, &trigger_line(d3.id, "Kaan"));
         c.execute("UPDATE delegations SET updated_at = ?2 WHERE id = ?1", params![d3.id, now() - BACKGROUND_WAIT_MAX_MS - 1]).unwrap();
         on_stop(&c, &t, "kaan", false, Some(&path)).unwrap();
         on_stop(&c, &t, "kaan", false, Some(&path)).unwrap();
@@ -1958,7 +1991,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only a `[Dex]` prompt opens a Dex turn; look-alikes stay the patron's.
+    /// Only a Dex prompt (`[Dex]` or `[Dex-Tür]`) opens a Dex turn; look-alikes stay the patron's.
     #[test]
     fn dex_look_alike_prompts_stay_the_patrons() {
         let (c, t) = (mem(), Turns::default());
@@ -1984,7 +2017,7 @@ mod tests {
         let (c, t) = (mem(), Turns::default());
         let l = leader(&c);
         let d = job(&c, &l, "şemayı güncelle");
-        prompt(&c, &t, &trigger_line(d.id));
+        prompt(&c, &t, &trigger_line(d.id, "Kaan"));
         prompt(&c, &t, "dur, önce testleri koş");
         assert!(on_stop(&c, &t, "kaan", false, None).unwrap().0.is_none());
         assert_eq!(get(&c, d.id).unwrap().status, "done_no_report");
@@ -2010,7 +2043,7 @@ mod tests {
     fn background_task_notification_keeps_the_turn_owner() {
         let (c, t) = (mem(), Turns::default());
         let note = "<task-notification>\n<task-id>b1x9ku68q</task-id>\n<status>completed</status>\n</task-notification>";
-        prompt(&c, &t, &trigger_line(1));
+        prompt(&c, &t, &trigger_line(1, "Kaan"));
         prompt(&c, &t, note);
         assert_eq!(t.dex_turn("kaan"), Some(true), "still Dex's session");
         prompt(&c, &t, "patronun sorusu");
@@ -2027,18 +2060,49 @@ mod tests {
         let (c, t) = (mem(), Turns::default());
         let l = leader(&c);
         let d = job(&c, &l, "UZUN-GÖREV-METNİ");
-        assert_eq!(trigger_id(&trigger_line(d.id)), Some(d.id));
-        assert!(!trigger_line(d.id).contains("UZUN-GÖREV-METNİ"), "no job text in the pane");
-        let ctx = prompt(&c, &t, &trigger_line(d.id)).unwrap();
+        assert_eq!(
+            trigger_line(d.id, "Kaan"),
+            format!("[Dex-Devretme] Kaan #{} · başladı — ayrıntı bu mesajın ekinde (görmüyorsan delegation_status ile oku).", d.id)
+        );
+        assert_eq!(trigger_id(&trigger_line(d.id, "Kaan")), Some(d.id));
+        assert_eq!(trigger_id(&format!("[Dex] yeni iş #{} — eski biçim", d.id)), Some(d.id), "old triggers still parse");
+        let body = worker_prompt(&c, &d).unwrap();
+        assert!(body.starts_with(&format!("[Dex-Devretme] Timur #{} · sana iş verdi:", d.id)), "{body}");
+        assert_eq!(trigger_id(&body), None, "the job body is not a trigger");
+        assert!(!trigger_line(d.id, "Kaan").contains("UZUN-GÖREV-METNİ"), "no job text in the pane");
+        let ctx = prompt(&c, &t, &trigger_line(d.id, "Kaan")).unwrap();
         let ctx = ctx["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
-        assert!(ctx.contains(&format!("yeni iş #{}", d.id)) && ctx.contains("UZUN-GÖREV-METNİ") && ctx.contains(&format!("delegationId={}", d.id)), "{ctx}");
+        assert!(ctx.contains(&format!("[Dex-Devretme] Kaan #{}", d.id)) && ctx.contains("UZUN-GÖREV-METNİ") && ctx.contains(&format!("delegationId={}", d.id)), "{ctx}");
         // Another worker's job, a finished job, a quoted trigger, an unknown id: no job context.
         let other = insert(&c, NewDelegation { from: &l, to_agent: "ayla".into(), team_id: "default".into(), service_team_id: None, prompt: "AYLA-İŞİ".into(), task_id: None, patron_words: None, effort: None }).unwrap();
-        assert!(prompt(&c, &t, &trigger_line(other.id)).is_none());
-        assert!(prompt(&c, &t, &format!("bak: {}", trigger_line(d.id))).is_none());
-        assert!(prompt(&c, &t, &trigger_line(9_999)).is_none());
+        assert!(prompt(&c, &t, &trigger_line(other.id, "Ayla")).is_none());
+        assert!(prompt(&c, &t, &format!("bak: {}", trigger_line(d.id, "Kaan"))).is_none());
+        assert!(prompt(&c, &t, &trigger_line(9_999, "Kaan")).is_none());
         set_status(&c, d.id, "done").unwrap();
-        assert!(prompt(&c, &t, &trigger_line(d.id)).is_none());
+        assert!(prompt(&c, &t, &trigger_line(d.id, "Kaan")).is_none());
+    }
+
+    /// #1751: result lines carry the typed tag, who, job number, status and one-line summary.
+    #[test]
+    fn results_text_uses_typed_tag_lines() {
+        let (c, _) = (mem(), Turns::default());
+        let l = leader(&c);
+        let d = job(&c, &l, "şemayı güncelle");
+        report(&c, &caller(&c, "kaan").unwrap(), d.id, "bitti: tamam", None).unwrap();
+        let done = take_unnotified(&c, "timur").unwrap();
+        assert_eq!(done.len(), 1);
+        let out = results_text(&c, "sen kapalıyken geldi", &done);
+        assert!(out.starts_with("[Dex-Devretme] sen kapalıyken geldi:\n"), "{out}");
+        assert!(out.contains(&format!("- [Dex-Devretme] Kaan #{} · bitti — bitti: tamam", d.id)), "{out}");
+        assert!(!out.contains("özet (devamı)"), "tek satır özet yalnız başlıkta: {out}");
+        // Çok satırlı özet: ilki başlıkta, devamı ayrıntıda, tekrar yok.
+        let d2 = job(&c, &l, "uzun iş");
+        report(&c, &caller(&c, "kaan").unwrap(), d2.id, "ilk satır\nikinci satır", None).unwrap();
+        let done = take_unnotified(&c, "timur").unwrap();
+        let out = results_text(&c, "x", &done);
+        assert!(out.contains(&format!("- [Dex-Devretme] Kaan #{} · bitti — ilk satır\n", d2.id)), "{out}");
+        assert!(out.contains("  özet (devamı): ikinci satır"), "{out}");
+        assert_eq!(out.matches("ikinci satır").count(), 1, "{out}");
     }
 
     #[test]
@@ -2118,7 +2182,7 @@ mod tests {
         assert_eq!(d.status, "failed");
         assert!(s.contains("server_error") && s.contains("503") && s.contains("geçici"), "{s}");
         let ctx = with(&db, |c| Ok(results_text(c, "x", &[get(c, a.id)?]))).unwrap();
-        assert!(ctx.contains("özet: sağlayıcı hatası"), "{ctx}");
+        assert!(ctx.contains("· başarısız — sağlayıcı hatası") && s.contains("server_error"), "{ctx}");
     }
 
     #[test]
@@ -2260,7 +2324,7 @@ mod tests {
         report(&c, &kaan, d.id, "bitti: x", Some(&file.to_string_lossy())).unwrap();
         let (ctx, _) = on_prompt(&c, &Turns::default(), "timur", &json!({})).unwrap();
         let ctx = ctx.unwrap()["hookSpecificOutput"]["additionalContext"].as_str().unwrap().to_string();
-        assert!(ctx.contains("özet: bitti: x") && ctx.contains(&format!("rapor: {} — oku", file.display())), "{ctx}");
+        assert!(ctx.contains("· bitti — bitti: x") && ctx.contains(&format!("rapor: {} — oku", file.display())), "{ctx}");
 
         // Session closed without `report` but the file was saved: the leader still gets the path.
         let b = insert(&c, new("b")).unwrap();

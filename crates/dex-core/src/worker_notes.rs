@@ -526,7 +526,7 @@ mod tests {
                     .timeout(Duration::from_millis(200))
                     .set("Authorization", &format!("Bearer {}", request.hooks.token))
                     .set("X-Dex-Agent", "kaan").set("X-Dex-Key", &request.mcp.key_for("kaan"))
-                    .send_json(json!({"hook_event_name":event,"session_id":"timeout-session","prompt":delegate::trigger_line(id)}))
+                    .send_json(json!({"hook_event_name":event,"session_id":"timeout-session","prompt":delegate::trigger_line(id, "kaan")}))
             });
             wait.recv_timeout(Duration::from_secs(2)).unwrap();
             let timed_out = client.join().unwrap().is_err();
@@ -920,7 +920,7 @@ mod tests {
         assert!(prompt.contains(&format!("Liderden not (#{}): rol bilgisi", d.id)));
         let db = Db::new(conn);
         let ev = Events::new(NullSink);
-        let body = json!({"prompt":delegate::trigger_line(d.id)});
+        let body = json!({"prompt":delegate::trigger_line(d.id, "ayla")});
         let out = crate::questions::on_hook(&db, &ev, "ayla", "UserPromptSubmit", &body, || {
             delegate::on_hook(&db, &ev, "ayla", "UserPromptSubmit", &body)
         })

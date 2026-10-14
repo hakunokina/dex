@@ -242,14 +242,31 @@ pub fn take_notes(conn: &Connection, agent: &str) -> Result<Option<String>, Stri
     notes_pending(conn, agent, None)
 }
 
+/// Tek not metni: etiketliyse aynen, değilse `[Dex-Not]` alır.
+/// Okuma anında uygulanır; DB'ye yazılmaz, tekrar okuma çift etiket üretmez.
+pub(crate) fn tag_note_text(t: &str) -> String {
+    let mut lines = t.lines();
+    let first = lines.next().unwrap_or("");
+    let mut out = if crate::dexmsg::tag_of(first).is_some() {
+        first.to_string()
+    } else {
+        crate::dexmsg::line(crate::dexmsg::NOT, first)
+    };
+    for l in lines {
+        out.push('\n');
+        out.push_str(l);
+    }
+    out
+}
+
 fn notes_pending(conn: &Connection, agent: &str, pending: Option<&crate::hook_delivery::Pending>) -> Result<Option<String>, String> {
     let rows = if pending.is_some() { note_rows(conn, agent, pending)? } else { take_note_rows(conn, agent)? };
     if rows.is_empty() {
         return Ok(None);
     }
-    let mut out = String::from("# Dex: plan / üye önerisi bildirimleri\n");
+    let mut out = format!("[{}] bekleyen bildirimlerin (plan / üye önerisi / not):\n", crate::dexmsg::NOT);
     for (_, t) in rows {
-        out.push_str(&format!("- {}\n", t.replace('\n', "\n  ")));
+        out.push_str(&format!("- {}\n", tag_note_text(&t).replace('\n', "\n  ")));
     }
     Ok(Some(out))
 }
@@ -423,9 +440,9 @@ impl crate::Core {
             let rows: Vec<(i64, String)> = c.prepare("SELECT id,text FROM leader_notes WHERE agent_id=?1 AND notified=0 ORDER BY id")
                 .map_err(e)?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?.collect::<Result<_, _>>().map_err(e)?;
             let questions = crate::questions::pending_for_leader(c, id)?;
-            let results: Vec<(i64, String)> = c.prepare("SELECT d.id,IFNULL(a.name,d.to_agent) FROM delegations d LEFT JOIN agents a ON a.id=d.to_agent
+            let results: Vec<(i64, String, String, Option<String>)> = c.prepare("SELECT d.id,IFNULL(a.name,d.to_agent),d.status,d.summary FROM delegations d LEFT JOIN agents a ON a.id=d.to_agent
                 WHERE d.from_agent=?1 AND d.notified=0 AND d.status IN ('done','done_no_report','failed') ORDER BY d.id")
-                .map_err(e)?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?.collect::<Result<_, _>>().map_err(e)?;
+                .map_err(e)?.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).map_err(e)?.collect::<Result<_, _>>().map_err(e)?;
             Ok((rows, questions, results))
         });
         let (rows, questions, results) = match pending {
@@ -448,14 +465,22 @@ impl crate::Core {
             return;
         }
         let flight = flights.entry(id.into()).or_insert_with(|| {
-            let mut parts = rows.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+            let mut parts = rows.iter().map(|(_, t)| tag_note_text(t)).collect::<Vec<_>>();
             if !questions.is_empty() { parts.push(crate::questions::leader_text(&questions, "sen boşta iken geldi")); }
-            if !results.is_empty() {
-                let names = results.iter().map(|(n, name)| format!("#{n} {name}")).collect::<Vec<_>>().join(", ");
-                parts.push(format!("Devretme sonucu geldi: {names}. Ayrıntı bu mesajın ekinde."));
+            for (n, name, status, summary) in &results {
+                let durum = match status.as_str() {
+                    "done" => "bitti",
+                    "done_no_report" => "RAPORSUZ bitti",
+                    _ => "başarısız",
+                };
+                let mut line = format!("[{}] {name} #{n} · {durum}", crate::dexmsg::DEVRETME);
+                if let Some(first) = summary.as_deref().map(crate::delegate::first_line).filter(|s| !s.is_empty()) {
+                    line.push_str(&format!(" — {first}"));
+                }
+                parts.push(line);
             }
             LeaderPaste {
-                text: format!("[Dex] {}", parts.join("\n")),
+                text: parts.join("\n"),
                 notes: rows.iter().map(|r| r.0).collect(),
                 questions: questions.iter().map(|q| q.id).collect(),
                 results: results.iter().map(|r| r.0).collect(),
@@ -945,11 +970,11 @@ pub fn step(conn: &Connection) -> Result<(Vec<Delegation>, bool), String> {
                     blocked.join(", ")
                 ));
             }
-            note(conn, &lead.id, &t)?;
+            note(conn, &lead.id, &crate::dexmsg::line(crate::dexmsg::PLAN, t))?;
         }
         if items.iter().all(|i| i.status == "done") {
             touch(conn, plan, Some("done"))?;
-            note(conn, &lead.id, &format!("Plan #{plan} tamamlandı ({} görev).", items.len()))?;
+            note(conn, &lead.id, &crate::dexmsg::line(crate::dexmsg::PLAN, format!("Plan #{plan} tamamlandı ({} görev).", items.len())))?;
         } else {
             touch(conn, plan, None)?;
         }

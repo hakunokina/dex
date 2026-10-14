@@ -2,6 +2,63 @@ export type Section =
   | { kind: 'markdown'; text: string }
   | { kind: 'group'; heading: string; color: 'warning' | 'success' | 'suggestion'; text: string }
 
+/** A `[Dex-Tür]` line outside code fences: drawn as plain colored text, never framed. */
+export type RichBlock =
+  | { kind: 'dex'; tag: string; text: string }
+  | { kind: 'text'; text: string }
+
+/** Tür başına yazı rengi (kutu/çerçeve yok). Devretme ve İnceleme satırın durumuna göre değişir. */
+export function dexColor(tag: string, line: string): string {
+  switch (tag) {
+    case 'Dex-Devretme': return /başarısız|RAPORSUZ/.test(line) ? '#f85149' : '#3fb950'
+    case 'Dex-İnceleme': return /düzelt|REDDEDİLDİ|bekliyor/.test(line) ? '#d29922' : '#3fb950'
+    case 'Dex-Soru': return '#e3b341'
+    case 'Dex-Cevap': return '#3fb950'
+    case 'Dex-Plan': return '#58a6ff'
+    case 'Dex-Üye': return /REDDEDİLDİ/.test(line) ? '#f85149' : '#bc8cff'
+    case 'Dex-Not': return '#8b949e'
+    case 'Dex-Sistem': return '#39c5cf'
+    default: return '#8b949e'
+  }
+}
+
+const DEX_LINE = /^[ \t]*(?:-[ \t]+)?\[Dex-([A-Za-zÇĞİÖŞÜçğıöşü]+)\]/u
+
+/** Fence-aware split: dex lines out, everything else kept verbatim (fences intact). */
+export function splitDexBlocks(text: string): RichBlock[] {
+  const blocks: RichBlock[] = []
+  let current = ''
+  let fence: string | undefined
+  const flush = () => { if (current) { blocks.push({ kind: 'text', text: current }); current = '' } }
+  for (const match of text.matchAll(/[^\n]*(?:\n|$)/g)) {
+    const line = match[0]
+    if (!line) continue
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line.replace(/\r?\n$/, '').trimEnd())
+    const delimiter = marker?.[1]
+    if (fence) {
+      current += line
+      if (delimiter && delimiter[0] === fence[0] && delimiter.length >= fence.length && !marker?.[2]?.trim()) {
+        fence = undefined
+      }
+      continue
+    }
+    if (delimiter && (delimiter[0] !== '`' || !marker?.[2]?.includes('`'))) {
+      fence = delimiter
+      current += line
+      continue
+    }
+    const tag = DEX_LINE.exec(line.replace(/\r?\n$/, ''))?.[1]
+    if (tag) {
+      flush()
+      blocks.push({ kind: 'dex', tag: `Dex-${tag}`, text: line })
+    } else {
+      current += line
+    }
+  }
+  flush()
+  return blocks
+}
+
 /** Fenced code blocks stand apart so the frame never runs beside a copyable command. */
 export function splitFences(text: string): { code: boolean; text: string }[] {
   const parts: { code: boolean; text: string }[] = []

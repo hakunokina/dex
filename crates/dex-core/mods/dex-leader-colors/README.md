@@ -1,11 +1,20 @@
 # Dex leader colors
 
-Claude Code 2.1.292 ile doğrulandı. `ui.render` / `AssistantMessage` dışında
-hiçbir olaya müdahale etmez. Başlıklar satır başında tek başına yazılır:
+Claude Code 2.1.292 ile doğrulandı. `ui.render` / `AssistantMessage` ve `UserMessage`
+dışında hiçbir olaya müdahale etmez. Başlıklar satır başında tek başına yazılır:
 
 - `Senden beklenen:` → tema `warning`
 - `Süren:` → tema `success`
 - `Biten:` → tema `suggestion`
+
+`[Dex-Tür]` ile başlayan satırlar (Dex'in otomatik mesajları: `[Dex-Devretme] Kaan
+#1745 · bitti — …`) kutusuz, kalın ve tür renginde düz yazıyla çizilir; hem
+kullanıcı mesajında (panoya yapışan Dex satırı) hem asistan yanıtında. Tür renkleri:
+
+- Devretme bitti yeşil `#3fb950`, başarısız/RAPORSUZ kırmızı `#f85149`
+- İnceleme onay yeşil, düzelt/bekliyor turuncu `#d29922`
+- Soru sarı `#e3b341`, Cevap yeşil, Plan mavi `#58a6ff`, Üye mor `#bc8cff`
+  (reddedildi kırmızı), Not gri `#8b949e`, Sistem camgöbeği `#39c5cf`
 
 Başlık kalın ve renklidir; gövde renksiz Markdown ve renkli sol şerittir.
 Başlıksız mesajlar ve `isSummary` blokları `next(e)` ile aynen devam eder.
