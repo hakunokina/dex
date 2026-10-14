@@ -2472,6 +2472,42 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_1756_diff_log_show_status_reads_and_writes_stay_denied() {
+        let root = PathBuf::from(abs("/w/proj"));
+        let reviewer = Ctx { read_only: true, read: vec![root.clone()], write: vec![root.clone()], cwd: Some(root.clone()), ..ctx() };
+        // The review prompt's form: `-C` quoted, forward slashes (also bare, run from the root).
+        let slash = root.to_string_lossy().replace('\\', "/");
+        let sha = "8f3c25b09d4e6f7a8b9c0d1e2f3a4b5c6d7e8f9";
+        for command in [
+            format!("git diff team...{sha}"),
+            format!("git diff team...{sha} -- crates/dex-core/src/permit.rs"),
+            format!("git show {sha}"),
+            format!("git show {sha}:crates/dex-core/src/permit.rs"),
+            format!("git log --oneline team..{sha}"),
+            "git status".to_string(),
+            format!("git -C \"{slash}\" diff team...{sha}"),
+            format!("git -C \"{slash}\" diff team...{sha} -- crates/dex-core/src/permit.rs"),
+            format!("git -C \"{slash}\" show {sha}"),
+            format!("git -C \"{slash}\" show {sha}:crates/dex-core/src/permit.rs"),
+            format!("git -C \"{slash}\" log --oneline team..{sha}"),
+            format!("git -C \"{slash}\" status"),
+        ] {
+            assert_eq!(decide("Bash", &json!({"command": command}), &reviewer), Verdict::Allow, "{command}");
+        }
+        // #1756: an unquoted backslash path is what bash runs — `C:\w` → `C:w`, outside the roots.
+        if cfg!(windows) {
+            assert!(matches!(decide("Bash", &json!({"command": format!("git -C {} status", root.display())}), &reviewer), Verdict::Deny(_)));
+        }
+        for sub in [
+            "add .", "commit -m x", "checkout topic", "reset --hard HEAD", "merge topic", "stash push",
+            "worktree add ../other -b other", "push origin main", "clean -fd", "branch -D topic", "remote add o url",
+        ] {
+            assert!(matches!(decide("Bash", &json!({"command": format!("git {sub}")}), &reviewer), Verdict::Deny(_)), "{sub}");
+            assert!(matches!(decide("Bash", &json!({"command": format!("git -C \"{slash}\" {sub}")}), &reviewer), Verdict::Deny(_)), "-C {sub}");
+        }
+    }
+
+    #[test]
     fn reviewer_744_quoted_redirect_pattern_is_text() {
         let reviewer = Ctx { read_only: true, ..ctx() };
         for command in [
