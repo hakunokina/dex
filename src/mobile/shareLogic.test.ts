@@ -2,9 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   IMAGE_MAX_BYTES,
+  assistantName,
   assistantTeams,
   base64Bytes,
   buildSubmit,
+  dative,
+  fastSendPlan,
   fitUnderLimit,
   hasShare,
   imageFitsAsIs,
@@ -12,8 +15,12 @@ import {
   resolveShareHost,
   resultText,
   scaleToFit,
+  sentToast,
+  shareTask,
   shouldReloadTargets,
+  taskText,
   validateSubmit,
+  type FastFacts,
 } from "./shareLogic.ts";
 
 const png = (bytes: number) => ({ mime: "image/png" as const, base64: "A".repeat(Math.ceil((bytes * 4) / 3)) });
@@ -111,4 +118,82 @@ test("shouldReloadTargets: yalnız başarısız aramada ve seçili host bağlan�
   assert.equal(shouldReloadTargets("B", "A", true), false);
   assert.equal(shouldReloadTargets("A", "A", false), false); // ilk yükleme sürüyor/başarılı: çift istek yok
   assert.equal(shouldReloadTargets("A", null, true), false);
+});
+
+test("shareTask: alias görevi; yok/bilinmeyen = ask", () => {
+  assert.equal(shareTask("repo"), "repo");
+  assert.equal(shareTask("verify"), "verify");
+  assert.equal(shareTask("ask"), "ask");
+  assert.equal(shareTask(undefined), "ask");
+  assert.equal(shareTask("REPO"), "ask");
+});
+
+test("taskText: ilk satır görev etiketi, metin kırpılır; yalnız görselde yalnız etiket", () => {
+  assert.equal(taskText("repo", "  https://instagram.com/reel/abc "), "Görev: Repo incele\nhttps://instagram.com/reel/abc");
+  assert.equal(taskText("verify", "iddia"), "Görev: Kaynak doğrula\niddia");
+  assert.equal(taskText("ask", "soru"), "Görev: Soru\nsoru");
+  assert.equal(taskText("repo", "   "), "Görev: Repo incele");
+  assert.deepEqual(buildSubmit("t1", taskText("repo", "x"), null, "c1"), { teamId: "t1", clientId: "c1", text: "Görev: Repo incele\nx" });
+});
+
+test("validateSubmit + görev: boşluk kullanıcı metninde, boyut etiketle birlikte", () => {
+  assert.equal(validateSubmit("  ", null, "t1", "repo"), "Gönderilecek bir şey yok", "etiket tek başına içerik sayılmaz");
+  const fits = "a".repeat(8 * 1024 - "Görev: Soru\n".length - 1); // "ö" 2 bayt
+  assert.equal(validateSubmit(fits, null, "t1", "ask"), null);
+  assert.equal(validateSubmit(fits + "a", null, "t1", "ask"), "Metin çok uzun (en fazla 8 KB)");
+  assert.equal(validateSubmit(fits + "a", null, "t1"), null, "görevsiz eski davranış");
+});
+
+test("assistantName: takımın asistanı", () => {
+  const agents = [
+    { teamId: "a", roleSlug: "backend", name: "Ayla" },
+    { teamId: "a", roleSlug: "assistant", name: "Echo" },
+    { teamId: "b", roleSlug: "assistant", name: "Defne" },
+  ];
+  assert.equal(assistantName("a", agents), "Echo");
+  assert.equal(assistantName("b", agents), "Defne");
+  assert.equal(assistantName("c", agents), null);
+});
+
+const facts = (f: Partial<FastFacts> = {}): FastFacts => ({
+  hostIds: ["h1"],
+  connected: true,
+  supportsInbox: true,
+  targets: [{ id: "h1:t1", assistant: "Echo" }],
+  problem: null,
+  ...f,
+});
+
+test("fastSendPlan: tek host + tek asistanlı takım + bağlı + geçerli → gönder", () => {
+  assert.deepEqual(fastSendPlan(facts()), { send: true, host: "h1", teamId: "h1:t1", assistant: "Echo" });
+});
+
+test("fastSendPlan: belirsizlik ya da hata → ekran (ilk eksik koşul)", () => {
+  const why = (f: Partial<FastFacts>) => {
+    const p = fastSendPlan(facts(f));
+    return p.send ? "send" : p.why;
+  };
+  assert.equal(why({ hostIds: [] }), "no-host");
+  assert.equal(why({ hostIds: ["h1", "h2"], connected: false }), "many-hosts", "çok host: bağlantı beklenmez");
+  assert.equal(why({ connected: false }), "offline");
+  assert.equal(why({ supportsInbox: false }), "unsupported");
+  assert.equal(why({ targets: [] }), "no-assistant");
+  assert.equal(why({ targets: [{ id: "a", assistant: "Echo" }, { id: "b", assistant: "Defne" }] }), "many-teams");
+  assert.equal(why({ problem: "Görsel çok büyük" }), "invalid");
+  // sürücünün karamsar varsayılanları: hiçbir olgu yokken asla gönderilmez
+  assert.equal(why({ hostIds: [], connected: false, supportsInbox: false, targets: [] }), "no-host");
+});
+
+test("dative / sentToast: Türkçe yönelme eki, içerik yok", () => {
+  assert.equal(dative("Echo"), "Echo'ya");
+  assert.equal(dative("Kaan"), "Kaan'a");
+  assert.equal(dative("Defne"), "Defne'ye");
+  assert.equal(dative("Timur"), "Timur'a");
+  assert.equal(dative("Işık"), "Işık'a");
+  assert.equal(dative("Ömer"), "Ömer'e");
+  assert.equal(dative("XYZ"), null);
+  assert.equal(sentToast("Echo", false), "Echo'ya gönderildi");
+  assert.equal(sentToast("Echo", true), "Echo'ya gönderildi (sıraya alındı)");
+  assert.equal(sentToast("", false), "Asistana gönderildi");
+  assert.ok(sentToast("x".repeat(500) + "a", false).length <= 80);
 });

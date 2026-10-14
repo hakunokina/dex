@@ -42,16 +42,22 @@ if [ -f "$KT" ]; then
   mkdir -p "$(dirname "$DST")"
   cp "$KT" "$DST"
 fi
-# Paylaş hedefi (Instagram vb. → Paylaş → Dex): ikinci Kotlin köprüsü + manifest intent-filter'ları.
-# gen/ commit'li değil; her derlemede idempotent eklenir. MainActivity singleTask olmalı (açık
-# uygulamaya yeni paylaşım onNewIntent ile gelir).
+# Paylaş hedefi (Instagram vb. → Paylaş → Dex): ikinci Kotlin köprüsü + manifest'te üç Paylaş girişi
+# (activity-alias, share-aliases.xml; alias adı görevi seçer). gen/ commit'li değil; her derlemede
+# işaretli blok silinip güncel hali yeniden eklenir (idempotent). Önbellekli gen/'deki eski (#1698)
+# yama — MainActivity içine doğrudan konmuş iki SEND filtresi — de silinir; yoksa dördüncü giriş kalır.
+# MainActivity singleTask olmalı (açık uygulamaya yeni paylaşım onNewIntent ile gelir).
 SKT=src-tauri/android/ShareTargetPlugin.kt
 [ -f "$SKT" ] && cp "$SKT" "$(dirname "$DST")/ShareTargetPlugin.kt"
 M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
-if ! grep -q 'android.intent.action.SEND' "$M"; then
-  awk -v f=src-tauri/android/share-intent-filters.xml '!done && /<\/activity>/ { while ((getline l < f) > 0) print l; done=1 } { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
-fi
-grep -q 'android.intent.action.SEND' "$M" || { echo "manifest'e Paylaş intent-filter eklenemedi"; exit 1; }
+awk -v f=src-tauri/android/share-aliases.xml '
+  /Paylaş hedefi \(ShareTargetPlugin.kt\): metin/ { skip = 2; next }
+  skip > 0 { if (/<\/intent-filter>/) skip--; next }
+  /dex-share-aliases:begin/, /dex-share-aliases:end/ { next }
+  !done && /<\/activity>/ { print; while ((getline l < f) > 0) print l; done = 1; next }
+  { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+[ "$(grep -c '<activity-alias' "$M")" = 3 ] && [ "$(grep -c 'android.intent.action.SEND' "$M")" = 6 ] \
+  || { echo "manifest'e Paylaş girişleri eklenemedi"; exit 1; }
 grep -q 'android:launchMode="singleTask"' "$M" || sed -i '0,/<activity/s//<activity android:launchMode="singleTask"/' "$M"
 grep -q 'android:launchMode="singleTask"' "$M" || { echo 'MainActivity singleTask yapılamadı; Paylaş (açık uygulama) çalışmaz'; exit 1; }
 grep -q security-crypto "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("androidx.security:security-crypto:1.1.0-alpha06")|' "$G"

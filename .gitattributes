@@ -6,3 +6,5 @@ scripts/yayin/** text eol=lf
 # Git invokes this extensionless shell hook on Windows too.
 scripts/hooks/pre-commit text eol=lf
 scripts/hooks/commit-msg text eol=lf
+# Shell scripts run on Linux build hosts (build-apk.sh, #1706): CRLF breaks bash
+*.sh text eol=lf

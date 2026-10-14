@@ -1,6 +1,8 @@
 // Android "Paylaş" → Dex: paylaşılan metin/görseli seçili sunucudaki asistana gönderir
 // (`inbox_submit`, mevcut kimlik doğrulamalı dexd bağlantısı). Düzenlenebilir metin, görsel önizleme,
 // sunucu ve (birden çok asistanlı takım varsa) takım seçici. İçerik loglanmaz.
+// #1717: hızlı gönderim olmadıysa açılır; görev (Paylaş girişi) seçili gelir ve değiştirilebilir,
+// hızlı denemenin clientId'si ve hatası taşınır (yeniden gönderim çift teslim etmez).
 import { useEffect, useMemo, useRef, useState } from "react";
 import { callHost, hostSupports, onHostUp, rawId, useHosts } from "../api/hosts";
 import type { RawShare } from "../api/shareTarget";
@@ -12,8 +14,11 @@ import {
   initialText,
   resolveShareHost,
   resultText,
+  SHARE_TASKS,
   shouldReloadTargets,
+  taskText,
   validateSubmit,
+  type ShareTask,
   type SubmitImage,
 } from "./shareLogic";
 import { ChevronLeft } from "lucide-react";
@@ -23,8 +28,19 @@ interface Target {
   name: string;
 }
 
-export function ShareScreen({ share, ready, defaultHost, onClose }: { share: RawShare; ready: boolean; defaultHost: string | null; onClose: () => void }) {
+export function ShareScreen({ share, ready, defaultHost, task: initialTask, clientId: fastClientId, error, onClose }: {
+  share: RawShare;
+  ready: boolean;
+  defaultHost: string | null;
+  task: ShareTask;
+  /** Hızlı denemenin id'si: aynı paylaşım aynı id ile gider. */
+  clientId?: string;
+  /** Hızlı denemenin hatası (zaman aşımı / RPC). */
+  error?: string | null;
+  onClose: () => void;
+}) {
   const hosts = useHosts();
+  const [task, setTask] = useState<ShareTask>(initialTask);
   const [text, setText] = useState(() => initialText(share));
   const [image, setImage] = useState<SubmitImage | null>(null);
   const [imageErr, setImageErr] = useState<string | null>(share.error ?? null);
@@ -37,10 +53,10 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
   // Hedef aramasını yeniden tetikler ("Yeniden dene" / sunucu bağlanınca).
   const [attempt, setAttempt] = useState(0);
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(error ?? null);
   const [done, setDone] = useState<string | null>(null);
   // Paylaşım başına bir kez: yeniden denemede aynı id gider, asistan çift teslim almaz.
-  const clientId = useRef(crypto.randomUUID());
+  const clientId = useRef(fastClientId ?? crypto.randomUUID());
 
   useEffect(() => {
     if (!share.image) return;
@@ -92,7 +108,7 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
     return () => void (live = false);
   }, [hostKey, attempt]);
 
-  const problem = useMemo(() => validateSubmit(text, image, teamId), [text, image, teamId]);
+  const problem = useMemo(() => validateSubmit(text, image, teamId, task), [text, image, teamId, task]);
   const waitingImage = !!share.image && !image && !imageErr;
 
   async function send() {
@@ -100,7 +116,7 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
     setBusy(true);
     setErr(null);
     try {
-      const r = await callHost<{ queued?: boolean }>(hostKey, "inbox_submit", { ...buildSubmit(rawId(teamId), text, image, clientId.current) });
+      const r = await callHost<{ queued?: boolean }>(hostKey, "inbox_submit", { ...buildSubmit(rawId(teamId), taskText(task, text), image, clientId.current) });
       setDone(resultText(r));
     } catch (e) {
       setErr(String(e));
@@ -154,6 +170,14 @@ export function ShareScreen({ share, ready, defaultHost, onClose }: { share: Raw
                 </select>
               </label>
             )}
+            <label className="m-share-field">
+              <span>Görev</span>
+              <select value={task} onChange={(e) => setTask(e.target.value as ShareTask)} disabled={busy}>
+                {SHARE_TASKS.map((t) => (
+                  <option key={t.id} value={t.id}>{t.label}</option>
+                ))}
+              </select>
+            </label>
             <label className="m-share-field">
               <span>Metin</span>
               <textarea value={text} onChange={(e) => setText(e.target.value)} rows={6} disabled={busy} placeholder="Metin / bağlantı" />

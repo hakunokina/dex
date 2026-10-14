@@ -18,6 +18,25 @@ export interface RawShare {
   subject?: string;
   image?: { mime: string; base64: string };
   error?: string;
+  /** #1717: hangi Paylaş girişinden gelindi (manifest activity-alias'ı); yok/bilinmeyen = "ask". */
+  task?: string;
+}
+
+/** #1717: Paylaş menüsündeki üç Dex girişi. `line` gönderilen metnin ilk satırıdır (asistanın rol metni bunu okur). */
+export type ShareTask = "repo" | "verify" | "ask";
+export const SHARE_TASKS: readonly { id: ShareTask; label: string; line: string }[] = [
+  { id: "repo", label: "Repo incele", line: "Görev: Repo incele" },
+  { id: "verify", label: "Kaynak doğrula", line: "Görev: Kaynak doğrula" },
+  { id: "ask", label: "Asistana sor", line: "Görev: Soru" },
+];
+
+export const shareTask = (t: unknown): ShareTask => (t === "repo" || t === "verify" ? t : "ask");
+
+/** Gönderilecek metin: görev satırı + (varsa) kullanıcının metni. */
+export function taskText(task: ShareTask, text: string): string {
+  const line = SHARE_TASKS.find((t) => t.id === task)!.line;
+  const t = text.trim();
+  return t ? `${line}\n${t}` : line;
 }
 
 export interface SubmitImage {
@@ -79,11 +98,14 @@ export async function fitUnderLimit<T>(
   return null;
 }
 
-/** Gönderilebilir mi; değilse kullanıcıya gösterilecek neden. */
-export function validateSubmit(text: string, image: SubmitImage | null, teamId: string | null): string | null {
+/**
+ * Gönderilebilir mi; değilse kullanıcıya gösterilecek neden. `task` verilirse boyut sınırı görev
+ * satırıyla birlikte gidecek metne uygulanır (boşluk denetimi yine kullanıcının metnine).
+ */
+export function validateSubmit(text: string, image: SubmitImage | null, teamId: string | null, task?: ShareTask): string | null {
   if (!teamId) return "Bu sunucuda asistan yok";
   if (!text.trim() && !image) return "Gönderilecek bir şey yok";
-  if (utf8Bytes(text.trim()) > TEXT_MAX_BYTES) return "Metin çok uzun (en fazla 8 KB)";
+  if (utf8Bytes(task ? taskText(task, text) : text.trim()) > TEXT_MAX_BYTES) return "Metin çok uzun (en fazla 8 KB)";
   if (image) {
     if (!isSubmitMime(image.mime)) return "Görsel biçimi desteklenmiyor";
     if (base64Bytes(image.base64) > IMAGE_MAX_BYTES) return "Görsel çok büyük";
@@ -107,6 +129,60 @@ export function assistantTeams<T extends { id: string }>(
 ): T[] {
   const withAssistant = new Set(agents.filter((a) => a.roleSlug === "assistant").map((a) => a.teamId));
   return teams.filter((t) => withAssistant.has(t.id));
+}
+
+/** Takımın (ilk) asistanının adı; yoksa null. */
+export function assistantName(teamId: string, agents: readonly { teamId: string; roleSlug: string | null; name: string }[]): string | null {
+  return agents.find((a) => a.teamId === teamId && a.roleSlug === "assistant")?.name ?? null;
+}
+
+/**
+ * #1717 hızlı gönderim: hedef belirsiz değilse ekran açılmadan gönderilir. Sıra önemli — ilk eksik
+ * koşul döner; sürücü (shareFast.ts) bilinmeyen alanları karamsar varsayılanla verir.
+ * `offline` dışındaki nedenleri ShareScreen kendisi gösterir (seçici, "asistan yok", doğrulama).
+ */
+export type FastWhy = "no-host" | "many-hosts" | "offline" | "unsupported" | "no-assistant" | "many-teams" | "invalid";
+export interface FastFacts {
+  hostIds: readonly string[];
+  /** Tek host süre içinde bağlandı mı. */
+  connected: boolean;
+  supportsInbox: boolean;
+  /** Asistanlı takımlar (asistan adıyla). */
+  targets: readonly { id: string; assistant: string }[];
+  /** validateSubmit ya da görsel hazırlama hatası; null = gönderilebilir. */
+  problem: string | null;
+}
+export type FastPlan = { send: true; host: string; teamId: string; assistant: string } | { send: false; why: FastWhy };
+
+export function fastSendPlan(f: FastFacts): FastPlan {
+  if (f.hostIds.length === 0) return { send: false, why: "no-host" };
+  if (f.hostIds.length > 1) return { send: false, why: "many-hosts" };
+  if (!f.connected) return { send: false, why: "offline" };
+  if (!f.supportsInbox) return { send: false, why: "unsupported" };
+  if (f.targets.length === 0) return { send: false, why: "no-assistant" };
+  if (f.targets.length > 1) return { send: false, why: "many-teams" };
+  if (f.problem) return { send: false, why: "invalid" };
+  return { send: true, host: f.hostIds[0], teamId: f.targets[0].id, assistant: f.targets[0].assistant };
+}
+
+const BACK_VOWELS = "aıouâû";
+const VOWELS = BACK_VOWELS + "eiöüî";
+
+/** Türkçe yönelme hali, özel adla: Echo → Echo'ya, Kaan → Kaan'a, Defne → Defne'ye. Ünlü yoksa null. */
+export function dative(name: string): string | null {
+  const n = name.trim();
+  const lower = n.toLocaleLowerCase("tr");
+  const vowels = [...lower].filter((c) => VOWELS.includes(c));
+  if (!vowels.length) return null;
+  const suffix = BACK_VOWELS.includes(vowels[vowels.length - 1]) ? "a" : "e";
+  const buffer = VOWELS.includes(lower[lower.length - 1]) ? "y" : "";
+  return `${n}'${buffer}${suffix}`;
+}
+
+/** Hızlı gönderim sonrası Toast metni; içerik taşımaz, kısa (Kotlin ayrıca 80 karakterde keser). */
+export function sentToast(assistant: string, queued: boolean): string {
+  const to = dative(assistant.trim().slice(0, 30)) ?? "Asistana";
+  return queued ? `${to} gönderildi (sıraya alındı)` : `${to} gönderildi`;
 }
 
 /**
