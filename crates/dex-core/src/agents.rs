@@ -799,7 +799,7 @@ impl crate::Core {
             return Ok(());
         }
         self.agent_spawn_locked(id, StartOptions {
-            prompt: Some("[Dex] Bekleyen soru, sonuç ve plan bildirimlerini değerlendir; kaldığın yerden devam et.".into()),
+            prompt: Some(crate::dexmsg::line(crate::dexmsg::SISTEM, "Bekleyen soru, sonuç ve plan bildirimlerini değerlendir; kaldığın yerden devam et.").into()),
             ..Default::default()
         }).map(|_| ())
     }
@@ -1415,7 +1415,7 @@ impl crate::Core {
             let text = if self.agent_states.typing(&a.id) {
                 format!("{label} sıfırlandı — {} bekliyor, devam etmesini yaz.", a.name)
             } else {
-                let prompt = format!("[Dex] {label} kotası sıfırlandı. Kaldığın yerden devam et; bitmiş işi baştan yapma.");
+                let prompt = crate::dexmsg::line(crate::dexmsg::SISTEM, format!("{label} kotası sıfırlandı. Kaldığın yerden devam et; bitmiş işi baştan yapma."));
                 match self.paste_prompt(&a.id, &prompt) {
                     Ok(()) => {
                         eprintln!("dex: {}: {label} sıfırlandı, bekleyen oturum sürüyor", a.id);
@@ -1443,8 +1443,7 @@ impl crate::Core {
     }
 
     /// Ajanın süren devretmesinin liderine tek satır (bir sonraki hook bağlamında). İş yoksa sessiz.
-    fn chain_note_lead(&self, agent: &str, text: &str) {
-        let lead = crate::db::with(&self.db, |c| {
+    fn chain_note_lead(&self, agent: &str, text: &str) {        let lead = crate::db::with(&self.db, |c| {
             c.query_row(
                 "SELECT from_agent FROM delegations WHERE to_agent = ?1 AND status = 'running' ORDER BY id DESC LIMIT 1",
                 [agent],
@@ -1454,7 +1453,7 @@ impl crate::Core {
             .map_err(|e| e.to_string())
         });
         if let Ok(Some(lead)) = lead {
-            let _ = crate::db::with(&self.db, |c| crate::plan::note(c, &lead, text));
+            let _ = crate::db::with(&self.db, |c| crate::plan::note(c, &lead, &crate::dexmsg::line(crate::dexmsg::SISTEM, text)));
         }
     }
 
@@ -3389,7 +3388,7 @@ mod quota_tests {
         assert_eq!(core.agent_states.get("kaan").status, Status::Waiting, "mevcut motor da bitti: iş bekler");
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
-        assert_eq!(got[0], format!("kaan: zincirde kotası olan motor yok, en erken sıfırlanma {} — iş bekliyor.", ms_to_iso(claude_reset)));
+        assert_eq!(got[0], format!("[Dex-Sistem] kaan: zincirde kotası olan motor yok, en erken sıfırlanma {} — iş bekliyor.", ms_to_iso(claude_reset)));
         assert!(muse_reset > claude_reset);
         finish(core, root);
     }
@@ -3442,7 +3441,7 @@ mod quota_tests {
         assert!(agent(&core, "kaan").active_provider.is_none());
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
-        assert!(got[0].starts_with("kaan: Claude %100 (hafta) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"), "{}", got[0]);
+        assert!(got[0].starts_with("[Dex-Sistem] kaan: Claude %100 (hafta) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"), "{}", got[0]);
         assert!(core.quota_tick(), "haftalık dolu sürerken ölçüm bildirimi sıfırlamaz");
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         assert_eq!(notes(&core, "timur").len(), 1, "tek bildirim");
@@ -3524,7 +3523,7 @@ mod quota_tests {
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 2, "{got:?}");
-        assert!(got[1].starts_with("kaan: Claude %100 (hafta) ama "), "{}", got[1]);
+        assert!(got[1].starts_with("[Dex-Sistem] kaan: Claude %100 (hafta) ama "), "{}", got[1]);
         assert!(core.quota_tick());
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         assert_eq!(notes(&core, "timur").len(), 2, "tükenme bölümünde tek not");
@@ -3543,7 +3542,7 @@ mod quota_tests {
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
-            got[0].starts_with("kaan: Claude %90 (5 sa) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"),
+            got[0].starts_with("[Dex-Sistem] kaan: Claude %90 (5 sa) ama zincirde jetonu/erişimi olan motor yok (Muse jetonu yok)"),
             "{}",
             got[0]
         );

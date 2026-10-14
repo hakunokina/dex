@@ -71,9 +71,10 @@ impl Default for Resets {
 
 fn prompt(memory: &str) -> String {
     format!(
-        "[Dex] Oturumun sıfırlanacak (patron temiz oturum istedi). Açık konuları, patron kararlarını ve süren işleri \
+        "[{}] Oturumun sıfırlanacak (patron temiz oturum istedi). Açık konuları, patron kararlarını ve süren işleri \
          hafızana ({memory}) devir notu olarak yaz ya da güncelle. Bitince dex MCP'sinin reset_ready aracını çağır; \
-         Dex oturumu kapatıp temiz açar, yeni oturum hafıza indeksini başta alır."
+         Dex oturumu kapatıp temiz açar, yeni oturum hafıza indeksini başta alır.",
+        crate::dexmsg::SISTEM
     )
 }
 

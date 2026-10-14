@@ -7,6 +7,7 @@ pub mod chain;
 pub mod chat;
 pub mod cost;
 pub mod db;
+pub mod dexmsg;
 pub mod diagnostics;
 pub mod effort;
 pub mod job_model;
@@ -917,14 +918,14 @@ impl Core {
             }
             self.resetting.lock().unwrap().remove(&d.to_agent);
         }
-        let (mut request, has_work, engine, worker) = with(&self.db, |conn| {
+        let (mut request, has_work, engine, worker, worker_name) = with(&self.db, |conn| {
             let a = teams::get_agent(conn, &d.to_agent)?;
             let worker = a.kind == "worker";
-            Ok((delegate::start_request(conn, &d)?, delegate::has_other_work(conn, &d)?, a.active_engine.unwrap_or(a.engine), worker))
+            Ok((delegate::start_request(conn, &d)?, delegate::has_other_work(conn, &d)?, a.active_engine.unwrap_or(a.engine), worker, a.name))
         })?;
         // Görev #19: claude gets only a short trigger in its pane (argument or paste); the job comes
         // as that prompt's UserPromptSubmit context.
-        request.prompt = delegate::trigger_line(d.id);
+        request.prompt = delegate::trigger_line(d.id, &worker_name);
         let mut status = self.agent_states.get(&d.to_agent).status;
         let running = self.ptys.is_running(&d.to_agent);
         if running && status == agents::Status::Offline {

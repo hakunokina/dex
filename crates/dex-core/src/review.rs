@@ -442,7 +442,7 @@ fn prompt(conn: &Connection, target: &Delegation, w: &Wt, sha: &str, team: &str)
 pub fn result_line(conn: &Connection, d: &Delegation) -> Option<String> {
     if let Ok(Some(r)) = get(conn, d.id) {
         let verdict = r.verdict.as_deref().unwrap_or("yok (rapor verilmedi)");
-        let mut s = format!("inceleme kararı (#{} @ {}): {verdict}", r.target_id, short(&r.sha));
+        let mut s = format!("[{}] #{} @ {} · {}", crate::dexmsg::INCELEME, r.target_id, short(&r.sha), verdict);
         if let Some(f) = r.findings.as_deref().filter(|f| !f.is_empty()) {
             s.push_str(&format!("\n  önemli:\n    {}", f.replace('\n', "\n    ")));
         }
@@ -455,7 +455,7 @@ pub fn result_line(conn: &Connection, d: &Delegation) -> Option<String> {
     }
     let r = latest(conn, d.id).ok().flatten()?;
     let who = delegate::get(conn, r.review_id).ok().and_then(|rd| delegate::caller(conn, &rd.to_agent).ok()).map(|c| c.name).unwrap_or_default();
-    Some(format!("inceleme: #{} ({who}) — karar `onay` gelmeden birleştirme yok", r.review_id))
+    Some(format!("[{}] #{} · karar bekleniyor ({who}) — karar `onay` gelmeden birleştirme yok", crate::dexmsg::INCELEME, r.review_id))
 }
 
 #[cfg(test)]

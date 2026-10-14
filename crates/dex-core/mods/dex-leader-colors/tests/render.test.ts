@@ -84,4 +84,47 @@ for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
       expect(propsSeen[propsSeen.length - 1]).toEqual(props)
     }
   })
+
+  test(`paints dex lines as plain colored text in the user message on ${surface}`, async ($, on) => {
+    on('ui.render', () => ({ type: 'Text', props: {}, children: ['default'] }))
+    const ui = await $.ui.mount({
+      plugin: 'dex-leader-colors', surface, component: 'UserMessage',
+      props: { text: '[Dex-Devretme] Kaan #1 · bitti — iş\n  özet: detay\n[Dex-Soru] Kaan #1 · soru #2 — neden?' },
+    })
+    expect(await ui.drawn()).toMatchObject({
+      type: 'Box', props: { flexDirection: 'column' }, children: [
+        { type: 'Text', props: { bold: true, color: '#3fb950' }, children: ['[Dex-Devretme] Kaan #1 · bitti — iş'] },
+        { type: 'Markdown', props: { text: '  özet: detay\n' } },
+        { type: 'Text', props: { bold: true, color: '#e3b341' }, children: ['[Dex-Soru] Kaan #1 · soru #2 — neden?'] },
+      ],
+    })
+  })
+
+  test(`passes a dex-free user message unchanged on ${surface}`, async ($, on) => {
+    on('ui.render', () => ({ type: 'Text', props: {}, children: ['default'] }))
+    const ui = await $.ui.mount({
+      plugin: 'dex-leader-colors', surface, component: 'UserMessage',
+      props: { text: 'Normal **yanıt**.' },
+    })
+    expect(await ui.drawn()).toMatchObject({ type: 'Text', props: {}, children: ['default'] })
+  })
+
+  test(`paints dex lines unframed beside framed groups in the reply on ${surface}`, async ($, on) => {
+    on('ui.render', () => ({ type: 'Text', props: {}, children: ['default'] }))
+    const ui = await $.ui.mount({
+      plugin: 'dex-leader-colors', surface, component: 'AssistantMessage',
+      props: { text: '[Dex-Devretme] Kaan #1 · başarısız\nSüren:\n- Test', isFirstOfReply: true },
+    })
+    expect(await ui.drawn()).toMatchObject({
+      type: 'Box', children: [
+        { type: 'Text', props: { bold: true, color: '#f85149' }, children: ['[Dex-Devretme] Kaan #1 · başarısız'] },
+        { type: 'Box', children: [
+          { type: 'Box', children: [
+            { type: 'Text', props: { bold: true, color: 'success' }, children: ['Süren:'] },
+            { type: 'Box', props: { borderStyle: 'single', borderColor: 'success' } },
+          ] },
+        ] },
+      ],
+    })
+  })
 }

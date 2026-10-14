@@ -501,19 +501,21 @@ fn is_light(model: &str) -> bool {
     m == "haiku" || m.starts_with("claude-haiku") || m.contains("flash")
 }
 
-/// Zincir geçişinde PTY'ye verilen kısa devam turu. `[Dex] ` önekiyle başlar: tur Dex turu
+/// Zincir geçişinde PTY'ye verilen kısa devam turu. `[Dex-Sistem]` ile başlar: tur Dex turu
 /// sayılır (delegate::on_prompt), böylece sonraki iş patron oturumuna değil yeni oturuma gider.
 pub fn continue_prompt(from_label: &str, to_label: &str) -> String {
     format!(
-        "[Dex] Kaldığın yerden devam et: az önce {from_label} sağlayıcısının kotası dolduğu için {to_label} üzerinden devam ediyorsun. \
-Yarım kalan işin neyse onu sürdür; bitmiş işi baştan yapma, kullanıcıya quoting yapmadan tek cümleyle geçişi belirt."
+        "[{}] Kaldığın yerden devam et: az önce {from_label} sağlayıcısının kotası dolduğu için {to_label} üzerinden devam ediyorsun. \
+Yarım kalan işin neyse onu sürdür; bitmiş işi baştan yapma, kullanıcıya quoting yapmadan tek cümleyle geçişi belirt.",
+        crate::dexmsg::SISTEM
     )
 }
 
 /// Görev #250: proaktif eşik geçişinin devam turu (`why` = "Claude %85 (5 sa)").
 pub fn continue_prompt_threshold(why: &str, to_label: &str) -> String {
     format!(
-        "[Dex] Kaldığın yerden devam et: {why} kullanım eşiğini geçtiği için {to_label} üzerinden devam ediyorsun. Yarım kalan işin neyse onu sürdür; bitmiş işi baştan yapma, kullanıcıya quoting yapmadan tek cümleyle geçişi belirt."
+        "[{}] Kaldığın yerden devam et: {why} kullanım eşiğini geçtiği için {to_label} üzerinden devam ediyorsun. Yarım kalan işin neyse onu sürdür; bitmiş işi baştan yapma, kullanıcıya quoting yapmadan tek cümleyle geçişi belirt.",
+        crate::dexmsg::SISTEM
     )
 }
 
@@ -524,7 +526,8 @@ mod tests {
     /// Görev #95: geçiş turu "[Dex]" ile başlamazsa patron turu sayılır ve sonraki iş dolu oturuma yapışır.
     #[test]
     fn continue_prompt_is_a_dex_turn() {
-        assert!(continue_prompt("GLM", "Muse").starts_with("[Dex]"));
+        assert!(crate::dexmsg::is_dex_turn(&continue_prompt("GLM", "Muse")));
+        assert!(continue_prompt("GLM", "Muse").starts_with("[Dex-Sistem] Kaldığın yerden devam et:"));
     }
 
     #[test]
