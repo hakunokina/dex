@@ -1,254 +1,222 @@
-// DEX-31: app settings as a dock panel. #44: a short tab list on the left (Genel / Ajanlar / Sunucular /
-// Gelişmiş); everyday settings first, rare technical ones folded under Gelişmiş. Resource limits (one total
-// CPU cap over all agents, optional per-agent CPU cap and memory ceiling) are stored in the DB by dex-core.
+// Ayarlar: V1 kartlı düzen. Sol gezinme iki grup (BU CİHAZ / SUNUCU), her bölüm
+// ayrı kart ve kapsam rozetli. Kaydetmeyi kontrol türü belirler: anahtar/seçim/
+// sıralama anında, yazı alanı satır içi Kaydet'le, yıkıcı işlem onaylı.
+// Davranışlar değişmez: aynı saklama yeri, aynı RPC — yalnız yer ve görünüm.
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
-import { callHost, hostName, LOCAL } from "../api/hosts";
-import { FirstReplySection } from "./FirstReply";
+import { hostName, LOCAL, useHosts, hostStatus } from "../api/hosts";
 import { ChainSection } from "./Chain";
-import { HostsSection } from "./Hosts";
+import { ServersSection } from "./Hosts";
 import { SnipSection } from "./Snip";
-import { DensitySection } from "./Density";
-import { UsageStripSection } from "./UsageStrip";
-import { DiagnosticsSection } from "./Diagnostics";
-import { CoreSection } from "./Core";
+import { AppearanceSection } from "./Density";
+import { TokenMonitorSection } from "./TokenMonitor";
+import { TailnetSection } from "./Tailnet";
+import { LayoutSection } from "./Layout";
+import { LimitsSection } from "./Limits";
 import { GpuSection } from "./Gpu";
+import { ProvidersSection } from "./Providers";
 import { SoundsSection } from "./Sounds";
+import { StallSection } from "./Stall";
 import { MOBILE } from "../api/platform";
-import { useTeams } from "../team/store";
-import { selectSettingsTab, TAB_EVENT, TAB_KEY, type SettingsTab } from "./tab";
-import "./settings.css";
-
-interface Limits {
-  totalCpuPercent: number;
-  agentCpuPercent: number;
-  memBytes: number;
-}
-interface LimitsView {
-  stored: Limits;
-  effective: Limits;
-  env: string[];
-  enforced: boolean;
-}
-interface TailnetView {
-  enabled: boolean;
-  port: number;
-  listening: string | null;
-  error: string | null;
-  firewallCommand: string;
-}
-interface Device { id: string; name: string; createdAt: number; lastSeen: number | null; }
-
-const GIB = 1024 ** 3;
-const pct = (s: string) => Math.max(0, Math.min(100, Math.round(Number(s) || 0)));
+import { ScopeBadge } from "./kit/ScopeBadge";
+import { FOCUS_EVENT, TAB_EVENT, migrateTab, selectSettingsTab, takePendingFocus, type SettingsTab } from "./tab";
+import "./kit/kit.css";
 
 type Tab = SettingsTab;
-const TABS: { id: Tab; label: string }[] = [
-  { id: "general", label: "Genel" },
-  { id: "agents", label: "Ajanlar" },
-  { id: "hosts", label: "Sunucular" },
-  { id: "advanced", label: "Gelişmiş" },
+
+const GROUPS: { title: string; tabs: { id: Tab; label: string }[] }[] = [
+  {
+    title: "Bu cihaz",
+    tabs: [
+      { id: "general", label: "Genel" },
+      { id: "notifications", label: "Bildirimler" },
+      { id: "connections", label: "Bağlantılar" },
+    ],
+  },
+  {
+    title: "Sunucu",
+    tabs: [
+      { id: "providers", label: "Sağlayıcılar" },
+      { id: "chain", label: "Kota zinciri" },
+      { id: "resources", label: "Kaynak sınırları" },
+      { id: "gpu", label: "GPU" },
+    ],
+  },
 ];
+const ALL_TABS = GROUPS.flatMap((g) => g.tabs);
+
 function storedTab(): Tab {
   try {
-    const t = localStorage.getItem(TAB_KEY);
-    if (TABS.some((x) => x.id === t)) return t as Tab;
-  } catch { /* storage blocked: the default */ }
-  return "general";
+    return migrateTab(localStorage.getItem("dex.settingsTab"));
+  } catch {
+    return "general";
+  }
 }
 
-export function SettingsView({ host }: { host: string }) {
-  const [tab, setTab] = useState(storedTab);
+export function SettingsView({ host, teamId }: { host: string; teamId: string }) {
+  const [tab, setTab] = useState<Tab>(storedTab);
+  const [server, setServer] = useState(host);
   const tabs = useRef<(HTMLButtonElement | null)[]>([]);
-  // Clicks and openSettings(…, tab) both go through the event, so the view follows either.
+  const bodyRef = useRef<HTMLDivElement>(null);
+  // Panel başka bir takımın dock'unda açıldıysa sunucu seçimini sıfırla.
+  useEffect(() => { setServer(host); }, [host]);
   useEffect(() => {
     const on = (e: Event) => setTab((e as CustomEvent<Tab>).detail);
     window.addEventListener(TAB_EVENT, on);
     return () => window.removeEventListener(TAB_EVENT, on);
   }, []);
+  // Derin bağlantı: ilgili satıra kaydır, odağı kontrole ver, kısaca vurgula.
+  useEffect(() => {
+    const apply = (id: string) => {
+      const root = bodyRef.current?.querySelector(`[data-setting="${id}"]`);
+      if (!root) return;
+      root.scrollIntoView({ block: "nearest" });
+      const target = root.querySelector<HTMLElement>("input, select, button:not(:disabled), [tabindex]");
+      target?.focus({ preventScroll: true });
+      root.classList.remove("set-flash");
+      void (root as HTMLElement).offsetWidth;
+      root.classList.add("set-flash");
+    };
+    const pending = takePendingFocus();
+    if (pending) requestAnimationFrame(() => apply(pending));
+    const on = (e: Event) => {
+      takePendingFocus();
+      const id = (e as CustomEvent<string>).detail;
+      requestAnimationFrame(() => apply(id));
+    };
+    window.addEventListener(FOCUS_EVENT, on);
+    return () => window.removeEventListener(FOCUS_EVENT, on);
+  }, [tab]);
+
   const pick = selectSettingsTab;
-  // WAI-ARIA tabs on a vertical list: ↑/↓/Home/End move focus and select.
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
-    const i = TABS.findIndex((x) => x.id === tab);
-    const next = ({ ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: TABS.length - 1 } as Record<string, number>)[e.key];
+    const i = ALL_TABS.findIndex((x) => x.id === tab);
+    const next = ({ ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: ALL_TABS.length - 1 } as Record<string, number>)[e.key];
     if (next === undefined) return;
     e.preventDefault();
-    const j = (next + TABS.length) % TABS.length;
-    pick(TABS[j].id);
+    const j = (next + ALL_TABS.length) % ALL_TABS.length;
+    pick(ALL_TABS[j].id);
     tabs.current[j]?.focus();
   };
-  const remote = host !== LOCAL && (
-    <p className="settings-note settings-host" role="note">
-      Bu takım <b>{hostName(host)}</b> sunucusunda: bu sekmedeki ayarlar o sunucunun ayarlarıdır.
-    </p>
-  );
-  // Panels stay mounted (hidden) so an unsaved field survives a tab switch.
-  const panel = (id: Tab, body: ReactNode) => (
-    <div className="settings-panel" role="tabpanel" id={`settings-${id}`} aria-labelledby={`settings-tab-${id}`} hidden={tab !== id}>
+  const page = (id: Tab, scope: ReactNode, body: ReactNode) => (
+    // Sayfalar mount'lu kalır (gizli): yazılmamış alan sekme değişiminde kaybolmaz.
+    <div className="set-page" role="tabpanel" id={`settings-${id}`} aria-labelledby={`settings-tab-${id}`} hidden={tab !== id}>
+      <div className="set-head">
+        <h2>{ALL_TABS.find((t) => t.id === id)?.label} {scope}</h2>
+      </div>
       {body}
     </div>
   );
+
+  let flat = 0;
+  const navButton = (t: { id: Tab; label: string }) => {
+    const i = flat++;
+    return (
+      <button
+        key={t.id}
+        ref={(el) => { tabs.current[i] = el; }}
+        role="tab"
+        id={`settings-tab-${t.id}`}
+        aria-selected={tab === t.id}
+        aria-controls={`settings-${t.id}`}
+        tabIndex={tab === t.id ? 0 : -1}
+        className={tab === t.id ? "on" : ""}
+        onClick={() => pick(t.id)}
+      >
+        {t.label}
+      </button>
+    );
+  };
+
   return (
-    <div className="settings">
-      <div className="settings-nav" role="tablist" aria-label="Ayar bölümleri" aria-orientation="vertical" onKeyDown={onKey}>
-        {TABS.map((t, i) => (
-          <button
-            key={t.id}
-            ref={(el) => { tabs.current[i] = el; }}
-            role="tab"
-            id={`settings-tab-${t.id}`}
-            aria-selected={tab === t.id}
-            aria-controls={`settings-${t.id}`}
-            tabIndex={tab === t.id ? 0 : -1}
-            className={tab === t.id ? "on" : ""}
-            onClick={() => pick(t.id)}
-          >
-            {t.label}
-          </button>
-        ))}
+    <div className="set-shell">
+      <nav className="set-nav">
+        <div className="set-nav-list" role="tablist" aria-label="Ayar bölümleri" aria-orientation="vertical" onKeyDown={onKey}>
+          {GROUPS.map((g) => (
+            <div key={g.title}>
+              <h2 className="set-nav-group" role="presentation">{g.title.toLocaleUpperCase("tr-TR")}</h2>
+              {g.tabs.map(navButton)}
+            </div>
+          ))}
+        </div>
+        <select
+          className="set-nav-select"
+          aria-label="Ayar sayfası"
+          value={tab}
+          onChange={(e) => pick(e.target.value as Tab)}
+        >
+          {GROUPS.map((g) => (
+            <optgroup key={g.title} label={g.title}>
+              {g.tabs.map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+            </optgroup>
+          ))}
+        </select>
+      </nav>
+      <div className="set-body" ref={bodyRef}>
+        {page("general", <ScopeBadge text="Bu cihaz" />, <>
+          <AppearanceSection />
+          <LayoutSection teamId={teamId} />
+          <SnipSection />
+        </>)}
+        {page("notifications", <ScopeBadge text="Bu cihaz" />, <>
+          {!MOBILE && <SoundsSection />}
+          <StallSection />
+        </>)}
+        {page("connections", <ScopeBadge text="Bu cihaz" />, <>
+          <ServersSection />
+          <TailnetSection />
+          <TokenMonitorSection />
+        </>)}
+        {page("providers", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
+          <ServerPicker server={server} onPick={setServer} />
+          <ProvidersSection host={server} hostLabel={hostName(server)} />
+        </>)}
+        {page("chain", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
+          <ServerPicker server={server} onPick={setServer} />
+          <ServerDownBand server={server} />
+          <ChainSection host={server} />
+        </>)}
+        {page("resources", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
+          <ServerPicker server={server} onPick={setServer} />
+          <ServerDownBand server={server} />
+          <LimitsSection host={server} />
+        </>)}
+        {page("gpu", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
+          <ServerPicker server={server} onPick={setServer} />
+          <ServerDownBand server={server} />
+          <GpuSection host={server} />
+        </>)}
       </div>
-      {panel("general", <>
-        <DensitySection />
-        {!MOBILE && <SoundsSection />}
-        {host === LOCAL && <SnipSection />}
-        {host === LOCAL && <UsageStripSection />}
-      </>)}
-      {panel("agents", <>
-        {remote}
-        <LimitsSection host={host} />
-        <GpuSection host={host} />
-      </>)}
-      {panel("hosts", <HostsSection />)}
-      {panel("advanced", <>
-        {remote}
-        <p className="settings-note">Nadiren gerekenler; varsayılanlar çoğu kullanım için yeterli.</p>
-        {host === LOCAL && <CoreSection />}
-        <WorktreeCleanupSection host={host} />
-        <FirstReplySection host={host} />
-        <DiagnosticsSection host={host} />
-        <ChainSection host={host} />
-        {host === LOCAL && <TailnetSection />}
-      </>)}
     </div>
   );
 }
 
-function WorktreeCleanupSection({ host }: { host: string }) {
-  const { teams } = useTeams();
-  const pending = teams.filter((t) => t.host === host).flatMap((t) => t.worktreeCleanup ?? []);
-  if (!pending.length) return null;
+/** SUNUCU sayfalarında ortak seçim: panel ömrü boyunca kalır, kaydedilmez. */
+function ServerPicker({ server, onPick }: { server: string; onPick: (h: string) => void }) {
+  const hosts = useHosts();
+  if (hosts.length === 0) {
+    return <p className="set-note">Sunucu: Yerel (bu bilgisayar)</p>;
+  }
   return (
-    <section className="settings-section" aria-label="Bekleyen worktree temizliği">
-      <h4>Bekleyen worktree temizliği</h4>
-      {pending.map((path) => (
-        <p className="settings-warn" key={path}>Temizlenemeyen worktree: <code>{path}</code> — elle silinebilir.</p>
-      ))}
-    </section>
+    <div className="set-head-row">
+      <label className="set-label" htmlFor="settings-server">Sunucu</label>
+      <select id="settings-server" value={server} onChange={(e) => onPick(e.target.value)}>
+        <option value={LOCAL}>Yerel (bu bilgisayar)</option>
+        {hosts.map((h) => (
+          <option key={h.rec.id} value={h.rec.id} disabled={h.status !== "connected"}>
+            {h.rec.name}{h.status === "connected" ? "" : " (bağlı değil)"}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }
 
-function LimitsSection({ host }: { host: string }) {
-  const [view, setView] = useState<LimitsView | null>(null);
-  const [form, setForm] = useState({ total: "", agent: "", mem: "" });
-  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-
-  const fill = (v: LimitsView) => {
-    setView(v);
-    setForm({ total: String(v.stored.totalCpuPercent), agent: String(v.stored.agentCpuPercent), mem: String(v.stored.memBytes / GIB) });
-  };
-  useEffect(() => {
-    callHost<LimitsView>(host, "limits_get").then(fill, (e) => setMsg({ ok: false, text: String(e) }));
-  }, [host]);
-
-  async function save() {
-    const limits: Limits = { totalCpuPercent: pct(form.total), agentCpuPercent: pct(form.agent), memBytes: Math.round((Number(form.mem) || 0) * GIB) };
-    try {
-      fill(await callHost<LimitsView>(host, "limits_set", { limits }));
-      setMsg({ ok: true, text: "Kaydedildi. Toplam tavan çalışan ajanlara hemen uygulandı; ajan başı tavan ve bellek yeni açılan pane'lerde geçerli." });
-    } catch (e) {
-      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
-    }
-  }
-
-  const eff = view?.effective;
+function ServerDownBand({ server }: { server: string }) {
+  const status = server === LOCAL ? "connected" : hostStatus(server);
+  if (status === "connected") return null;
   return (
-    <section className="settings-section" aria-label="Kaynak sınırları">
-      <h4>Kaynak sınırları</h4>
-      <p className="settings-note">
-        Ajanların bilgisayarı ne kadar kullanabileceği. Tavana gelince hepsi birlikte yavaşlar; durdurulmaz, yük düşünce hızlanır.
-      </p>
-      <label className="settings-row">
-        <span>Toplam CPU tavanı (tüm ajanlar)</span>
-        <input type="number" min={0} max={100} value={form.total} onChange={(e) => setForm({ ...form, total: e.target.value })} />
-        <em>% · 0 = sınırsız</em>
-      </label>
-      <label className="settings-row">
-        <span>Ajan başı CPU tavanı</span>
-        <input type="number" min={0} max={100} value={form.agent} onChange={(e) => setForm({ ...form, agent: e.target.value })} />
-        <em>% · 0 = kapalı</em>
-      </label>
-      <label className="settings-row">
-        <span>Ajan başı bellek tavanı</span>
-        <input type="number" min={0} step={1} value={form.mem} onChange={(e) => setForm({ ...form, mem: e.target.value })} />
-        <em>GiB · 0 = kapalı (aşılırsa ajan çökebilir)</em>
-      </label>
-      <div className="settings-actions">
-        <button className="primary" disabled={!view} onClick={() => void save()}>Kaydet</button>
-      </div>
-      {view && view.env.length > 0 && eff && (
-        <p className="settings-warn" role="status">
-          Ortam değişkeni geçersiz kılıyor ({view.env.join(", ")}): etkin değerler toplam %{eff.totalCpuPercent || "∞"}, ajan başı %
-          {eff.agentCpuPercent || "—"}, bellek {eff.memBytes ? `${(eff.memBytes / GIB).toFixed(1)} GiB` : "kapalı"}.
-        </p>
-      )}
-      {view && !view.enforced && <p className="settings-warn">Bu platformda sınırlar henüz uygulanmıyor (yalnız Windows).</p>}
-      {msg && <p className={msg.ok ? "settings-note" : "settings-err"} role={msg.ok ? "status" : "alert"}>{msg.text}</p>}
-    </section>
+    <div className="set-band" role="status">
+      {hostName(server)} sunucusuna bağlantı yok — ayarlar okunamadı. Ajanlar sunucuda çalışmaya devam ediyor.
+    </div>
   );
-}
-
-function TailnetSection() {
-  const [view, setView] = useState<TailnetView | null>(null);
-  const [port, setPort] = useState("7717");
-  const [code, setCode] = useState<string | null>(null);
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [msg, setMsg] = useState<string | null>(null);
-  const refresh = async () => {
-    const next = await callHost<TailnetView>(LOCAL, "tailnet_get");
-    setView(next); setPort(String(next.port));
-    setDevices(next.listening ? await callHost<Device[]>(LOCAL, "tailnet_devices") : []);
-  };
-  useEffect(() => { void refresh().catch((e) => setMsg(String(e))); }, []);
-  async function toggle(enabled: boolean) {
-    try {
-      const next = await callHost<TailnetView>(LOCAL, "tailnet_set", { enabled, port: Number(port) });
-      setView(next); setPort(String(next.port)); setCode(null); setMsg(null);
-      setDevices(next.listening ? await callHost<Device[]>(LOCAL, "tailnet_devices") : []);
-    } catch (e) { setMsg(String(e)); void refresh().catch(() => {}); }
-  }
-  async function pair() {
-    try { setCode(await callHost<string>(LOCAL, "tailnet_pair_code")); setMsg("Kod 10 dakika geçerli ve tek kullanımlık."); }
-    catch (e) { setMsg(String(e)); }
-  }
-  async function revoke(id: string) {
-    try { await callHost(LOCAL, "tailnet_device_revoke", { id }); await refresh(); }
-    catch (e) { setMsg(String(e)); }
-  }
-  return <details className="settings-section settings-fold" aria-label="Bu bilgisayarı ağa aç" open={view?.enabled || undefined}>
-    <summary>
-      <b>Telefondan erişim (Tailscale)</b>
-      <span>Bu bilgisayarı yalnız Tailscale ağınızdaki cihazlara açar; yerel ağa ve internete açılmaz.</span>
-    </summary>
-    <label className="settings-row settings-row-wide"><span>Port</span><input type="number" min={1} max={65535} value={port} disabled={view?.enabled} onChange={(e) => setPort(e.target.value)} /></label>
-    <label className="settings-row settings-row-wide"><span>Ağ erişimi</span><input type="checkbox" checked={view?.enabled ?? false} onChange={(e) => void toggle(e.target.checked)} /></label>
-    {view?.listening && <p className="settings-note" role="status">Dinliyor: <code>{view.listening}</code></p>}
-    {(msg || view?.error) && <p className="settings-err" role="alert">{msg || view?.error}</p>}
-    {view?.enabled && <>
-      <div className="settings-actions"><button className="primary" onClick={() => void pair()}>Eşleme kodu üret</button></div>
-      {code && <p className="settings-pair-code" role="status">{code}</p>}
-      <p className="settings-note">Windows Güvenlik Duvarı engellerse PowerShell’i yönetici olarak açıp yalnız tailnet kaynaklarına izin veren şu komutu çalıştırın:</p>
-      <code className="settings-command">{view.firewallCommand}</code>
-      <h5>Eşlenmiş cihazlar</h5>
-      {devices.length === 0 ? <p className="settings-note">Henüz cihaz eşlenmedi.</p> : <ul className="hosts">{devices.map((d) => <li className="host-row" key={d.id}><span>{d.name}</span><code>{d.id}</code><button onClick={() => void revoke(d.id)}>İptal et</button></li>)}</ul>}
-    </>}
-  </details>;
 }

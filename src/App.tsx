@@ -86,10 +86,10 @@ export default function App() {
                       {status === "blocked"
                         ? `${hostName(t.host)} adresi engellendi — şifresiz bağlantı yalnız yerel/Tailscale adreslerinde kullanılabilir. Sunucuyu wss:// ile yeniden ekleyin.`
                         : status === "unauthorized" || status === "no-token"
-                        ? `${hostName(t.host)} sunucusu bu cihazı tanımıyor — Ayarlar → Sunucular'dan yeniden eşleyin.`
+                        ? `${hostName(t.host)} sunucusu bu cihazı tanımıyor — Ayarlar → Bağlantılar'dan yeniden eşleyin.`
                         : `${hostName(t.host)} sunucusuna bağlantı yok — yeniden bağlanılıyor. Ajanlar sunucuda çalışmaya devam ediyor.`}
                       {(status === "unauthorized" || status === "no-token" || status === "blocked") && (
-                        <button onClick={() => void openSettings(t.id, "hosts")}>Sunucular…</button>
+                        <button onClick={() => void openSettings(t.id, "connections")}>Sunucular…</button>
                       )}
                     </div>
                   )}

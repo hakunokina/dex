@@ -16,7 +16,7 @@ test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await expect(projects).toBeVisible();
   await expect(projects.getByText("git", { exact: true })).toBeVisible();
@@ -121,7 +121,7 @@ test("proje hafızası: tek grafikte yalnız seçili proje; oturum başlığı k
   await app.setViewportSize({ width: 390, height: 780 });
   await scope.focus();
   await expect(scope).toBeFocused();
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).focus();
+  await app.getByRole("button", { name: "Takım ayarları" }).focus();
   await app.keyboard.press("Enter");
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   const row = (p: { name: string }) => projects.locator(".project-row", { has: app.getByText(p.name, { exact: true }) });
@@ -154,7 +154,7 @@ test("varsayılan takım: Main yanında klasör tek çağrıda oluşturulur; dar
   await app.reload();
   await openTeam(app, team.name);
   await app.setViewportSize({ width: 390, height: 780 });
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await expect(projects.getByText("Kategori kökü kullanılamıyor", { exact: false })).toHaveCount(0);
   const folder = projects.getByRole("textbox", { name: "Yeni klasör adı" });
@@ -193,7 +193,7 @@ test("eski uzak host: project_list var, yeni klasör yeteneği yok; mkdir ve roo
   await app.reload();
   await app.locator('.team-tab[title^="Uzak:"]').filter({ hasText: team.name }).click();
   await app.setViewportSize({ width: 390, height: 780 });
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await projects.getByRole("textbox", { name: "Yeni klasör adı" }).fill("Eski Site");
   await projects.getByRole("button", { name: "Oluştur ve bağla", exact: true }).focus();
@@ -216,7 +216,7 @@ test("eski host yalnız project_list metot kanıtıyla eski klasör UI'sını ko
   await app.addInitScript(() => { window.__dexOld = { hide: ["project_list"], unknown: ["project_list"] }; });
   await app.reload();
   await openTeam(app, team.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   await expect(app.locator(".team-settings:visible").getByText("Çalışma dizini", { exact: true })).toBeVisible();
   await expect(app.getByRole("region", { name: "Projeler", exact: true })).toHaveCount(0);
   await expect(app.getByRole("combobox", { name: "Aktif proje", exact: true })).toHaveCount(0);
@@ -230,7 +230,7 @@ test("mevcut takım önerilen kategori kökünü Kullan ile kabul eder", async (
   expect(team.suggestedWorkspaceRoot).toBe(workspace);
   await app.reload();
   await openTeam(app, team.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await expect(projects.getByText(`Kategori kökü: ${workspace}`)).toBeVisible();
   await expect(projects.getByText("Kategori kökü kullanılamıyor", { exact: false })).toHaveCount(0);
@@ -270,7 +270,7 @@ test("proje liste hatası görünür; eski klasör UI'sına sessiz dönüş yok"
   await app.addInitScript(() => { window.__dexFake = { project_list: null }; });
   await app.reload();
   await openTeam(app, team.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await expect(projects.getByRole("alert")).toContainText("Projeler okunamadı");
   await expect(projects.getByRole("button", { name: "Yeniden dene" })).toBeVisible();
@@ -285,7 +285,7 @@ test("uzak takım: home kategorisinde scoped klasör gezme ve oluşturma", async
   }, { url: dexd.url, token: dexd.token });
   await app.reload();
   await app.locator('.team-tab[title^="Uzak:"]').filter({ hasText: team.name }).click();
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   await projects.getByRole("button", { name: "Mevcut klasör bağla", exact: true }).click();
   await projects.getByRole("button", { name: "Klasör seç…", exact: true }).click();

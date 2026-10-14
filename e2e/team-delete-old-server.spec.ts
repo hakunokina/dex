@@ -22,7 +22,7 @@ test("eski sunucu: bilgi yerine not, çalışan ajan varken anlaşılır hata, y
   const pane = await paneOf(app, leader.name);
   await expect(pane.locator(".xterm-rows")).toContainText("fake-claude hazir");
 
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Takım ayarları ve üyeler", exact: true }).click();
+  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Takım ayarları", exact: true }).click();
   const del = app.getByRole("button", { name: "Takımı sil", exact: true });
   const err = app.locator(".team-err");
   let message = "";

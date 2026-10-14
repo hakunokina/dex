@@ -36,7 +36,7 @@ isolatedTest("eğitim profili: klavyeyle takım kurulur, yalnız eğitim rolleri
   const team = (await dexd.call<{ id: string; name: string; profile: string }[]>("team_list")).find(t => t.name === "Ders")!;
   expect(team.profile).toBe("edu");
   expect((await teamAgents(dexd, team.id)).map(a => a.name).sort()).toEqual(["Chalk-1", "Sage"]);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   const settings = app.locator(".team-settings");
   for (const label of ["Sage rolü", "Chalk-1 rolü", "Yeni üyenin rolü"]) {
     const picker = settings.getByRole("combobox", { name: label, exact: true });
@@ -89,7 +89,7 @@ test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi
   await expect(kart).toContainText("çalışıyor");
   await expect(kart).toContainText("boşta");
   await expect(kart).not.toContainText("bekliyor");
-  for (const b of ["Görevler", "Yeni takım", "Takım ayarları ve üyeler", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  for (const b of ["Görevler", "Yeni takım", "Takım ayarları", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
   // #70/#73: the top bar holds only team tabs | DEX logo | crew chips, plus the window controls.
   const bar = app.locator("header.topbar");
   // Only the leader and the red (working/waiting or job-carrying) workers get a chip; a new team's workers are quiet.
@@ -253,7 +253,7 @@ test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh 
   await app.reload();
   await openTeam(app, source.name);
   await app.setViewportSize({ width: 390, height: 780 });
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
   const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
   await expect(form.getByRole("textbox", { name: "Ad", exact: true })).toHaveValue("");
@@ -364,7 +364,7 @@ test("takımı kopyala: eski hosttan gelen Codex üyesi Claude'a çevrilir", asy
   await app.reload();
   await openTeam(app, source.name);
   await app.setViewportSize({ width: 390, height: 780 });
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
   const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
   await expect(form.getByText("Codex üyeleri Claude'a çevrildi")).toBeVisible();
@@ -388,7 +388,7 @@ test("takımı kopyala: katalog gecikirken de Codex üyesi gönderilmez", async 
   });
   await app.reload();
   await openTeam(app, source.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   // The catalog never arrives for the clone form.
   await app.evaluate(() => { window.__dexFake!.provider_list = new Promise(() => {}); });
   await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
@@ -412,7 +412,7 @@ test("kopya şablonu hatası görünür ve yeniden denenebilir", async ({ app, d
   });
   await app.reload();
   await openTeam(app, source.name);
-  await app.getByRole("button", { name: "Takım ayarları ve üyeler" }).click();
+  await app.getByRole("button", { name: "Takım ayarları" }).click();
   await app.locator(".team-settings").getByRole("button", { name: "Takımı kopyala", exact: true }).click();
   const form = app.getByRole("dialog", { name: "Takımı kopyala", exact: true });
   await expect(form.getByRole("alert")).toContainText("team_clone_template");

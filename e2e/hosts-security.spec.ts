@@ -10,7 +10,7 @@ test("masaüstü Sunucular LAN WS'yi reddeder, loopback eşlemesi klavyeyle çal
   await app.reload();
   await openTeam(app, team.name);
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
-  await app.getByRole("tab", { name: "Sunucular", exact: true }).click();
+  await app.getByRole("tab", { name: "Bağlantılar", exact: true }).click();
   const hosts = app.getByRole("region", { name: "Sunucular", exact: true });
   const address = hosts.getByLabel("Adres", { exact: true });
   await expect(address).toHaveAttribute("placeholder", /^wss:\/\//);
@@ -24,7 +24,7 @@ test("masaüstü Sunucular LAN WS'yi reddeder, loopback eşlemesi klavyeyle çal
   await address.fill(dexd.url.replace(/^ws:\/\//, ""));
   await hosts.getByRole("button", { name: "Sunucu ekle", exact: true }).focus();
   await app.keyboard.press("Enter");
-  await expect(hosts.locator(".host-row").filter({ hasText: "Loopback" }).getByRole("status")).toHaveText("bağlı");
+  await expect(hosts.locator(".set-item").filter({ hasText: "Loopback" }).getByRole("status")).toHaveText("bağlı");
   const duplicate = await app.evaluate(async () => {
     const path = "/src/api/hosts.ts";
     const { remoteHosts, addHost } = await import(path);

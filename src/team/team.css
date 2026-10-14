@@ -40,7 +40,7 @@
 .team-pop h3 { margin: 0 0 2px; font-size: var(--fs-md); font-weight: var(--fw-semibold); display: flex; align-items: center; gap: var(--sp-2); }
 .team-pop h3 .close { margin-left: auto; }
 .team-pop label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: var(--fs-xs); }
-.team-pop input, .team-pop select, .token-edit input {
+.team-pop input, .team-pop select {
   font-size: var(--fs-sm); color: var(--text); height: var(--ctl-h);
   background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 0 var(--sp-2);
 }
@@ -123,9 +123,6 @@
   .team-settings .team-members td:last-child::before { margin-right: auto; }
   .team-settings .team-add { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .team-settings .team-add > * { min-width: 0; width: 100%; }
-  .team-settings .provider-rows { width: 100%; }
-  .team-settings .token-edit { flex-wrap: wrap; }
-  .team-settings .token-edit input { max-width: 100%; }
 }
 
 @container (max-width: 460px) {
@@ -143,29 +140,10 @@
 }
 .team-stage.hidden { visibility: hidden; pointer-events: none; }
 
-/* DEX-13: provider tokens (status is a mask; the raw token never renders). */
+/* Sağlayıcı anahtarları Ayarlar › Sunucu › Sağlayıcılar'da; burada yalnız bağlantı notu. */
 .team-providers { border-top: 1px solid var(--line); padding-top: var(--sp-2); }
 .team-providers h4 { margin: 0 0 6px; font-size: var(--fs-xs); color: var(--muted); font-weight: var(--fw-medium); }
-.provider-rows { border-collapse: collapse; font-size: var(--fs-sm); }
-.provider-rows th { text-align: left; color: var(--muted); font-weight: var(--fw-medium); font-size: var(--fs-xs); padding: 3px var(--sp-2) 3px 0; }
-.provider-rows td { height: var(--row-h); padding: 2px var(--sp-2) 2px 0; border-bottom: 1px solid var(--line); font-family: var(--font-mono); font-size: var(--fs-xs); }
-.provider-rows td:last-child { border-bottom: none; font-family: inherit; }
-.provider-rows button, .token-edit input { font-size: var(--fs-sm); }
-.token-edit { display: inline-flex; gap: 6px; align-items: center; }
-.token-edit input { width: 160px; font-family: var(--font-mono); }
-.provider-import { margin-top: var(--sp-2); display: flex; flex-direction: column; gap: 6px; }
-/* DEX-25: local LiteLLM section. */
-.local-llm { margin-top: var(--sp-2); display: flex; flex-direction: column; gap: 6px; }
-.local-llm h4 { margin: 0; font-size: var(--fs-xs); color: var(--muted); font-weight: var(--fw-medium); }
-.local-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-.local-row input, .local-row button { font-size: var(--fs-sm); }
-.local-note { margin: 0; font-size: var(--fs-xs); color: var(--muted); }
-.local-models { margin: 0; padding: 0; list-style: none; max-height: 160px; overflow-y: auto; font-size: var(--fs-xs); }
-.local-models li { display: flex; align-items: center; gap: var(--sp-2); min-height: var(--ctl-h-sm); border-bottom: 1px solid var(--line); }
-.local-models code { font-family: var(--font-mono); }
-.local-backend { color: var(--muted); font-family: var(--font-mono); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.provider-import ul { margin: 0; padding-left: 18px; font-size: var(--fs-xs); color: var(--muted); font-family: var(--font-mono); }
-.provider-import li { margin: 2px 0; }
+.team-link { background: none; border: 0; padding: 0; color: var(--text); text-decoration: underline; cursor: pointer; font: inherit; }
 /* DEX-24: escalated worker questions stack above member proposals in one bottom-right column. */
 .patron-cards {
   position: fixed; right: var(--sp-4); bottom: var(--sp-4); z-index: var(--z-patron);

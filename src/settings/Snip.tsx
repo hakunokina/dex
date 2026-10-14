@@ -1,7 +1,10 @@
-// #34: ekran alıntısının global kısayolu (src-tauri/src/snip_hotkey.rs). Yalnız bu bilgisayarın
-// ayarı; kayıt başarısızsa (kombinasyon başka uygulamada) hata burada ve OS bildiriminde görünür.
+// Bu cihaz › Genel › Ekran alıntısı: global kısayol (src-tauri/src/snip_hotkey.rs).
+// Yalnız bu bilgisayarın ayarı; her zaman görünür (LOCAL çağrısı her yerden çalışır).
 import { useEffect, useState, type KeyboardEvent } from "react";
 import { callHost, LOCAL } from "../api/hosts";
+import { Row } from "./kit/Row";
+import { Section } from "./kit/Section";
+import { FieldMsg } from "./kit/states";
 
 interface HotkeyView { hotkey: string; active: boolean; error: string | null; }
 
@@ -20,6 +23,7 @@ export function SnipSection() {
   useEffect(() => {
     callHost<HotkeyView>(LOCAL, "snip_hotkey_get").then(fill, (e) => setMsg({ ok: false, text: String(e) }));
   }, []);
+  const dirty = !!view && draft !== view.hotkey;
 
   async function save() {
     try {
@@ -30,17 +34,34 @@ export function SnipSection() {
     }
   }
 
-  return <section className="settings-section" aria-label="Ekran alıntısı">
-    <h4>Ekran alıntısı</h4>
-    <label className="settings-row settings-row-wide">
-      <span>Kısayol</span>
-      <input value={draft} readOnly title="Kutuya tıklayıp yeni tuşlara basın" onKeyDown={(e) => { const c = combo(e); if (c) { e.preventDefault(); setDraft(c); } }} />
-    </label>
-    <p className="settings-note">Her uygulamada çalışır: bölge seçin, PNG Resimler\Screenshots'a kaydedilir ve yolu panoya kopyalanır. Varsayılan Ctrl+Shift+S, Dex açıkken diğer uygulamaların "Farklı kaydet"ini ezer; çakışırsa kutuya tıklayıp yeni tuşlara basın.</p>
-    <div className="settings-actions">
-      <button className="primary" disabled={!view || (draft === view.hotkey && view.active)} onClick={() => void save()}>Kaydet</button>
-    </div>
-    {view && !view.active && view.error && <p className="settings-err" role="alert">{view.error}</p>}
-    {msg && <p className={msg.ok ? "settings-note" : "settings-err"} role={msg.ok ? "status" : "alert"}>{msg.text}</p>}
-  </section>;
+  return (
+    <Section label="Ekran alıntısı">
+      <Row
+        id="snip-shortcut"
+        label="Kısayol"
+        description="Bölge seçer, PNG'yi panoya kopyalar. Başka uygulamanın kısayolunu ezebilir."
+        control={
+          <span className="set-field">
+            <input
+              aria-label="Ekran alıntısı kısayolu"
+              value={draft}
+              readOnly
+              title="Kutuya tıklayıp yeni tuşlara basın"
+              onKeyDown={(e) => { const c = combo(e); if (c) { e.preventDefault(); setDraft(c); } }}
+            />
+            {dirty && (
+              <span className="set-field-btns">
+                <button type="button" className="primary" onClick={() => void save()}>Kaydet</button>
+                <button type="button" onClick={() => view && setDraft(view.hotkey)}>Vazgeç</button>
+              </span>
+            )}
+          </span>
+        }
+        feedback={<>
+          {view && !view.active && view.error && <FieldMsg ok={false} text={view.error} />}
+          {msg && <FieldMsg ok={msg.ok} text={msg.text} />}
+        </>}
+      />
+    </Section>
+  );
 }

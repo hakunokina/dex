@@ -11,9 +11,8 @@ import { FolderPreview } from "./FolderPreview";
 import { useTeamProjects } from "../project/store";
 import { getStatus } from "../agents";
 import {
-  DEFAULT_WORKER_ROLES, importProviders, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
-  setProviderToken, teamDeleteInfo, teamCloneTemplate, supportsEducation,
-  type AgentKind, type LocalStatus, type PendingModel, type ProviderImportRow, type ProviderInfo, type Role,
+  DEFAULT_WORKER_ROLES, listProviders, localStatus, teamDeleteInfo, teamCloneTemplate, supportsEducation,
+  type AgentKind, type LocalStatus, type PendingModel, type ProviderInfo, type Role,
   type TeamKind, type TeamProfile, type TeamCloneTemplate,
 } from "./api";
 import {
@@ -23,7 +22,7 @@ import {
 import "./team.css";
 import { Server, Trash2, X } from "lucide-react";
 import { getSnapshot as getLayoutSnapshot, subscribe as subscribeLayout } from "../layout/store";
-import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../layout/panels";
+import { applyFavoriteLayout, applyFavoriteToAll, openSettings, saveFavoriteLayout } from "../layout/panels";
 import { isActive } from "../layout/rackOrder";
 import { teamAccent } from "./accent";
 import { providerModels } from "./providerModels";
@@ -623,7 +622,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
       </form>
       {role === "assistant" && assistantTaken(members) && <p className="team-warn" role="status">Takımda zaten bir asistan var</p>}
 
-      <ProviderSettings host={host} providers={providers} reload={reloadProviders} local={local} setLocal={setLocal} />
+      <ProvidersMovedNote teamId={team.id} hostLabel={hostName(host)} />
       {providerError && <p className="team-err" role="alert">{providerError}</p>}
 
       {error && <p className="team-err" role="alert">{error}</p>}
@@ -700,7 +699,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
 function tokenWarning(providers: ProviderInfo[], provider: string): string | null {
   if (provider === "anthropic") return null;
   const p = providers.find((x) => x.id === provider);
-  return p && !p.hasToken ? `${p.label} jetonu yok — Takım → Sağlayıcılar'dan içe aktar ya da gir` : null;
+  return p && !p.hasToken ? `${p.label} anahtarı yok — Ayarlar › Sağlayıcılar'dan içe aktar ya da gir` : null;
 }
 
 /** DEX-17: sağlayıcı id → görünen ad. */
@@ -793,167 +792,17 @@ function WorkersBulk({ teamId, providers }: {
   );
 }
 
-/** DEX-13: tokens live in the OS keyring; this panel only ever sees masks over the IPC boundary. */
-function ProviderSettings({ host, providers, reload, local, setLocal }: {
-  host: string;
-  providers: ProviderInfo[];
-  reload: () => void;
-  local: LocalStatus | null;
-  setLocal: (s: LocalStatus | null) => void;
-}) {
-  const [rows, setRows] = useState<ProviderImportRow[] | null>(null);
-  const [edit, setEdit] = useState<string | null>(null);
-  const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(null);
-
-  async function save(id: string) {
-    try {
-      await setProviderToken(host, id, token);
-      setEdit(null);
-      setToken("");
-      setError(null);
-      reload();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
-
+/** Sağlayıcı anahtarları sunucu düzeyinde: Ayarlar › Sunucu › Sağlayıcılar'da. */
+function ProvidersMovedNote({ teamId, hostLabel }: { teamId: string; hostLabel: string }) {
   return (
     <section className="team-providers" aria-label="Sağlayıcılar">
-      <h4>Sağlayıcılar{host !== LOCAL && <span className="team-kind">{hostName(host)}</span>}</h4>
-      {host !== LOCAL && <p className="team-note">Bu takımın sunucusunun sağlayıcıları: jetonlar sunucuya gider, bu bilgisayarda saklanmaz.</p>}
-      <table className="provider-rows">
-        <tbody>
-          {providers.map((p) => (
-            <tr key={p.id}>
-              <th scope="row">{p.label}</th>
-              <td title={p.baseUrl ?? "yerleşik Anthropic"}>
-                {p.id !== "anthropic" ? (p.hasToken ? `jeton ${p.tokenMask}` : "jeton yok") : "—"}
-              </td>
-              <td>
-                {p.id !== "anthropic" && (edit === p.id ? (
-                  <span className="token-edit">
-                    <input type="password" value={token} placeholder="jeton" aria-label={`${p.label} jetonu`}
-                      onChange={(e) => setToken(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && void save(p.id)} autoFocus />
-                    <button className="primary" disabled={!token.trim()} onClick={() => void save(p.id)}>Kaydet</button>
-                    <button onClick={() => { setEdit(null); setToken(""); }}>Vazgeç</button>
-                  </span>
-                ) : (
-                  <button onClick={() => { setEdit(p.id); setToken(""); setError(null); }}>Jeton değiştir</button>
-                ))}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      <div className="provider-import">
-        <button onClick={() => void (async () => {
-          try {
-            setRows(await importProviders(host));
-            setError(null);
-            reload();
-          } catch (err) {
-            setError(err instanceof Error ? err.message : String(err));
-          }
-        })()}>
-          routes.conf'tan içe aktar
+      <h4>Sağlayıcılar</h4>
+      <p className="team-note">
+        Anahtarlar {hostLabel} sunucusunda saklanır; bu takıma özel değildir.{" "}
+        <button type="button" className="team-link" onClick={() => void openSettings(teamId, "providers")}>
+          Ayarlar › Sağlayıcılar'da yönet →
         </button>
-        {rows && (
-          <ul>
-            {rows.map((r) => (
-              <li key={r.provider}>
-                <b>{r.provider}</b>: {r.token ? `jeton ${r.token}` : "jeton alınamadı"} — {r.note}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      <LocalLlm host={host} provider={providers.find((p) => p.id === "local")} status={local} setStatus={setLocal} reload={reload} />
-      {error && <p className="team-err">{error}</p>}
+      </p>
     </section>
-  );
-}
-
-/** DEX-25: local LiteLLM — address, connection test, live model list, register/remove by name. */
-function LocalLlm({ host, provider, status, setStatus, reload }: {
-  host: string;
-  provider: ProviderInfo | undefined;
-  status: LocalStatus | null;
-  setStatus: (s: LocalStatus | null) => void;
-  reload: () => void;
-}) {
-  const [url, setUrl] = useState(provider?.baseUrl ?? "");
-  const [name, setName] = useState("");
-  const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => { setUrl(provider?.baseUrl ?? ""); }, [provider?.baseUrl]);
-  if (!provider) return null;
-
-  const act = async (label: string, f: () => Promise<LocalStatus | void>) => {
-    setBusy(label);
-    setError(null);
-    try {
-      const st = await f();
-      if (st) setStatus(st);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  return (
-    <div className="local-llm" aria-busy={busy !== null}>
-      <h4>Yerel LLM</h4>
-      <form className="local-row" onSubmit={(e) => {
-        e.preventDefault();
-        void act("adres", async () => { await setLocalBaseUrl(host, url); reload(); });
-      }}>
-        <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="http://192.0.2.10:4000"
-          aria-label="Yerel LLM adresi" size={28} />
-        <button type="submit" disabled={!url.trim() || url.trim() === provider.baseUrl || busy !== null}>Adresi kaydet</button>
-        <button type="button" disabled={!provider.baseUrl || !provider.hasToken || busy !== null}
-          title={!provider.hasToken ? "Önce jeton gir" : ""}
-          onClick={() => void act("test", () => localStatus(host))}>
-          {busy === "test" ? "Deneniyor…" : "Bağlantıyı test et"}
-        </button>
-      </form>
-      {status && (
-        <>
-          <p className="local-note" role="status">
-            Bağlı · {status.models.length} model · kayıt {status.registry ? "açık" : "kapalı (sunucuda LiteLLM veritabanı yok)"}
-          </p>
-          <ul className="local-models">
-            {status.models.map((m) => (
-              <li key={m.id}>
-                <code>{m.id}</code>{m.backend && <span className="local-backend">{m.backend}</span>}
-                <button className="icon-btn" disabled={!m.removable || busy !== null}
-                  title={m.removable ? "Sunucudan sil" : "Sunucunun config dosyasında — Dex'ten silinmez"}
-                  aria-label={`${m.id} modelini sil`}
-                  onClick={() => {
-                    if (confirm(`${m.id} sunucudan silinsin mi?`)) void act("sil", () => localDelete(host, m.id));
-                  }}><Trash2 /></button>
-              </li>
-            ))}
-          </ul>
-          <form className="local-row" onSubmit={(e) => {
-            e.preventDefault();
-            void act("ekle", async () => {
-              const st = await localAdd(host, name);
-              setName("");
-              return st;
-            });
-          }}>
-            <input value={name} onChange={(e) => setName(e.target.value)} placeholder="model adı (motordaki kimlik)"
-              aria-label="Kaydedilecek model adı" size={28} />
-            <button type="submit" className="primary" disabled={!name.trim() || busy !== null}>
-              {busy === "ekle" ? "Ekleniyor…" : "Ekle"}
-            </button>
-          </form>
-        </>
-      )}
-      {error && <p className="team-err" role="alert">{error}</p>}
-    </div>
   );
 }

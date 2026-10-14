@@ -19,7 +19,7 @@ export function termSize(): number {
   return termFontSize();
 }
 
-function setTermSize(n: number | null) {
+export function setTermSize(n: number | null) {
   const next = n === null ? termFontSize() : clamp(n);
   try {
     if (n === null) localStorage.removeItem(KEY);

@@ -195,8 +195,8 @@ export function UsageStrip() {
       <aside className="usage-strip off" aria-label="Kullanım şeridi" data-status={u.status}>
         {/* #314: GPU durumu TM'den bağımsız; kullanım verisi gelmese de görünür. */}
         <GpuCell />
-        <button className="usage-off" title={`${text} — Ayarlar → Genel → Kullanım şeridi`}
-          onClick={() => { const team = getActiveTeamId(); if (team) void openSettings(team, "general"); }}>
+        <button className="usage-off" title={`${text} — Ayarlar → Bağlantılar → Token Monitor`}
+          onClick={() => { const team = getActiveTeamId(); if (team) void openSettings(team, "connections", "tm-key"); }}>
           <PlugZap size={16} />
           <span>{text}</span>
         </button>

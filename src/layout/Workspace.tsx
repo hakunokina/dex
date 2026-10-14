@@ -104,7 +104,7 @@ function NotesPanel({ params }: IDockviewPanelProps<{ page: NotesPage }>) {
 /** S4: limits and first-reply thresholds are the team's host's (a remote team → its server). */
 function SettingsPanel() {
   const { teamId } = useContext(WorkspaceCtx);
-  return lazyPanel(<SettingsView host={hostOf(teamId)} />);
+  return lazyPanel(<SettingsView host={hostOf(teamId)} teamId={teamId} />);
 }
 
 function TeamSettingsPanel({ api }: IDockviewPanelProps) {

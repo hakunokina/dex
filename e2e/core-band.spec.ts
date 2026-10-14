@@ -1,5 +1,5 @@
 // #151: the local core (`dexd --local`) on screen — down → the team's band with "Çekirdeği başlat";
-// another build → "Çekirdek güncel değil"; Ayarlar → Gelişmiş → Çekirdek (status, "Çekirdeği kapat").
+// another build → "Çekirdek güncel değil"; Ayarlar → Bağlantılar → Sunucular (bu bilgisayar satırı, "Çekirdeği kapat").
 // bridge.ts fakes the shell side: LOCAL_DOWN_KEY makes `local_host` answer "down", FAKE_LIFE is
 // `core_life` (the worker's dexd is `serve`, which keeps that method to a local endpoint).
 import { test, expect, calls, newTeam, openTeam } from "./fixtures";
@@ -71,30 +71,29 @@ test("çekirdek başka derleme: 'Çekirdek güncel değil' bandı, Gizle ile kal
   await expect(band).toHaveCount(0);
 });
 
-test("Ayarlar → Gelişmiş → Çekirdek: durum ve onaylı 'Çekirdeği kapat'", async ({ app, dexd }) => {
+test("Ayarlar → Bağlantılar → Sunucular: bu bilgisayar satırı ve onaylı 'Çekirdeği kapat'", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Ayar çekirdek ${test.info().workerIndex}`);
   await app.reload();
   await openTeam(app, team.name);
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
-  await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Gelişmiş" }).click();
-  const core = app.getByRole("region", { name: "Çekirdek" });
-  await expect(core).toContainText("Durum");
+  await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Bağlantılar" }).click();
+  const servers = app.getByRole("region", { name: "Sunucular", exact: true });
+  const core = servers.filter({ hasText: "Bu bilgisayar" });
+  await expect(core).toContainText("Bu bilgisayar (yerel çekirdek)");
   await expect(core).toContainText("çalışıyor");
   await expect(core).toContainText(String(FAKE_LIFE.pid));
   await expect(core).toContainText(FAKE_LIFE.commit);
-  await expect(core.locator(".settings-row", { hasText: "Bağlı pencere" })).toContainText(String(FAKE_LIFE.clients));
-  await expect(core.locator(".settings-row", { hasText: "Çalışan ajan" })).toContainText(String(FAKE_LIFE.agents));
+  await expect(core).toContainText(`pencere ${FAKE_LIFE.clients}`);
+  await expect(core).toContainText(`ajan ${FAKE_LIFE.agents}`);
 
-  // Cancelled: nothing is called; confirmed: the shell stops the core.
-  app.once("dialog", (d) => void d.dismiss());
-  await core.getByRole("button", { name: "Çekirdeği kapat" }).click();
+  // Vazgeç: hiçbir şey çağrılmaz; onayla: çekirdek kapanır.
+  await servers.getByRole("button", { name: "Çekirdeği kapat" }).click();
+  const dialog = app.getByRole("alertdialog", { name: "Yerel çekirdek kapatılsın mı?" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Vazgeç", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
   expect((await calls(app)).some((c) => c.cmd === "local_shutdown")).toBe(false);
-  let message = "";
-  app.once("dialog", (d) => {
-    message = d.message();
-    void d.accept();
-  });
-  await core.getByRole("button", { name: "Çekirdeği kapat" }).click();
+  await servers.getByRole("button", { name: "Çekirdeği kapat" }).click();
+  await app.getByRole("alertdialog", { name: "Yerel çekirdek kapatılsın mı?" }).getByRole("button", { name: "Çekirdeği kapat", exact: true }).click();
   await expect.poll(async () => (await calls(app)).some((c) => c.cmd === "local_shutdown")).toBe(true);
-  expect(message).toContain("çalışan tüm ajanlar kapanır");
 });
