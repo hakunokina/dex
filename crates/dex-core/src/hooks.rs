@@ -301,6 +301,8 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
     }
     let code = match read_request(&mut s, token, deadline) {
         Ok((agent, key, body)) => {
+            // #1813: karar süresi (kilit beklemeleri dahil) PreToolUse'ta ölçülür; kişisel veri yok.
+            let decision_t0 = std::time::Instant::now();
             if !core.mcp.verifies(&agent, &key) {
                 let _ = write!(s, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 return;
@@ -414,6 +416,13 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
             // FIX-3: UserPromptSubmit arms the first-reply watch, any later event ends it.
             if current_stop { core.first_reply_on_hook(&agent_id, &event_name); }
             // Finish the response before usage ingestion, context refresh or watch setup.
+            // #1813: PreToolUse karar süresi (p50/p99 buradan); yanıtsız 204'te sonuç yazılmaz.
+            let pre_tool_outcome = (event_name == "PreToolUse").then(|| {
+                delegated
+                    .as_deref()
+                    .and_then(|o| serde_json::from_str::<Value>(o).ok())
+                    .and_then(|v| v["hookSpecificOutput"]["permissionDecision"].as_str().map(str::to_string))
+            }).flatten();
             let reply = delegated.or_else(|| context.map(|ctx| json!({ "hookSpecificOutput": {
                 "hookEventName": "SessionStart", "additionalContext": ctx
             }}).to_string()));
@@ -426,6 +435,13 @@ fn serve(mut s: TcpStream, core: std::sync::Arc<Core>, seq: u64, deadline: crate
             drop(s);
             crate::diagnostics::event("leader_delivery", json!({"agent":agent_id, "seq":seq,
                 "reason":if written.is_ok() { "hook_reply" } else { "write_error" }}));
+            if event_name == "PreToolUse" {
+                let ms = decision_t0.elapsed().as_millis() as u64;
+                crate::diagnostics::hook_timing(&agent_id, ms, pre_tool_outcome.as_deref());
+                if ms > 2000 {
+                    eprintln!("dex: PreToolUse yavaş: {agent_id} {ms} ms");
+                }
+            }
             if let Some(session) = deferred_session.as_deref().filter(|session|
                 core.agent_states.get(&agent_id).session_id.as_deref() == Some(*session)
                     && core.ptys.generation(&agent_id) == process)
