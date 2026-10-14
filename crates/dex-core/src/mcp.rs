@@ -1723,7 +1723,10 @@ fn tools() -> Value {
               "delegationId": { "type": "integer" }, "summary": { "type": "string" }, "resultPath": { "type": "string" },
               "content": { "type": "string", "minLength": 1, "maxLength": delegate::REPORT_CONTENT_LIMIT } } } },
         { "name": "reset_ready", "description": "YALNIZ LİDER. Dex oturum sıfırlaması istediğinde devir notunu hafızana yazdıktan sonra çağır; Dex oturumunu kapatıp temiz açar. Dex istemediyse reddedilir.",
-          "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} } }
+          "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} } },
+        { "name": "map_refresh", "description": "YALNIZ LİDER. Projenin `.dex/map.md` repo haritası iskeletini tazeler (Scout-2'nin Genel bakış bölümü korunur). Birleştirme sonrası otomatik tazelenir; bu araç elle tetikleme içindir.",
+          "annotations": { "readOnlyHint": false },
+          "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "project": project_schema() } } }
     ]);
     // DEX-22: plan, plan_status, plan_cancel, propose_member (+ DEX-28 plan_retry).
     all.as_array_mut().unwrap().extend(crate::plan::tools());
@@ -2254,6 +2257,18 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
             drop(conn);
             core.leader_reset_ready(&c.id)
         }
+        // Plan #99 mapgen: repo haritası iskeletini elle tazeleme (lider).
+        "map_refresh" => {
+            lead_only("map_refresh")?;
+            let context = delegate::resolve_context(&conn, &core.paths.data_dir, &c, project_arg(args)?, None)?;
+            let root = crate::project_context::validate(&context).map_err(|e| e.to_string())?.ok_or("proje kökü yok")?;
+            let root = Path::new(root.root_path());
+            drop(conn);
+            let started = std::time::Instant::now();
+            let out = crate::repomap::refresh(&root)?;
+            Ok(json!({ "ok": true, "path": out.path, "files": out.files, "symbols": out.symbols,
+                "bytes": out.bytes, "ms": started.elapsed().as_millis() as u64 }))
+        }
         _ => {
             drop(conn);
             crate::plan::mcp_call_with_ptys(&core.db, &core.events, &core.ptys, &c, name, args)
@@ -2353,4 +2368,37 @@ fn summarize(core: &Core, d: delegate::Delegation) -> Result<Value, String> {
     };
     Ok(json!({ "delegationId": d.id, "to": d.to_agent, "toName": name, "targetRole": d.target_role, "queuePosition": d.queue_position, "status": d.status, "note": note, "summary": d.summary,
         "model": d.model, "modelApproval": d.model_approval, "actualModel": d.actual_model, "actualProvider": d.actual_provider, "actualEngine": d.actual_engine }))
+}
+
+#[cfg(test)]
+mod map_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn map_refresh_rewrites_skeleton_and_stays_leader_only() {
+        let dir = crate::projects::tests::Fixture::new();
+        let storage = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("map-refresh-{}-{}", std::process::id(), crate::agents::next_seq()));
+        let core = Core::start(crate::Paths { data_dir: storage.join("data"), config_dir: storage.join("config") },
+            crate::Events::new(crate::events::NullSink)).unwrap();
+        let root = dir.dir("map-project");
+        std::fs::write(root.join("main.rs"), "pub fn main() {}\n").unwrap();
+        let team_cwd = dir.dir("team-cwd");
+        let pid = crate::db::with(&core.db, |c| {
+            crate::teams::update_team(c, &dir.0, "default", crate::teams::TeamPatch {
+                cwd: Some(Some(team_cwd.to_string_lossy().into_owned())), worktrees: Some(false), ..Default::default()
+            })?;
+            let ready = crate::projects::prepare_root(root.to_str().unwrap(), None).map_err(|e| e.to_string())?;
+            Ok(crate::projects::create(c, "default", crate::projects::NewProject { name: "Map".into(), worktrees: None }, &ready).map_err(|e| e.to_string())?.id)
+        }).unwrap();
+        let listed = tools_list_for_test(&core, "timur");
+        assert!(listed.iter().any(|t| t["name"] == "map_refresh"));
+        let ok = call_with_args_for_test(&core, "timur", "map_refresh", json!({"project": pid}));
+        assert_eq!(ok["structuredContent"]["ok"], true, "{ok}");
+        let text = std::fs::read_to_string(root.join(".dex/map.md")).unwrap();
+        assert!(text.contains("#### `main.rs`") && text.contains("fn `main`"), "{text}");
+        let denied = call_with_args_for_test(&core, "kaan", "map_refresh", json!({"project": pid}));
+        assert_eq!(denied["isError"], true, "{denied}");
+        core.shutdown();
+    }
 }
