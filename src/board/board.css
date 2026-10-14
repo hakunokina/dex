@@ -49,12 +49,33 @@
   position: fixed; z-index: var(--z-drag); pointer-events: none; cursor: grabbing;
   box-shadow: var(--shadow-pop); transform: rotate(1.5deg);
 }
-.board-card-title { font-weight: var(--fw-semibold); word-break: break-word; }
+.board-card-title {
+  font-weight: var(--fw-semibold); word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+/* İş numarası + canlı rozet: sol üstte, numara seçilebilir. */
+.board-card-top { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; min-height: 18px; }
+.board-card-top:empty { display: none; }
+.board-num {
+  font-family: var(--font-mono); font-size: var(--fs-sm); font-weight: var(--fw-semibold);
+  color: var(--text); user-select: text; cursor: text;
+}
+.board-live {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap;
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 0 5px;
+}
+.board-live .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); }
+.board-live.working { color: var(--text); border-color: var(--line-strong); }
+.board-live.working .dot { background: var(--green); }
+.board-live.patron .dot { background: var(--amber); }
+.board-doing-count { font-weight: var(--fw-normal); text-transform: none; letter-spacing: normal; }
+.board-doing-count b { color: var(--text-2); font-variant-numeric: tabular-nums; }
 .board-card-title-input { width: 100%; height: var(--ctl-h-sm); padding: 0 5px; font-weight: var(--fw-semibold); }
 .board-card-desc { width: 100%; margin-top: 5px; padding: var(--sp-1) 5px; resize: vertical; user-select: text; }
 .board-card-desc-view {
-  margin-top: 2px; color: var(--muted); font-size: var(--fs-sm); white-space: pre-wrap;
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+  margin-top: 2px; color: var(--text-2); font-size: var(--fs-sm); white-space: pre-wrap;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 .board-card-foot { display: flex; flex-wrap: wrap; align-items: center; margin-top: var(--sp-1); }
 .board-role-chip { min-width: 0; max-width: 100%; margin-left: var(--sp-1); color: var(--text-2); }

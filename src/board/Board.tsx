@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { AGENTS } from "../agents";
+import { AGENTS, getStatus, subscribeAgentStatus } from "../agents";
 import { openPanel } from "../layout/panels";
 import { getActiveTeamId, useTeams } from "../team/store";
 import { isAssignable } from "../team/rolePolicy";
@@ -18,6 +18,7 @@ import { jobProjectName, useTeamProjects } from "../project/store";
 import "../project/project.css";
 import { PanelsTopLeft, Trash2, X } from "lucide-react";
 import { taskRoleName } from "./taskRole";
+import { LIVE_LABEL, doingRank, plainPreview, taskLive, type LiveState } from "./taskLive";
 
 const COLUMNS: { status: TaskStatus; label: string }[] = [
   { status: "todo", label: "Yapılacak" },
@@ -70,6 +71,11 @@ export function BoardView({ tools }: { tools?: ReactNode }) {
   useTeamProjects(teamId); // the cards' project chips follow the team's project list
   const cost = useTeamCost(teamId || null);
   const delegations = useDelegations();
+  // Ajan çalıştı/durdu/soru sordu → rozetler tazelenir.
+  const [, setStatusTick] = useState(0);
+  useEffect(() => subscribeAgentStatus(() => setStatusTick((t) => t + 1)), []);
+  const host = hostOf(teamId);
+  const liveOf = (t: Task): LiveState => taskLive(t, host, delegations, getStatus);
   const taskCost = (t: Task) => {
     if (cost?.status !== "ready") return null;
     const host = hostOf(teamId);
@@ -185,17 +191,21 @@ export function BoardView({ tools }: { tools?: ReactNode }) {
         <div className="board-cols" aria-busy={tasks === null && !error}>
           {COLUMNS.map((c) => {
             const items = tasks?.filter((t) => t.status === c.status) ?? [];
+            const withLive = items.map((t) => ({ t, live: liveOf(t) }));
+            // "Sürüyor"de çalışanlar üstte.
+            if (c.status === "doing") withLive.sort((a, b) => doingRank(a.live.kind) - doingRank(b.live.kind));
             return (
               <section key={c.status} data-status={c.status} className={`board-col${drag?.over === c.status ? " over" : ""}`}>
                 <header>
-                  {c.label} <Count n={items.length} />
+                  {c.label} {c.status === "doing" ? <DoingCount rows={withLive} /> : <Count n={items.length} />}
                 </header>
                 <div className="board-list">
                   {tasks === null && !error && <SkeletonCards />}
-                  {items.map((t) => (
+                  {withLive.map(({ t, live }) => (
                     <Card
                       key={t.id}
                       task={t}
+                      live={live}
                       cost={taskCost(t)}
                       role={taskRoleName(t, hostOf(teamId), delegations, roles)}
                       editing={editing === t.id}
@@ -228,6 +238,17 @@ function Count({ n }: { n: number }) {
   return <b>{useCountUp(n)}</b>;
 }
 
+/** "Sürüyor 4 çalışıyor · 2 sırada · 5 bekliyor". */
+function DoingCount({ rows }: { rows: { live: LiveState }[] }) {
+  const working = rows.filter((r) => r.live.kind === "working").length;
+  const queued = rows.filter((r) => r.live.kind === "queued").length;
+  return (
+    <span className="board-doing-count">
+      <b>{working}</b> çalışıyor · <b>{queued}</b> sırada · <b>{rows.length - working - queued}</b> bekliyor
+    </span>
+  );
+}
+
 /** Two card-sized placeholders per column while the first list loads. */
 function SkeletonCards() {
   return (
@@ -244,6 +265,7 @@ function SkeletonCards() {
 
 interface CardProps extends Pick<React.HTMLAttributes<HTMLDivElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel"> {
   task: Task;
+  live: LiveState;
   role: string | null;
   cost: { total: UsageTotal; warnings: string[] } | null;
   editing: boolean;
@@ -252,7 +274,7 @@ interface CardProps extends Pick<React.HTMLAttributes<HTMLDivElement>, "onPointe
   onDelete: () => void;
 }
 
-function Card({ task, role, cost, editing, dragging, onPatch, onDelete, ...pointer }: CardProps) {
+function Card({ task, live, role, cost, editing, dragging, onPatch, onDelete, ...pointer }: CardProps) {
   const members = useTeams().agents;
   const assignable = AGENTS.filter(a => {
     const member = members.find(m => m.id === a.id);
@@ -260,8 +282,25 @@ function Card({ task, role, cost, editing, dragging, onPatch, onDelete, ...point
   });
   const agent = AGENTS.find((a) => a.id === task.agentId);
   const project = jobProjectName(task); // #838: only where the team has several projects
+  const preview = task.description ? plainPreview(task.description) : "";
+  const stopDrag = (e: React.SyntheticEvent) => e.stopPropagation(); // numara seçilir/kopyalanır, kart sürüklenmez
   return (
     <div className={`board-card${dragging ? " dragging" : ""}${editing ? " editing" : ""}`} {...pointer}>
+      {(live.delegationId != null || live.kind) && (
+        <div className="board-card-top">
+          {live.delegationId != null && (
+            <span className="board-num" title="İş numarası (seçip kopyalayabilirsin)"
+              onPointerDown={stopDrag} onPointerMove={stopDrag} onPointerUp={stopDrag}>
+              #{live.delegationId}
+            </span>
+          )}
+          {live.kind && (
+            <span className={`board-live ${live.kind}`} title={LIVE_LABEL[live.kind]}>
+              <i className="dot" aria-hidden="true" />{LIVE_LABEL[live.kind]}
+            </span>
+          )}
+        </div>
+      )}
       {editing ? (
         <input
           className="board-card-title-input"
@@ -282,7 +321,7 @@ function Card({ task, role, cost, editing, dragging, onPatch, onDelete, ...point
           onBlur={(e) => e.target.value !== task.description && onPatch({ description: e.target.value })}
         />
       )}
-      {!editing && task.description && <div className="board-card-desc-view">{task.description}</div>}
+      {!editing && preview && <div className="board-card-desc-view">{preview}</div>}
       <div className="board-card-foot">
         <select
           className="board-agent"

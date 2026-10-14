@@ -223,6 +223,28 @@ test("görev panosu: görev oluşturulur, listede ve çekirdekte görünür", as
   await expect(boardBtn).toHaveAttribute("aria-pressed", "false");
 });
 
+test("görev panosu: kartta ham markdown yok, Sürüyor başlığı dağılımı gösterir", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Pano Sade ${test.info().workerIndex}`);
+  await dexd.call("task_create", { task: {
+    teamId: team.id, title: "Markdown görev", status: "doing",
+    description: "## Patronun sözü\n**Kalın** ve `kod` ile ilk cümle. İkinci cümle.",
+  } });
+  await app.reload();
+  await openTeam(app, team.name);
+  await app.setViewportSize({ width: 390, height: 780 });
+  const boardBtn = app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Görevler" });
+  await boardBtn.click();
+  const board = app.getByRole("complementary");
+  await expect(board.getByText("Markdown görev")).toBeVisible();
+  // Ham markdown görünmez; ilk anlamlı cümleler sade görünür.
+  await expect(board.getByText("## Patronun sözü")).toHaveCount(0);
+  await expect(board.getByText("**Kalın**")).toHaveCount(0);
+  await expect(board.getByText("Kalın ve kod ile ilk cümle. İkinci cümle.")).toBeVisible();
+  // Devretmesiz görevde iş numarası yok; başlık dağılımı gösterir.
+  await expect(board.locator(".board-num")).toHaveCount(0);
+  await expect(board.locator('[data-status="doing"] header')).toContainText("0 çalışıyor · 0 sırada · 1 bekliyor");
+});
+
 test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh klasör/proje/hafıza", async ({ app, dexd }) => {
   const source = await newTeam(dexd, "Kaynak");
   await dexd.call("agent_create", { agent: { teamId: source.id, name: "Özel Üye", kind: "worker", model: "claude-sonnet-5-5", roleSlug: "frontend" } });
