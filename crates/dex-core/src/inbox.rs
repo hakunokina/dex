@@ -177,7 +177,18 @@ impl crate::Core {
 
     pub(crate) fn inbox_prompt_received(&self, agent: &str, prompt: &str) {
         // Only the exact UPS is receipt evidence. Mismatches wait for the ambiguity timeout.
-        let _ = with(&self.db, |c| c.execute("DELETE FROM inbox_messages WHERE agent_id=?1 AND pasted=1 AND prompt=?2", params![agent,prompt]).map(|_| ()).map_err(|e| e.to_string()));
+        let accepted = with(&self.db, |c| {
+            let row = c.query_row("SELECT m.receipt_id,r.team_id FROM inbox_messages m JOIN inbox_receipts r ON r.id=m.receipt_id
+                WHERE m.agent_id=?1 AND m.pasted=1 AND m.prompt=?2 ORDER BY m.receipt_id LIMIT 1", params![agent,prompt],
+                |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?))).optional().map_err(|e| e.to_string())?;
+            c.execute("DELETE FROM inbox_messages WHERE agent_id=?1 AND pasted=1 AND prompt=?2", params![agent,prompt]).map_err(|e| e.to_string())?;
+            Ok(row)
+        }).ok().flatten();
+        // #1718: this turn's answer becomes the share's reply; any other prompt clears the mark.
+        match accepted {
+            Some((receipt, team)) => self.inbox_reply_mark(agent, receipt, &team, prompt),
+            None => self.inbox_reply_forget(agent),
+        }
     }
 
     pub(crate) fn inbox_wake(&self, agent: &str) {

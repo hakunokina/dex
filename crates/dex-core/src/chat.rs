@@ -259,6 +259,25 @@ pub(crate) fn last_assistant_text(path: &Path, max_chars: usize) -> Option<Strin
     Some(short(&m.text, max_chars))
 }
 
+/// #1718: the turn's final answer — the trailing assistant text after its last tool call or
+/// prompt, read from byte `from` (the turn's UPS). An interrupted window has no answer.
+pub(crate) fn turn_reply(path: &Path, from: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    if text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).any(|v| claude_interrupted(&v)) {
+        return None;
+    }
+    let messages = collect(&text);
+    let mut tail: Vec<&str> = messages.iter().rev().filter(|m| !m.thinking)
+        .take_while(|m| m.role == "assistant" && m.tool.is_none())
+        .map(|m| m.text.trim()).collect();
+    tail.reverse();
+    Some(tail.join("\n\n")).filter(|t| !t.trim().is_empty())
+}
+
 /// #125: the claude transcript's last turn is over — its last conversation row (user / assistant /
 /// `system` `turn_duration`, sidechains skipped) is `turn_duration`, which claude writes once a turn
 /// really ends (a blocked Stop goes on with an assistant row). Meta rows (title, mode, file history)
@@ -730,6 +749,8 @@ impl crate::Core {
 
     /// [`Core::paste_prompt`] for a path that holds its turn already ([`crate::Core::admit`]).
     pub(crate) fn paste_admitted(&self, agent: &str, text: &str, _turn: &crate::restart::Turn) -> Result<(), String> {
+        // A new turn starts here; only its exact inbox UPS marks it again (#1718).
+        self.inbox_reply_forget(agent);
         self.paste_text(agent, text)?;
         self.paste_enter(agent).map(|_| {
             // The sender already knows the prompt. Do not wait for a hook to preserve

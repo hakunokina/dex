@@ -5,6 +5,8 @@ use rusqlite::OptionalExtension;
 impl Core {
     pub(crate) fn team_turn_ended(&self, state: &State) -> Result<(), String> {
         if state.status != Status::Idle { return Ok(()) }
+        // #1718: a share turn whose Stop carried no answer (or was missed) ends here.
+        self.inbox_reply_turn_ended(&state.agent_id);
         // Paste acknowledgement takes its reservation lock before DB; keep that order here.
         let pending_chat = self.chat_queues.lock().unwrap().get(&state.agent_id)
             .is_some_and(|queue| !queue.is_empty());

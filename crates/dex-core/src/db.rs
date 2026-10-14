@@ -424,6 +424,9 @@ const MIGRATIONS: &[&str] = &[
     // transaction: before commit ROLLBACK. After commit: rows stay (status/decided_at only);
     // to reopen: UPDATE member_proposals SET status='pending', decided_at=NULL WHERE id IN (...).
     STALE_PROPOSALS,
+    // 39 (#1718): share replies + FCM device tokens, both host-only. Additive, IF NOT EXISTS.
+    // Before commit: ROLLBACK. After commit: keep the tables; revert only the application.
+    crate::inbox_reply::SCHEMA,
 ];
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
