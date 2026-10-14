@@ -4,7 +4,6 @@
 import alibaba from "./icons/alibaba.svg";
 import antigravity from "./icons/antigravity.svg";
 import claude from "./icons/claude.svg";
-import codex from "./icons/codex.svg";
 import commandcode from "./icons/commandcode.svg";
 import copilot from "./icons/copilot.svg";
 import cursor from "./icons/cursor.svg";
@@ -16,6 +15,7 @@ import kiro from "./icons/kiro.svg";
 import meta from "./icons/meta.svg";
 import minimax from "./icons/minimax.svg";
 import ollama from "./icons/ollama.svg";
+import openai from "./icons/openai.svg";
 import opencode from "./icons/opencode.svg";
 import openrouter from "./icons/openrouter.svg";
 import qoder from "./icons/qoder.svg";
@@ -41,8 +41,7 @@ const P = (label: string, brand: string, icon?: string): Omit<ProviderMeta, "col
 
 const PROVIDERS: Record<string, ReturnType<typeof P>> = {
   claude: P("Claude", "#cc7c5e", claude),
-  codex: P("Codex", "#49a3b0", codex),
-  openai: P("OpenAI", "#49a3b0", codex),
+  openai: P("OpenAI", "#49a3b0", openai),
   opencode: P("OpenCode", "#000000", opencode),
   cursor: P("Cursor", "#000000", cursor),
   antigravity: P("Antigravity", "#4285f4", antigravity),

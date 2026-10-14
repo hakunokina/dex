@@ -228,7 +228,6 @@ test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh 
   await dexd.call("agent_create", { agent: { teamId: source.id, name: "Özel Üye", kind: "worker", model: "claude-sonnet-5-5", roleSlug: "frontend" } });
   const original = await teamAgents(dexd, source.id);
   const template = await dexd.call<{ kind: string; members: { name: string; kind: string; model: string; engine: string; roleSlug: string }[] }>("team_clone_template", { teamId: source.id });
-  await app.addInitScript(() => { window.__dexFake = { codex_models: [{ id: "gpt-5.4", label: "GPT 5.4" }] }; });
   await app.reload();
   await openTeam(app, source.name);
   await app.setViewportSize({ width: 390, height: 780 });
@@ -244,8 +243,10 @@ test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh 
   await form.getByRole("textbox", { name: "Ad", exact: true }).fill("Kopya");
   await form.getByRole("textbox", { name: "Üye 2 adı", exact: true }).fill("Yeni Üye");
   await form.getByRole("combobox", { name: "Üye 2 rolü", exact: true }).selectOption("backend");
-  await form.getByRole("combobox", { name: "Üye 2 motoru", exact: true }).selectOption("codex");
-  await expect(form.getByRole("combobox", { name: "Üye 2 modeli", exact: true })).toHaveValue("gpt-5.4");
+  // #1713: tek motor (Claude) kaldı — motor seçicisi yok, sağlayıcı ve model seçimi duruyor.
+  await expect(form.getByRole("combobox", { name: /motoru$/ })).toHaveCount(0);
+  await form.getByRole("combobox", { name: "Üye 2 modeli", exact: true }).selectOption("claude-opus-5-5");
+  await expect(form.getByRole("combobox", { name: "Üye 2 modeli", exact: true })).toHaveValue("claude-opus-5-5");
   expect((await form.boundingBox())!.width).toBeLessThanOrEqual(390);
   await form.getByRole("button", { name: "Oluştur", exact: true }).focus();
   await app.keyboard.press("Tab");
@@ -265,7 +266,7 @@ test("takımı kopyala: panel ve sekme menüsü, düzenlenebilir üyeler, fresh 
   const copied = crew.filter(a => a.teamId === copy.id);
   expect(copied).toHaveLength(original.length);
   expect(copied.every(a => !original.some(o => o.id === a.id))).toBe(true);
-  expect(copied.find(a => a.name === "Yeni Üye")).toMatchObject({ engine: "codex", roleSlug: "backend", model: "gpt-5.4" });
+  expect(copied.find(a => a.name === "Yeni Üye")).toMatchObject({ engine: "claude", roleSlug: "backend", model: "claude-opus-5-5" });
   expect(await dexd.call("project_list", { teamId: copy.id })).toMatchObject([{ name: "KopyaMain", rootPath: copy.cwd }]);
   expect((await calls(app)).filter(c => c.cmd === "team_create").at(-1)?.args).toMatchObject({ team: { name: "Kopya", cwd: null, members: expect.any(Array) } });
   const tab = app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: /^Kaynak( \d+)?$/ });
@@ -293,7 +294,6 @@ for (const provider of ["anthropic", "local"]) {
           { id: "anthropic", label: "Anthropic", baseUrl: null, hasToken: false, tokenMask: null, models: [{ id: "claude-sonnet-5-5", label: "Sonnet" }] },
           { id: "local", label: "Local", baseUrl: "http://127.0.0.1:4000", hasToken: true, tokenMask: null, models: [] },
         ],
-        codex_models: [],
         provider_local_status: { baseUrl: "http://127.0.0.1:4000", registry: false, models: [
           { id: "qwen-a", backend: null, removable: false }, { id: "qwen-b", backend: null, removable: false },
         ] },
@@ -335,7 +335,6 @@ test("kopya şablonu hatası görünür ve yeniden denenebilir", async ({ app, d
   const source = await newTeam(dexd, "Kopya Hata");
   await app.addInitScript(() => {
     window.__dexOld = { unknown: ["team_clone_template"] };
-    window.__dexFake = { codex_models: [] };
   });
   await app.reload();
   await openTeam(app, source.name);

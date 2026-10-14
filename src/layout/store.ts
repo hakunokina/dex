@@ -142,7 +142,7 @@ export function clearAgent(agentId: string) {
   if (lastSession.delete(agentId)) set(s => ({ ...s }));
 }
 
-/** DEX-30: the agent switched engine — a claude session id means nothing to codex (and back). */
+/** DEX-30: the agent switched engine — a session id means nothing to another engine. */
 export function forgetSession(agentId: string) {
   if (lastSession.delete(agentId)) set(s => ({ ...s }));
 }

@@ -57,7 +57,6 @@ function Row({ a, onOpen, leader }: { a: AgentRec; onOpen: (id: string) => void;
   const stalled = stalledFor(a.id);
   // Chat preview from what the phone already has: the open question, else the newest result line.
   const preview = question?.question ?? lastResultLine(delegations, a.id) ?? "";
-  const engine = a.engine === "codex" ? "Codex" : "Claude";
   return (
     <button className={`m-agent${leader ? " leader" : ""}`} onClick={() => onOpen(a.id)}>
       <span className={`m-dot ${STATUS_DOT[status]}`} />
@@ -74,7 +73,7 @@ function Row({ a, onOpen, leader }: { a: AgentRec; onOpen: (id: string) => void;
         </span>
       )}
       <span className="m-agent-side">
-        <span className="m-engine">{engine}</span>
+        <span className="m-engine">Claude</span>
         <span className="m-status-text">{STATUS_TEXT[status]}</span>
       </span>
       <ChevronRight size={16} className="m-chev-agent" />

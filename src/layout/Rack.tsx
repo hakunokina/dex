@@ -41,7 +41,7 @@ export function Rack({ teamId, focusedId, onFocus }: Props) {
   const title = (a: AgentRec) => {
     const st = STATUS_LABEL[statuses[a.id] ?? "offline"];
     const active = activeTarget(a);
-    const route = active ? `\nAktif: ${active} · asıl: ${a.engine === "codex" ? "Codex" : a.provider}` : "";
+    const route = active ? `\nAktif: ${active} · asıl: ${a.provider}` : "";
     if (a.kind === "leader") return `${a.name} — lider · ${st}${route}${stallLine(a.id)}`;
     const line = lastResultLine(delegations, a.id);
     const q = workerQuestion(questions, a.id);
@@ -133,7 +133,6 @@ function useSlide(box: RefObject<HTMLDivElement | null>, order: string) {
 }
 
 function activeTarget(a: AgentRec) {
-  if (a.activeEngine === "codex") return "Codex";
   if (a.activeProvider === "local") return "Yerel";
   if (a.activeProvider) return a.activeProvider.toUpperCase();
   return null;

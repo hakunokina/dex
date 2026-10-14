@@ -24,7 +24,7 @@ export interface Agent {
   model: string;
   /** DEX-13: `anthropic` (default) | `glm` | `muse`. */
   provider: string;
-  /** DEX-26: `claude` (default) | `codex`. */
+  /** DEX-26: the CLI the agent runs; only `claude` since #1710. */
   engine: string;
   /** DEX-17: zincirle geçilen geçici hedef; asıl ayarlar `engine/provider/model` olarak kalır. */
   activeEngine?: string | null;

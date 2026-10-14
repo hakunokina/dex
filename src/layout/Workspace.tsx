@@ -165,7 +165,7 @@ function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }
       {delegated > 0 && <span className="pane-deleg" title="Aktif devretmeler">⇢ {delegated}</span>}
       {pending > 0 && <span className="pane-ask" title="Worker soruları cevap bekliyor">? {pending}</span>}
       {status === "offline" ? (
-        <button className="dex-tab-action" title={session ? "Oturumu sürdür" : `${agent?.engine === "codex" ? "Codex" : "Claude"}'u başlat`}
+        <button className="dex-tab-action" title={session ? "Oturumu sürdür" : "Claude'u başlat"}
           onPointerDown={control} onClick={(e) => { control(e); requestStart(agentId); }}><Play /></button>
       ) : (
         <button className="dex-tab-action" title="Durdur" onPointerDown={control}

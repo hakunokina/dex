@@ -205,6 +205,8 @@ export function UsageStrip() {
   }
 
   const idle = !live || now - (u.rateAt ?? 0) > RATE_ACTIVE_MS;
+  // #1713: Codex is gone from Dex; TM may still report the subscription, the strip doesn't show it.
+  const providers = u.providers.filter((p) => p.id !== "codex");
   return (
     <aside className="usage-strip" aria-label="Kullanım şeridi" data-status={u.status}>
       <div className={`usage-cell usage-rate ${idle ? "idle" : ""}`} title="Canlı çıktı hızı (token/sn)">
@@ -218,10 +220,10 @@ export function UsageStrip() {
       </div>
       <GpuCell />
       <div className="usage-provs">
-        {u.providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}
+        {providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}
       </div>
       {hoverId && anchor && (() => {
-        const p = u.providers.find((x) => x.id === hoverId);
+        const p = providers.find((x) => x.id === hoverId);
         return p ? <ProviderCard p={p} snap={u} now={now} anchor={anchor} onHover={onHover} /> : null;
       })()}
     </aside>

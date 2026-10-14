@@ -101,7 +101,7 @@ async function reload() {
   for (const id of Object.keys(layout.getSnapshot().teams)) if (!known.has(id)) layout.dropTeam(id);
   const agentIds = new Set(agents.map(a => a.id));
   for (const a of state.agents) if (!agentIds.has(a.id)) layout.clearAgent(a.id);
-  // DEX-30/34: a session id can't be resumed across engines (claude ↔ codex transcripts differ); every
+  // DEX-30/34: a session id can't be resumed across engines (their transcripts differ); every
   // reload checks each saved session's engine against the DB, so no engine-switch path can leave one stale.
   layout.syncSessionEngines(new Map(agents.map(a => [a.id, a.engine])));
   if (activeId) layout.setActiveTeam(activeId);

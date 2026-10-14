@@ -120,11 +120,9 @@ export class HoverCard {
       this.kind.textContent = KIND_TEXT[agent.kind] ?? "";
       this.kind.style.display = this.kind.textContent ? "" : "none";
       this.rows.get("Rol")!.value.textContent = agent.roleName || agent.title || "—";
-      // DEX-26: motor · model; a codex agent's provider is not used.
-      const engine = agent.activeEngine ?? agent.engine;
       const provider = agent.activeProvider ?? agent.provider;
       const model = agent.activeModel ?? agent.model;
-      const prov = engine === "codex" ? "Codex" : PROVIDER_TEXT[provider];
+      const prov = PROVIDER_TEXT[provider];
       this.rows.get("Model")!.value.textContent = prov ? `${prov} · ${model}` : model || "—";
       const proj = this.rows.get("Proje")!;
       proj.row.style.display = project ? "" : "none";

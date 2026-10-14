@@ -4,7 +4,7 @@
 export type UsageStatus = "connecting" | "live" | "offline" | "unauthorized";
 
 export interface ProviderUsage {
-  /** claude, codex, zai, muse… */
+  /** claude, zai, muse… */
   id: string;
   /** Birincil pencerede kalan %; null = şu an bildirmiyor ("--"). */
   remainingPercent: number | null;
