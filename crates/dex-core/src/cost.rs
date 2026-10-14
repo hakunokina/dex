@@ -14,7 +14,7 @@ pub struct Tokens {
     pub cache_write: u64,
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct ParserState {
     context: Option<AgentContext>,
@@ -124,7 +124,27 @@ pub(crate) fn reset_context(c: &Connection, agent: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> {
+/// Lock-free unit of [`context`]: everything the file read needs, resolved with fast queries.
+/// `source` (id + session) survives even when no transcript file resolves — the snapshot still
+/// names the session, only the ingest is skipped.
+struct ContextPre {
+    team: String,
+    model: String,
+    /// Raw `cost_context_heads.source_id` read here; `context_post` publishes only if unchanged.
+    head: Option<i64>,
+    source: Option<(i64, String)>,
+    ingest: Option<IngestPre>,
+}
+
+struct IngestPre {
+    engine: String,
+    path: std::path::PathBuf,
+    offset: u64,
+    state: ParserState,
+    force: bool,
+}
+
+fn context_pre(c: &Connection, agent: &str) -> Result<ContextPre, String> {
     let a = crate::teams::get_agent(c, agent)?;
     // Upgrade existing installations lazily, using the indexed agent history.
     c.execute(
@@ -133,21 +153,12 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
         [agent],
     )
     .map_err(err)?;
-    let (source, previous): (Option<i64>, Option<String>) = c
-        .query_row(
-            "SELECT source_id,snapshot FROM cost_context_heads WHERE agent_id=?1",
-            [agent],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    let head: Option<i64> = c
+        .query_row("SELECT source_id FROM cost_context_heads WHERE agent_id=?1", [agent], |r| r.get(0))
         .map_err(err)?;
     let model = a.active_model.unwrap_or(a.model);
-    let mut out = AgentContext {
-        window: model_window(&model),
-        model,
-        ..Default::default()
-    };
     // Only Claude transcripts are read; older engines' sources keep their history but are not re-read.
-    let source = match source {
+    let source = match head {
         Some(id) => c
             .query_row("SELECT engine,session,path FROM cost_sources WHERE id=?1 AND engine='claude'", [id], |r| {
                 Ok((id, r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
@@ -156,10 +167,23 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
             .map_err(err)?,
         None => None,
     };
+    let mut ingest = None;
+    let mut source_id = None;
     if let Some((source, engine, session, known)) = source {
+        source_id = Some((source, session.clone()));
         if let Some(path) = crate::chat::transcript_of(Some(&session), known.as_deref()) {
-            ingest(c, source, &engine, &path)?;
+            let (offset, state, force) = ingest_begin(c, source)?;
+            ingest = Some(IngestPre { engine, path, offset, state, force });
         }
+    }
+    Ok(ContextPre { team: a.team_id, model, head, source: source_id, ingest })
+}
+
+/// Snapshot from the (possibly concurrently advanced) parser row; stores it on change.
+fn context_post(c: &Connection, agent: &str, pre: &ContextPre) -> Result<Option<(AgentContext, bool)>, String> {
+    let (source, session) = pre.source.clone().unzip();
+    let mut out = AgentContext { window: model_window(&pre.model), model: pre.model.clone(), ..Default::default() };
+    if let (Some(source), Some(session)) = (source, session) {
         let parser: String = c
             .query_row("SELECT parser FROM cost_sources WHERE id=?1", [source], |r| r.get(0))
             .map_err(err)?;
@@ -169,8 +193,24 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
         }
         out.session_id = Some(session);
     }
+    // Baş, kilit dışı okuma sırasında taze başlatmayla değişmiş olabilir: aynı kilit altında
+    // yeniden oku; kaynak artık aynı değilse bu ölçüm bayattır, yazma ve yayınlama.
+    let Some((head, previous)) = c
+        .query_row(
+            "SELECT source_id,snapshot FROM cost_context_heads WHERE agent_id=?1",
+            [agent],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    if head != pre.head {
+        return Ok(None);
+    }
     let encoded = serde_json::to_string(&out).map_err(err)?;
-    let changed = previous.as_deref() != Some(&encoded);
+    let changed = previous.as_deref() != Some(encoded.as_str());
     if changed {
         c.execute(
             "UPDATE cost_context_heads SET snapshot=?2 WHERE agent_id=?1",
@@ -178,7 +218,24 @@ fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> 
         )
         .map_err(err)?;
     }
-    Ok((out, changed))
+    Ok(Some((out, changed)))
+}
+
+#[cfg(test)]
+fn context(c: &Connection, agent: &str) -> Result<(AgentContext, bool), String> {
+    let pre = context_pre(c, agent)?;
+    if let (Some((source, _)), Some(ig)) = (pre.source.as_ref(), pre.ingest.as_ref()) {
+        let mut reader = TailReader::open(*source, &ig.path, ig.offset)?;
+        let mut state = ig.state.clone();
+        loop {
+            let Some((lines, pos)) = reader.next_chunk()? else { break };
+            let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
+            let (rows, next) = parse_chunk(*source, &ig.engine, &lines, state, base)?;
+            state = next;
+            commit_chunk(c, *source, &ig.path, &rows, &state, base, pos, ig.force)?;
+        }
+    }
+    context_post(c, agent, &pre)?.ok_or_else(|| "bağlam başı işlem sırasında değişti".to_string())
 }
 
 fn err(e: impl std::fmt::Display) -> String {
@@ -271,12 +328,31 @@ struct StoredState {
 
 /// Complete lines only. Cursor, parser state and message upserts commit together; a crash
 /// cannot count an append twice. Message content is neither persisted nor logged.
-fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> Result<(), String> {
+///
+/// #1813: the transcript file used to be read line by line while holding the process-wide DB
+/// mutex (every hook runs `agent_context`, `usage_summary` ingests every source). A large tail —
+/// or a slow `agent-context` emit in the same lock — held the lock for seconds, and the next
+/// hook's PreToolUse decision queued behind it until curl's 8 s timeout denied the tool.
+/// The ingest is therefore split: [`ingest_begin`] (fast DB reads), [`TailReader`] + [`parse_chunk`]
+/// (file I/O and JSON parsing with no lock held), [`commit_chunk`] (one short transaction per
+/// chunk, so hook decisions slip between chunks). Chunk upserts stay idempotent
+/// (`ON CONFLICT … MAX`, message keys) and the offset only advances over committed complete
+/// lines, never backwards (`max`), so concurrent ingests of the same source cannot double-count.
+const INGEST_CHUNK: usize = 500;
+
+/// File read + parse budget above which the ingest is worth a diagnostic line (durations and
+/// counts only, no content). The slow tail blocks no hook, but it explains long hook gaps nearby.
+const INGEST_SLOW_MS: u64 = 500;
+
+/// Fast DB reads only: cursor + parser state. No file I/O, no transaction. `force` is set when
+/// a pre-context cursor is replayed from zero (parser reset): the replay is authoritative and the
+/// commit must overwrite unconditionally, even though the stored cursor already covers the file.
+fn ingest_begin(c: &Connection, source: i64) -> Result<(u64, ParserState, bool), String> {
     let (offset, state): (u64, String) = c
         .query_row("SELECT byte_offset,parser FROM cost_sources WHERE id=?1", [source], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })
-        .map_err(err)?;
+        .map_err(|_| format!("usage source {source}: kaynak yok"))?;
     let saved: StoredState = serde_json::from_str(&state).map_err(err)?;
     // Pre-context cursors get one replay. Existing message keys make it idempotent.
     // Afterwards even a null context is persisted.
@@ -284,73 +360,184 @@ fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> 
         .map_err(err)?
         .as_object()
         .is_some_and(|o| o.contains_key("context"));
-    let mut state = ParserState { context: saved.context };
-    let offset = if legacy {
-        state = ParserState::default();
-        0
+    if legacy {
+        Ok((0, ParserState::default(), true))
     } else {
-        offset
-    };
-    let mut f = std::fs::File::open(path).map_err(|_| format!("usage source {source}: transcript okunamıyor"))?;
-    if f.metadata().map_err(err)?.len() < offset {
-        return Err(format!("usage source {source}: transcript küçüldü"));
+        Ok((offset, ParserState { context: saved.context }, false))
     }
-    f.seek(SeekFrom::Start(offset)).map_err(err)?;
-    let mut reader = std::io::BufReader::new(f);
-    let tx = c.unchecked_transaction().map_err(err)?;
-    let mut pos = offset;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|_| format!("usage source {source}: satır okunamıyor"))?;
-        if n == 0 || !line.ends_with('\n') {
-            break;
+}
+
+/// A transcript tail read with no DB access: at most `INGEST_CHUNK` complete `\n`-terminated
+/// lines per call, the byte offset past them. A trailing partial line stays for the next read.
+struct TailReader {
+    source: i64,
+    reader: std::io::BufReader<std::fs::File>,
+    pos: u64,
+}
+
+impl TailReader {
+    fn open(source: i64, path: &std::path::Path, offset: u64) -> Result<Self, String> {
+        let mut f =
+            std::fs::File::open(path).map_err(|_| format!("usage source {source}: transcript okunamıyor"))?;
+        if f.metadata().map_err(err)?.len() < offset {
+            return Err(format!("usage source {source}: transcript küçüldü"));
         }
-        let v: Value = serde_json::from_str(&line).map_err(|_| format!("usage source {source}: geçersiz JSON, offset {pos}"))?;
-        if let Some(row) = parse_usage(&v, engine, &mut state) {
-            // Missing timestamps cannot be reliably assigned across resumed/provider-switched sessions.
-            let ts = row.ts.ok_or_else(|| format!("usage source {source}: usage zaman damgası eksik"))?;
-            let segment: Option<i64> = tx
-                .query_row(
-                    "SELECT id FROM cost_sessions WHERE source_id=?1 AND started_at<=?2
-                AND (ended_at IS NULL OR ended_at>=?2) ORDER BY started_at DESC,id DESC LIMIT 1",
-                    params![source, ts],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(err)?;
-            if let Some(segment) = segment {
-                tx.execute(
-                    "INSERT INTO cost_messages(source_id,message_key,segment_id,model,ts,input,output,cache_read,cache_write)
-                    VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
-                    ON CONFLICT(source_id,message_key) DO UPDATE SET
-                    input=MAX(input,excluded.input),output=MAX(output,excluded.output),
-                    cache_read=MAX(cache_read,excluded.cache_read),cache_write=MAX(cache_write,excluded.cache_write)",
-                    params![
-                        source,
-                        row.key,
-                        segment,
-                        row.model,
-                        ts,
-                        row.tokens.input,
-                        row.tokens.output,
-                        row.tokens.cache_read,
-                        row.tokens.cache_write
-                    ],
-                )
-                .map_err(err)?;
+        f.seek(SeekFrom::Start(offset)).map_err(err)?;
+        Ok(Self { source, reader: std::io::BufReader::new(f), pos: offset })
+    }
+
+    fn next_chunk(&mut self) -> Result<Option<(Vec<String>, u64)>, String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        while lines.len() < INGEST_CHUNK {
+            line.clear();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|_| format!("usage source {}: satır okunamıyor", self.source))?;
+            if n == 0 || !line.ends_with('\n') {
+                break;
             }
+            self.pos += n as u64;
+            lines.push(std::mem::take(&mut line));
         }
-        pos += n as u64;
+        if lines.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some((lines, self.pos)))
+        }
+    }
+}
+
+/// Pure CPU: JSON parsing and usage-row extraction of one chunk. No DB access.
+fn parse_chunk(
+    source: i64,
+    engine: &str,
+    lines: &[String],
+    mut state: ParserState,
+    base: u64,
+) -> Result<(Vec<UsageRow>, ParserState), String> {
+    let mut rows = Vec::new();
+    let mut at = base;
+    for line in lines {
+        // `read_line` strips nothing here: `lines` already came from `TailReader`.
+        let v: Value =
+            serde_json::from_str(line).map_err(|_| format!("usage source {source}: geçersiz JSON, offset {at}"))?;
+        if let Some(row) = parse_usage(&v, engine, &mut state) {
+            rows.push(row);
+        }
+        at += line.len() as u64;
+    }
+    Ok((rows, state))
+}
+
+/// One short transaction: the chunk's upserts plus the cursor advance. `base` is the offset
+/// this ingest read from, `force` a replay from zero after a parser reset; the stored cursor can
+/// only have moved forward since:
+/// - force, or stored <= base: nobody covered our range — unconditional advance (legacy replay
+///   included, even though the stored cursor already spans the file);
+/// - stored in (base, pos): our tail is partly new — rows apply idempotently, the newer parser wins;
+/// - stored >= pos: our range was already covered — rows re-apply harmlessly, cursor untouched.
+/// Rows are idempotent either way (`ON CONFLICT … MAX`, message keys), so concurrent ingests of
+/// the same source cannot double-count; only the cursor needs the guard.
+fn commit_chunk(
+    c: &Connection,
+    source: i64,
+    path: &std::path::Path,
+    rows: &[UsageRow],
+    state: &ParserState,
+    base: u64,
+    pos: u64,
+    force: bool,
+) -> Result<(), String> {
+    let tx = c.unchecked_transaction().map_err(err)?;
+    for row in rows {
+        // Missing timestamps cannot be reliably assigned across resumed/provider-switched sessions.
+        let ts = row.ts.ok_or_else(|| format!("usage source {source}: usage zaman damgası eksik"))?;
+        let segment: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM cost_sessions WHERE source_id=?1 AND started_at<=?2
+            AND (ended_at IS NULL OR ended_at>=?2) ORDER BY started_at DESC,id DESC LIMIT 1",
+                params![source, ts],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        if let Some(segment) = segment {
+            tx.execute(
+                "INSERT INTO cost_messages(source_id,message_key,segment_id,model,ts,input,output,cache_read,cache_write)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                ON CONFLICT(source_id,message_key) DO UPDATE SET
+                input=MAX(input,excluded.input),output=MAX(output,excluded.output),
+                cache_read=MAX(cache_read,excluded.cache_read),cache_write=MAX(cache_write,excluded.cache_write)",
+                params![
+                    source,
+                    row.key,
+                    segment,
+                    row.model,
+                    ts,
+                    row.tokens.input,
+                    row.tokens.output,
+                    row.tokens.cache_read,
+                    row.tokens.cache_write
+                ],
+            )
+            .map_err(err)?;
+        }
     }
     tx.execute(
-        "UPDATE cost_sources SET byte_offset=?2,parser=?3,path=?4 WHERE id=?1",
-        params![source, pos, serde_json::to_string(&state).map_err(err)?, path.to_string_lossy()],
+        "UPDATE cost_sources SET byte_offset=CASE WHEN ?6 OR byte_offset<=?5 THEN ?2 ELSE max(byte_offset,?2) END,
+        parser=CASE WHEN ?6 OR byte_offset<=?5 THEN ?3 WHEN ?2>byte_offset THEN ?3 ELSE parser END,path=?4 WHERE id=?1",
+        params![source, pos, serde_json::to_string(state).map_err(err)?, path.to_string_lossy(), base, force as i64],
     )
     .map_err(err)?;
     tx.commit().map_err(err)
+}
+
+/// Compatibility path (tests, single-lock callers): same behavior as the old monolithic ingest,
+/// still under the caller's lock. Production paths use [`ingest_split`] so the lock is released
+/// between chunks.
+#[cfg(test)]
+fn ingest(c: &Connection, source: i64, engine: &str, path: &std::path::Path) -> Result<(), String> {
+    let (offset, state, force) = ingest_begin(c, source)?;
+    let mut reader = TailReader::open(source, path, offset)?;
+    let mut state = state;
+    loop {
+        let Some((lines, pos)) = reader.next_chunk()? else { break };
+        let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
+        let (rows, next) = parse_chunk(source, engine, &lines, state, base)?;
+        state = next;
+        commit_chunk(c, source, path, &rows, &state, base, pos, force)?;
+    }
+    Ok(())
+}
+
+/// Production path: the DB lock is held only for the fast cursor read and for one short
+/// transaction per chunk. File I/O and JSON parsing run lock-free, so hook decisions
+/// (PreToolUse) never queue behind a transcript tail.
+fn ingest_split(db: &crate::db::Db, source: i64, engine: &str, path: &std::path::Path) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let (offset, state, force) = crate::db::with(db, |c| ingest_begin(c, source))?;
+    let mut reader = TailReader::open(source, path, offset)?;
+    let mut state = state;
+    let mut lines_total: u64 = 0;
+    loop {
+        let Some((lines, pos)) = reader.next_chunk()? else { break };
+        lines_total += lines.len() as u64;
+        let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
+        let (rows, next) = parse_chunk(source, engine, &lines, state, base)?;
+        state = next;
+        crate::db::with(db, |c| commit_chunk(c, source, path, &rows, &state, base, pos, force))?;
+    }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms > INGEST_SLOW_MS {
+        // Counts and durations only; message content is never logged.
+        crate::diagnostics::event(
+            "cost_ingest_slow",
+            serde_json::json!({"id": source, "line": lines_total, "duration_ms": ms, "bytes": reader.pos.saturating_sub(offset)}),
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -387,7 +574,16 @@ pub struct Summary {
     pub warnings: Vec<String>,
 }
 
-fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i64>) -> Result<Summary, String> {
+/// #1813: `usage_summary` eskiden bütün kaynakları tek DB kilidi altında ingest ediyordu.
+/// Kaynak listesi kısa bir kilitle alınır, her kaynak [`ingest_split`] ile (dosya okuma kilitsiz,
+/// parça başı kısa işlem) işlenir, toplama ayrı bir kısa kilitte koşar. Sıra korunur: her kaynağın
+/// uyarısı (ingest hatası ya da bulunamayan transcript) sorgu sırasındaki yerinde durur.
+enum SourceItem {
+    Ready { id: i64, engine: String, path: std::path::PathBuf },
+    Missing { warning: String },
+}
+
+fn source_files(c: &Connection, team: &str, delegation: Option<i64>) -> Result<Vec<SourceItem>, String> {
     let sources = c
         .prepare(
             "SELECT DISTINCT f.id,f.engine,f.session,f.path FROM cost_sources f
@@ -406,23 +602,49 @@ fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i6
         .map_err(err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(err)?;
+    let mut out = Vec::new();
+    for (id, engine, session, known) in sources {
+        match crate::chat::transcript_of(Some(&session), known.as_deref()) {
+            Some(path) => out.push(SourceItem::Ready { id, engine, path }),
+            None => out.push(SourceItem::Missing {
+                warning: format!("usage source {id}: transcript bulunamadı"),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i64>) -> Result<Summary, String> {
+    let files = source_files(c, team, delegation)?;
+    let mut warnings = Vec::new();
+    for item in &files {
+        match item {
+            SourceItem::Ready { id, engine, path } => {
+                if let Err(e) = ingest(c, *id, engine, path) {
+                    warnings.push(e);
+                }
+            }
+            SourceItem::Missing { warning } => warnings.push(warning.clone()),
+        }
+    }
+    summary_aggregate(c, team, since, delegation, warnings)
+}
+
+fn summary_aggregate(
+    c: &Connection,
+    team: &str,
+    since: Option<i64>,
+    delegation: Option<i64>,
+    warnings: Vec<String>,
+) -> Result<Summary, String> {
     let mut out = Summary {
         cost_label: "API eşdeğer maliyeti",
         total: Total::default(),
         agents: BTreeMap::new(),
         delegations: BTreeMap::new(),
-        warnings: Vec::new(),
+        warnings,
     };
-    for (id, engine, session, known) in sources {
-        match crate::chat::transcript_of(Some(&session), known.as_deref()) {
-            Some(path) => {
-                if let Err(e) = ingest(c, id, &engine, &path) {
-                    out.warnings.push(e);
-                }
-            }
-            None => out.warnings.push(format!("usage source {id}: transcript bulunamadı")),
-        }
-    }
     let price_map: BTreeMap<_, _> = prices(c)?.into_iter().map(|p| ((p.provider, p.model), p.rates)).collect();
     let mut st = c
         .prepare(
@@ -535,19 +757,42 @@ fn set_prices(c: &Connection, values: Vec<Price>) -> Result<Vec<Price>, String> 
 
 impl crate::Core {
     pub fn agent_context(&self, agent_id: &str) -> Result<AgentContext, String> {
-        crate::db::with(&self.db, |c| {
-            let (snapshot, changed) = context(c, agent_id)?;
-            if changed {
-                let team = crate::teams::get_agent(c, agent_id)?.team_id;
-                let _ = self.events.emit(
-                    "agent-context",
-                    &serde_json::json!({
-                        "agentId":agent_id,"teamId":team,"context":snapshot
-                    }),
-                );
+        // #1813: kısa kilitler — dosya okuma/JSON çözümleme kilitsiz, her parça kısa bir işlem.
+        // Böylece bir transcript kuyruğu işlenirken PreToolUse kararları kilidi aralarda alır.
+        // Kilit dışındayken taze başlatma (`reset_context`/yeni SessionStart) başı değiştirebilir;
+        // o zaman eski ölçüm ne yazılır ne yayınlanır, güncel başla yeniden hesaplanır.
+        let mut attempts = 0;
+        let (pre, snapshot, changed) = loop {
+            let pre = crate::db::with(&self.db, |c| context_pre(c, agent_id))?;
+            if let (Some((source, _)), Some(ig)) = (pre.source.as_ref(), pre.ingest.as_ref()) {
+                let mut reader = TailReader::open(*source, &ig.path, ig.offset)?;
+                let mut state = ig.state.clone();
+                loop {
+                    let Some((lines, pos)) = reader.next_chunk()? else { break };
+                    let base = pos - lines.iter().map(|l| l.len() as u64).sum::<u64>();
+                    let (rows, next) = parse_chunk(*source, &ig.engine, &lines, state, base)?;
+                    state = next;
+                    crate::db::with(&self.db, |c| commit_chunk(c, *source, &ig.path, &rows, &state, base, pos, ig.force))?;
+                }
             }
-            Ok(snapshot)
-        })
+            match crate::db::with(&self.db, |c| context_post(c, agent_id, &pre))? {
+                Some((snapshot, changed)) => break (pre, snapshot, changed),
+                None if attempts < 2 => attempts += 1,
+                None => return Err("bağlam başı hesaplama sırasında değişmeye devam etti".into()),
+            }
+        };
+        if changed {
+            // Kilit dışında: yavaş bir tüketici DB kilidini tutmasın. #1813'ün kök nedeni buydu:
+            // her hook bu emit'i kilit altında yapıyor, sonraki PreToolUse 8 sn'yi aşıp
+            // fail-closed ile reddediliyordu.
+            let _ = self.events.emit(
+                "agent-context",
+                &serde_json::json!({
+                    "agentId":agent_id,"teamId":pre.team,"context":snapshot
+                }),
+            );
+        }
+        Ok(snapshot)
     }
 
     pub fn team_context(&self, team_id: &str) -> Result<BTreeMap<String, AgentContext>, String> {
@@ -566,11 +811,24 @@ impl crate::Core {
         if since.is_some_and(|t| t < 0) {
             return Err("since negatif olamaz (epoch ms)".into());
         }
-        crate::db::with(&self.db, |c| summary(c, team_id, since, None))
+        // #1813: tek kilit yok — kaynaklar kilitsiz ingest ile, toplama ayrı kısa kilitte.
+        let files = crate::db::with(&self.db, |c| source_files(c, team_id, None))?;
+        let mut warnings = Vec::new();
+        for item in &files {
+            match item {
+                SourceItem::Ready { id, engine, path } => {
+                    if let Err(e) = ingest_split(&self.db, *id, engine, path) {
+                        warnings.push(e);
+                    }
+                }
+                SourceItem::Missing { warning } => warnings.push(warning.clone()),
+            }
+        }
+        crate::db::with(&self.db, |c| summary_aggregate(c, team_id, since, None, warnings))
     }
     pub fn usage_delegation(&self, id: i64) -> Result<Summary, String> {
-        crate::db::with(&self.db, |c| {
-            // The historical record survives deletion of the original delegation/team.
+        // The historical record survives deletion of the original delegation/team.
+        let (team, files) = crate::db::with(&self.db, |c| {
             let team: Option<String> = c
                 .query_row("SELECT team_id FROM cost_sessions WHERE delegation_id=?1 LIMIT 1", [id], |r| {
                     r.get(0)
@@ -584,8 +842,20 @@ impl crate::Core {
                     d.service_team_id.unwrap_or(d.team_id)
                 }
             };
-            summary(c, &team, None, Some(id))
-        })
+            Ok((team.clone(), source_files(c, &team, Some(id))?))
+        })?;
+        let mut warnings = Vec::new();
+        for item in &files {
+            match item {
+                SourceItem::Ready { id: source, engine, path } => {
+                    if let Err(e) = ingest_split(&self.db, *source, engine, path) {
+                        warnings.push(e);
+                    }
+                }
+                SourceItem::Missing { warning } => warnings.push(warning.clone()),
+            }
+        }
+        crate::db::with(&self.db, |c| summary_aggregate(c, &team, None, Some(id), warnings))
     }
     pub fn settings_usage_prices(&self) -> Result<Vec<Price>, String> {
         crate::db::with(&self.db, prices)
@@ -666,6 +936,27 @@ mod tests {
         core.shutdown();
     }
 
+    /// #1816: eski hook'un ölçümü kilit dışındayken taze başlatma başı sıfırlar; eski
+    /// `context_post` yeni oturumun snapshot'ını ezmemeli ve yayın için `changed` vermemeli.
+    #[test]
+    fn stale_context_post_after_reset_neither_writes_nor_publishes() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        observe(&c, "timur", "stale-old", "claude", None, "SessionStart").unwrap();
+        let old = context_pre(&c, "timur").unwrap();
+        assert_eq!(old.source.as_ref().map(|s| s.1.as_str()), Some("stale-old"));
+        reset_context(&c, "timur").unwrap();
+        let fresh = context(&c, "timur").unwrap().0;
+        assert_eq!(fresh.session_id, None);
+        assert_eq!(context_post(&c, "timur", &old).unwrap(), None);
+        let stored: String = c
+            .query_row("SELECT snapshot FROM cost_context_heads WHERE agent_id='timur'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(serde_json::from_str::<AgentContext>(&stored).unwrap(), fresh);
+        // Aynı baş ve aynı değer: geçerli, ama yeniden yayınlanmaz.
+        let same = context_pre(&c, "timur").unwrap();
+        assert_eq!(context_post(&c, "timur", &same).unwrap(), Some((fresh, false)));
+    }
+
     #[test]
     fn context_compaction_invalidates_old_measurement() {
         let mut state = ParserState {
@@ -710,6 +1001,121 @@ mod tests {
             assert_eq!(saved["context"]["tokens"], input + 23);
             assert_eq!(saved["context"]["window"], 1_000_000);
         }
+    }
+
+    /// #1813: yavaş bir `agent-context` tüketicisi sürerken PreToolUse kararı hızlı döner.
+    /// Eskiden emit DB kilidi altında yapılıyordu; 2 sn'lik tüketici kararı da 2 sn bekletiyor,
+    /// 8 sn'lik curl sınırında fail-closed red geliyordu.
+    #[test]
+    fn slow_context_emit_does_not_block_pre_tool_decision() {
+        struct Slow;
+        impl crate::EventSink for Slow {
+            fn emit(&self, event: &str, _: Value) -> Result<(), String> {
+                if event == "agent-context" {
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                }
+                Ok(())
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../.dex/tmp/slow-emit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let core = crate::Core::start(
+            crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
+            crate::Events::new(Slow),
+        )
+        .unwrap();
+        let bg = std::thread::spawn({
+            let core = core.clone();
+            move || {
+                let t0 = std::time::Instant::now();
+                core.agent_context("timur").unwrap();
+                t0.elapsed()
+            }
+        });
+        // Arka plan emit'e girsin: ilk snapshot her zaman değişir.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let body = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test -p dex-core --lib chat"},
+        });
+        let t0 = std::time::Instant::now();
+        let answer = core.delegation_on_hook("kaan", "PreToolUse", &body, false);
+        let decision = t0.elapsed();
+        let bg_took = bg.join().unwrap();
+        assert!(bg_took >= std::time::Duration::from_millis(2000), "arka plan yavaş emit yapmalıydı: {bg_took:?}");
+        assert!(
+            decision < std::time::Duration::from_millis(1500),
+            "PreToolUse yavaş işin arkasında bekledi: {decision:?}"
+        );
+        assert!(answer.is_some(), "güvenli komut cevapsız kalmamalı");
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1813: büyük bir transcript kuyruğu işlenirken PreToolUse kararı hızlı döner.
+    /// Dosya okuma + JSON çözümleme kilitsiz, parça işlemleri kısa tutulur.
+    #[test]
+    fn large_transcript_ingest_does_not_block_pre_tool_decision() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../.dex/tmp/slow-ingest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let core = crate::Core::start(
+            crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
+            crate::Events::new(crate::events::NullSink),
+        )
+        .unwrap();
+        let path = root.join("slow.jsonl");
+        let mut bulk = String::new();
+        for i in 0..150_000 {
+            bulk.push_str(&serde_json::json!({"type":"assistant","timestamp":"2026-10-05T10:00:00Z",
+                "message":{"id":format!("m{i}"),"model":"claude-sonnet-5-5",
+                "usage":{"input_tokens":100,"output_tokens":10}}}).to_string());
+            bulk.push('\n');
+        }
+        std::fs::write(&path, bulk).unwrap();
+        let source: i64 = crate::db::with(&core.db, |c| {
+            observe(c, "timur", "slow-session", "claude", Some(path.to_str().unwrap()), "UserPromptSubmit")?;
+            c.query_row("SELECT id FROM cost_sources WHERE session='slow-session'", [], |r| r.get(0))
+                .map_err(err)
+        })
+        .unwrap();
+        let bg = std::thread::spawn({
+            let db = core.db.clone();
+            let path = path.clone();
+            move || {
+                let t0 = std::time::Instant::now();
+                ingest_split(&db, source, "claude", &path).unwrap();
+                t0.elapsed()
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let body = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test -p dex-core --lib chat"},
+        });
+        let t0 = std::time::Instant::now();
+        let answer = core.delegation_on_hook("kaan", "PreToolUse", &body, false);
+        let decision = t0.elapsed();
+        assert!(
+            !bg.is_finished(),
+            "karar, kuyruk işleme bitmeden dönmeli (yoksa test boş geçer)"
+        );
+        let bg_took = bg.join().unwrap();
+        assert!(bg_took >= std::time::Duration::from_millis(2000), "arka plan kuyruğu işlemeliydi: {bg_took:?}");
+        assert!(
+            decision < std::time::Duration::from_millis(1500),
+            "PreToolUse kuyruk işlemenin arkasında bekledi: {decision:?}"
+        );
+        assert!(answer.is_some(), "güvenli komut cevapsız kalmamalı");
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -81,6 +81,8 @@ impl log::Log for Logger {
                     *s,
                     "hook_received"
                         | "hook_processed"
+                        | "hook_timing"
+                        | "cost_ingest_slow"
                         | "delegation"
                         | "pty_spawn"
                         | "pty_exit"
@@ -183,6 +185,17 @@ pub(crate) fn denial_rule(reason: &str) -> &'static str {
 /// Later Dex gates can veto a call that the permit policy deferred (service jobs, questions).
 pub(crate) fn permit_hook_reply(agent: &str, body: &Value, reply: Option<&str>) {
     if let Some(fields) = permit_hook_reply_fields(agent, body, reply) { event("permit", fields); }
+}
+
+/// #1813: PreToolUse karar süresi (kilit beklemeleri dahil). Her çağrıda bir satır: p50/p99
+/// buradan. Kişisel veri yok — yalnız ajan adı, süre ve izin sonucu (allow/deny; yanıtsız 204'te
+/// karar alanı yazılmaz).
+pub(crate) fn hook_timing(agent: &str, decision_ms: u64, outcome: Option<&str>) {
+    let mut fields = json!({"hook": "PreToolUse", "agent": agent, "duration_ms": decision_ms});
+    if let Some(o) = outcome.filter(|o| matches!(*o, "allow" | "deny")) {
+        fields["decision"] = o.into();
+    }
+    event("hook_timing", fields);
 }
 
 fn permit_hook_reply_fields(agent: &str, body: &Value, reply: Option<&str>) -> Option<Value> {
