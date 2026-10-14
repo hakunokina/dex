@@ -5,8 +5,10 @@
 // a narrow one (`mobile.css` tightens the same layout under ~360px); folding/unfolding is a resize,
 // which the PCB canvas and the terminal both follow (ResizeObserver / visualViewport).
 import { useEffect, useState } from "react";
-import { LOCAL, useHosts } from "../api/hosts";
+import { LOCAL, onEvent, useHosts } from "../api/hosts";
 import { SHARE_EVENT, shareDone, takeShare, type RawShare } from "../api/shareTarget";
+import { REPLY_LINK_EVENT, takeReplyLink } from "../api/push";
+import { INBOX_REPLY_EVENT, type ReplyId } from "../api/replies";
 import { initTeams, selectTeam, useTeams } from "../team/store";
 import { Office } from "../office/Office";
 import { START_EVENT, type StartRequest } from "../launcher";
@@ -16,9 +18,12 @@ import { AgentScreen } from "./AgentScreen";
 import { ShareScreen } from "./ShareScreen";
 import { hasShare, shareTask, type ShareTask } from "./shareLogic";
 import { tryFastShare } from "./shareFast";
+import { RepliesList, ReplyScreen } from "./Replies";
+import { parseReplyLink } from "./replyLogic";
+import { askNotifyOnce, startPush } from "./push";
 import { BoardView } from "../board/Board";
 import { NotesEditor } from "../layout/Notes";
-import { ChevronLeft, CircuitBoard, KanbanSquare, NotebookPen, Server, Users } from "lucide-react";
+import { ChevronLeft, CircuitBoard, Inbox, KanbanSquare, NotebookPen, Server, Users } from "lucide-react";
 import "../App.css";
 import "./mobile.css";
 
@@ -37,6 +42,14 @@ export default function MobileApp() {
   const [serverSheet, setServerSheet] = useState(false);
   /** The agent screen shown over everything (its id), if any. */
   const [agent, setAgent] = useState<string | null>(null);
+  /** #1719: Echo'nun cevabından "Terminale geç" → ajan ekranı terminal görünümünde. */
+  const [agentView, setAgentView] = useState<"term" | "chat" | undefined>(undefined);
+  /** #1719 Echo cevapları: liste ya da tek cevap (host null: bildirimden, aranır). Ekranlar tek tek
+   *  açılır (her biri kendi geri-tuşu kaydını tutar). */
+  const [replies, setReplies] = useState<
+    { view: "list" } | { view: "reply"; host: string | null; id: ReplyId; fromList: boolean } | null
+  >(null);
+  const [unreadReply, setUnreadReply] = useState(false);
   // Office slap → nobody may have a pane mounted on the phone yet: open the screen and start there.
   const [pendingStart, setPendingStart] = useState<string | null>(null);
   useEffect(() => {
@@ -53,6 +66,26 @@ export default function MobileApp() {
   useEffect(() => {
     void initTeams();
   }, []);
+
+  // #1719: FCM jetonu → eşlenmiş hostlara `push_register`; bildirime dokunma → o cevabın ekranı.
+  useEffect(() => startPush(), []);
+  useEffect(() => {
+    const pull = () =>
+      void takeReplyLink().then(
+        (uri) => {
+          const id = parseReplyLink(uri);
+          if (id === null) return;
+          setAgent(null);
+          setAgentView(undefined);
+          setReplies({ view: "reply", host: null, id, fromList: false });
+        },
+        () => {}, // köprü yok (eski APK / masaüstü önizleme)
+      );
+    pull();
+    window.addEventListener(REPLY_LINK_EVENT, pull);
+    return () => window.removeEventListener(REPLY_LINK_EVENT, pull);
+  }, []);
+  useEffect(() => onEvent(INBOX_REPLY_EVENT, () => setUnreadReply(true)), []);
 
   // Android Paylaş → Dex: uygulama kapalıyken açılışta bekleyen paylaşım alınır; açıkken Kotlin
   // `dex-share` olayını atar. `seq` her yeni paylaşımda ekranı sıfırdan kurar.
@@ -79,7 +112,8 @@ export default function MobileApp() {
             if (mine !== seq) return; // arada yeni paylaşım geldi
             if (r.sent) {
               setShare(null);
-              void shareDone(r.toast).catch(() => {});
+              // İlk paylaşımda bildirim izni (Echo cevap verince haber vermek için), sonra arka plana.
+              void askNotifyOnce().finally(() => shareDone(r.toast).catch(() => {}));
             } else {
               setShare((s) => (s?.seq === mine ? { ...s, fast: false, error: r.error } : s));
             }
@@ -135,6 +169,17 @@ export default function MobileApp() {
             setAgent(null);
           }}
         />
+        <button
+          className="m-host-btn m-replies-btn"
+          onClick={() => {
+            setUnreadReply(false);
+            setReplies({ view: "list" });
+          }}
+          aria-label="Echo cevapları"
+        >
+          <Inbox />
+          {unreadReply && <span className="m-host-dot connected" />}
+        </button>
         <button
           className="m-host-btn"
           onClick={() => setServerSheet(true)}
@@ -208,8 +253,33 @@ export default function MobileApp() {
           teamId={team.id}
           agentId={agent}
           autoStart={agent === pendingStart}
-          onClose={() => setAgent(null)}
+          initialView={agentView}
+          onClose={() => {
+            setAgent(null);
+            setAgentView(undefined);
+          }}
           onStarted={() => setPendingStart(null)}
+        />
+      )}
+      {replies?.view === "list" && (
+        <RepliesList
+          onOpen={(host, id) => setReplies({ view: "reply", host, id, fromList: true })}
+          onClose={() => setReplies(null)}
+        />
+      )}
+      {replies?.view === "reply" && (
+        <ReplyScreen
+          key={`${replies.host}:${replies.id}`}
+          host={replies.host}
+          id={replies.id}
+          onClose={() => setReplies(replies.fromList ? { view: "list" } : null)}
+          onTerminal={(teamId, agentId) => {
+            setReplies(null);
+            selectTeam(teamId);
+            setTab("card");
+            setAgentView("term");
+            setAgent(agentId);
+          }}
         />
       )}
       {shareScreen}

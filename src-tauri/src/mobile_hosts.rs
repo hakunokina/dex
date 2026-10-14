@@ -163,3 +163,67 @@ pub async fn share_done<R: Runtime>(app: AppHandle<R>, message: String) -> Resul
     .await
     .map_err(|e| format!("paylaş köprüsü koptu: {e}"))?
 }
+
+const PUSH_IDENTIFIER: &str = "com.hakunokina.dex.hosttokens";
+const PUSH_CLASS: &str = "PushPlugin";
+
+/// #1719 bildirim köprüsü (`PushPlugin.kt`): FCM jetonu, bildirimden açılış, sistem tarayıcısı.
+pub struct Push<R: Runtime>(PluginHandle<R>);
+
+/// Ayrı Tauri eklentisi (Kotlin eklentileri Tauri eklenti adıyla anahtarlanır, bkz. `init_share`).
+/// Yoksa yalnız bildirim/bağlantı açma çalışmaz.
+pub fn init_push<R: Runtime>() -> TauriPlugin<R> {
+    Builder::new("dex-push")
+        .setup(|app, api: PluginApi<R, ()>| {
+            match api.register_android_plugin(PUSH_IDENTIFIER, PUSH_CLASS) {
+                Ok(handle) => {
+                    app.manage(Push::<R>(handle));
+                }
+                Err(e) => eprintln!("dex-push: bildirim köprüsü yüklenemedi: {e}"),
+            }
+            Ok(())
+        })
+        .build()
+}
+
+async fn push_call<R: Runtime>(
+    app: &AppHandle<R>,
+    method: &'static str,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = app
+        .try_state::<Push<R>>()
+        .ok_or("bildirim köprüsü yüklenemedi (Android eklentisi yok)")?
+        .inner()
+        .0
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        handle
+            .run_mobile_plugin::<serde_json::Value>(method, payload)
+            .map_err(|e| format!("bildirim köprüsü ({method}): {e}"))
+    })
+    .await
+    .map_err(|e| format!("bildirim köprüsü koptu: {e}"))?
+}
+
+/// FCM jetonu: `{ token? }` (Firebase'siz APK: `{}`). Jeton loglanmaz.
+#[tauri::command]
+pub async fn push_token<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    push_call(&app, "token", serde_json::json!({})).await
+}
+
+/// Bildirime dokunulduysa bekleyen `dex://reply/<id>`: `{ uri? }`, bir kez.
+#[tauri::command]
+pub async fn push_take<R: Runtime>(app: AppHandle<R>) -> Result<serde_json::Value, String> {
+    push_call(&app, "take", serde_json::json!({})).await
+}
+
+/// Cevaptaki bağlantıyı sistem tarayıcısında açar; yalnız http/https (Kotlin de denetler).
+#[tauri::command]
+pub async fn push_open_url<R: Runtime>(app: AppHandle<R>, url: String) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("https://") || lower.starts_with("http://")) || url.len() > 4096 {
+        return Err("yalnız http/https bağlantı açılır".into());
+    }
+    push_call(&app, "openUrl", serde_json::json!({ "url": url })).await.map(|_| ())
+}
