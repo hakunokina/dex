@@ -1021,6 +1021,7 @@ fn on_stop_pending(conn: &Connection, turns: &Turns, agent: &str, failure: bool,
         .and_then(|p| crate::chat::last_assistant_text(Path::new(p), 1_500));
     for id in running {
         set_status(conn, id, if failure { "failed" } else { "done_no_report" })?;
+        crate::review::finish_task(conn, id)?;
         if let Some(m) = &last {
             conn.execute(
                 "UPDATE delegations SET summary = IFNULL(summary, ?2) WHERE id = ?1",
@@ -1400,6 +1401,7 @@ fn on_exit(conn: &Connection, agent: &str) -> Result<(Vec<Delegation>, Option<De
             params![id, now()],
         )
         .map_err(e)?;
+        crate::review::finish_task(conn, id)?;
         changed.push(get(conn, id)?);
     }
     if waiting {
@@ -1413,7 +1415,7 @@ fn on_exit(conn: &Connection, agent: &str) -> Result<(Vec<Delegation>, Option<De
 /// #161 `keep_queued`: a clean restart (restart.rs) — a queued job was never delivered and the new
 /// core delivers it; only `running` rows close.
 pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize, String> {
-    conn.execute(
+    let n = conn.execute(
         "UPDATE delegations SET
              summary = IFNULL(summary, CASE status WHEN 'running' THEN 'Dex kapandı; worker rapor vermeden durdu'
                                                    ELSE 'Dex kapandı; iş worker''a hiç teslim edilmedi' END),
@@ -1423,7 +1425,16 @@ pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize,
            AND NOT (status='queued' AND to_agent='' AND id IN (SELECT delegation_id FROM delegation_role_queue))",
         params![now(), keep_queued],
     )
-    .map_err(e)
+    .map_err(e)?;
+    // Yeniden başlatmada kapanan incelemeler panoda "Sürüyor"da kalmaz.
+    conn.execute(
+        "UPDATE tasks SET status = 'done', updated_at = ?1 WHERE status = 'doing' AND id IN (
+             SELECT d.task_id FROM delegations d JOIN delegation_reviews r ON r.review_id = d.id
+             WHERE d.task_id IS NOT NULL AND (d.status IN ('done','done_no_report','failed') OR r.verdict IS NOT NULL))",
+        [now()],
+    )
+    .map_err(e)?;
+    Ok(n)
 }
 
 /// The patron opened the worker's pane (DEX-19): its finished results no longer need the dock mark.
