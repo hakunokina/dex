@@ -1035,6 +1035,7 @@ impl crate::Core {
         let ended = self.agent_states.input(id, draft);
         self.leader_paste_input(id);
         if ended {
+            self.inbox_wake(id);
             self.delegation_retry_fresh(id);
             self.leader_reset_deliver_later(id);
         }

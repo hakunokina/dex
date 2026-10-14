@@ -111,6 +111,7 @@ pub struct TeamMemberTemplate {
     pub kind: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub model: String,
     #[serde(default)]
     pub provider: Option<String>,
@@ -231,6 +232,7 @@ pub struct NewAgent {
     pub kind: String,
     #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub model: String,
     /// DEX-13: absent → `anthropic`. Validated against `providers.rs`.
     #[serde(default)]
@@ -530,7 +532,7 @@ const ROLE_NAMES: &[(&str, &str)] = &[
     ("code-review", "Lens"), ("pm", "Compass"), ("marketing", "Signal"), ("seo", "Rank"), ("support", "Relay"),
     ("code-automation", "Bot"), ("n8n-automation", "Bot"), ("mobile", "Droid"),
     ("game-designer", "Dice"), ("technical-artist", "Prism"), ("gameplay-programmer", "Loop"),
-    ("teacher", "Sage"), ("visual-explainer", "Chalk"),
+    ("teacher", "Sage"), ("visual-explainer", "Chalk"), ("assistant", "Echo"),
 ];
 const FALLBACK_NAME: &str = "Agent";
 
@@ -872,7 +874,8 @@ pub fn get_agent(conn: &Connection, id: &str) -> Result<Agent, String> {
 
 /// An empty `name` gets the role's template name (`auto_name`). `data_dir` finds the team's memory
 /// root: the new slug skips folders left on disk (#436).
-pub fn create_agent(conn: &Connection, data_dir: &Path, a: NewAgent) -> Result<Agent, String> {
+pub fn create_agent(conn: &Connection, data_dir: &Path, mut a: NewAgent) -> Result<Agent, String> {
+    if a.role_slug.as_deref() == Some("assistant") && a.model.is_empty() { a.model = crate::providers::CLAUDE_MID.into(); }
     one_of(&a.kind, AGENT_KINDS, "ajan türü")?;
     let provider = match a.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None | Some("anthropic") => "anthropic".to_string(),
@@ -1129,6 +1132,13 @@ pub fn delete_agent(conn: &Connection, id: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assistant_defaults_to_claude_mid_and_echo() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        let a: super::NewAgent = serde_json::from_value(serde_json::json!({"teamId":"default","name":"","kind":"worker","roleSlug":"assistant"})).unwrap();
+        let agent = super::create_agent(&c, std::path::Path::new("/data"), a).unwrap();
+        assert_eq!((agent.name.as_str(), agent.engine.as_str(), agent.model.as_str(), agent.provider.as_str()), ("Echo-1", "claude", crate::providers::CLAUDE_MID, "anthropic"));
+    }
     use super::*;
 
     #[test]

@@ -897,6 +897,8 @@ impl crate::Core {
             return Err("mesaj çok uzun (en çok 50.000 karakter)".into());
         }
         with_engine(self, agent, None)?; // unknown agent / no db row
+        let gate = self.delivery_gate(agent);
+        let _delivery = gate.lock().map_err(|_| "teslim kilidi kullanılamıyor")?;
         // #447: admit before reading live state: an unseen leader may close until this gate.
         // A drain holds the text in the queue (the drain's end or the next core delivers it).
         let turn = self.admit(agent);
@@ -946,6 +948,10 @@ impl crate::Core {
                 Ok("sent")
             }
         }
+    }
+
+    pub(crate) fn delivery_gate(&self, agent: &str) -> std::sync::Arc<Mutex<()>> {
+        self.delivery_gates.lock().unwrap().entry(agent.into()).or_default().clone()
     }
 
     /// Bracketed-paste + Enter (the S2b idle path) and mark the agent working. #447: past the gate
@@ -1007,6 +1013,8 @@ impl crate::Core {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(600));
             let Some(core) = weak.upgrade() else { return };
+            let gate = core.delivery_gate(&agent);
+            let Ok(_delivery) = gate.lock() else { return };
             // Keep queue protection until admission takes over, then hold the turn through Enter.
             let Some(turn) = core.admit(&agent) else { return };
             let state = core.agent_states.get(&agent);

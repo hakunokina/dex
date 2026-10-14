@@ -205,7 +205,7 @@ pub fn pick_worker(conn: &Connection, team_id: &str, key: Option<&str>) -> Resul
         .prepare(
             "SELECT a.id, a.name, IFNULL(a.role_slug,''), IFNULL(r.name,''), a.title
              FROM agents a LEFT JOIN roles r ON r.slug = a.role_slug
-             WHERE a.team_id = ?1 AND a.kind = 'worker' ORDER BY a.sort, a.id",
+             WHERE a.team_id = ?1 AND a.kind = 'worker' AND IFNULL(a.role_slug,'') <> 'assistant' ORDER BY a.sort, a.id",
         )
         .map_err(e)?;
     let all: Vec<[String; 5]> = st
@@ -259,6 +259,7 @@ pub(crate) fn role_target(
         .into_iter()
         .find(|r| r.slug.to_lowercase() == normalized || r.name.to_lowercase() == normalized)
     {
+        if role.slug == "assistant" { return Err("assistant patrona doğrudan cevap verir; devretme hedefi olamaz".into()); }
         let worker: Option<String> = conn.query_row(
             "SELECT id FROM agents WHERE team_id=?1 AND kind='worker' AND role_slug=?2 ORDER BY sort,id LIMIT 1",
             params![team,role.slug],|r|r.get(0),
@@ -528,6 +529,9 @@ pub fn insert_bound(conn: &Connection, d: NewDelegation, context: &ProjectContex
 pub(crate) fn insert_snapshot(conn: &Connection, d: NewDelegation, snapshot: &ProjectSnapshot) -> Result<Delegation, String> {
     let from = caller(conn, &d.from.id)?;
     let to = caller(conn, &d.to_agent)?;
+    if crate::teams::get_agent(conn, &d.to_agent)?.role_slug.as_deref() == Some("assistant") {
+        return Err("assistant patrona doğrudan cevap verir; devretme hedefi olamaz".into());
+    }
     if !from.is_leader() || from.team_id != d.team_id || to.team_id != d.service_team_id.as_deref().unwrap_or(&d.team_id) {
         return Err(crate::projects::ProjectError::NotFound.to_string());
     }

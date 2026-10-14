@@ -136,6 +136,7 @@ pub fn run() {
         .plugin(host::plugin())
         .invoke_handler(tauri::generate_handler![
             agents::agent_start,
+            agents::inbox_submit,
             agents::agent_status_list,
             chat::chat_history,
             chat::usage_summary,

@@ -1743,6 +1743,10 @@ pub(crate) fn tools_list_for_test(core: &Core, agent: &str) -> Vec<Value> {
 fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
     let mut all = tools();
     if let Ok(conn) = lock(core) {
+        if crate::teams::get_agent(&conn, agent).is_ok_and(|a| a.role_slug.as_deref() == Some("assistant")) {
+            all.as_array_mut().unwrap().retain(|t| t["name"] == "memory_search");
+            return all;
+        }
         if let Ok(c) = delegate::caller(&conn, agent) {
             if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note"); }
             all.as_array_mut().unwrap().extend(crate::gpu::tools_for(&conn, &c, job));
@@ -2075,6 +2079,9 @@ fn check_member(conn: &rusqlite::Connection, c: &Caller, agent: &str) -> Result<
 
 fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> Result<Value, String> {
     let conn = lock(core)?;
+    if crate::teams::get_agent(&conn, agent)?.role_slug.as_deref() == Some("assistant") && name != "memory_search" {
+        return Err("asistan salt okur: yalnız memory_search açık".into());
+    }
     let c = delegate::caller(&conn, agent)?;
     let lead_only = |what: &str| -> Result<(), String> {
         if c.is_leader() {
