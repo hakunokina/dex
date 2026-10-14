@@ -80,7 +80,7 @@ grep -q 'android:launchMode="singleTask"' "$M" || { echo 'MainActivity singleTas
 # #1759: MainActivity saydam tema (soğuk paylaşımda arkada Instagram görünür). Açılış etiketi çok
 # satıra yayılabileceği için awk ile MainActivity bloğunda değiştirilir/eklenir (idempotent).
 awk '
-  /<activity[[:space:]>]/ { inact = 1; ismain = ($0 ~ /\.MainActivity/) }
+  /<activity([[:space:]>]|$)/ { inact = 1; ismain = ($0 ~ /\.MainActivity/) }
   inact && /\.MainActivity/ { ismain = 1 }
   inact && ismain && /android:theme="/ { sub(/android:theme="[^"]*"/, "android:theme=\"@style/DexTranslucent\""); themed = 1 }
   inact && />/ { if (ismain && !themed) sub(/>/, " android:theme=\"@style/DexTranslucent\">"); inact = 0; ismain = 0 }
