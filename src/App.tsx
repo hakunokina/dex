@@ -66,7 +66,8 @@ export default function App() {
   return (
     <div className="app">
       <TopBar focusedId={focusedId} onFocus={setFocusedId} />
-      {/* #139: the usage strip floats over the stage (right edge, vertically centred); dockview keeps the full width. */}
+      {/* #139: the usage strip floats over the stage (right or left edge, vertically centred); dockview keeps the full width.
+          #2034: set to the top bar, it sits left of the window controls instead. */}
       <div className="app-body">
         <main className="stage">
           <HostEmptyStates />
@@ -106,7 +107,7 @@ export default function App() {
                 </div>
               );
             })}
-          <UsageStrip />
+          <UsageStrip slot="stage" />
         </main>
       </div>
       {boardOpen && (
@@ -147,6 +148,7 @@ function TopBar({ focusedId, onFocus }: { focusedId: string | null; onFocus: (id
         <div className="topbar-rack" data-tauri-drag-region>
           {activeId && <Rack key={activeId} teamId={activeId} focusedId={focusedId} onFocus={onFocus} />}
         </div>
+        <UsageStrip slot="top" />
         <WindowControls />
       </div>
     </header>

@@ -61,8 +61,41 @@
 }
 .usage-off span { writing-mode: vertical-rl; font-size: var(--fs-xs); white-space: nowrap; }
 
+/* #2034: sol kenar — sağın aynası (yer ayırmaz, sahnenin üstünde yüzer). */
+.usage-strip.left {
+  right: auto; left: 0;
+  border-right: 1px solid var(--line); border-left: 0; border-radius: 0 var(--r-md) var(--r-md) 0;
+}
+/* #2034: üst başlık — pencere düğmelerinin solunda kendine ayrılmış yatay alan; takım çipleri
+ * (.topbar-rack, flex:1 taban 0) kalan yeri alır, şerit yalnız o da bitince daralıp yana kayar.
+ * Zemin başlığın kendisi; yükseklik başlığa sığar, halkalar küçülür. */
+.usage-strip.top {
+  position: relative; z-index: auto; inset: auto; flex: 0 1 auto; min-width: 0;
+  width: auto; height: 100%; max-height: none; margin: 0;
+  flex-direction: row; align-items: center; gap: var(--sp-3);
+  overflow-x: auto; overflow-y: hidden; padding: 0 var(--sp-2);
+  border: 0; border-left: 1px solid var(--line); border-radius: 0; box-shadow: none;
+}
+.usage-strip.top::before { display: none; }
+.usage-strip.top > * { flex: none; }
+.usage-strip.top .usage-cell {
+  flex-direction: row; align-items: baseline; gap: 4px; white-space: nowrap;
+  padding: 0 var(--sp-3) 0 0; border-bottom: 0; border-right: 1px solid var(--line);
+}
+.usage-strip.top .usage-provs { flex-direction: row; gap: var(--sp-3); }
+.usage-strip.top .usage-prov {
+  display: grid; grid-template-columns: auto auto; grid-template-rows: auto auto;
+  column-gap: 4px; align-items: center;
+}
+.usage-strip.top .usage-ring { grid-row: 1 / 3; width: 28px; height: 28px; }
+.usage-strip.top .usage-mark { width: 12px; height: 12px; }
+.usage-strip.top .usage-pct { align-self: end; line-height: 1.1; }
+.usage-strip.top .usage-pct-week { align-self: start; }
+.usage-strip.top .usage-off { flex-direction: row; width: auto; padding: 0; }
+.usage-strip.top .usage-off span { writing-mode: horizontal-tb; }
+
 /* #118: sağlayıcı hover kartı (TM edge panelindeki Muse kartı): koyu yuvarlak kart, halkanın
- * solunda, halkaya bakan ok. `position: fixed` — şerit overflow-x:hidden keserdi. */
+ * yanında (başlıkta altında), halkaya bakan ok. `position: fixed` — şerit taşmayı keserdi. */
 .usage-card {
   position: fixed; z-index: var(--z-team-pop); width: 228px; max-height: calc(100vh - 16px); overflow-y: auto;
   padding: var(--sp-3); background: var(--surface-pop); border: 1px solid var(--line-strong);
@@ -85,8 +118,16 @@
 .usage-card-reset { font-size: var(--fs-xs); color: var(--muted); }
 .usage-card-empty { margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); }
 .usage-card-today { margin-top: var(--sp-2); font-size: var(--fs-xs); color: var(--text-2); }
-/* Halkaya bakan küçük ok: kartın sağ kenarında, halka hizasında (kart dikey ortalıysa orta). */
+/* Halkaya bakan küçük ok, halka hizasında: sağ şeritte kartın sağ kenarında, sol şeritte sol
+ * kenarında, başlıkta üst kenarında (#2034). */
 .usage-card-arrow {
   position: absolute; right: -5px; width: 8px; height: 8px; transform: translateY(-50%) rotate(45deg);
   background: var(--surface-pop); border-top: 1px solid var(--line-strong); border-right: 1px solid var(--line-strong);
+}
+.usage-card[data-arrow="left"] .usage-card-arrow {
+  right: auto; left: -5px; border: 0; border-bottom: 1px solid var(--line-strong); border-left: 1px solid var(--line-strong);
+}
+.usage-card[data-arrow="top"] .usage-card-arrow {
+  right: auto; top: -5px; transform: translateX(-50%) rotate(45deg);
+  border: 0; border-top: 1px solid var(--line-strong); border-left: 1px solid var(--line-strong);
 }

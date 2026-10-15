@@ -153,7 +153,7 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
 
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
   await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Genel" }).click();
-  const toggle = app.getByRole("switch", { name: "Sağ kenarda göster" });
+  const toggle = app.getByRole("switch", { name: "Kullanım şeridini göster" });
   await expect(toggle).toBeChecked();
   await toggle.uncheck();
   await expect(strip).toHaveCount(0);
@@ -213,6 +213,98 @@ test("Claude 2: Ayarlar → Sağlayıcılar'dan bağlanır, girişi terminalde a
   await expect(confirm).toHaveCount(0);
   expect((await calls(app)).filter((c) => c.cmd === "claude_account_remove").at(-1)?.args).toEqual({ id: "anthropic-2" });
   await expect(card).toContainText("Bağlantı kaldırıldı.");
+});
+
+// #2034: konum Ayarlar → Genel → Görünüm'den: sağ (varsayılan) / sol / üst başlık; anında uygulanır.
+// Başlıkta şerit pencere düğmelerinin hemen solunda, takım çipleri kalan yere daralır; kart aşağı açılır.
+test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişlikte çakışmasız", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Şerit konum ${test.info().workerIndex}`);
+  const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
+  await app.addInitScript(fakeUsage, LIVE);
+  await app.evaluate(() => { localStorage.removeItem("dex.usageStrip"); localStorage.removeItem("dex.usageStripPlace"); });
+  await app.reload();
+  await openTeam(app, team.name);
+  await paneOf(app, leader.name);
+  const strip = app.getByRole("complementary", { name: "Kullanım şeridi" });
+  await expect(strip).toHaveAttribute("data-place", "right");
+  await expect(strip).toHaveAttribute("data-status", "live");
+
+  await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
+  await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Genel" }).click();
+  const place = app.getByRole("radiogroup", { name: "Kullanım şeridi" });
+  await expect(place.getByRole("radio", { name: "Sağ" })).toHaveAttribute("aria-checked", "true");
+  // Ayarlar paneli açık kalır: şerit ve kartı panellerin üstünde, seçim anında uygulanır.
+  const choose = async (label: string, value: string) => {
+    await place.getByRole("radio", { name: label }).click();
+    await expect(strip).toHaveAttribute("data-place", value);
+    expect(await app.evaluate(() => localStorage.getItem("dex.usageStripPlace"))).toBe(value);
+  };
+  const geo = () => app.evaluate(() => {
+    const r = (q: string) => document.querySelector(q)?.getBoundingClientRect() ?? null;
+    const s = document.querySelector(".usage-strip")!;
+    return {
+      vw: document.documentElement.clientWidth, vh: innerHeight,
+      strip: r(".usage-strip")!, body: r(".app-body")!, bar: r(".topbar")!, rack: r(".topbar-rack")!, rackScroll: r(".rack-scroll"),
+      ctl: r(".win-ctl")!, brand: r(".brand")!, inBar: !!s.closest(".topbar"), drag: s.hasAttribute("data-tauri-drag-region"),
+      overflow: [...s.querySelectorAll<HTMLElement>(".usage-cell, .usage-prov")].some((c) => c.getBoundingClientRect().bottom > s.getBoundingClientRect().bottom + 1 || c.getBoundingClientRect().top < s.getBoundingClientRect().top - 1),
+    };
+  });
+  const cardBelow = async () => {
+    const ring = strip.locator('[data-provider="anthropic"]');
+    await ring.hover();
+    const card = app.locator('[data-card="anthropic"]');
+    await expect(card).toBeVisible();
+    const [c, rb] = [await card.boundingBox(), await ring.boundingBox()];
+    return { c: c!, ring: rb! };
+  };
+
+  // Sol: sol kenara yaslı, dikeyde ortalı, sahneyi daraltmaz; kart şeridin sağında.
+  await choose("Sol", "left");
+  let g = await geo();
+  expect(g.inBar).toBe(false);
+  expect(Math.round(g.strip.left)).toBe(Math.round(g.body.left));
+  expect(Math.round(g.strip.width)).toBe(56);
+  expect(Math.abs((g.strip.top - g.body.top) - (g.body.bottom - g.strip.bottom))).toBeLessThan(2);
+  let { c } = await cardBelow();
+  expect(c.x).toBeGreaterThanOrEqual(g.strip.right);
+  expect(c.y).toBeGreaterThanOrEqual(0);
+  expect(c.y + c.height).toBeLessThanOrEqual(g.vh);
+  await app.mouse.move(g.vw / 2, g.vh / 2);
+
+  // Üst başlık: pencere düğmelerinin hemen solunda, başlığa sığar; takım çipleri şeridin solunda biter.
+  await choose("Üst başlık", "top");
+  for (const width of [2560, 1280]) {
+    await app.setViewportSize({ width, height: 900 });
+    g = await geo();
+    expect(g.inBar, `${width}`).toBe(true);
+    expect(g.drag, `${width}`).toBe(true);
+    expect(g.strip.right, `${width}`).toBeLessThanOrEqual(g.ctl.left + 0.5);
+    expect(g.ctl.left - g.strip.right, `${width}`).toBeLessThan(12);
+    expect(g.strip.top, `${width}`).toBeGreaterThanOrEqual(g.bar.top - 0.5);
+    expect(g.strip.bottom, `${width}`).toBeLessThanOrEqual(g.bar.bottom + 0.5);
+    expect(g.overflow, `${width}`).toBe(false);
+    expect(g.rack.right, `${width}`).toBeLessThanOrEqual(g.strip.left + 0.5);
+    expect(g.rack.left, `${width}`).toBeGreaterThanOrEqual(g.brand.right);
+    if (g.rackScroll) expect(g.rackScroll.right, `${width}`).toBeLessThanOrEqual(g.strip.left + 0.5);
+    // Sahne başlıkta yer kaplayan şeridin altında tam genişlikte; sahnede şerit yok.
+    expect(await app.locator(".stage .usage-strip").count()).toBe(0);
+    const k = await cardBelow();
+    expect(k.c.y, `${width}`).toBeGreaterThanOrEqual(g.bar.bottom);
+    expect(k.c.x, `${width}`).toBeGreaterThanOrEqual(0);
+    expect(k.c.x + k.c.width, `${width}`).toBeLessThanOrEqual(g.vw);
+    expect(k.c.y + k.c.height, `${width}`).toBeLessThanOrEqual(g.vh);
+    expect(Math.abs(k.c.x + k.c.width / 2 - (k.ring.x + k.ring.width / 2)), `${width}`).toBeLessThan(2);
+    await app.mouse.move(width / 2, 600);
+  }
+  // Başlıkta değilken takım çipleri pencere düğmelerine kadar uzanır (bugünkü düzen).
+  await app.setViewportSize({ width: 1400, height: 900 });
+  const rackTop = (await geo()).rack;
+  await choose("Sağ", "right");
+  g = await geo();
+  expect(g.inBar).toBe(false);
+  expect(Math.round(g.strip.right)).toBe(g.vw);
+  expect(g.rack.width).toBeGreaterThan(rackTop.width);
+  await app.getByRole("button", { name: "Ayarlar panelini kapat" }).click();
 });
 
 // #311: GPU hücresi (gpu_overview köprüde hazır) ve worker'ın işi LLM yüzünden beklerse tek toast.
@@ -297,4 +389,16 @@ test("Kullanım şeridi: kullanım verisi yokken GPU hücresi görünür", async
   expect(await fits()).toEqual({ w: 56, overflow: false });
   await gpu.focus();
   await expect(gpu).toBeFocused();
+  // #2034: veri yokken başlıkta da yatay ve başlığa sığar.
+  await app.evaluate(() => { localStorage.setItem("dex.usageStripPlace", "top"); dispatchEvent(new Event("dex:usage-strip")); });
+  await expect(strip).toHaveAttribute("data-place", "top");
+  const top = await app.evaluate(() => {
+    const s = document.querySelector(".usage-strip")!.getBoundingClientRect();
+    const bar = document.querySelector(".topbar")!.getBoundingClientRect();
+    const ctl = document.querySelector(".win-ctl")!.getBoundingClientRect();
+    const off = document.querySelector(".usage-off")!.getBoundingClientRect();
+    return { inBar: s.top >= bar.top - 0.5 && s.bottom <= bar.bottom + 0.5, beforeCtl: s.right <= ctl.left + 0.5, offFits: off.bottom <= s.bottom + 0.5 && off.width > off.height };
+  });
+  expect(top).toEqual({ inBar: true, beforeCtl: true, offFits: true });
+  await expect(gpu).toContainText("3/120");
 });

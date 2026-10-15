@@ -1,11 +1,13 @@
 // #54: Dex penceresinin sağ kenarındaki kullanım şeridi (TM Edge Dock'u gibi): bugünün token'ı,
 // sağlayıcı başına kalan kota halkası. #139: yer ayırmaz, sahnenin üstünde yüzer (usage.css).
 // #1861: veri etkin takımın sunucusundan (dexd); halkada dış yay 5 saat, iç yay haftalık pencere.
+// #2034: konum bu cihazın tercihi — sağ/sol kenarda dikey (sahnede) ya da üst başlıkta yatay.
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { useTeams } from "../team/store";
 import { callHost, hostOf, LOCAL, onEvent } from "../api/hosts";
 import { gpuStripCell, type GpuOverview } from "../gpu/view";
-import { useStripVisible, useUsage } from "./store";
+import { useStripPlace, useStripVisible, useUsage } from "./store";
+import { cardSpot, type CardSpot, type StripPlace } from "./place";
 import { providerMeta } from "./providers";
 import { WINDOWS, resetShort, severity, updatedAgo } from "./format";
 import type { ProviderUsage, UsageStatus } from "./types";
@@ -77,32 +79,24 @@ function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id
 
 /** TM edge panelindeki Muse kartının sade şablonu, her sağlayıcıda: logo + ad, güncellenme, iki
  *  pencere satırı (% kaldı + çubuk + sıfırlanma), bugünün token'ı. `position: fixed` ile açılır
- *  çünkü şerit `overflow-x: hidden` — mutlak konumlu kart kesilirdi. Dikey konum halka ortalanır,
- *  pencere kenarından taşmayacak şekilde kırpılır. */
-function ProviderCard({ p, now, anchor, onHover }: {
-  p: ProviderUsage; now: number; anchor: DOMRect;
+ *  çünkü şerit taşmayı keser — mutlak konumlu kart kesilirdi. Yer `cardSpot`'tan: dikey şeritte
+ *  yanında, başlıkta altında; halkaya ortalı, pencere içinde kırpılı. */
+function ProviderCard({ p, now, anchor, place, onHover }: {
+  p: ProviderUsage; now: number; anchor: DOMRect; place: StripPlace;
   onHover: (id: string | null, anchor: DOMRect | null) => void;
 }) {
   const m = providerMeta(p.id);
   const cardRef = useRef<HTMLDivElement>(null);
-  const [top, setTop] = useState<number | null>(null);
-  const [cardH, setCardH] = useState(0);
-  // Kart şeridin sol kenarına yaslanır (halka div'i şeritten içeride başlar).
-  const [right, setRight] = useState<number | null>(null);
+  const [spot, setSpot] = useState<CardSpot | null>(null);
   useLayoutEffect(() => {
-    const h = cardRef.current?.offsetHeight ?? 0;
-    setCardH(h);
-    const want = anchor.top + anchor.height / 2 - h / 2;
-    setTop(Math.min(Math.max(8, want), Math.max(8, window.innerHeight - h - 8)));
-    const stripLeft = cardRef.current?.closest(".usage-strip")?.getBoundingClientRect().left
-      ?? anchor.left;
-    setRight(Math.max(8, window.innerWidth - stripLeft + 8));
-  }, [anchor]);
-  // Ok halkayı gösterir; kart kenara yaslanınca kart içinde kalır.
-  const arrowTop = top === null ? 0 : Math.min(Math.max(14, anchor.top + anchor.height / 2 - top), Math.max(14, cardH - 14));
+    const el = cardRef.current;
+    if (!el) return;
+    const strip = el.closest(".usage-strip")?.getBoundingClientRect() ?? anchor;
+    setSpot(cardSpot(place, anchor, strip, { w: el.offsetWidth, h: el.offsetHeight }, { w: window.innerWidth, h: window.innerHeight }));
+  }, [anchor, place]);
   return (
-    <div ref={cardRef} className="usage-card" data-card={p.id} role="status"
-      style={{ top: top ?? -9999, right: right ?? -9999, visibility: top === null ? "hidden" : "visible" } as CSSProperties}
+    <div ref={cardRef} className="usage-card" data-card={p.id} data-arrow={spot?.arrow} role="status"
+      style={{ top: spot?.top ?? -9999, left: spot?.left ?? -9999, maxHeight: spot?.maxHeight, visibility: spot ? "visible" : "hidden" } as CSSProperties}
       onMouseEnter={() => onHover(p.id, anchor)}
       onMouseLeave={() => onHover(null, null)}>
       <div className="usage-card-head">
@@ -138,7 +132,7 @@ function ProviderCard({ p, now, anchor, onHover }: {
       {p.todayTokens !== null && (
         <div className="usage-card-today">Bugün {p.todayTokens.toLocaleString("tr-TR")} token</div>
       )}
-      <span className="usage-card-arrow" aria-hidden="true" style={{ top: arrowTop }} />
+      <span className="usage-card-arrow" aria-hidden="true" style={spot?.arrow === "top" ? { left: spot.arrowAt } : { top: spot?.arrowAt ?? 0 }} />
     </div>
   );
 }
@@ -178,8 +172,10 @@ const OFF_TEXT: Record<Exclude<UsageStatus, "live">, string> = {
   unsupported: "sunucu eski",
 };
 
-export function UsageStrip() {
+/** `slot`: "stage" sahnede (sağ/sol kenar), "top" başlıkta; şerit yalnız seçili konumun yuvasında çizilir. */
+export function UsageStrip({ slot }: { slot: "stage" | "top" }) {
   const visible = useStripVisible();
+  const place = useStripPlace();
   const { activeId } = useTeams();
   const { status, snap } = useUsage(activeId ? hostOf(activeId) : LOCAL);
   const [now, setNow] = useState(Date.now);
@@ -205,12 +201,14 @@ export function UsageStrip() {
     const t = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(t);
   }, [snap]);
-  if (!visible) return null;
+  if (!visible || (place === "top") !== (slot === "top")) return null;
+  // Başlıkta şeridin boşluğu pencere sürükleme alanı olarak kalır.
+  const shell = { className: `usage-strip ${place}`, "aria-label": "Kullanım şeridi", "data-status": status, "data-place": place, "data-tauri-drag-region": place === "top" ? true : undefined };
 
   if (status !== "live" || !snap) {
     const text = OFF_TEXT[status === "live" ? "connecting" : status];
     return (
-      <aside className="usage-strip off" aria-label="Kullanım şeridi" data-status={status}>
+      <aside {...shell} className={`${shell.className} off`}>
         {/* #314: GPU durumu kullanım verisinden bağımsız; veri gelmese de görünür. */}
         <GpuCell />
         <div className="usage-off" title={`Kullanım verisi yok: ${text}`}>
@@ -221,19 +219,19 @@ export function UsageStrip() {
   }
 
   return (
-    <aside className="usage-strip" aria-label="Kullanım şeridi" data-status={status}>
+    <aside {...shell}>
       <div className="usage-cell usage-today"
         title={`Bugün Dex ajanları: ${snap.todayTokens?.toLocaleString("tr-TR") ?? "--"} token (girdi + çıktı + önbellek)`}>
         <span className="usage-cap">bugün</span>
         <span className="usage-big">{snap.todayTokens === null ? "--" : compactTokens(snap.todayTokens)}</span>
       </div>
       <GpuCell />
-      <div className="usage-provs">
+      <div className="usage-provs" data-tauri-drag-region={place === "top" ? true : undefined}>
         {snap.providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}
       </div>
       {hoverId && anchor && (() => {
         const p = snap.providers.find((x) => x.id === hoverId);
-        return p ? <ProviderCard p={p} now={now} anchor={anchor} onHover={onHover} /> : null;
+        return p ? <ProviderCard p={p} now={now} anchor={anchor} place={place} onHover={onHover} /> : null;
       })()}
     </aside>
   );
