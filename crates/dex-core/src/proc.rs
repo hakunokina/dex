@@ -987,12 +987,28 @@ mod tests {
 
     /// DEX-31 live burn: three one-core busy loops, each in its own pane job, under a 5% total —
     /// together they stay at the cap (uncapped they'd take 3 cores). Upper bound only: a busy
-    /// machine may give them less, never more.
+    /// machine may give them less, never more. Measured in CPU cycles, the unit the OS enforces
+    /// the cap in. The job's user/kernel times are sampled per clock tick (15.6 ms by default)
+    /// and 5% of 4 cores is a fraction of one tick: on a CI runner they read %28.9 (#2085), and
+    /// with many burners per tick they read about twice the cycles even at a 1 ms tick.
     #[cfg(windows)]
     #[test]
     fn total_cap_holds_under_burners() {
+        use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::JobObjects::*;
+        use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+        use windows_sys::Win32::System::Threading::GetCurrentThread;
+        use windows_sys::Win32::System::WindowsProgramming::{QueryProcessCycleTime, QueryThreadCycleTime};
+        // Cycles per second: a spin counts cycles only while it runs, so a preempted slice reads
+        // low, never high — the fastest slice is the counter's rate.
+        let hz = (0..50).map(|_| {
+            let (mut c0, mut c1) = (0u64, 0u64);
+            unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c0) };
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(2) { std::hint::spin_loop(); }
+            unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c1) };
+            (c1 - c0) as f64 / t.elapsed().as_secs_f64()
+        }).fold(0.0, f64::max);
         let parent = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         let lim = super::Limits { total_cpu_percent: 5, agent_cpu_percent: 0, mem_bytes: 0 };
         let mut kids = Vec::new();
@@ -1001,18 +1017,18 @@ mod tests {
             let t = super::Tree::adopt_in(c.id(), &lim, Some(parent)).expect("job");
             kids.push((c, t));
         }
-        let used = || {
-            let mut acc: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
-            let ok = unsafe { QueryInformationJobObject(parent, JobObjectBasicAccountingInformation, &mut acc as *mut _ as _, std::mem::size_of_val(&acc) as u32, std::ptr::null_mut()) };
-            assert_ne!(ok, 0);
-            (acc.TotalUserTime + acc.TotalKernelTime) as f64 / 1e7 // 100 ns → s
-        };
+        // A burner is one cmd with no children: its processes' cycles are the job's.
+        let used = || kids.iter().map(|(c, _): &(std::process::Child, super::Tree)| {
+            let mut n = 0u64;
+            assert_ne!(unsafe { QueryProcessCycleTime(c.as_raw_handle() as _, &mut n) }, 0);
+            n as f64 / hz // cycles → s
+        }).sum::<f64>();
         std::thread::sleep(std::time::Duration::from_millis(800));
         let (t0, w0) = (used(), std::time::Instant::now());
         std::thread::sleep(std::time::Duration::from_secs(3));
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
         let share = 100.0 * (used() - t0) / w0.elapsed().as_secs_f64() / cores;
-        eprintln!("DEX-31: 3 yakıcı, toplam tavan %5 → makine payı %{share:.1} ({cores} çekirdek; tavansız ≈ %{:.0})", 100.0 * 3.0_f64.min(cores) / cores);
+        eprintln!("DEX-31: 3 yakıcı, toplam tavan %5 → makine payı %{share:.1} ({cores} çekirdek, {:.0} MHz döngü; tavansız ≈ %{:.0})", hz / 1e6, 100.0 * 3.0_f64.min(cores) / cores);
         for (mut c, t) in kids {
             drop(t);
             let _ = c.wait();
