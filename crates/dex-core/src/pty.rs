@@ -173,6 +173,8 @@ pub(crate) struct AgentLaunch {
     pub job: Option<i64>,
     pub memory: crate::hooks::MemoryScope,
     pub prompt: String,
+    /// A leader's [`crate::prompts::fingerprint`], read with `prompt`.
+    pub print: Option<String>,
 }
 
 #[cfg(test)]
@@ -310,14 +312,18 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // DEX-35: role text + Dex rules, one text for `--append-system-prompt` (claude takes the flag
     // once; a second one would silently replace the first).
     let mut append: Vec<String> = Vec::new();
+    // Plan #114: a leader's patron inputs, recorded once the session runs.
+    let mut print = None;
     if let Some(l) = launch.as_ref().filter(|_| is_claude) {
         // #838 G: built from the session's context (rules::system_prompt_for_context, agents.rs).
         append.push(l.prompt.clone());
+        print.clone_from(&l.print);
     } else if is_claude {
         // PTY ids are agent ids; the role comes from the DB, not from the webview.
         let conn = core.db.0.lock().map_err(|_| "db kilidi zehirli")?;
         let memory = memory_dir.as_deref().map(std::path::Path::new).map(|r| Ok::<_, String>((r.join("shared"), crate::slug::memory_dir(&conn, r, &id)?))).transpose()?;
         append.push(crate::rules::system_prompt(&conn, &id, memory.as_ref().map(|(s, o)| (s.as_path(), o.as_path()))));
+        print = crate::prompts::fingerprint(&conn, &id);
     }
     if is_claude && !append.is_empty() {
         builder.arg("--append-system-prompt");
@@ -423,6 +429,9 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // #126: an idle worker session is closed after a while (leaders and shells are not watched).
     if is_claude {
         core.idle_close_watch(&id);
+    }
+    if let Some(print) = print {
+        core.leader_prompt_applied(&id, &print);
     }
 
     // Keeps draining with no subscriber left, so the child never blocks on a full pipe.
@@ -1470,7 +1479,7 @@ mod tests {
         let other = root.join("other-agent");
         let launch = AgentLaunch { job: None,
             memory: crate::hooks::MemoryScope { root: root.clone(), write: write.clone(), read: read.clone() },
-            prompt: "BOUND-CONTEXT-PROMPT".into() };
+            prompt: "BOUND-CONTEXT-PROMPT".into(), print: None };
         let req = Spawn { id: "timur".into(), cmd: f.0.join("claude.exe").to_string_lossy().into_owned(),
             cwd: Some(f.0.to_string_lossy().into_owned()), memory_dir: Some(base.join("ipc-memory").to_string_lossy().into_owned()),
             args: vec!["--resume".into(), "s1".into()],

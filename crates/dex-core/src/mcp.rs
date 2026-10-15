@@ -1744,7 +1744,14 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "additionalProperties": false, "required": ["morning", "noon", "evening"], "properties": {
               "morning": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS },
               "noon": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS },
-              "evening": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS } } } }
+              "evening": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS } } } },
+        { "name": "team_note_get", "description": "YALNIZ LİDER. Kendi takımının notunu (patronun Takım notu) okur. Patronun sana eklemeleri salt okunur gelir: systemAppend oturum açılışında sistem istemine, messageAppend her patron mesajına eklenir.",
+          "annotations": { "readOnlyHint": true },
+          "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} } },
+        { "name": "team_note_set", "description": "YALNIZ LİDER. Kendi takımının notunu yazar: body notun tam yeni metnidir, öncekinin üzerine yazar (en çok 1 MB). Önce team_note_get ile oku, patronun yazdığını koru. Patronun eklemelerini değiştirmez.",
+          "annotations": { "readOnlyHint": false },
+          "inputSchema": { "type": "object", "additionalProperties": false, "required": ["body"], "properties": {
+              "body": { "type": "string" } } } }
     ]);
     // DEX-22: plan, plan_status, plan_cancel, propose_member (+ DEX-28 plan_retry).
     all.as_array_mut().unwrap().extend(crate::plan::tools());
@@ -1803,7 +1810,7 @@ fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
             return all;
         }
         if let Ok(c) = delegate::caller(&conn, agent) {
-            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note"); }
+            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| !matches!(t["name"].as_str(), Some("note" | "team_note_get" | "team_note_set"))); }
             if !motivation_writer(&c) { all.as_array_mut().unwrap().retain(|t| t["name"] != "motivation_set"); }
             all.as_array_mut().unwrap().extend(crate::gpu::tools_for(&conn, &c, job));
         }
@@ -2295,6 +2302,25 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
             drop(conn);
             core.motivation_set(morning, noon, evening)
         }
+        // Plan #114: the leader's own team note; the patron's appends are read-only here.
+        "team_note_get" => {
+            lead_only("team_note_get")?;
+            let note = crate::notes::get(&conn, &c.team_id)?;
+            let p = crate::prompts::get(&conn, &c.team_id)?;
+            Ok(json!({ "teamId": c.team_id, "body": note.body, "updatedAt": note.updated_at,
+                "systemAppend": p.system_append, "messageAppend": p.message_append }))
+        }
+        "team_note_set" => {
+            lead_only("team_note_set")?;
+            let fields = args.as_object().ok_or("arguments nesne olmalı")?;
+            if let Some(key) = fields.keys().find(|k| k.as_str() != "body") {
+                return Err(format!("bilinmeyen alan: {key}"));
+            }
+            let body = s(args, "body").ok_or("body gerekli (metin)")?;
+            drop(conn);
+            let n = core.note_set(&c.team_id, body)?;
+            Ok(json!({ "teamId": n.scope, "updatedAt": n.updated_at, "bytes": n.body.len() }))
+        }
         // Plan #99 mapgen: repo haritası iskeletini elle tazeleme (lider).
         "map_refresh" => {
             lead_only("map_refresh")?;
@@ -2442,6 +2468,114 @@ b", "evening": "akşam"}));
         let ok = call_with_args_for_test(&core, "timur", "motivation_set", lines);
         assert_eq!(ok["structuredContent"]["ok"], true, "{ok}");
         assert_eq!(core.motivation_today().unwrap().unwrap().noon, "öğle");
+        core.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod team_note_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<(String, Value)>>>);
+    impl crate::events::EventSink for Seen {
+        fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+            self.0.lock().unwrap().push((event.into(), payload));
+            Ok(())
+        }
+    }
+    impl Seen {
+        fn take(&self, event: &str) -> Vec<Value> {
+            let mut all = self.0.lock().unwrap();
+            let out = all.iter().filter(|(e, _)| e == event).map(|(_, p)| p.clone()).collect();
+            all.clear();
+            out
+        }
+    }
+
+    fn core(name: &str, seen: &Seen) -> Arc<Core> {
+        let storage = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("{name}-{}-{}", std::process::id(), crate::agents::next_seq()));
+        Core::start(crate::Paths { data_dir: storage.join("data"), config_dir: storage.join("config") },
+            crate::Events::new(seen.clone())).unwrap()
+    }
+
+    #[test]
+    fn team_note_tools_are_the_leaders_own_team_and_appends_read_only() {
+        let seen = Seen::default();
+        let core = core("team-note-mcp", &seen);
+        for tool in ["team_note_get", "team_note_set"] {
+            assert!(tools_list_for_test(&core, "timur").iter().any(|t| t["name"] == tool), "{tool}");
+            assert!(!tools_list_for_test(&core, "kaan").iter().any(|t| t["name"] == tool), "{tool}");
+            let denied = call_with_args_for_test(&core, "kaan", tool, json!({"body": "x"}));
+            assert_eq!(denied["isError"], true, "{denied}");
+        }
+        core.note_set("default", "patronun notu").unwrap();
+        core.leader_prompt_set("default", Some("sistem eki"), Some("mesaj eki")).unwrap();
+        let got = call_with_args_for_test(&core, "timur", "team_note_get", json!({}));
+        let got = &got["structuredContent"];
+        assert_eq!((got["teamId"].as_str(), got["body"].as_str(), got["systemAppend"].as_str(), got["messageAppend"].as_str()),
+            (Some("default"), Some("patronun notu"), Some("sistem eki"), Some("mesaj eki")), "{got}");
+        seen.take("");
+        let extra = call_with_args_for_test(&core, "timur", "team_note_set", json!({"body": "x", "systemAppend": "y"}));
+        assert_eq!(extra["isError"], true, "eklemeler liderden yazılmaz: {extra}");
+        let ok = call_with_args_for_test(&core, "timur", "team_note_set", json!({"body": "patronun notu\n- lider ekledi"}));
+        assert_eq!(ok["structuredContent"]["teamId"], "default", "{ok}");
+        let changed = seen.take("notes-changed");
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0]["body"], "patronun notu\n- lider ekledi");
+        assert_eq!(core.note_get("default").unwrap().body, "patronun notu\n- lider ekledi");
+        assert_eq!(core.leader_prompt_get("default").unwrap().system_append, "sistem eki");
+        // Another team's leader reads and writes its own note only.
+        let other = core.team_create(crate::teams::NewTeam { profile: None, name: "Diğer".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let lead = core.agent_list().unwrap().into_iter().find(|a| a.team_id == other.id && a.kind == "leader").unwrap().id;
+        call_with_args_for_test(&core, &lead, "team_note_set", json!({"body": "diğer"}));
+        let theirs = call_with_args_for_test(&core, &lead, "team_note_get", json!({}));
+        assert_eq!((theirs["structuredContent"]["teamId"].as_str(), theirs["structuredContent"]["body"].as_str(), theirs["structuredContent"]["systemAppend"].as_str()),
+            (Some(other.id.as_str()), Some("diğer"), Some("")));
+        assert_eq!(core.note_get("default").unwrap().body, "patronun notu\n- lider ekledi");
+        core.shutdown();
+    }
+
+    #[test]
+    fn writes_emit_views_and_leader_prompts_get_the_message_append() {
+        let seen = Seen::default();
+        let core = core("leader-prompt-core", &seen);
+        seen.take("");
+        core.leader_prompt_set("default", None, Some("Her mesaja: kısa yaz.")).unwrap();
+        let views = seen.take("leader-prompt-changed");
+        assert_eq!(views.len(), 1);
+        assert_eq!((views[0]["teamId"].as_str(), views[0]["messageAppend"].as_str(), views[0]["pendingRestart"].as_bool()),
+            (Some("default"), Some("Her mesaja: kısa yaz."), Some(false)));
+        core.leader_prompt_applied("timur", &crate::db::with(&core.db, |c| Ok(crate::prompts::fingerprint(c, "timur"))).unwrap().unwrap());
+        assert_eq!(seen.take("leader-prompt-changed").len(), 1);
+        let part = core.prompt_part_set("role:lead", "Rolün: özel lider.").unwrap();
+        assert!(part.overridden);
+        assert_eq!(seen.0.lock().unwrap().iter().filter(|(e, _)| e == "prompt-parts-changed").count(), 1);
+        let views = seen.take("leader-prompt-changed");
+        assert!(views.iter().any(|v| v["teamId"] == "default" && v["pendingRestart"] == true), "{views:?}");
+        assert!(core.prompt_part_set("gpu", "x").is_err());
+        assert!(core.prompt_parts().unwrap().parts.iter().any(|p| p.id == "role:lead" && p.overridden));
+        core.prompt_part_reset("role:lead").unwrap();
+        assert!(!core.leader_prompt_get("default").unwrap().pending_restart);
+        // The real hook endpoint: a patron prompt carries the append, a Dex paste and a worker do not.
+        let hook = |agent: &str, prompt: &str| -> Value {
+            let reply = ureq::post(&format!("http://127.0.0.1:{}/hook", core.hooks.port))
+                .timeout(std::time::Duration::from_secs(5))
+                .set("Authorization", &format!("Bearer {}", core.hooks.token))
+                .set("X-Dex-Agent", agent).set("X-Dex-Key", &core.mcp.key_for(agent))
+                .send_json(json!({"hook_event_name": "UserPromptSubmit", "session_id": format!("s-{agent}"), "prompt": prompt}))
+                .unwrap();
+            if reply.status() == 204 { Value::Null } else { reply.into_json().unwrap() }
+        };
+        let patron = hook("timur", "durum ne?");
+        assert_eq!(patron["hookSpecificOutput"]["additionalContext"].as_str(),
+            Some(format!("{}\nHer mesaja: kısa yaz.", crate::prompts::MESSAGE_HEAD).as_str()), "{patron}");
+        let dex = hook("timur", "[Dex-Devretme] Kaan #1 · bitti — x");
+        assert!(!dex.to_string().contains("Her mesaja"), "{dex}");
+        let worker = hook("kaan", "durum ne?");
+        assert!(!worker.to_string().contains("Her mesaja"), "{worker}");
         core.shutdown();
     }
 }

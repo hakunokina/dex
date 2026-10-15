@@ -97,10 +97,12 @@ pub fn name_of(conn: &Connection, slug: &str) -> Result<String, String> {
         .ok_or_else(|| format!("rol yok: {slug}"))
 }
 
-/// The system prompt of the agent's role; None for unknown agents / no role.
+/// The system prompt of the agent's role (the patron's override first, Plan #114); None for
+/// unknown agents / no role.
 pub fn prompt_for_agent(conn: &Connection, agent_id: &str) -> Option<String> {
     conn.query_row(
-        "SELECT r.system_prompt FROM agents a JOIN roles r ON r.slug = a.role_slug WHERE a.id = ?1",
+        "SELECT COALESCE(o.body, r.system_prompt) FROM agents a JOIN roles r ON r.slug = a.role_slug
+         LEFT JOIN prompt_overrides o ON o.part_id = 'role:' || r.slug WHERE a.id = ?1",
         [agent_id],
         |r| r.get(0),
     )

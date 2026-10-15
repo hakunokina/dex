@@ -278,6 +278,15 @@ handlers! {
         "note_set" => {
             |core, p| ok(core.note_set(&arg::<String>(p, "scope")?, &arg::<String>(p, "body")?))
         },
+        // Plan #114: the leader's appends (Takım notu) and Dex's prompt parts; the patron's.
+        "leader_prompt_get" => |core, p| ok(core.leader_prompt_get(&arg::<String>(p, "teamId")?)),
+        "leader_prompt_set" => |core, p| {
+            let (system, message) = (arg::<Option<String>>(p, "systemAppend")?, arg::<Option<String>>(p, "messageAppend")?);
+            ok(core.leader_prompt_set(&arg::<String>(p, "teamId")?, system.as_deref(), message.as_deref()))
+        },
+        "prompt_parts" => |core, _| ok(core.prompt_parts()),
+        "prompt_part_set" => |core, p| ok(core.prompt_part_set(&arg::<String>(p, "id")?, &arg::<String>(p, "text")?)),
+        "prompt_part_reset" => |core, p| ok(core.prompt_part_reset(&arg::<String>(p, "id")?)),
 }
 
 #[cfg(test)]
@@ -517,6 +526,31 @@ mod tests {
         "snip_hotkey_get",
         "snip_hotkey_set",
     ];
+
+    #[test]
+    fn leader_prompt_and_prompt_part_rpc_contract() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/prompt-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let core = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(NullSink)).unwrap();
+        for m in ["leader_prompt_get", "leader_prompt_set", "prompt_parts", "prompt_part_set", "prompt_part_reset"] {
+            assert!(METHODS.contains(&m), "{m}");
+        }
+        let v = call(&core, "leader_prompt_set", &serde_json::json!({"teamId": "default", "systemAppend": "s"})).unwrap();
+        assert_eq!((v["systemAppend"].as_str(), v["messageAppend"].as_str(), v["pendingRestart"].as_bool()), (Some("s"), Some(""), Some(false)));
+        let v = call(&core, "leader_prompt_set", &serde_json::json!({"teamId": "default", "messageAppend": "m"})).unwrap();
+        assert_eq!((v["systemAppend"].as_str(), v["messageAppend"].as_str()), (Some("s"), Some("m")));
+        assert_eq!(call(&core, "leader_prompt_get", &serde_json::json!({"teamId": "default"})).unwrap(), v);
+        assert_eq!(call(&core, "leader_prompt_set", &serde_json::json!({"teamId": "default", "systemAppend": 1})).unwrap_err().code, "bad_request");
+        assert_eq!(call(&core, "leader_prompt_get", &serde_json::json!({"teamId": "yok"})).unwrap_err().code, "failed");
+        let list = call(&core, "prompt_parts", &serde_json::json!({})).unwrap();
+        assert!(list["policyNote"].is_string() && list["parts"][0]["id"] == "dex-rules", "{list}");
+        let p = call(&core, "prompt_part_set", &serde_json::json!({"id": "role:lead", "text": "özel"})).unwrap();
+        assert_eq!((p["overridden"].as_bool(), p["text"].as_str(), p["editable"].as_bool()), (Some(true), Some("özel"), Some(true)));
+        let p = call(&core, "prompt_part_reset", &serde_json::json!({"id": "role:lead"})).unwrap();
+        assert_eq!(p["overridden"], false);
+        assert_eq!(call(&core, "prompt_part_set", &serde_json::json!({"id": "roster", "text": "x"})).unwrap_err().code, "failed");
+        core.shutdown();
+    }
 
     #[test]
     fn tauri_registers_only_client_only_commands() {

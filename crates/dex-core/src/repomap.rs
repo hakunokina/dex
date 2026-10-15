@@ -453,13 +453,15 @@ pub fn refresh(root: &Path) -> Result<RefreshOut, String> {
 /// Ajan istemindeki tek satır — harita dosyası varsa. Yoksa None (istem baytı değişmez).
 pub fn prompt_line(root: &Path) -> Option<String> {
     if root.join(MAP_FILE).is_file() {
-        Some(format!(
-            "Proje haritası: `{}/.dex/map.md` — iş karışık gelirse ya da nereden başlayacağını bilmiyorsan bak; hemen bakmak zorunda değilsin, işin ortasında da açabilirsin.",
-            root.display()
-        ))
+        Some(prompt_text(&root.display().to_string()))
     } else {
         None
     }
+}
+
+/// [`prompt_line`]'s text for `root`; the prompt-part list (Plan #114) shows it with a placeholder.
+pub(crate) fn prompt_text(root: &str) -> String {
+    format!("Proje haritası: `{root}/.dex/map.md` — iş karışık gelirse ya da nereden başlayacağını bilmiyorsan bak; hemen bakmak zorunda değilsin, işin ortasında da açabilirsin.")
 }
 
 #[cfg(test)]

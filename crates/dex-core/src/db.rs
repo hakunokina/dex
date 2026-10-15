@@ -461,6 +461,9 @@ const MIGRATIONS: &[&str] = &[
     // 41 (#1858): the patron's daily three lines, one row per local day. Additive, IF NOT EXISTS.
     // Before commit: ROLLBACK. After commit: keep the table; revert only the application.
     crate::motivation::SCHEMA,
+    // 42 (Plan #114): the leader's appends, prompt-part overrides, the applied print. Additive,
+    // IF NOT EXISTS. Before commit: ROLLBACK. After commit: keep the tables; revert the application.
+    crate::prompts::SCHEMA,
 ];
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
@@ -749,6 +752,41 @@ mod job_model_migration_tests {
         for _ in 0..2 { migrate(&mut clean).unwrap(); }
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
         println!("motivation migration: preserved={before:?}; v{version} + clean DB 2 runs");
+    }
+
+    #[test]
+    fn prompts_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let version = MIGRATIONS.iter().position(|sql| *sql == crate::prompts::SCHEMA).unwrap();
+        for (i, sql) in MIGRATIONS[..version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch("INSERT INTO notes(scope,body,updated_at) VALUES('default','takım notu',1);").unwrap();
+        let snapshot = |c: &Connection| -> (i64, i64, String) {
+            (c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT COUNT(*) FROM teams", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT body FROM notes WHERE scope='default'", [], |r| r.get(0)).unwrap())
+        };
+        let before = snapshot(&c);
+        for _ in 0..2 { migrate(&mut c).unwrap(); assert_eq!(snapshot(&c), before); }
+        crate::roles::seed(&c).unwrap();
+        crate::prompts::set(&c, "default", Some("sistem"), Some("mesaj")).unwrap();
+        crate::prompts::part_set(&c, "role:lead", "özel").unwrap();
+        crate::prompts::record_applied(&c, "timur", "fp").unwrap();
+        for _ in 0..2 {
+            c.execute_batch(crate::prompts::SCHEMA).unwrap();
+            assert_eq!(crate::prompts::get(&c, "default").unwrap().system_append, "sistem");
+            assert_eq!(c.query_row("SELECT COUNT(*) FROM prompt_overrides", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        let fk: i64 = c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(fk, 0);
+        println!("prompts migration: preserved={before:?}; v{version} + clean DB 2 runs; FK=0");
     }
 
     #[test]
