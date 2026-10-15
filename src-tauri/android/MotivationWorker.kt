@@ -32,7 +32,7 @@ import java.util.concurrent.TimeUnit
 
 /** JezLauncher sözleşmesi. Değişirse burası + motivation.xml (build-apk.sh ikisini eşler).
  *  Bundle: date (yyyy-MM-dd, telefonun yerel günü), morning, noon, evening — dördü zorunlu, boş değil,
- *  en çok 200 karakter. Dönüş boş Bundle = kabul; geçersiz set IllegalArgumentException, izin yoksa
+ *  en çok 250 karakter. Dönüş boş Bundle = kabul; geçersiz set IllegalArgumentException, izin yoksa
  *  SecurityException. Launcher son 7 günü saklar; aynı tarih üzerine yazılır. */
 object JezLauncher {
     const val AUTHORITY = "dev.jez.launcher.motivation"
