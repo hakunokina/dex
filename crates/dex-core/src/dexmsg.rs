@@ -26,6 +26,8 @@ pub const SISTEM: &str = "Dex-Sistem";
 pub const INCELEME: &str = "Dex-İnceleme";
 /// Günlük motivasyon isteği (lidere, #1858).
 pub const MOTIVASYON: &str = "Dex-Motivasyon";
+/// Çekirdek yeniden başladı; turu kesilen ajana tek devam turu (#1875).
+pub const DEVAM: &str = "Dex-Devam";
 
 /// `[Tür] gövde` satırını kurar.
 pub fn line(tag: &str, body: impl AsRef<str>) -> String {

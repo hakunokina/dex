@@ -16,9 +16,19 @@
 //!   (`agent_start`) — holds a [`Turn`] until the turn shows (Working; a start's pending prompt) or
 //!   fails. The drain is the gate: closed, chat waits in its queue (the marker carries it), leader
 //!   notes stay unsent; the drain's end or the next core delivers them.
+//! - #1875 **Cut turns**: the marker also names the agents mid-turn at the exit (`busy`). A busy
+//!   worker's running job stays running (not done_no_report): the next core reopens its session
+//!   (`--resume`, its job's binding: same job, worktree, GPU grant) with one `[Dex-Devam]` turn; a
+//!   busy leader gets the same turn. Starts go one at a time, [`RESUME_GAP`] apart; the turn is the
+//!   start's own prompt (the CLI takes it once ready — no paste). An idle agent gets none.
+//! - #1875 **Live snapshot** (`<data_dir>/dex.live.json`, [`LIVE_FILE`]): the same marker, kept
+//!   fresh while the core runs (`Core::live_watch`) and removed by a clean exit
+//!   ([`Core::shutdown`]). A start without a marker that finds a fresh one (a crash, an installer's
+//!   kill) restarts as after a marker; an old one ([`FRESH_MS`]) is ignored as before.
 
 use crate::db::with;
 use crate::{agents, teams, Core};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -1204,6 +1214,189 @@ mod lifecycle_tests {
         assert!(c.ptys.is_running("timur"));
         finish(&c);
     }
+
+    // ---- #1875: cut turns come back ----
+
+    fn bind_session(c: &Core, agent: &str, session: &str, job: Option<i64>) {
+        with(&c.db, |db| {
+            agents::record_session(db, agent, session, "claude", None)?;
+            db.execute("UPDATE agent_sessions SET delegation_id = ?2, project_id = (SELECT project_id FROM delegations WHERE id = ?2) WHERE agent_id = ?1", rusqlite::params![agent, job]).map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    fn job_for(c: &Core, worker: &str, status: &str) -> i64 {
+        with(&c.db, |db| {
+            let from = delegate::caller(db, "timur")?;
+            let d = delegate::insert(db, delegate::NewDelegation { from: &from, to_agent: worker.into(), team_id: "default".into(), service_team_id: None, prompt: "iş".into(), task_id: None, patron_words: None, effort: None })?;
+            delegate::set_status(db, d.id, status)?;
+            Ok(d.id)
+        })
+        .unwrap()
+    }
+    fn status_of(c: &Core, id: i64) -> String {
+        with(&c.db, |db| delegate::get(db, id)).unwrap().status
+    }
+    fn devams(starts: &[agents::Captured], agent: &str) -> usize {
+        starts.iter().filter(|(s, _)| s.id == agent && s.args.last() == Some(&continue_line())).count()
+    }
+
+    /// A restart (planned or not — both hand the start a marker): the running job of a worker cut
+    /// mid-turn stays running, an idle worker's closes as before; a plan item keeps its kept job.
+    #[test]
+    fn a_restart_keeps_the_job_of_a_worker_cut_mid_turn_running() {
+        let c = core();
+        let cut = job_for(&c, "kaan", "running");
+        let idle = job_for(&c, "ayla", "running");
+        let queued = job_for(&c, "kaan", "queued");
+        let busy = vec!["kaan".to_string(), "timur".to_string()];
+        let kept = with(&c.db, |db| kept_jobs(db, &busy)).unwrap();
+        assert_eq!(kept, vec![(cut, "kaan".to_string())], "leaders hold no job; idle ayla is not cut");
+        let ids: Vec<i64> = kept.iter().map(|(id, _)| *id).collect();
+        with(&c.db, |db| {
+            db.execute(
+                "INSERT INTO plans (id, leader, team_id, title, status, created_at, updated_at) VALUES (900, 'timur', 'default', 'p', 'active', 1, 1)",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+            for (key, d) in [("a", cut), ("b", idle)] {
+                db.execute(
+                    "INSERT INTO plan_items (plan_id, key, title, prompt, target, status, delegation_id) VALUES (900, ?1, ?1, ?1, 'kaan', 'running', ?2)",
+                    rusqlite::params![key, d],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(with(&c.db, |db| crate::plan::requeue_interrupted_keeping(db, true, &ids)).unwrap(), 1, "only the idle job's item goes again");
+        assert_eq!(with(&c.db, |db| delegate::reconcile_on_start_keeping(db, true, &ids)).unwrap(), 1);
+        assert_eq!(status_of(&c, cut), "running", "cut mid-turn: not done_no_report");
+        assert_eq!(status_of(&c, idle), "done_no_report", "idle at the exit: as before");
+        assert_eq!(status_of(&c, queued), "queued");
+        finish(&c);
+    }
+
+    /// The new core: one `[Dex-Devam]` per agent cut mid-turn (the start's own prompt: no paste
+    /// before the CLI is up), the worker on its job's session; one start at a time; none to an
+    /// agent idle at the exit; a worker whose session cannot open has its job closed.
+    #[test]
+    fn restart_resume_sends_one_devam_per_cut_agent_in_order() {
+        let c = core();
+        let cut = job_for(&c, "kaan", "running");
+        bind_session(&c, "timur", "leader-saved", None);
+        bind_session(&c, "kaan", "kaan-saved", Some(cut));
+        let m = Marker { at_ms: crate::diagnostics::now_ms(), leaders: vec!["timur".into()], busy: vec!["timur".into(), "kaan".into()], ..Default::default() };
+        let kept = with(&c.db, |db| kept_jobs(db, &m.busy)).unwrap();
+        let gap = std::time::Duration::from_millis(300);
+        agents::CAPTURE.with(|cap| *cap.borrow_mut() = Some(Vec::new()));
+        let t0 = std::time::Instant::now();
+        c.restart_resume_paced(m, kept, gap);
+        let took = t0.elapsed();
+        let starts = agents::CAPTURE.with(|cap| cap.borrow_mut().take().unwrap());
+        let order: Vec<&str> = starts.iter().map(|(s, _)| s.id.as_str()).collect();
+        assert_eq!(order, ["timur", "kaan"], "one start each, in turn");
+        assert!(took >= gap, "a gap between the two starts: {took:?}");
+        assert_eq!((devams(&starts, "timur"), devams(&starts, "kaan")), (1, 1));
+        assert!(starts[0].0.args.windows(2).any(|a| a == ["--resume", "leader-saved"]));
+        assert!(starts[1].0.args.windows(2).any(|a| a == ["--resume", "kaan-saved"]));
+        assert_eq!(starts[1].1, Some(cut), "the worker comes back on its job's binding");
+        assert!(crate::dexmsg::is_dex_turn(&continue_line()) && continue_line().starts_with("[Dex-Devam] "));
+        assert_eq!(status_of(&c, cut), "running");
+        finish(&c);
+
+        // Idle at the exit: the leader comes back with no turn, the worker not at all.
+        let c = core();
+        bind_session(&c, "timur", "leader-saved", None);
+        let m = Marker { at_ms: crate::diagnostics::now_ms(), leaders: vec!["timur".into()], ..Default::default() };
+        let kept = with(&c.db, |db| kept_jobs(db, &m.busy)).unwrap();
+        agents::CAPTURE.with(|cap| *cap.borrow_mut() = Some(Vec::new()));
+        c.restart_resume_paced(m, kept, gap);
+        let starts = agents::CAPTURE.with(|cap| cap.borrow_mut().take().unwrap());
+        assert_eq!(starts.len(), 1);
+        assert_eq!(devams(&starts, "timur"), 0, "no [Dex-Devam] to an idle agent");
+        assert!(starts.iter().all(|(s, _)| !s.args.iter().any(|a| a.contains("[Dex-Devam]"))));
+        finish(&c);
+
+        // A cut worker whose start fails (the drain holds it): its job closes, the leader hears.
+        let c = core();
+        let cut = job_for(&c, "kaan", "running");
+        bind_session(&c, "kaan", "kaan-saved", Some(cut));
+        c.drain(true);
+        agents::CAPTURE.with(|cap| *cap.borrow_mut() = Some(Vec::new()));
+        c.restart_resume_paced(Marker { busy: vec!["kaan".into()], ..Default::default() }, vec![(cut, "kaan".into())], gap);
+        assert!(agents::CAPTURE.with(|cap| cap.borrow_mut().take().unwrap()).is_empty());
+        assert_eq!(status_of(&c, cut), "done_no_report");
+        c.drain(false);
+        finish(&c);
+    }
+
+    /// A worker cut before its session was named (no saved session for the job): a fresh session on
+    /// the job's own trigger, which brings the job back as its context.
+    #[test]
+    fn a_cut_worker_without_a_session_restarts_on_its_jobs_trigger() {
+        let c = core();
+        let cut = job_for(&c, "kaan", "running");
+        agents::CAPTURE.with(|cap| *cap.borrow_mut() = Some(Vec::new()));
+        c.restart_resume_paced(Marker { busy: vec!["kaan".into()], ..Default::default() }, vec![(cut, "kaan".into())], std::time::Duration::ZERO);
+        let starts = agents::CAPTURE.with(|cap| cap.borrow_mut().take().unwrap());
+        assert_eq!(starts.len(), 1);
+        assert!(!starts[0].0.args.iter().any(|a| a == "--resume"));
+        let name = with(&c.db, |db| teams::get_agent(db, "kaan")).unwrap().name;
+        assert_eq!(starts[0].0.args.last(), Some(&delegate::trigger_line(cut, &name)));
+        assert_eq!(starts[0].1, Some(cut));
+        assert_eq!(status_of(&c, cut), "running");
+        finish(&c);
+    }
+
+    /// The unplanned path: the live snapshot names the agents mid-turn, follows changes, a clean
+    /// exit removes it for good, and a stale one is ignored.
+    #[test]
+    fn live_snapshot_follows_turns_and_a_clean_exit_removes_it() {
+        let c = core();
+        open(&c, "timur");
+        open(&c, "kaan");
+        c.agent_states.hook("kaan", Some(agents::Status::Working), None);
+        let data = c.paths.data_dir.clone();
+        assert!(c.live_write());
+        let m = take_live(&data).expect("a fresh snapshot");
+        assert_eq!((m.leaders.as_slice(), m.busy.as_slice()), (&["timur".to_string()][..], &["kaan".to_string()][..]));
+        assert!(take_live(&data).is_none(), "taken once");
+        c.agent_states.hook("kaan", Some(agents::Status::Idle), None);
+        assert!(c.live_write());
+        assert!(take_live(&data).expect("rewritten on a change").busy.is_empty());
+        assert!(c.live_write());
+        assert!(!data.join(LIVE_FILE).exists(), "unchanged within the beat: not rewritten");
+        c.agent_states.hook("timur", Some(agents::Status::Working), None);
+        assert!(c.live_write());
+        assert!(data.join(LIVE_FILE).exists());
+        c.live_close();
+        assert!(!data.join(LIVE_FILE).exists(), "a clean exit removes it");
+        assert!(!c.live_write(), "and nothing writes it again");
+        assert!(!data.join(LIVE_FILE).exists());
+        write_file(&data.join(LIVE_FILE), &Marker { at_ms: crate::diagnostics::now_ms() - FRESH_MS - 1, busy: vec!["kaan".into()], ..Default::default() }).unwrap();
+        assert!(take_live(&data).is_none(), "a crash long ago reopens nothing");
+        finish(&c);
+    }
+
+    /// The planned path: the marker carries the agents mid-turn; an older marker without them reads.
+    #[test]
+    fn restart_mark_names_agents_mid_turn() {
+        let c = core();
+        open(&c, "timur");
+        open(&c, "kaan");
+        open(&c, "ayla");
+        c.agent_states.hook("kaan", Some(agents::Status::Working), None);
+        c.agent_states.hook("timur", Some(agents::Status::Waiting), None);
+        let m = c.restart_mark().unwrap();
+        let mut busy = m.busy.clone();
+        busy.sort();
+        assert_eq!(busy, ["kaan", "timur"], "idle ayla is not named");
+        assert_eq!(take(&c.paths.data_dir), Some(m));
+        std::fs::write(c.paths.data_dir.join(FILE), format!(r#"{{"atMs":{},"leaders":["timur"]}}"#, crate::diagnostics::now_ms())).unwrap();
+        assert!(take(&c.paths.data_dir).is_some_and(|m| m.busy.is_empty()));
+        finish(&c);
+    }
 }
 
 pub const FILE: &str = "dex.restart.json";
@@ -1220,22 +1413,78 @@ pub struct Marker {
     /// core starts each agent with it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub chat: std::collections::BTreeMap<String, Vec<String>>,
+    /// #1875: agents (leaders and workers) whose PTY ran mid-turn: each gets one `[Dex-Devam]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub busy: Vec<String>,
+}
+
+/// #1875: the crash-time twin of [`FILE`], rewritten while the core runs.
+pub const LIVE_FILE: &str = "dex.live.json";
+/// #1875: how often the live snapshot is looked at; written when it changed, or at least every
+/// [`LIVE_BEAT`] (its age is what tells a crash a moment ago from one days ago).
+#[cfg_attr(test, allow(dead_code))]
+const LIVE_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+const LIVE_BEAT: std::time::Duration = std::time::Duration::from_secs(30);
+/// #1875: agents come back one at a time, this far apart.
+pub const RESUME_GAP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// #1875: the one turn an agent cut mid-turn by a restart gets.
+pub fn continue_line() -> String {
+    crate::dexmsg::line(crate::dexmsg::DEVAM, "Çekirdek yeniden başladı; kaldığın yerden devam et.")
+}
+
+/// #1875: the live snapshot's writer state (`Core::live_write`).
+#[derive(Default)]
+pub(crate) struct Live {
+    /// A clean exit removed the file: nothing writes it again.
+    closed: bool,
+    /// What was written last and when.
+    last: Option<(Marker, std::time::Instant)>,
 }
 
 pub fn write(data_dir: &Path, m: &Marker) -> Result<(), String> {
-    let path = data_dir.join(FILE);
+    write_file(&data_dir.join(FILE), m)
+}
+
+fn write_file(path: &Path, m: &Marker) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(m).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The marker, once: it is removed whatever it says. None: none, unreadable, or stale.
 pub fn take(data_dir: &Path) -> Option<Marker> {
-    let path = data_dir.join(FILE);
-    let bytes = std::fs::read(&path).ok()?;
-    let _ = std::fs::remove_file(&path);
+    take_file(&data_dir.join(FILE))
+}
+
+/// #1875: the live snapshot a core that did not exit cleanly left, once; None as [`take`].
+pub fn take_live(data_dir: &Path) -> Option<Marker> {
+    take_file(&data_dir.join(LIVE_FILE))
+}
+
+fn take_file(path: &Path) -> Option<Marker> {
+    let bytes = std::fs::read(path).ok()?;
+    let _ = std::fs::remove_file(path);
     let m: Marker = serde_json::from_slice(&bytes).ok()?;
     (crate::diagnostics::now_ms().saturating_sub(m.at_ms) <= FRESH_MS).then_some(m)
+}
+
+/// #1875: the running jobs (id, worker) of the workers `busy` names — what a restart keeps running.
+pub fn kept_jobs(conn: &rusqlite::Connection, busy: &[String]) -> Result<Vec<(i64, String)>, String> {
+    let busy = serde_json::to_string(busy).map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.id, d.to_agent FROM delegations d JOIN agents a ON a.id = d.to_agent
+             WHERE d.status = 'running' AND a.kind = 'worker' AND d.to_agent IN (SELECT value FROM json_each(?1))
+             ORDER BY d.id",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt.query_map([busy], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
 }
 
 /// Per-agent deliveries and the report close deferred until their final release.
@@ -1359,15 +1608,20 @@ impl Core {
 
     /// Just before a restart's exit: the marker, with the leaders running now.
     pub fn restart_mark(&self) -> Result<Marker, String> {
+        let m = self.snapshot()?;
+        write(&self.paths.data_dir, &m)?;
+        crate::diagnostics::event("restart_mark", serde_json::json!({ "leaders": m.leaders, "chat": m.chat.len(), "busy": m.busy }));
+        Ok(m)
+    }
+
+    /// The marker of now: the leaders running, the chat queued, the agents mid-turn (#1875).
+    fn snapshot(&self) -> Result<Marker, String> {
+        // Tests: a shell stands in for the CLI (agents.rs `CAPTURE`).
+        let agents: Vec<String> = self.ptys.list().into_iter().filter(|p| p.kind == "agent" || cfg!(test)).map(|p| p.id).collect();
         let leaders = with(&self.db, |c| {
-            Ok(self
-                .ptys
-                .list()
-                .into_iter()
-                .filter(|p| p.kind == "agent" && teams::get_agent(c, &p.id).is_ok_and(|a| a.kind == "leader"))
-                .map(|p| p.id)
-                .collect::<Vec<_>>())
+            Ok(agents.iter().filter(|id| teams::get_agent(c, id).is_ok_and(|a| a.kind == "leader")).cloned().collect::<Vec<_>>())
         })?;
+        let busy = agents.into_iter().filter(|id| self.agent_states.get(id).in_turn()).collect();
         let chat = self
             .chat_queues
             .lock()
@@ -1376,42 +1630,146 @@ impl Core {
             .filter(|(_, q)| !q.is_empty())
             .map(|(a, q)| (a.clone(), q.iter().cloned().collect()))
             .collect();
-        let m = Marker { at_ms: crate::diagnostics::now_ms(), leaders, chat };
-        write(&self.paths.data_dir, &m)?;
-        crate::diagnostics::event("restart_mark", serde_json::json!({ "leaders": m.leaders, "chat": m.chat.len() }));
-        Ok(m)
+        Ok(Marker { at_ms: crate::diagnostics::now_ms(), leaders, chat, busy })
+    }
+
+    /// #1875: the live snapshot every [`LIVE_TICK`] until the core goes or exits cleanly.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn live_watch(&self) {
+        let weak = self.weak_self.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(LIVE_TICK);
+            let Some(core) = weak.upgrade() else { return };
+            if !core.live_write() {
+                return;
+            }
+        });
+    }
+
+    /// #1875: writes the live snapshot if it changed or [`LIVE_BEAT`] passed; false once closed.
+    /// Read first (the DB lock let go), written under the live lock only: no file I/O under the DB
+    /// lock, and no write after [`Core::live_close`].
+    pub(crate) fn live_write(&self) -> bool {
+        let m = match self.snapshot() {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("canlı anlık görüntü okunamadı: {e}");
+                return !self.live.lock().unwrap().closed;
+            }
+        };
+        let mut live = self.live.lock().unwrap();
+        if live.closed {
+            return false;
+        }
+        let same = live.last.as_ref().is_some_and(|(last, at)| at.elapsed() < LIVE_BEAT && Marker { at_ms: m.at_ms, ..last.clone() } == m);
+        if same {
+            return true;
+        }
+        match write_file(&self.paths.data_dir.join(LIVE_FILE), &m) {
+            Ok(()) => live.last = Some((m, std::time::Instant::now())),
+            Err(e) => log::warn!("canlı anlık görüntü yazılamadı: {e}"),
+        }
+        true
+    }
+
+    /// #1875: a clean exit — the live snapshot goes and is not written again.
+    pub(crate) fn live_close(&self) {
+        let mut live = self.live.lock().unwrap();
+        live.closed = true;
+        let _ = std::fs::remove_file(self.paths.data_dir.join(LIVE_FILE));
     }
 
     /// After a start that found a marker: its leaders again (their saved session; their queued chat
-    /// is the prompt, else their unsent notes go in once they are up), the other agents with queued
-    /// chat (#447), then the kept queue.
-    pub(crate) fn restart_resume(&self, mut m: Marker) {
+    /// is the prompt, else — cut mid-turn, #1875 — `[Dex-Devam]`, else their unsent notes go in once
+    /// they are up), the workers cut mid-job (`kept`, #1875), the other agents with queued chat
+    /// (#447), then the kept queue.
+    pub(crate) fn restart_resume(&self, m: Marker, kept: Vec<(i64, String)>) {
+        self.restart_resume_paced(m, kept, RESUME_GAP);
+    }
+
+    /// [`Core::restart_resume`], one start at a time, `gap` apart.
+    pub(crate) fn restart_resume_paced(&self, mut m: Marker, kept: Vec<(i64, String)>, gap: std::time::Duration) {
+        let mut started = false;
+        let mut pace = || {
+            if std::mem::replace(&mut started, true) {
+                std::thread::sleep(gap);
+            }
+        };
+        let busy: std::collections::HashSet<String> = m.busy.iter().cloned().collect();
         for id in &m.leaders {
             let leader = with(&self.db, |c| Ok(teams::get_agent(c, id).is_ok_and(|a| a.kind == "leader"))).unwrap_or(false);
             if !leader {
                 continue;
             }
-            let r = self.chat_start(id, m.chat.remove(id));
-            crate::diagnostics::event("restart_resume", serde_json::json!({ "agent": id, "ok": r.is_ok() }));
+            pace();
+            let nudge = busy.contains(id).then(continue_line);
+            let r = self.chat_start(id, m.chat.remove(id), nudge.clone());
+            crate::diagnostics::event("restart_resume", serde_json::json!({ "agent": id, "ok": r.is_ok(), "devam": nudge.is_some() }));
             match r {
-                Ok(false) => self.leader_notes_wake(id),
-                Ok(true) => {}
+                Ok(false) if nudge.is_none() => self.leader_notes_wake(id),
+                Ok(_) => {}
                 Err(e) => eprintln!("dex: {id}: yeniden başlatma sonrası açılamadı: {e}"),
             }
         }
+        for (job, id) in kept {
+            pace();
+            // Patron chat the gate held is this session's turn; else the one `[Dex-Devam]`.
+            let r = match m.chat.remove(&id) {
+                Some(chat) => self.chat_start(&id, Some(chat), None).map(drop),
+                None => self.worker_continue(&id, job),
+            };
+            crate::diagnostics::event("restart_resume", serde_json::json!({ "agent": id, "job": job, "ok": r.is_ok() }));
+            if let Err(e) = r {
+                eprintln!("dex: {id}: #{job} yeniden başlatma sonrası sürdürülemedi: {e}");
+                if let Err(e) = crate::delegate::close_unresumed(&self.db, &self.events, job, &e) {
+                    log::error!("#{job} kapatılamadı: {e}");
+                }
+            }
+        }
         for (id, chat) in m.chat {
-            if let Err(e) = self.chat_start(&id, Some(chat)) {
+            pace();
+            if let Err(e) = self.chat_start(&id, Some(chat), None) {
                 eprintln!("dex: {id}: sıradaki sohbet yeniden başlatma sonrası iletilemedi: {e}");
             }
         }
         self.dispatch_queued();
     }
 
+    /// #1875: the worker's session of running `job` again — `--resume` of the session bound to that
+    /// job (its worktree, env, effort) with the one `[Dex-Devam]` turn. Its session lost (none
+    /// recorded, or the CLI cannot find it): a fresh one on the job's trigger (the job comes again
+    /// as its context; it goes on in the same worktree).
+    fn worker_continue(&self, id: &str, job: i64) -> Result<(), String> {
+        let (session, name) = with(&self.db, |c| {
+            let session = c
+                .query_row(
+                    "SELECT session_id FROM agent_sessions WHERE agent_id = ?1 AND delegation_id = ?2 AND session_id <> ''",
+                    rusqlite::params![id, job],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            Ok((session, teams::get_agent(c, id)?.name))
+        })?;
+        let trigger = crate::delegate::trigger_line(job, &name);
+        let options = match session {
+            Some(session) => agents::StartOptions {
+                prompt: Some(continue_line()),
+                resume: Some(session),
+                fallback_prompt: Some(trigger),
+                ..Default::default()
+            },
+            None => agents::StartOptions { prompt: Some(trigger), delegation_id: Some(job), fresh: true, ..Default::default() },
+        };
+        self.agent_start(id, options).map(drop)
+    }
+
     /// #447: `chat` (queued before a restart, or while the gate held it) goes in as the start's
-    /// prompt; `true` if there was some. Not started: back into the agent's queue.
-    fn chat_start(&self, id: &str, chat: Option<Vec<String>>) -> Result<bool, String> {
+    /// prompt; `true` if there was some. #1875: none — `nudge` is. Not started: chat back into the
+    /// agent's queue.
+    fn chat_start(&self, id: &str, chat: Option<Vec<String>>, nudge: Option<String>) -> Result<bool, String> {
         let chat = chat.filter(|c| !c.is_empty());
-        let prompt = chat.as_ref().map(|c| c.join("\n\n"));
+        let prompt = chat.as_ref().map(|c| c.join("\n\n")).or(nudge);
         match self.agent_start(id, agents::StartOptions { prompt, ..Default::default() }) {
             Ok(_) => Ok(chat.is_some()),
             Err(e) => {
@@ -1437,7 +1795,7 @@ impl Core {
             }
             let queued = self.chat_queues.lock().unwrap().get_mut(&a).map(|q| q.drain(..).collect());
             self.emit_queue(&a, &[]);
-            if let Err(e) = self.chat_start(&a, queued) {
+            if let Err(e) = self.chat_start(&a, queued, None) {
                 eprintln!("dex: {a}: sıradaki sohbet iletilemedi: {e}");
             }
         }
