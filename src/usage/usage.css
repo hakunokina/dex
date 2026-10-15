@@ -68,9 +68,11 @@
 }
 /* #2034: üst başlık — pencere düğmelerinin solunda kendine ayrılmış yatay alan; takım çipleri
  * (.topbar-rack, flex:1 taban 0) kalan yeri alır, şerit yalnız o da bitince daralıp yana kayar.
- * Zemin başlığın kendisi; yükseklik başlığa sığar, halkalar küçülür. */
+ * Zemin başlığın kendisi; yükseklik başlığa sığar, halkalar küçülür.
+ * #2043: isolation yok — yoksa fixed kartın --z-team-pop değeri şeridin içinde kalır, sahne
+ * (terminal, host bandı, yüzen gruplar) aşağı açılan kartı örter. ::before burada yok. */
 .usage-strip.top {
-  position: relative; z-index: auto; inset: auto; flex: 0 1 auto; min-width: 0;
+  position: relative; z-index: auto; isolation: auto; inset: auto; flex: 0 1 auto; min-width: 0;
   width: auto; height: 100%; max-height: none; margin: 0;
   flex-direction: row; align-items: center; gap: var(--sp-3);
   overflow-x: auto; overflow-y: hidden; padding: 0 var(--sp-2);

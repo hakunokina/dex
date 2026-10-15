@@ -221,6 +221,8 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
   const team = await newTeam(dexd, `Şerit konum ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   await app.addInitScript(fakeUsage, LIVE);
+  // Çekirdek sürüm bandı (host-warn, z --z-banner) açık: kart sahnedeki bant ve terminalin üstünde kalmalı.
+  await app.addInitScript(() => { window.__dexOld = { ...window.__dexOld, commit: "0ld0000000", commitTime: 1 }; });
   await app.evaluate(() => { localStorage.removeItem("dex.usageStrip"); localStorage.removeItem("dex.usageStripPlace"); });
   await app.reload();
   await openTeam(app, team.name);
@@ -254,6 +256,15 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
     await ring.hover();
     const card = app.locator('[data-card="anthropic"]');
     await expect(card).toBeVisible();
+    // #2043: toBeVisible örtülmeyi görmez — kartın ortasında ve üst kenarında (bandın denk geldiği yer)
+    // en üstteki öğe kartın kendisi olmalı.
+    expect(await card.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return [r.top + r.height / 2, r.top + 4].map((y) => {
+        const top = document.elementFromPoint(r.left + r.width / 2, y);
+        return top ? el.contains(top) || top.className.toString() : "yok";
+      });
+    })).toEqual([true, true]);
     const [c, rb] = [await card.boundingBox(), await ring.boundingBox()];
     return { c: c!, ring: rb! };
   };
@@ -273,6 +284,7 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
 
   // Üst başlık: pencere düğmelerinin hemen solunda, başlığa sığar; takım çipleri şeridin solunda biter.
   await choose("Üst başlık", "top");
+  await expect(app.locator(".team-stage:not(.hidden) .host-banner")).toBeVisible();
   for (const width of [2560, 1280]) {
     await app.setViewportSize({ width, height: 900 });
     g = await geo();
