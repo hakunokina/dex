@@ -401,7 +401,8 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
   const chat = chatSupported(agentId);
   // #212: güncel context doluluğu; eski dexd'de null (gizli). Kırmızı eşikte "Temiz oturum" vurgulanır.
   const ctx = useAgentContext(teamId, agentId);
-  const urgent = !!ctx && ctx.updatedAt !== null && contextLevel(ctx.tokens) === "critical";
+  const level = ctx && ctx.updatedAt !== null ? contextLevel(ctx.tokens) : "ok";
+  const urgent = level === "critical";
   const view = chat ? picked : "term";
   const [chatOpen, setChatOpen] = useState(false);
   const showChat = (v: "term" | "chat") => {
@@ -436,7 +437,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
         </button>
       )}
       {agent?.kind === "leader" && view === "term" && (
-        <button className={`pane-reset${urgent ? " urgent" : ""}`} disabled={!!reset || asking} onClick={() => void resetSession()}
+        <button className={`pane-reset ctx-${level}${urgent ? " urgent" : ""}`} disabled={!!reset || asking} onClick={() => void resetSession()}
           title="Lider devir notunu hafızasına yazar, sonra temiz oturumla yeniden başlar (konuşma geçmişi taşınmaz)">
           <RotateCcw /> Temiz oturum
         </button>

@@ -356,12 +356,12 @@ svg.lucide { width: var(--icon); height: var(--icon); stroke-width: var(--icon-s
 .pane-view-toggle button svg { width: 13px; height: 13px; }
 .pane-view-toggle button.on { background: var(--surface-3); color: var(--text); }
 /* #22: worker pane watch-only ↔ write switch, at the row's right end; write mode is marked red. */
-.pane-view-toggle .pane-write, .pane-view-toggle .pane-reset { margin-left: auto; }
+.pane-view-toggle .pane-write { margin-left: auto; }
 .pane-view-toggle .pane-reset:disabled { opacity: .5; cursor: default; }
 .pane-view-toggle .pane-write.on svg { color: var(--red); }
 /* #212: context fill — absolute token thresholds (contextFormat.ts); the row's right end, before reset/write. */
 .pane-view-toggle .ctx-meter {
-  display: flex; align-items: center; gap: 6px; min-width: 0; margin-left: auto; padding: 0 6px;
+  display: flex; align-items: center; gap: 6px; min-width: 0; margin-left: var(--sp-2); padding: 0 6px;
   border-radius: var(--r-sm); color: var(--text-2); font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
@@ -375,6 +375,10 @@ svg.lucide { width: var(--icon); height: var(--icon); stroke-width: var(--icon-s
 .ctx-meter.ctx-high .ctx-bar > span { background: var(--orange); }
 .ctx-meter.ctx-critical { color: var(--red-hi); font-weight: var(--fw-semibold); }
 .ctx-meter.ctx-critical .ctx-bar > span { background: var(--red); }
+/* Temiz oturum: context göstergesiyle aynı eşik rengi (urgent ayrıca zemin alır). */
+.pane-view-toggle .pane-reset.ctx-warn { color: var(--amber); }
+.pane-view-toggle .pane-reset.ctx-high { color: var(--orange); }
+.pane-view-toggle .pane-reset.ctx-critical { color: var(--red-hi); font-weight: var(--fw-semibold); }
 .pane-view-toggle .pane-reset.urgent { color: var(--red-hi); background: var(--red-soft); box-shadow: inset 0 0 0 1px var(--red-line); }
 /* S5-B: the chat fills the pane body (the terminal stays mounted, CSS-hidden). */
 .chat-host { position: absolute; inset: 0; display: flex; min-height: 0; }
