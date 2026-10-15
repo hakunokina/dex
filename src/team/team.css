@@ -205,7 +205,7 @@
 /* #151: the local core's start error sits before its button, which keeps the right edge. */
 .host-banner .core-start-err { margin-left: auto; color: var(--red); }
 .host-banner .core-start-err + button { margin-left: 0; }
-.host-banner .core-drift-actions { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+.host-banner .core-drift-actions { margin-left: var(--sp-2); display: flex; gap: 6px; align-items: center; }
 .host-banner .core-drift-actions button { margin-left: 0; }
 .host-empty .core-start-err { color: var(--red); white-space: normal; }
 /* #203: why the core is down — one line, the whole text on hover. */
