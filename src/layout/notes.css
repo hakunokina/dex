@@ -17,3 +17,84 @@
 .md-mark { color: var(--muted); }
 .md-q { color: var(--muted); }
 .md-code { color: var(--amber); }
+
+/* #2040: notes tab name — red while the page holds something, white (the text token) while empty. */
+.notes-tab-name { color: var(--text); }
+.notes-tab-name.filled { color: var(--red-hi); }
+
+/* #2040: the team page — band, the note, the leader appends under it. */
+.team-notes { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--surface-1); }
+.team-notes > .notes { flex: 1 1 auto; height: auto; min-height: 96px; }
+.notes-band { flex: none; }
+.notes-appends {
+  flex: none; max-height: 55%; overflow-y: auto; display: flex; flex-direction: column; gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3) var(--sp-3); border-top: 1px solid var(--line); background: var(--surface-2);
+}
+.notes-appends-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; }
+.notes-appends-head h3 { margin: 0; font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-2); }
+.notes-append { display: flex; flex-direction: column; gap: 2px; }
+.notes-append label { font-size: var(--fs-sm); color: var(--text); }
+.notes-append textarea {
+  width: 100%; min-height: 44px; resize: vertical; box-sizing: border-box;
+  padding: var(--sp-1) var(--sp-2); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface-1); color: var(--text); font: var(--fw-regular) var(--fs-sm)/var(--lh) var(--font-ui);
+}
+.notes-append textarea[aria-invalid="true"] { border-color: var(--red-line); }
+.notes-hint { margin: 0; font-size: var(--fs-xs); color: var(--text-2); line-height: var(--lh); }
+.notes-err { margin: 0; font-size: var(--fs-xs); color: var(--red-hi); line-height: var(--lh); }
+.notes-btn {
+  display: inline-flex; align-items: center; gap: var(--sp-1); min-height: var(--ctl-h); padding: 0 var(--sp-2);
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: transparent; color: var(--text);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.notes-btn svg { width: 14px; height: 14px; }
+.notes-btn:hover:not(:disabled) { background: var(--hover); }
+.notes-btn:disabled { opacity: 0.5; cursor: default; }
+.notes-btn.primary { border-color: var(--red-line); background: var(--red-soft); }
+.notes-btn.danger { color: var(--red-hi); border-color: var(--red-line); }
+:is(.notes-appends, .pp) :is(button, textarea):focus-visible { outline: 2px solid var(--text-2); outline-offset: 2px; }
+
+/* #2040: "Dex istemleri" overlay — part list | text. Stacks on a narrow window. */
+.pp-backdrop {
+  position: fixed; inset: 0; z-index: var(--z-palette); display: flex; align-items: center; justify-content: center;
+  padding: var(--sp-4); background: var(--scrim);
+}
+.pp {
+  width: min(980px, 100%); height: min(720px, 100%); display: flex; flex-direction: column; min-height: 0;
+  background: var(--surface-pop); border-radius: var(--r-lg); box-shadow: var(--shadow-pop); outline: none; overflow: hidden;
+}
+.pp-head { display: flex; align-items: center; justify-content: space-between; padding: var(--sp-2) var(--sp-2) var(--sp-2) var(--sp-4); border-bottom: 1px solid var(--line); }
+.pp-head h2 { margin: 0; font-size: var(--fs-lg); font-weight: var(--fw-semibold); }
+.pp-policy { margin: 0; padding: var(--sp-2) var(--sp-4); font-size: var(--fs-xs); color: var(--text-2); border-bottom: 1px solid var(--line); }
+.pp-state { margin: var(--sp-4); font-size: var(--fs-sm); color: var(--text-2); }
+.pp-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(200px, 260px) 1fr; }
+.pp-list { margin: 0; padding: var(--sp-1); list-style: none; overflow-y: auto; border-right: 1px solid var(--line); }
+.pp-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; min-height: 36px; text-align: left;
+  padding: var(--sp-1) var(--sp-2); border: 0; border-left: 2px solid transparent; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-2); cursor: pointer;
+}
+.pp-item:hover { background: var(--hover); color: var(--text); }
+.pp-item.on { background: var(--press); color: var(--text); border-left-color: var(--red); border-radius: 0 var(--r-sm) var(--r-sm) 0; }
+.pp-item-title { font-size: var(--fs-sm); }
+.pp-dot { color: var(--amber); }
+.pp-tags { display: flex; flex-wrap: wrap; gap: var(--sp-1); }
+.pp-tag { display: inline-flex; align-items: center; padding: 0 5px; border-radius: var(--r-xs); background: var(--surface-3); color: var(--text-2); font-size: var(--fs-2xs); line-height: 16px; }
+.pp-tag svg { width: 10px; height: 10px; }
+.pp-tag-on { background: var(--red-soft); color: var(--red-hi); }
+.pp-detail { display: flex; flex-direction: column; gap: var(--sp-2); min-width: 0; min-height: 0; padding: var(--sp-3) var(--sp-4); }
+.pp-meta h3 { margin: 0; font-size: var(--fs-md); font-weight: var(--fw-semibold); }
+.pp-meta > span { font-size: var(--fs-xs); color: var(--text-2); }
+.pp-note { margin: var(--sp-1) 0 0; font-size: var(--fs-xs); color: var(--amber); }
+.pp-text {
+  flex: 1; min-height: 120px; resize: none; padding: var(--sp-2); border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  background: var(--surface-1); color: var(--text); font: var(--fs-sm)/var(--lh) var(--font-mono); white-space: pre-wrap;
+}
+.pp-text[readonly] { color: var(--text-2); }
+.pp-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--sp-2); }
+.pp-confirm { flex: 1 1 200px; font-size: var(--fs-xs); color: var(--amber); }
+@media (max-width: 640px) {
+  .pp-backdrop { padding: var(--sp-2); }
+  .pp-body { grid-template-columns: 1fr; grid-template-rows: minmax(0, 35%) 1fr; }
+  .pp-list { border-right: 0; border-bottom: 1px solid var(--line); }
+}
