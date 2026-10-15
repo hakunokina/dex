@@ -1,43 +1,66 @@
-// #54: kullanım şeridinin durumu. Veri yerel çekirdeğin köprüsünden (usage_get + usage_snapshot olayı;
-// poll yok); görünürlük bu cihazın tercihi (localStorage, varsayılan açık).
-import { useSyncExternalStore } from "react";
-import { callLocal, LOCAL, transportOf } from "../api/hosts";
-import { hasLocalCore } from "../api/platform";
-import { OFFLINE, type UsageSnapshot } from "./types";
+// #54/#1861: kullanım şeridinin durumu. Veri sunucudan (dexd usage_get + usage-snapshot olayı; poll
+// yok), sunucu başına; şerit etkin takımın sunucusunu gösterir. Görünürlük bu cihazın tercihi
+// (localStorage, varsayılan açık).
+import { useEffect, useSyncExternalStore } from "react";
+import { callHost, hostSupports, onHostUp } from "../api/hosts";
+import { kept, listenKept } from "../hot";
+import type { UsageSnapshot, UsageStatus } from "./types";
 
-const EVENT = "usage_snapshot";
 const KEY = "dex.usageStrip";
 const VISIBLE_EVENT = "dex:usage-strip";
+const hot = import.meta.hot;
 
-let snap: UsageSnapshot = OFFLINE;
-let started = false;
-const subs = new Set<() => void>();
-const set = (s: UsageSnapshot) => {
-  snap = s;
-  for (const f of subs) f();
-};
-
-function start() {
-  if (started) return;
-  started = true;
-  // Olay önce: usage_get ile ilk olay arasında gelen veri kaybolmasın. Komut yoksa (tarayıcı/e2e
-  // köprüsü, uzak çekirdek) şerit "TM bağlı değil"de kalır.
-  if (!hasLocalCore) return;
-  try {
-    void transportOf(LOCAL).on<UsageSnapshot>(EVENT, (e) => set(e.payload)).catch(() => {});
-  } catch { /* no Tauri: stays offline */ }
-  callLocal<UsageSnapshot>("usage_get").then((s) => { if (snap === OFFLINE) set(s); }, () => {});
+export interface UsageView {
+  status: UsageStatus;
+  snap: UsageSnapshot | null;
 }
 
+const CONNECTING: UsageView = { status: "connecting", snap: null };
+const views = kept(hot, "usageViews", () => new Map<string, UsageView>());
+const watched = kept(hot, "usageWatched", () => new Map<string, number>());
+const subs = kept(hot, "usageSubs", () => new Set<() => void>());
+const set = (host: string, v: UsageView) => {
+  views.set(host, v);
+  subs.forEach((f) => f());
+};
+
+async function load(host: string) {
+  if (!hostSupports(host, "usage_get")) return set(host, { status: "unsupported", snap: null });
+  try {
+    const snap = await callHost<UsageSnapshot>(host, "usage_get");
+    // Yükleme sürerken gelen olay daha yeni: onu ezme.
+    const cur = views.get(host)?.snap;
+    if (!cur || cur.updatedAt <= snap.updatedAt) set(host, { status: "live", snap });
+  } catch (e) {
+    const old = views.get(host);
+    set(host, String(e).includes("bilinmeyen metot") ? { status: "unsupported", snap: null } : { status: old?.snap ? "live" : "offline", snap: old?.snap ?? null });
+  }
+}
+
+// usage_get'i bilmeyen (eski) sunucu bu olayı yaymaz; yükseltilmiş sunucu yeniden bağlanınca onHostUp yükler.
+listenKept<UsageSnapshot>(hot, "usage-snapshot", ({ payload }, host) => {
+  if (views.get(host)?.status !== "unsupported") set(host, { status: "live", snap: payload });
+});
+kept(hot, "usageUp", () => onHostUp((host) => { if (watched.has(host)) void load(host); }));
+
 function subscribe(f: () => void) {
-  start();
   subs.add(f);
   return () => void subs.delete(f);
 }
 
-export const useUsage = () => useSyncExternalStore(subscribe, () => snap);
-
-export const setHubSecret = (secret: string) => callLocal<void>("usage_hub_secret_set", { secret });
+/** `host`'un kullanım görüntüsü; izlenmeye ilk başlayan yükler. */
+export function useUsage(host: string): UsageView {
+  useEffect(() => {
+    watched.set(host, (watched.get(host) ?? 0) + 1);
+    if (!views.has(host) || views.get(host)!.status !== "live") void load(host);
+    return () => {
+      const n = (watched.get(host) ?? 1) - 1;
+      if (n > 0) watched.set(host, n);
+      else watched.delete(host);
+    };
+  }, [host]);
+  return useSyncExternalStore(subscribe, () => views.get(host) ?? CONNECTING);
+}
 
 export function stripVisible(): boolean {
   try {

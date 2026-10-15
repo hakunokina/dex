@@ -24,7 +24,6 @@
 .usage-cap { font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
 .usage-big { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text); line-height: 1.2; }
 .usage-sub { font-size: var(--fs-xs); color: var(--text-2); }
-.usage-rate.idle .usage-big { color: var(--muted); }
 /* #311: GPU hücresi — sahip (boş/LLM/iş), bugün kullanılan/limit, kuyruk. */
 .usage-gpu { cursor: default; }
 .usage-gpu.warn .usage-gpu-daily { color: var(--amber); }
@@ -35,6 +34,8 @@
 .usage-ring svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .usage-ring-track { fill: none; stroke: var(--surface-3); stroke-width: 3; }
 .usage-ring-fill { fill: none; stroke: var(--ring-color); stroke-width: 3; stroke-linecap: round; transition: stroke-dasharray 0.3s ease; }
+/* #1861: iç yay haftalık pencere — daha ince, dış yay (5 saat) öne çıksın. */
+.usage-ring [data-window="weekly"] circle { stroke-width: 2; }
 /* Logo maske olarak boyanır (TM dock'u gibi metin renginde); logosu olmayana baş harf. */
 .usage-mark {
   position: relative; width: 15px; height: 15px; background-color: var(--text);
@@ -47,11 +48,11 @@
 .usage-prov.low .usage-pct { color: var(--amber); }
 .usage-prov.critical .usage-pct { color: var(--red-hi); }
 .usage-prov.unknown .usage-pct { color: var(--muted); }
+.usage-pct-week { font-size: 9px; color: var(--muted); line-height: 1; }
 .usage-off {
   display: flex; flex-direction: column; align-items: center; gap: var(--sp-2); width: 100%;
-  padding: var(--sp-2) 0; border: 0; background: none; color: var(--muted); cursor: pointer;
+  padding: var(--sp-2) 0; color: var(--muted); cursor: default;
 }
-.usage-off:hover { color: var(--text-2); background: var(--hover); }
 .usage-off span { writing-mode: vertical-rl; font-size: var(--fs-xs); white-space: nowrap; }
 
 /* #118: sağlayıcı hover kartı (TM edge panelindeki Muse kartı): koyu yuvarlak kart, halkanın
@@ -69,10 +70,6 @@
 }
 .usage-card-glyph { font-size: 14px; font-weight: 700; line-height: 1; color: var(--text); }
 .usage-card-name { flex: 1; min-width: 0; font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.usage-card-badge {
-  flex: none; padding: 1px 6px; border-radius: var(--r-pill); background: var(--amber-soft);
-  border: 1px solid var(--amber-line); color: var(--amber); font-size: var(--fs-xs);
-}
 .usage-card-updated { margin-top: 2px; font-size: var(--fs-xs); color: var(--muted); }
 .usage-card-win { margin-top: var(--sp-2); display: flex; flex-direction: column; gap: 4px; }
 .usage-card-winrow { display: flex; align-items: baseline; justify-content: space-between; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); }
@@ -80,7 +77,8 @@
 .usage-card-bar { height: 3px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
 .usage-card-bar i { display: block; height: 100%; background: var(--ring-color); border-radius: inherit; }
 .usage-card-reset { font-size: var(--fs-xs); color: var(--muted); }
-.usage-card-empty { margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--muted); }
+.usage-card-empty { margin-top: var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); }
+.usage-card-today { margin-top: var(--sp-2); font-size: var(--fs-xs); color: var(--text-2); }
 /* Halkaya bakan küçük ok: kartın sağ kenarında, halka hizasında (kart dikey ortalıysa orta). */
 .usage-card-arrow {
   position: absolute; right: -5px; width: 8px; height: 8px; transform: translateY(-50%) rotate(45deg);

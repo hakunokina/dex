@@ -1,7 +1,7 @@
 // #118: hover kartı metinleri.
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { WINDOW_SHORT, resetShort, updatedAgo } from "./format.ts";
+import { resetShort, severity, updatedAgo } from "./format.ts";
 
 describe("updatedAgo", () => {
   it("null boş döner", () => assert.equal(updatedAgo(null, 1_000), ""));
@@ -26,9 +26,16 @@ describe("resetShort", () => {
   });
 });
 
-describe("WINDOW_SHORT", () => {
-  it("TM kind → Türkçe", () => {
-    assert.equal(WINDOW_SHORT.session, "Oturum");
-    assert.equal(WINDOW_SHORT.weekly, "Haftalık");
+describe("severity", () => {
+  const p = (five: number | null, week: number | null) => ({
+    id: "glm", note: null, measuredAt: null, todayTokens: null,
+    fiveHour: five === null ? null : { remainingPercent: five, resetsAt: null },
+    weekly: week === null ? null : { remainingPercent: week, resetsAt: null },
+  });
+  it("ölçüm yoksa unknown", () => assert.equal(severity(p(null, null)), "unknown"));
+  it("az kalan pencere belirler", () => {
+    assert.equal(severity(p(90, 8)), "critical");
+    assert.equal(severity(p(20, 90)), "low");
+    assert.equal(severity(p(null, 60)), "ok");
   });
 });

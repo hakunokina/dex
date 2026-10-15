@@ -1,38 +1,38 @@
-// #54: sağ kenar kullanım şeridi. e2e köprüsünde usage_get yok (dexd'de CLIENT_ONLY) → şerit
-// "TM bağlı değil"de açılır; Rust köprüsünün olayı (usage_snapshot) taklit edilince veriyi çizer;
-// Ayarlar → Genel'den kapanır/açılır. #139: şerit yer ayırmaz, sahnenin üstünde yüzer.
+// #54/#1861: sağ kenar kullanım şeridi. Veri dexd'den (usage_get + usage-snapshot olayı): sağlayıcı
+// başına 5 saatlik (dış yay) ve haftalık (iç yay) kalan kota, bugünün token'ı. Ayarlar → Genel'den
+// kapanır/açılır. #139: şerit yer ayırmaz, sahnenin üstünde yüzer.
 import { test, expect, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
+// Gerçek ölçüm makinenin kimliklerine bağlı: görüntü __dexFake ile verilir (measuredAt sayfada damgalanır).
 const LIVE = {
-  source: "token-monitor",
-  status: "live",
-  tokPerSec: 113.2,
-  rateAt: 0, // test içinde Date.now()
-  todayTokens: 221_700_000,
-  todayCostUsd: 94.04,
   providers: [
-    { id: "claude", remainingPercent: 66, window: "session", resetsAt: "2099-01-01T12:00:00.000Z" },
-    { id: "openai", remainingPercent: 97, window: "weekly", resetsAt: null },
-    { id: "codex", remainingPercent: 50, window: "weekly", resetsAt: null },
-    { id: "muse", remainingPercent: null, window: null, resetsAt: null },
-    { id: "zai", remainingPercent: 100, window: "session", resetsAt: null },
-    { id: "acme-code", remainingPercent: 40, window: "daily", resetsAt: null },
+    { id: "anthropic", fiveHour: { remainingPercent: 66, resetsAt: "2099-01-01T12:00:00.000Z" }, weekly: { remainingPercent: 41, resetsAt: "2099-01-05T00:00:00.000Z" }, note: null as string | null, measuredAt: 0 as number | null, todayTokens: 200_000_000 },
+    { id: "glm", fiveHour: { remainingPercent: 100, resetsAt: null }, weekly: { remainingPercent: 8, resetsAt: null }, note: null, measuredAt: 0, todayTokens: 21_700_000 },
+    { id: "muse", fiveHour: null, weekly: null, note: "Muse anahtar ucu kullanım bildirmiyor", measuredAt: null, todayTokens: 0 },
   ],
-  hasSecret: true,
+  todayTokens: 221_700_000,
   updatedAt: 0,
 };
 
-test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ayarlar → Genel'den kapanır", async ({ app, dexd }) => {
+const fakeUsage = (s: typeof LIVE) => {
+  const now = Date.now();
+  window.__dexFake = {
+    ...window.__dexFake,
+    usage_get: { ...s, updatedAt: now, providers: s.providers.map((p) => ({ ...p, measuredAt: p.fiveHour || p.weekly ? now : null })) },
+  };
+};
+
+test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla güncellenir, Ayarlar → Genel'den kapanır", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Şerit ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
+  await app.addInitScript(fakeUsage, LIVE);
   await app.evaluate(() => localStorage.removeItem("dex.usageStrip"));
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
 
   const strip = app.getByRole("complementary", { name: "Kullanım şeridi" });
-  await expect(strip).toHaveAttribute("data-status", "offline");
-  await expect(strip).toContainText("TM bağlı değil");
+  await expect(strip).toHaveAttribute("data-status", "live");
 
   // #139: şerit yer ayırmaz — sahne (dockview) tam genişlikte, şerit sağ kenarda onun üstünde;
   // yarı saydam arka plan, fare yalnız şeridin kutusunda (yanındaki terminal tıklanabilir).
@@ -62,19 +62,19 @@ test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ay
   expect(edges.bg).toMatch(/(rgba|color)\(.*[ /,]\s*0?\.\d+\)$/); // yarı saydam
   expect(edges.z).toBeLessThan(90); // yüzen dockview gruplarının (--z-float) altında
 
-  await app.evaluate((s) => {
-    const now = Date.now();
-    const w = window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } };
-    return w.__TAURI_INTERNALS__.invoke("plugin:event|emit", { event: "usage_snapshot", payload: { ...s, rateAt: now, updatedAt: now } });
-  }, LIVE);
-  await expect(strip).toHaveAttribute("data-status", "live");
-  await expect(strip).toContainText("113");
+  // Bugünün token'ı; tok/s ve $ yok (gerçek kaynakları yok).
   await expect(strip).toContainText("221.7M");
-  await expect(strip).toContainText("$94.0");
-  const claude = strip.locator('[data-provider="claude"]');
-  await expect(claude).toContainText("66%");
-  await expect(claude).toHaveAttribute("title", /Claude — 5 saatlik pencere: %66 kalan\nsıfırlanma/);
-  await expect(strip.locator('[data-provider="muse"]')).toContainText("--");
+  await expect(strip).not.toContainText("tok/s");
+  await expect(strip).not.toContainText("$");
+  const claude = strip.locator('[data-provider="anthropic"]');
+  await expect(claude.locator('.usage-pct[data-window="fiveHour"]')).toHaveText("66%");
+  await expect(claude.locator('.usage-pct[data-window="weekly"]')).toHaveText("41%");
+  await expect(claude).toHaveAttribute("title", /^Claude\n5 saat: %66 kalan, sıfırlanma .+\nHaftalık: %41 kalan, sıfırlanma /);
+  // Ton iki pencereden az kalanına göre: GLM'in haftalığı %8 → kritik.
+  await expect(strip.locator('[data-provider="glm"]')).toHaveClass(/critical/);
+  const muse = strip.locator('[data-provider="muse"]');
+  await expect(muse.locator(".usage-pct")).toHaveText(["--", "--"]);
+  await expect(muse).toHaveAttribute("title", "Muse Code — şu an veri yok (Muse anahtar ucu kullanım bildirmiyor)");
 
   // #118: şerit sağa yaslı ama dikeyde ortalı (içerik kısayken üstte değil ortada yüzer).
   const centered = await app.evaluate(() => {
@@ -85,15 +85,18 @@ test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ay
   expect(centered.top).toBeGreaterThan(0);
   expect(Math.abs(centered.top - centered.bottom)).toBeLessThan(2);
 
-  // #118: hover kartı — her halkada TM Muse tarzı sade kart (ad + güncellenme + pencere).
+  // #118: hover kartı — iki pencere satırı + bugünün token'ı.
   await claude.hover();
-  const card = app.locator('[data-card="claude"]');
+  const card = app.locator('[data-card="anthropic"]');
   await expect(card).toBeVisible();
   await expect(card).toContainText("Claude");
-  await expect(card).toContainText("Oturum");
-  await expect(card).toContainText("%66 kaldı");
+  await expect(card.locator('[data-window="fiveHour"]')).toContainText("5 saat");
+  await expect(card.locator('[data-window="fiveHour"]')).toContainText("%66 kaldı");
+  await expect(card.locator('[data-window="weekly"]')).toContainText("Haftalık");
+  await expect(card.locator('[data-window="weekly"]')).toContainText("%41 kaldı");
   await expect(card).toContainText(/Sıfırlanma/);
   await expect(card).toContainText(/önce güncellendi|az önce güncellendi/);
+  await expect(card).toContainText("Bugün 200.000.000 token");
   // Kart pencere içinde: sağ kenar şeridin solunda, tamamı görünür alanda.
   const cardBox = await card.boundingBox();
   const stripBox = await strip.boundingBox();
@@ -101,38 +104,42 @@ test("Kullanım şeridi: TM yokken 'TM bağlı değil', olayla veriyi çizer, Ay
   expect(cardBox!.y).toBeGreaterThanOrEqual(0);
   const vh = await app.evaluate(() => innerHeight);
   expect(cardBox!.y + cardBox!.height).toBeLessThanOrEqual(vh);
-  // Penceresiz sağlayıcıda kart durum metnini gösterir.
-  await strip.locator('[data-provider="muse"]').hover();
+  // Ölçümsüz sağlayıcıda kart nedeni gösterir.
+  await muse.hover();
   const museCard = app.locator('[data-card="muse"]');
   await expect(museCard).toBeVisible();
   await expect(museCard).toContainText("Muse Code");
-  await expect(museCard).toContainText("şu an veri yok");
+  await expect(museCard).toContainText("şu an veri yok — Muse anahtar ucu kullanım bildirmiyor");
 
-  // TM dock'u gibi logolar: bilinen sağlayıcıda maske-boyalı logo, bilinmeyende baş harf; halka
-  // marka renginde, siyah markalı (z.ai) halka koyu yüzeyde metin rengine düşer.
+  // TM dock'u gibi logolar: maske-boyalı logo; dış yay 5 saat, iç yay haftalık, marka renginde;
+  // siyah markalı (z.ai) halka koyu yüzeyde metin rengine düşer; ölçümsüzde dolgu yok.
   const marks = await app.evaluate(() => [...document.querySelectorAll<HTMLElement>(".usage-prov")].map((p) => {
-    const mark = p.querySelector<HTMLElement>(".usage-mark");
-    const box = (mark ?? p.querySelector<HTMLElement>(".usage-glyph"))!.getBoundingClientRect();
-    const fill = p.querySelector(".usage-ring-fill");
-    return {
-      id: p.dataset.provider,
-      mask: mark ? getComputedStyle(mark).maskImage : null,
-      glyph: p.querySelector(".usage-glyph")?.textContent ?? null,
-      ring: fill ? getComputedStyle(fill).stroke : null,
-      size: Math.round(box.width),
+    const mark = p.querySelector<HTMLElement>(".usage-mark")!;
+    const fill = (w: string) => {
+      const c = p.querySelector(`[data-window="${w}"] .usage-ring-fill`);
+      return c ? getComputedStyle(c).stroke : null;
     };
+    return { id: p.dataset.provider, mask: getComputedStyle(mark).maskImage, size: Math.round(mark.getBoundingClientRect().width), five: fill("fiveHour"), week: fill("weekly") };
   }));
-  // #1713: TM'nin Codex kaydı şeritte gösterilmez.
-  expect(marks.map((m) => m.id)).toEqual(["claude", "openai", "muse", "zai", "acme-code"]);
-  for (const m of marks.slice(0, 4)) {
+  expect(marks.map((m) => m.id)).toEqual(["anthropic", "glm", "muse"]);
+  for (const m of marks) {
     expect(m.mask, m.id).toMatch(/^url\(/);
     expect(m.size, m.id).toBe(15);
   }
-  expect(marks[4]).toMatchObject({ mask: null, glyph: "A" });
-  expect(marks[0].ring).toBe("rgb(204, 124, 94)");
-  expect(marks[1].ring).toBe("rgb(73, 163, 176)");
-  expect(marks[2].ring, "veri yok: dolgu yok").toBeNull();
-  expect(marks[3].ring, "--text").toBe("rgb(213, 216, 221)");
+  expect(marks[0]).toMatchObject({ five: "rgb(204, 124, 94)", week: "rgb(204, 124, 94)" });
+  expect(marks[1].five, "--text").toBe("rgb(213, 216, 221)");
+  expect(marks[2]).toMatchObject({ five: null, week: null });
+
+  // dexd'nin olayı görüntüyü değiştirir (poll yok).
+  await app.evaluate((s) => {
+    const now = Date.now();
+    const payload = { ...s, updatedAt: now + 1, providers: s.providers.map((p) => p.id === "glm" ? { ...p, weekly: { remainingPercent: 50, resetsAt: null }, measuredAt: now } : p) };
+    const sock = (window.__dexSockets ?? []).filter((w) => w.readyState === WebSocket.OPEN).at(-1);
+    if (!sock) throw new Error("açık soket yok");
+    sock.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ event: "usage-snapshot", payload }) }));
+  }, LIVE);
+  await expect(strip.locator('[data-provider="glm"] .usage-pct[data-window="weekly"]')).toHaveText("50%");
+  await expect(strip.locator('[data-provider="glm"]')).toHaveClass(/ok/);
 
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
   await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Genel" }).click();
@@ -156,16 +163,13 @@ test("Kullanım şeridi: GPU sahibi + günlük kullanım; gpu-waiting işe bir k
     error: null, errorKind: null, checkedAt: 1,
   };
   await app.addInitScript((o) => { window.__dexFake = { ...window.__dexFake, gpu_overview: o, gpu_request_list: [] }; }, overview);
+  await app.addInitScript(fakeUsage, LIVE);
   await app.evaluate(() => localStorage.removeItem("dex.usageStrip"));
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
-  await app.evaluate((s) => {
-    const now = Date.now();
-    const w = window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } };
-    return w.__TAURI_INTERNALS__.invoke("plugin:event|emit", { event: "usage_snapshot", payload: { ...s, rateAt: now, updatedAt: now } });
-  }, LIVE);
   const strip = app.getByRole("complementary", { name: "Kullanım şeridi" });
+  await expect(strip).toHaveAttribute("data-status", "live");
   const gpu = strip.locator(".usage-gpu");
   await expect(gpu).toHaveAttribute("data-gpu-owner", "LLM");
   await expect(gpu).toContainText("9/120");
@@ -201,8 +205,8 @@ test("Kullanım şeridi: GPU sahibi + günlük kullanım; gpu-waiting işe bir k
   await expect(toasts.filter({ hasText: "GPU bekliyor" })).toHaveCount(1);
 });
 
-// #314: GPU hücresi TM durumundan bağımsız — TM offline/yetkisizken de şeritte görünür.
-test("Kullanım şeridi: TM offline ya da yetkisizken GPU hücresi görünür", async ({ app, dexd }) => {
+// #314: GPU hücresi kullanım verisinden bağımsız — dexd usage_get bilmiyorken (eski sunucu) de görünür.
+test("Kullanım şeridi: kullanım verisi yokken GPU hücresi görünür", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Şerit GPU off ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   const overview = {
@@ -211,6 +215,7 @@ test("Kullanım şeridi: TM offline ya da yetkisizken GPU hücresi görünür", 
     error: null, errorKind: null, checkedAt: 1,
   };
   await app.addInitScript((o) => { window.__dexFake = { ...window.__dexFake, gpu_overview: o, gpu_request_list: [] }; }, overview);
+  await app.addInitScript(() => { window.__dexOld = { hide: ["usage_get"], unknown: ["usage_get"] }; });
   await app.evaluate(() => localStorage.removeItem("dex.usageStrip"));
   await app.reload();
   await openTeam(app, team.name);
@@ -218,8 +223,8 @@ test("Kullanım şeridi: TM offline ya da yetkisizken GPU hücresi görünür", 
 
   const strip = app.getByRole("complementary", { name: "Kullanım şeridi" });
   const gpu = strip.locator(".usage-gpu");
-  await expect(strip).toHaveAttribute("data-status", "offline");
-  await expect(strip).toContainText("TM bağlı değil");
+  await expect(strip).toHaveAttribute("data-status", "unsupported");
+  await expect(strip).toContainText("sunucu eski");
   await expect(gpu).toContainText("3/120");
   await expect(gpu).toContainText("1 sırada");
   const fits = () => app.evaluate(() => {
@@ -230,16 +235,4 @@ test("Kullanım şeridi: TM offline ya da yetkisizken GPU hücresi görünür", 
   expect(await fits()).toEqual({ w: 56, overflow: false });
   await gpu.focus();
   await expect(gpu).toBeFocused();
-
-  await app.evaluate(() => {
-    const w = window as unknown as { __TAURI_INTERNALS__: { invoke: (c: string, a: unknown) => Promise<unknown> } };
-    return w.__TAURI_INTERNALS__.invoke("plugin:event|emit", { event: "usage_snapshot", payload: {
-      source: "token-monitor", status: "unauthorized", tokPerSec: null, rateAt: null, todayTokens: null, todayCostUsd: null,
-      providers: [], hasSecret: false, updatedAt: null,
-    } });
-  });
-  await expect(strip).toHaveAttribute("data-status", "unauthorized");
-  await expect(strip).toContainText("TM anahtarı gerekli");
-  await expect(gpu).toContainText("3/120");
-  expect(await fits()).toEqual({ w: 56, overflow: false });
 });

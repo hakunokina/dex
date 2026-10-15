@@ -8,7 +8,6 @@ import { ChainSection } from "./Chain";
 import { ServersSection } from "./Hosts";
 import { SnipSection } from "./Snip";
 import { AppearanceSection } from "./Density";
-import { TokenMonitorSection } from "./TokenMonitor";
 import { TailnetSection } from "./Tailnet";
 import { LayoutSection } from "./Layout";
 import { LimitsSection } from "./Limits";
@@ -167,7 +166,6 @@ export function SettingsView({ host, teamId }: { host: string; teamId: string })
         {page("connections", <ScopeBadge text="Bu cihaz" />, <>
           <ServersSection />
           <TailnetSection />
-          <TokenMonitorSection />
         </>)}
         {page("providers", <ScopeBadge text={`Sunucu: ${hostName(server)}`} />, <>
           <ServerPicker server={server} onPick={setServer} />

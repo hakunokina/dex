@@ -72,6 +72,8 @@ handlers! {
         "team_context" => |core,p| ok(core.team_context(&arg::<String>(p,"teamId")?)),
         "usage_summary" => |core,p| ok(core.usage_summary(&arg::<String>(p,"teamId")?,arg(p,"since")?)),
         "usage_delegation" => |core,p| ok(core.usage_delegation(arg(p,"id")?)),
+        // #1861: the usage strip — provider 5 h/weekly windows + today's tokens (`usage-snapshot` event).
+        "usage_get" => |core,_| ok(Ok::<_, String>(core.usage_get())),
         "settings_usage_prices" => |core,_| ok(core.settings_usage_prices()),
         "settings_set_usage_prices" => |core,p| ok(core.settings_set_usage_prices(arg(p,"prices")?)),
         "core_status" => |core, _| ok(core.core_status()),
@@ -376,6 +378,10 @@ mod tests {
         assert_eq!(call(&core,"usage_summary",&serde_json::json!({"teamId":"other"})).unwrap()["total"]["tokens"]["input"],0);
         assert!(call(&core,"usage_summary",&serde_json::json!({"teamId":"default","since":-1})).is_err());
         assert!(METHODS.contains(&"usage_summary") && METHODS.contains(&"usage_delegation"));
+        // #1861: the strip's snapshot — the three providers, Dex agents' tokens since local midnight.
+        let strip = call(&core,"usage_get",&serde_json::json!({})).unwrap();
+        assert_eq!(strip["providers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect::<Vec<_>>(), ["anthropic","glm","muse"]);
+        assert!(strip["todayTokens"].is_u64() && METHODS.contains(&"usage_get"));
         core.shutdown();
     }
 
@@ -490,7 +496,7 @@ mod tests {
     /// #150 (B): the shell answers only what is this machine's screen, keyring and window; every
     /// core call goes to dexd. Turned around from A0: a new Tauri command must be CLIENT_ONLY —
     /// add it there (and to src/api/clientOnly.ts) or, better, to dexd.
-    const CLIENT_ONLY: [&str; 17] = [
+    const CLIENT_ONLY: [&str; 15] = [
         // The local core's endpoint (url + token for this webview) and its lifetime (tray, band).
         "local_host",
         "local_start",
@@ -510,10 +516,6 @@ mod tests {
         "snip_cancel",
         "snip_hotkey_get",
         "snip_hotkey_set",
-        // #54: the usage strip reads this machine's Token Monitor hub (loopback) and keeps its
-        // secret in the desktop's keyring; a remote dexd has neither.
-        "usage_get",
-        "usage_hub_secret_set",
     ];
 
     #[test]

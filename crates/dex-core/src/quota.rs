@@ -222,6 +222,8 @@ impl crate::Core {
     pub(crate) fn quota_tick(&self) -> bool {
         let source = self.quota_source.lock().unwrap().clone();
         let read = source.read();
+        // #1861: aynı ölçüm kullanım şeridine de gider (ikinci sorgu yok).
+        self.usage_record("anthropic", read.as_ref().map(crate::usage::Limits::from).map_err(Clone::clone));
         let now = crate::model_news::now_ms();
         let ok = match read {
             Ok(u) => {
