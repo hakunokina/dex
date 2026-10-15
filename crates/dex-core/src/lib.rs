@@ -61,6 +61,7 @@ pub mod slug;
 pub mod stack;
 pub mod teams;
 pub mod test_budget;
+pub mod usage;
 pub mod worktree;
 mod merge_gate;
 
@@ -107,6 +108,8 @@ pub struct Core {
     /// Görev #250: son Claude kullanım ölçümü ve kaynağı (testte sahtesi; `quota_set_source`).
     pub(crate) quota: Mutex<quota::State>,
     quota_source: Mutex<std::sync::Arc<dyn quota::UsageSource>>,
+    /// #1861: kullanım şeridinin sağlayıcı ölçümleri (Claude quota'dan, GLM/Muse kendi uçlarından).
+    pub(crate) usage: usage::Meter,
     /// S5-B: live transcript watches (one per agent) + queued chat texts per agent.
     pub(crate) chat_watches: chat::Watches,
     pub(crate) chat_queues: Mutex<HashMap<String, VecDeque<String>>>,
@@ -227,6 +230,7 @@ impl Core {
             } else {
                 std::sync::Arc::new(quota::OAuthUsage)
             }),
+            usage: usage::Meter::default(),
             chat_watches: chat::Watches::default(),
             chat_queues: Mutex::default(),
             inbox_gate: Mutex::default(),
@@ -277,6 +281,7 @@ impl Core {
         core.plan_resume()?;
         core.chain_schedule_existing();
         core.quota_watch();
+        core.usage_watch();
         #[cfg(not(test))]
         core.maintenance_watch();
         core.gpu_refresh_later();

@@ -1,44 +1,33 @@
-// #54: kullanım şeridinin sağlayıcı-bağımsız verisi (src-tauri/src/usage.rs UsageSnapshot). Şerit
-// kaynağı bilmez: Aşama 1'de Token Monitor hub'ı, Aşama 2'de Dex'in kendi kullanım modülü.
+// #54/#1861: kullanım şeridinin sağlayıcı-bağımsız verisi (crates/dex-core/src/usage.rs UsageSnapshot).
+// dexd üretir (usage_get + usage-snapshot olayı); şerit kaynağı bilmez.
 
-export type UsageStatus = "connecting" | "live" | "offline" | "unauthorized";
+export interface UsageWindow {
+  /** Kalan % (0-100). */
+  remainingPercent: number;
+  /** RFC 3339 */
+  resetsAt: string | null;
+}
 
 export interface ProviderUsage {
-  /** claude, zai, muse… */
+  /** Dex sağlayıcı kimliği: anthropic, glm, muse. */
   id: string;
-  /** Birincil pencerede kalan %; null = şu an bildirmiyor ("--"). */
-  remainingPercent: number | null;
-  /** session (5 saat) | daily | weekly | billing */
-  window: string | null;
-  /** ISO-8601 */
-  resetsAt: string | null;
-  /** TM'nin durum etiketi ("High Usage" gibi); hub yollamadıkça boş. */
-  statusLabel?: string | null;
+  /** null = taze ölçüm yok ("--"); nedeni `note`. */
+  fiveHour: UsageWindow | null;
+  weekly: UsageWindow | null;
+  note: string | null;
+  /** epoch ms; gösterilen ölçümün anı */
+  measuredAt: number | null;
+  /** Bugün bu sağlayıcıdaki Dex ajanlarının token'ı. */
+  todayTokens: number | null;
 }
 
 export interface UsageSnapshot {
-  source: string;
-  status: UsageStatus;
-  /** Çıktı token/sn; `rateAt` anındaki örnek. */
-  tokPerSec: number | null;
-  /** epoch ms */
-  rateAt: number | null;
-  todayTokens: number | null;
-  todayCostUsd: number | null;
   providers: ProviderUsage[];
-  hasSecret: boolean;
+  /** Bugün tüm sağlayıcılarda Dex ajanlarının token'ı (input + output + cache). */
+  todayTokens: number | null;
   /** epoch ms */
-  updatedAt: number | null;
+  updatedAt: number;
 }
 
-export const OFFLINE: UsageSnapshot = {
-  source: "",
-  status: "offline",
-  tokPerSec: null,
-  rateAt: null,
-  todayTokens: null,
-  todayCostUsd: null,
-  providers: [],
-  hasSecret: false,
-  updatedAt: null,
-};
+/** Şeridin bağlantı durumu: veri yok (sunucu kapalı / eski dexd) ya da canlı. */
+export type UsageStatus = "connecting" | "live" | "offline" | "unsupported";

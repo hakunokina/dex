@@ -614,6 +614,30 @@ fn source_files(c: &Connection, team: &str, delegation: Option<i64>) -> Result<V
     Ok(out)
 }
 
+/// #1861: `since`'ten beri açık (bitmemiş ya da sonra biten) oturumların kaynakları, tüm takımlar.
+fn sources_since(c: &Connection, since: i64) -> Result<Vec<SourceItem>, String> {
+    let rows = c
+        .prepare(
+            "SELECT DISTINCT f.id,f.engine,f.session,f.path FROM cost_sources f
+        JOIN cost_sessions s ON s.source_id=f.id
+        WHERE f.engine='claude' AND (s.ended_at IS NULL OR s.ended_at>=?1)",
+        )
+        .map_err(err)?
+        .query_map([since], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, Option<String>>(3)?))
+        })
+        .map_err(err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(err)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, engine, session, known)| {
+            let path = crate::chat::transcript_of(Some(&session), known.as_deref())?;
+            Some(SourceItem::Ready { id, engine, path })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 fn summary(c: &Connection, team: &str, since: Option<i64>, delegation: Option<i64>) -> Result<Summary, String> {
     let files = source_files(c, team, delegation)?;
@@ -856,6 +880,31 @@ impl crate::Core {
             }
         }
         crate::db::with(&self.db, |c| summary_aggregate(c, &team, None, Some(id), warnings))
+    }
+    /// #1861: sağlayıcı → `since`'ten beri token (input + output + cache okuma/yazma), tüm takımlar.
+    /// `ingest`: o andan beri açık kaynakların kuyruğu önce okunur (kilitsiz, #1813 deseni).
+    pub(crate) fn cost_tokens_since(&self, since: i64, ingest: bool) -> Result<BTreeMap<String, u64>, String> {
+        if ingest {
+            for item in crate::db::with(&self.db, |c| sources_since(c, since))? {
+                if let SourceItem::Ready { id, engine, path } = item {
+                    // Okunamayan kuyruk eski sayımı bozmaz; özet uyarısı usage_summary'nin işi.
+                    let _ = ingest_split(&self.db, id, &engine, &path);
+                }
+            }
+        }
+        crate::db::with(&self.db, |c| {
+            let mut st = c
+                .prepare(
+                    "SELECT s.provider,SUM(m.input+m.output+m.cache_read+m.cache_write)
+                FROM cost_sessions s JOIN cost_messages m ON m.segment_id=s.id AND m.ts>=?1
+                WHERE s.ended_at IS NULL OR s.ended_at>=?1 GROUP BY s.provider",
+                )
+                .map_err(err)?;
+            let rows = st
+                .query_map([since], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?.max(0) as u64)))
+                .map_err(err)?;
+            rows.collect::<Result<_, _>>().map_err(err)
+        })
     }
     pub fn settings_usage_prices(&self) -> Result<Vec<Price>, String> {
         crate::db::with(&self.db, prices)

@@ -1,8 +1,8 @@
-Sağlayıcı ikonları Token Monitor'ün `assets/icons/` klasöründen değiştirilmeden kopyalandı
+Sağlayıcı ikonları token-monitor projesinin `assets/icons/` klasöründen değiştirilmeden kopyalandı
 (dosya adları TM'dekiyle aynı, yalnız OpenAI logosu `openai.svg` adını taşır; `providers.ts` kimlik → dosya
 eşlemesini tutar).
 
-Token Monitor — https://github.com/Javis603/token-monitor:
+token-monitor — https://github.com/Javis603/token-monitor:
 
 MIT License
 

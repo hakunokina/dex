@@ -63,7 +63,7 @@ pnpm release
 | --- | --- |
 | Remote dexd / tailnet | Pair your own host; remote hosts start empty and tailnet is disabled by default. Local desktop work continues without either. Tailnet needs Tailscale. See [self-hosting](docs/deploy.md), [host registry](src/api/hosts.ts), [tailnet](crates/dexd/src/tailnet.rs). |
 | GPU broker | Configure broker addresses and credentials. Without them, GPU operations are unavailable; normal local agent work continues. Submissions require an approved job grant and budget ([GPU](crates/dex-core/src/gpu.rs)). |
-| Token Monitor | Separate local hub for the usage strip. If absent, the strip remains offline; it does not prevent agents from running ([usage](src-tauri/src/usage.rs)). |
+| Usage strip | dexd measures Claude/GLM/Muse 5-hour and weekly quota windows and today's agent tokens. A provider without credentials or a readable quota shows "--"; agents run regardless ([usage](crates/dex-core/src/usage.rs)). |
 | Browser tools | Browser-enabled roles use Node/npx and Playwright MCP 0.0.79. Windows uses Edge, macOS Chrome, Linux Playwright Chromium. Missing browser/package access breaks those tools; other roles do not require them ([browser](crates/dex-core/src/browser.rs)). |
 | Android | Requires a paired host. `pnpm release:apk` is a separate SSH/SDK/NDK/keystore pipeline; configure it before use. `pnpm release:all` also runs that pipeline ([APK script](scripts/release-apk.mjs)). |
 

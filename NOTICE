@@ -7,7 +7,7 @@ their own licenses; this file does not relicense them or grant trademark rights.
 
 Provider icons
 --------------
-src/usage/icons/ contains icons copied from Token Monitor:
+src/usage/icons/ contains icons copied from the token-monitor project:
 https://github.com/Javis603/token-monitor
 Copyright (c) 2026 Javis — MIT.
 Its full MIT notice and the LobeHub Icons attribution are retained in

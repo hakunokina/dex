@@ -1,23 +1,15 @@
-// #54: Dex penceresinin sağ kenarındaki kullanım şeridi (TM Edge Dock'u gibi): tok/s, bugünün
-// token + $'ı, sağlayıcı başına kalan kota halkası. #139: yer ayırmaz, sahnenin üstünde yüzer (usage.css).
-// Aşama 2: tıklama ajan bazlı döküm açacak; şimdilik ayrıntı tooltip'te.
+// #54: Dex penceresinin sağ kenarındaki kullanım şeridi (TM Edge Dock'u gibi): bugünün token'ı,
+// sağlayıcı başına kalan kota halkası. #139: yer ayırmaz, sahnenin üstünde yüzer (usage.css).
+// #1861: veri etkin takımın sunucusundan (dexd); halkada dış yay 5 saat, iç yay haftalık pencere.
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
-import { PlugZap } from "lucide-react";
-import { openSettings } from "../layout/panels";
-import { getActiveTeamId } from "../team/store";
-import { callHost, LOCAL, onEvent } from "../api/hosts";
+import { useTeams } from "../team/store";
+import { callHost, hostOf, LOCAL, onEvent } from "../api/hosts";
 import { gpuStripCell, type GpuOverview } from "../gpu/view";
 import { useStripVisible, useUsage } from "./store";
 import { providerMeta } from "./providers";
-import { WINDOW_SHORT, resetShort, updatedAgo } from "./format";
-import type { ProviderUsage, UsageSnapshot } from "./types";
+import { WINDOWS, resetShort, severity, updatedAgo } from "./format";
+import type { ProviderUsage, UsageStatus } from "./types";
 import "./usage.css";
-
-/** TM'nin eşikleri: bu kadar yeni örnek "canlı", bundan eski ama RATE_CLEAR'dan yeni olan sönük. */
-const RATE_ACTIVE_MS = 8_000;
-const RATE_CLEAR_MS = 180_000;
-
-const WINDOW_LABEL: Record<string, string> = { session: "5 saatlik pencere", daily: "günlük", weekly: "haftalık", billing: "dönem" };
 
 export function compactTokens(n: number): string {
   const units: [number, string][] = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
@@ -34,15 +26,20 @@ function untilText(iso: string, now: number): string {
   return `sıfırlanma ${clock} (${rel} sonra)`;
 }
 
+const pctText = (n: number | undefined) => (n === undefined ? "--" : `${Math.round(n)}%`);
+
+/** Halka yayları: dış 5 saat, iç haftalık (ortada logo). */
+const ARCS = [{ k: "fiveHour", r: 15.5 }, { k: "weekly", r: 11.5 }] as const;
+
 function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id: string | null, anchor: DOMRect | null) => void }) {
   const m = providerMeta(p.id);
-  const r = 15;
-  const c = 2 * Math.PI * r;
-  const pct = p.remainingPercent;
-  const sev = pct === null ? "unknown" : pct <= 10 ? "critical" : pct <= 25 ? "low" : "ok";
-  const title = pct === null
-    ? `${m.label} — şu an veri yok`
-    : [`${m.label} — ${WINDOW_LABEL[p.window ?? ""] ?? p.window ?? ""}: %${Math.round(pct)} kalan`, p.resetsAt && untilText(p.resetsAt, now)].filter(Boolean).join("\n");
+  const sev = severity(p);
+  const title = sev === "unknown"
+    ? `${m.label} — şu an veri yok${p.note ? ` (${p.note})` : ""}`
+    : [m.label, ...WINDOWS.map(([k, label]) => {
+      const w = p[k];
+      return w ? [`${label}: %${Math.round(w.remainingPercent)} kalan`, w.resetsAt && untilText(w.resetsAt, now)].filter(Boolean).join(", ") : `${label}: --`;
+    })].join("\n");
   // TM dock'u gibi: halka marka renginde, harcanan kısım o rengin soluk tonu, ortada logo metin renginde.
   const brand = m.color.startsWith("#") ? m.color : undefined;
   return (
@@ -53,31 +50,39 @@ function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id
       onBlur={() => onHover(null, null)}>
       <div className="usage-ring" style={{ "--ring-color": m.color } as CSSProperties}>
         <svg viewBox="0 0 36 36" aria-hidden="true">
-          <circle className="usage-ring-track" cx="18" cy="18" r={r} style={brand ? { stroke: `${brand}33` } : undefined} />
-          {pct !== null && (
-            <circle className="usage-ring-fill" cx="18" cy="18" r={r}
-              strokeDasharray={`${(c * pct) / 100} ${c}`} transform="rotate(-90 18 18)" />
-          )}
+          {ARCS.map(({ k, r }) => {
+            const w = p[k];
+            const c = 2 * Math.PI * r;
+            return (
+              <g key={k} data-window={k}>
+                <circle className="usage-ring-track" cx="18" cy="18" r={r} style={brand ? { stroke: `${brand}33` } : undefined} />
+                {w && (
+                  <circle className="usage-ring-fill" cx="18" cy="18" r={r}
+                    strokeDasharray={`${(c * w.remainingPercent) / 100} ${c}`} transform="rotate(-90 18 18)" />
+                )}
+              </g>
+            );
+          })}
         </svg>
         {m.icon
           ? <span className="usage-mark" data-icon={p.id} style={{ maskImage: `url("${m.icon}")`, WebkitMaskImage: `url("${m.icon}")` }} />
           : <span className="usage-glyph" data-icon="">{m.glyph}</span>}
       </div>
-      <span className="usage-pct">{pct === null ? "--" : `${Math.round(pct)}%`}</span>
+      <span className="usage-pct" data-window="fiveHour">{pctText(p.fiveHour?.remainingPercent)}</span>
+      <span className="usage-pct usage-pct-week" data-window="weekly">{pctText(p.weekly?.remainingPercent)}</span>
     </div>
   );
 }
 
-/** TM edge panelindeki Muse kartının sade şablonu, her sağlayıcıda: logo + ad (+ varsa
- *  durum etiketi), güncellenme, pencere satırı (% kaldı + çubuk + sıfırlanma). `position: fixed`
- *  ile açılır çünkü şerit `overflow-x: hidden` — mutlak konumlu kart kesilirdi. Dikey konum
- *  halka ortalanır, pencere kenarından taşmayacak şekilde kırpılır. */
-function ProviderCard({ p, snap, now, anchor, onHover }: {
-  p: ProviderUsage; snap: UsageSnapshot; now: number; anchor: DOMRect;
+/** TM edge panelindeki Muse kartının sade şablonu, her sağlayıcıda: logo + ad, güncellenme, iki
+ *  pencere satırı (% kaldı + çubuk + sıfırlanma), bugünün token'ı. `position: fixed` ile açılır
+ *  çünkü şerit `overflow-x: hidden` — mutlak konumlu kart kesilirdi. Dikey konum halka ortalanır,
+ *  pencere kenarından taşmayacak şekilde kırpılır. */
+function ProviderCard({ p, now, anchor, onHover }: {
+  p: ProviderUsage; now: number; anchor: DOMRect;
   onHover: (id: string | null, anchor: DOMRect | null) => void;
 }) {
   const m = providerMeta(p.id);
-  const pct = p.remainingPercent;
   const cardRef = useRef<HTMLDivElement>(null);
   const [top, setTop] = useState<number | null>(null);
   const [cardH, setCardH] = useState(0);
@@ -104,26 +109,33 @@ function ProviderCard({ p, snap, now, anchor, onHover }: {
           ? <span className="usage-card-mark" style={{ maskImage: `url("${m.icon}")`, WebkitMaskImage: `url("${m.icon}")` }} />
           : <span className="usage-card-glyph">{m.glyph}</span>}
         <span className="usage-card-name">{m.label}</span>
-        {p.statusLabel && <span className="usage-card-badge">{p.statusLabel}</span>}
       </div>
-      {updatedAgo(snap.updatedAt, now) && (
-        <div className="usage-card-updated">{updatedAgo(snap.updatedAt, now)}</div>
+      {updatedAgo(p.measuredAt, now) && (
+        <div className="usage-card-updated">{updatedAgo(p.measuredAt, now)}</div>
       )}
-      {pct === null || !p.window ? (
-        <div className="usage-card-empty">şu an veri yok</div>
-      ) : (
-        <div className="usage-card-win">
-          <div className="usage-card-winrow">
-            <span>{WINDOW_SHORT[p.window] ?? p.window}</span>
-            <b>%{Math.round(pct)} kaldı</b>
+      {severity(p) === "unknown" ? (
+        <div className="usage-card-empty">şu an veri yok{p.note ? ` — ${p.note}` : ""}</div>
+      ) : WINDOWS.map(([k, label]) => {
+        const w = p[k];
+        return (
+          <div className="usage-card-win" key={k} data-window={k}>
+            <div className="usage-card-winrow">
+              <span>{label}</span>
+              <b>{w ? `%${Math.round(w.remainingPercent)} kaldı` : "--"}</b>
+            </div>
+            {w && (
+              <div className="usage-card-bar" style={{ "--ring-color": m.color } as CSSProperties}>
+                <i style={{ width: `${Math.round(w.remainingPercent)}%` }} />
+              </div>
+            )}
+            {w && resetShort(w.resetsAt, now) && (
+              <div className="usage-card-reset">{resetShort(w.resetsAt, now)}</div>
+            )}
           </div>
-          <div className="usage-card-bar" style={{ "--ring-color": m.color } as CSSProperties}>
-            <i style={{ width: `${Math.round(pct)}%` }} />
-          </div>
-          {resetShort(p.resetsAt, now) && (
-            <div className="usage-card-reset">{resetShort(p.resetsAt, now)}</div>
-          )}
-        </div>
+        );
+      })}
+      {p.todayTokens !== null && (
+        <div className="usage-card-today">Bugün {p.todayTokens.toLocaleString("tr-TR")} token</div>
       )}
       <span className="usage-card-arrow" aria-hidden="true" style={{ top: arrowTop }} />
     </div>
@@ -159,9 +171,16 @@ function GpuCell() {
   );
 }
 
+const OFF_TEXT: Record<Exclude<UsageStatus, "live">, string> = {
+  connecting: "yükleniyor",
+  offline: "sunucu yok",
+  unsupported: "sunucu eski",
+};
+
 export function UsageStrip() {
   const visible = useStripVisible();
-  const u = useUsage();
+  const { activeId } = useTeams();
+  const { status, snap } = useUsage(activeId ? hostOf(activeId) : LOCAL);
   const [now, setNow] = useState(Date.now);
   // Hover kartı: tek kart, şerit düzeyinde; halkadan karta fare geçişinde titremesin diye
   // kapatma kısa gecikmeli, karta giriş sayacı iptal eder.
@@ -174,57 +193,46 @@ export function UsageStrip() {
     if (id === null) {
       hideTimer.current = window.setTimeout(() => { setHoverId(null); setAnchor(null); }, 120);
     } else {
+      setNow(Date.now());
       setHoverId(id);
       setAnchor(rect);
     }
   };
-  // Hız örneği yeni itme gelmeden de eskir; yalnız bir örnek varken saniyede bir yeniden çiz.
-  const live = u.rateAt !== null && now - u.rateAt < RATE_CLEAR_MS;
+  // Sıfırlanma/güncellenme metinleri yeni veri gelmeden de ilerlesin.
   useEffect(() => {
     setNow(Date.now());
-    if (u.rateAt === null) return;
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    const t = window.setInterval(() => setNow(Date.now()), 60_000);
     return () => window.clearInterval(t);
-  }, [u.rateAt]);
+  }, [snap]);
   if (!visible) return null;
 
-  if (u.status !== "live") {
-    const unauthorized = u.status === "unauthorized";
-    const text = unauthorized ? (u.hasSecret ? "TM anahtarı yanlış" : "TM anahtarı gerekli") : u.status === "connecting" ? "TM'ye bağlanıyor" : "TM bağlı değil";
+  if (status !== "live" || !snap) {
+    const text = OFF_TEXT[status === "live" ? "connecting" : status];
     return (
-      <aside className="usage-strip off" aria-label="Kullanım şeridi" data-status={u.status}>
-        {/* #314: GPU durumu TM'den bağımsız; kullanım verisi gelmese de görünür. */}
+      <aside className="usage-strip off" aria-label="Kullanım şeridi" data-status={status}>
+        {/* #314: GPU durumu kullanım verisinden bağımsız; veri gelmese de görünür. */}
         <GpuCell />
-        <button className="usage-off" title={`${text} — Ayarlar → Bağlantılar → Token Monitor`}
-          onClick={() => { const team = getActiveTeamId(); if (team) void openSettings(team, "connections", "tm-key"); }}>
-          <PlugZap size={16} />
+        <div className="usage-off" title={`Kullanım verisi yok: ${text}`}>
           <span>{text}</span>
-        </button>
+        </div>
       </aside>
     );
   }
 
-  const idle = !live || now - (u.rateAt ?? 0) > RATE_ACTIVE_MS;
-  // #1713: Codex is gone from Dex; TM may still report the subscription, the strip doesn't show it.
-  const providers = u.providers.filter((p) => p.id !== "codex");
   return (
-    <aside className="usage-strip" aria-label="Kullanım şeridi" data-status={u.status}>
-      <div className={`usage-cell usage-rate ${idle ? "idle" : ""}`} title="Canlı çıktı hızı (token/sn)">
-        <span className="usage-cap">tok/s</span>
-        <span className="usage-big">{live && u.tokPerSec !== null ? Math.round(u.tokPerSec) : "--"}</span>
-      </div>
-      <div className="usage-cell" title={`Bugün: ${u.todayTokens?.toLocaleString("tr-TR") ?? "--"} token · $${u.todayCostUsd?.toFixed(2) ?? "--"}`}>
+    <aside className="usage-strip" aria-label="Kullanım şeridi" data-status={status}>
+      <div className="usage-cell usage-today"
+        title={`Bugün Dex ajanları: ${snap.todayTokens?.toLocaleString("tr-TR") ?? "--"} token (girdi + çıktı + önbellek)`}>
         <span className="usage-cap">bugün</span>
-        <span className="usage-big">{u.todayTokens === null ? "--" : compactTokens(u.todayTokens)}</span>
-        <span className="usage-sub">{u.todayCostUsd === null ? "" : `$${u.todayCostUsd.toFixed(1)}`}</span>
+        <span className="usage-big">{snap.todayTokens === null ? "--" : compactTokens(snap.todayTokens)}</span>
       </div>
       <GpuCell />
       <div className="usage-provs">
-        {providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}
+        {snap.providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}
       </div>
       {hoverId && anchor && (() => {
-        const p = providers.find((x) => x.id === hoverId);
-        return p ? <ProviderCard p={p} snap={u} now={now} anchor={anchor} onHover={onHover} /> : null;
+        const p = snap.providers.find((x) => x.id === hoverId);
+        return p ? <ProviderCard p={p} now={now} anchor={anchor} onHover={onHover} /> : null;
       })()}
     </aside>
   );

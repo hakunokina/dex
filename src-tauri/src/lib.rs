@@ -61,8 +61,6 @@ mod teams;
 mod tray;
 #[cfg(all(desktop, feature = "inproc-core"))]
 mod tailnet;
-#[cfg(desktop)]
-mod usage;
 #[cfg(mobile)]
 mod mobile_hosts;
 
@@ -105,7 +103,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(snip_hotkey::plugin())
-        .plugin(usage::plugin())
         .setup(|app| {
             snip_hotkey::init(app.handle())?;
             #[cfg(not(feature = "inproc-core"))]
@@ -130,9 +127,7 @@ pub fn run() {
         snip::snip_finish,
         snip::snip_cancel,
         snip_hotkey::snip_hotkey_get,
-        snip_hotkey::snip_hotkey_set,
-        usage::usage_get,
-        usage::usage_hub_secret_set
+        snip_hotkey::snip_hotkey_set
     ]);
     #[cfg(all(desktop, feature = "inproc-core"))]
     let builder = builder
@@ -246,9 +241,7 @@ pub fn run() {
             snip::snip_finish,
             snip::snip_cancel,
             snip_hotkey::snip_hotkey_get,
-            snip_hotkey::snip_hotkey_set,
-            usage::usage_get,
-            usage::usage_hub_secret_set
+            snip_hotkey::snip_hotkey_set
         ]);
     #[cfg(mobile)]
     let builder = builder.invoke_handler(tauri::generate_handler![

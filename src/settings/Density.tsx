@@ -51,7 +51,7 @@ export function AppearanceSection() {
       <Row
         id="strip"
         label="Sağ kenarda göster"
-        description="Kullanım şeridi: sağ kenarda Token Monitor verisi."
+        description="Kullanım şeridi: sağ kenarda sağlayıcı kotaları (5 saat / haftalık) ve bugünün token'ı."
         control={
           <Switch label="Sağ kenarda göster" checked={visible} onChange={setStripVisible} />
         }

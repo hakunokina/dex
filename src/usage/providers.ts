@@ -41,6 +41,7 @@ const P = (label: string, brand: string, icon?: string): Omit<ProviderMeta, "col
 
 const PROVIDERS: Record<string, ReturnType<typeof P>> = {
   claude: P("Claude", "#cc7c5e", claude),
+  anthropic: P("Claude", "#cc7c5e", claude),
   openai: P("OpenAI", "#49a3b0", openai),
   opencode: P("OpenCode", "#000000", opencode),
   cursor: P("Cursor", "#000000", cursor),

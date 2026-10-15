@@ -75,7 +75,7 @@ export function buildCommands(bridge: Bridge): Command[] {
       [
         ["general", "Ayar: Bu cihaz · Genel", "görünüm yoğunluk pano düzeni ekran alıntısı kısayol"],
         ["notifications", "Ayar: Bu cihaz · Bildirimler", "ses takılma uyarı watchdog stall"],
-        ["connections", "Ayar: Bu cihaz · Bağlantılar", "sunucu telefondan erişim token monitor tm hub"],
+        ["connections", "Ayar: Bu cihaz · Bağlantılar", "sunucu telefondan erişim"],
         ["providers", "Ayar: Sunucu · Sağlayıcılar", "sağlayıcı provider anahtar jeton token glm muse yerel llm"],
         ["chain", "Ayar: Sunucu · Kota zinciri", "kota zincir motor failover"],
         ["resources", "Ayar: Sunucu · Kaynak sınırları", "cpu bellek memory tavan limit sınır"],

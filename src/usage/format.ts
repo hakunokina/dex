@@ -1,12 +1,16 @@
 // Hover kartının Türkçe metinleri (UsageStrip.tsx kullanır; saf fonksiyonlar → birim testli).
-// Pencere adları TM hub'ının `kind` alanından gelir (session/daily/weekly/billing).
+import type { ProviderUsage } from "./types";
 
-export const WINDOW_SHORT: Record<string, string> = {
-  session: "Oturum",
-  daily: "Günlük",
-  weekly: "Haftalık",
-  billing: "Dönem",
-};
+/** #1861: şeridin iki penceresi, gösterim sırasıyla. */
+export const WINDOWS = [["fiveHour", "5 saat"], ["weekly", "Haftalık"]] as const;
+
+/** Halkanın tonu: iki pencereden az kalanına göre; ölçüm yoksa "unknown". */
+export function severity(p: ProviderUsage): "unknown" | "critical" | "low" | "ok" {
+  const left = WINDOWS.map(([k]) => p[k]?.remainingPercent).filter((n): n is number => n !== undefined);
+  if (left.length === 0) return "unknown";
+  const min = Math.min(...left);
+  return min <= 10 ? "critical" : min <= 25 ? "low" : "ok";
+}
 
 /** "5 dk önce güncellendi" / "az önce güncellendi"; null = "". */
 export function updatedAgo(updatedAt: number | null, now: number): string {
