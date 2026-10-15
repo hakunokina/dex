@@ -973,7 +973,13 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
     }
-    if let Some(reason) = crate::test_budget::full_suite_denial_in_shell(command, ctx.cwd.as_deref(), d).filter(|_| !ctx.qa) {
+    // #1876: a leader runs no e2e test at all; the others not the whole suite (QA does).
+    let budget = if ctx.leader {
+        crate::test_budget::leader_e2e_denial(command, ctx.cwd.as_deref(), d)
+    } else {
+        crate::test_budget::full_suite_denial_in_shell(command, ctx.cwd.as_deref(), d).filter(|_| !ctx.qa)
+    };
+    if let Some(reason) = budget {
         verdicts.push(Verdict::Deny(reason.into()));
     }
     // #495: a worker's allow needs `parsed` below, which reads no `$` (but PowerShell's `>$null`),
@@ -3364,6 +3370,23 @@ mod tests {
         let mut c = ctx();
         c.qa = true;
         assert_eq!(decide("Bash", &json!({ "command": "npx playwright test" }), &c), Verdict::Allow);
+    }
+
+    #[test]
+    fn leader_runs_no_e2e_test() {
+        let spec = "npx playwright test e2e/x.spec.ts --workers=1";
+        assert_eq!(decide("Bash", &json!({ "command": spec }), &ctx()), Verdict::Allow, "worker: single spec");
+        let mut c = ctx();
+        c.leader = true;
+        for command in [spec, "npx playwright test --grep \"ad\"", "npx playwright test"] {
+            match decide("Bash", &json!({ "command": command }), &c) {
+                Verdict::Deny(why) => assert!(why.starts_with(crate::test_budget::DENY_LEADER), "{command}: {why}"),
+                v => panic!("{command}: {v:?}"),
+            }
+        }
+        for command in ["npx tsc --noEmit", "cargo test -p dex-core --lib x"] {
+            assert_eq!(decide("Bash", &json!({ "command": command }), &c), Verdict::Allow, "{command}");
+        }
     }
 
     #[test]
