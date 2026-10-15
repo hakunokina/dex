@@ -437,7 +437,10 @@ pub fn remove(w: &Wt) -> Result<(), String> {
     // A branch still checked out in a registered tree (uncommitted work) refuses; that is right.
     let exists = git(&w.root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", w.branch)]).is_ok();
     // #901: `-d` asks HEAD; a pinned job's branch is checked against its target instead.
-    let landed = w.merge_branch.as_deref().is_some_and(|t| git(&w.root, &["merge-base", "--is-ancestor", &w.branch, &format!("refs/heads/{t}")]).is_ok());
+    // #1980: a merge-only branch (disposed unmerged) holds nothing of its own — every line is in
+    // a parent other refs still name — so it may go the same way.
+    let landed = w.merge_branch.as_deref().is_some_and(|t| git(&w.root, &["merge-base", "--is-ancestor", &w.branch, &format!("refs/heads/{t}")]).is_ok())
+        || (exists && matches!(own_changes(w), OwnChanges::None { .. }));
     let branch = if exists { git(&w.root, &["branch", if landed { "-D" } else { "-d" }, &w.branch]).map(|_| ()) } else { Ok(()) };
     match (dir, branch) {
         (Ok(()), Ok(())) => Ok(()),
@@ -626,6 +629,9 @@ pub fn result_line(w: &Wt) -> String {
     let log = git(&w.root, &["log", "--oneline", "--no-decorate", "-n", "5", &range]).unwrap_or_default();
     let count = git(&w.root, &["rev-list", "--count", &range]).unwrap_or_else(|_| "?".into());
     let mut s = format!("dal: {} ({count} commit) — birleştirmek için delegation_merge", w.branch);
+    if matches!(own_changes(w), OwnChanges::None { .. }) {
+        s.push_str(" — kendi değişikliği yok (yalnız merge); inceleme açılmaz, içerik asıl işin dalından gelir");
+    }
     for l in log.lines() {
         s.push_str(&format!("\n    {l}"));
     }
@@ -646,6 +652,79 @@ pub fn tip(w: &Wt) -> Option<(String, String)> {
         None => git(&w.root, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?,
     };
     Some((sha, team))
+}
+
+/// #1980: does the branch carry the worker's own change since its base, or only merges of other
+/// branches (a QA job that merged a prerequisite in to test it, Dex's own plan/`fixOf` prerequisite
+/// merges)? A merge-only branch has nothing of its own to review — its content is reviewed (and
+/// lands) with the branches it merged in. Fail-open to `Own` on any doubt: reviewed as today.
+#[derive(Debug, PartialEq)]
+pub enum OwnChanges {
+    Own,
+    /// No own change; the non-first parents the branch's merges brought in.
+    None { foreign: Vec<String> },
+}
+
+/// A merge commit's own content — a conflict resolution or an "evil" change: lines in its tree
+/// that are in neither parent. The combined diff shows exactly those; a clean merge (or one that
+/// took a side whole) has none, so nothing lands that a parent's review did not already cover.
+fn merge_extra_content(root: &Path, sha: &str) -> bool {
+    git(root, &["show", "--cc", "--format=", sha]).map(|s| !s.is_empty()).unwrap_or(true)
+}
+
+fn parents_of(root: &Path, sha: &str) -> Vec<String> {
+    git(root, &["rev-list", "--parents", "-n", "1", sha])
+        .map(|l| l.split_whitespace().skip(1).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+pub fn own_changes(w: &Wt) -> OwnChanges {
+    // First-parent from the base: the worker's own commits and the merges made on this branch.
+    // What a merge brought in rides behind its other parents and is not this branch's own work —
+    // cherry-picks/squashes of it are new commits here, hence `Own`, reviewed as today.
+    let Ok(list) = git(&w.root, &["rev-list", "--first-parent", "--parents", &format!("{}..{}", w.base, w.branch)]) else {
+        return OwnChanges::Own;
+    };
+    let mut foreign: Vec<String> = Vec::new();
+    for line in list.lines() {
+        let mut it = line.split_whitespace();
+        let Some(sha) = it.next() else { continue };
+        let parents: Vec<&str> = it.collect();
+        if parents.len() < 2 || merge_extra_content(&w.root, sha) {
+            return OwnChanges::Own;
+        }
+        for p in &parents[1..] {
+            if !foreign.iter().any(|f| f == p) {
+                foreign.push(p.to_string());
+            }
+        }
+    }
+    OwnChanges::None { foreign }
+}
+
+/// #1980: a merged-in commit is covered when it already landed in the target, or its content was
+/// in a reviewed diff: a review approved that very commit, or it is an ancestor of an approved
+/// tip of a still-unmerged branch of the team. Coverage passes through clean merges (a merge-only
+/// branch merged into another one). `tips`: (job, branch tip, tip approved) of the team's
+/// unmerged branches in this repository; `approved_shas`: every commit a review approved.
+fn covered(sha: &str, root: &Path, target: &str, tips: &[(i64, String, bool)], approved_shas: &[String], seen: &mut Vec<String>) -> bool {
+    if git(root, &["merge-base", "--is-ancestor", sha, target]).is_ok() || approved_shas.iter().any(|s| s == sha) {
+        return true;
+    }
+    if tips.iter().any(|(_, tip, ok)| *ok && git(root, &["merge-base", "--is-ancestor", sha, tip]).is_ok()) {
+        return true;
+    }
+    let parents = parents_of(root, sha);
+    if parents.len() < 2 || merge_extra_content(root, sha) || seen.iter().any(|s| s == sha) {
+        return false;
+    }
+    seen.push(sha.to_string());
+    parents.iter().all(|p| covered(p, root, target, tips, approved_shas, seen))
+}
+
+/// The job whose unmerged branch carries `sha`, when one matches (for the refusal's note).
+fn foreign_owner(tips: &[(i64, String, bool)], root: &Path, sha: &str) -> Option<i64> {
+    tips.iter().find(|(_, tip, _)| git(root, &["merge-base", "--is-ancestor", sha, tip]).is_ok()).map(|(id, _, _)| *id)
 }
 
 /// For the worker's prompt.
@@ -748,6 +827,75 @@ pub fn merge(db: &Db, c: &Caller, id: i64, force_policy: bool, force_review: boo
     let notes = after_merge_notes(&changed);
     let already = git(root, &["merge-base", "--is-ancestor", &sha, &target_sha]).is_ok();
     if !already {
+        // #1980: a branch with no change of its own (only merges of other branches) never gets a
+        // review and never lands content itself — that would let merged-in work past its own
+        // review. While a merged-in commit is unapproved the merge is refused; once all of it is
+        // covered the branch is simply done: nothing to land, the tree is cleaned up. Only where
+        // the gate exists at all (#287: no reviewer → branches land as before), and never under
+        // `force_review` (the patron may still land it as-is).
+        if !force_review {
+            if let OwnChanges::None { foreign } = own_changes(&w) {
+                let (gate_on, approved_shas, candidates) = with(db, |conn| {
+                    let mut st = conn
+                        .prepare(
+                            "SELECT w.delegation_id, w.branch FROM delegation_worktrees w JOIN delegations d ON d.id = w.delegation_id
+                             WHERE d.team_id = ?1 AND w.merged_at IS NULL AND w.delegation_id <> ?2 AND w.root = ?3",
+                        )
+                        .map_err(e)?;
+                    let rows = st.query_map(params![d.team_id, id, w.root.to_string_lossy()], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(e)?;
+                    let mut candidates = Vec::new();
+                    for c in rows {
+                        candidates.push(c.map_err(e)?);
+                    }
+                    Ok((crate::review::gate_on(conn, &d.team_id)?, crate::review::approved_shas(conn)?, candidates))
+                })?;
+                if gate_on {
+                    let mut tips: Vec<(i64, String, bool)> = Vec::new();
+                    for (dep, branch) in candidates {
+                        if let Ok(tip_sha) = git(root, &["rev-parse", "--verify", &format!("refs/heads/{branch}")]) {
+                            tips.push((dep, tip_sha, false));
+                        }
+                    }
+                    let tips = with(db, |conn| {
+                        let mut out = Vec::new();
+                        for (dep, tip_sha, _) in tips {
+                            let ok = matches!(crate::review::gate(conn, dep, &tip_sha)?, crate::review::Gate::Pass);
+                            out.push((dep, tip_sha, ok));
+                        }
+                        Ok(out)
+                    })?;
+                    let waiting: Vec<String> = foreign
+                        .iter()
+                        .filter(|f| !covered(f, root, &target_sha, &tips, &approved_shas, &mut Vec::new()))
+                        .map(|f| match foreign_owner(&tips, root, f) {
+                            Some(dep) => format!("#{dep} ({})", &f[..f.len().min(8)]),
+                            None => f[..f.len().min(8)].to_string(),
+                        })
+                        .collect();
+                    if !waiting.is_empty() {
+                        return Ok(json!({
+                            "merged": false, "branch": w.branch, "code": "no_own_changes",
+                            "review": { "state": "kendi değişikliği yok", "waiting": waiting },
+                            "note": format!("bu dalda worker'ın kendi değişikliği yok (yalnız başka dal(lar) birleştirilmiş); bu dala inceleme açılmaz ve üzerinden birleştirme yapılmaz — inceleme kapısı böyle dolanılmaz. İçerik asıl işin kendi incelemesi onaylanınca onun dalından gelir; onayı bekleyen: {}. Asıl iş(ler) birleşince bu çağrıyı tekrarla, dal temizlenir.", waiting.join(", ")),
+                        }));
+                    }
+                    // A late commit may have made it a branch of its own: leave it to the gate.
+                    if let Some(refusal) = source_changed()? {
+                        return Ok(refusal);
+                    }
+                    with(db, |conn| conn.execute("UPDATE delegation_worktrees SET merged_at = ?2 WHERE delegation_id = ?1", params![id, now()]).map_err(e))?;
+                    with(db, |conn| delegate::sync_task(conn, id))?;
+                    let mut out = json!({
+                        "merged": true, "branch": w.branch, "code": "no_own_changes", "files": 0,
+                        "note": "bu dal birleştirilmedi: worker'ın kendi değişikliği yoktu (yalnız başka dal(lar) birleştirilmiş), worktree temizlendi. İçerik takım dalına asıl işin kendi dalıyla gelir; henüz gelmediyse o iş için delegation_merge çağır.",
+                    });
+                    if let Some(err) = tidy(db, id, &w, release) {
+                        out["cleanup"] = err.into();
+                    }
+                    return Ok(out);
+                }
+            }
+        }
         if !force_review {
             let gate = with(db, |conn| {
                 if !crate::review::gate_on(conn, &d.team_id)? {
@@ -1432,6 +1580,85 @@ pub(crate) mod tests {
 
     fn prepare_plan_is_none(c: &Connection, d: &Delegation) -> Result<bool, String> {
         Ok(plan(c, d).map_err(|err| format!("{err:?}"))?.is_none())
+    }
+
+    #[test]
+    fn merge_only_branch_gets_no_review_and_cannot_bypass_the_gate() {
+        // #1980 (the #1977 shape): a QA job merges the job it checks into its own branch and
+        // changes nothing itself.
+        let root = repo("mergeonly");
+        let db = db_for(&root);
+        add_reviewer(&db);
+        let a = job(&db, "kaan");
+        let wa = prepare(&db, &a).unwrap().unwrap();
+        std::fs::write(wa.path.join("b.txt"), "b\n").unwrap();
+        commit(&wa.path, "b ekle");
+        finish(&db, a.id);
+        let qa = job(&db, "ayla");
+        let wq = prepare(&db, &qa).unwrap().unwrap();
+        git(&wq.path, &["merge", "--no-ff", "--no-edit", &wa.branch]).unwrap();
+        finish(&db, qa.id);
+        // Ahead of the team branch, yet nothing of its own — so no review opens for it
+        // (`review_open` stops on exactly this), and the merge refuses without asking for one.
+        assert!(tip(&wq).is_some());
+        let a_tip = git(&root, &["rev-parse", &wa.branch]).unwrap();
+        assert_eq!(own_changes(&wq), OwnChanges::None { foreign: vec![a_tip] });
+        let merge_now = |id: i64| merge(&db, &lead(&db), id, false, false, &|_| false).unwrap();
+        let out = merge_now(qa.id);
+        assert_eq!((out["merged"].as_bool(), out["code"].as_str(), state(&out)), (Some(false), Some("no_own_changes"), "kendi değişikliği yok"), "{out}");
+        assert!(out["note"].as_str().unwrap().contains(&format!("#{}", a.id)), "{out}");
+        assert!(!root.join("b.txt").exists(), "the unreviewed work did not land through the QA branch");
+        let reviews: i64 = with(&db, |c| c.query_row("SELECT COUNT(*) FROM delegation_reviews WHERE target_id = ?1", [qa.id], |r| r.get(0)).map_err(e)).unwrap();
+        assert_eq!(reviews, 0, "no review was opened for the merge-only branch");
+        // The original job is reviewed and approved on its own branch: now the QA branch is
+        // simply done — cleaned up, and still nothing landed through it.
+        let ra = open_review(&db, &a);
+        review_report(&db, &root, ra.id, "karar: onay\n").unwrap();
+        let out = merge_now(qa.id);
+        assert_eq!((out["merged"].as_bool(), out["code"].as_str()), (Some(true), Some("no_own_changes")), "{out}");
+        assert!(!root.join("b.txt").exists(), "the content still lands with its own job");
+        assert!(!wq.path.exists(), "the QA tree is gone");
+        assert!(git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", wq.branch)]).is_err(), "the QA branch is gone too");
+        assert!(with(&db, |c| get(c, qa.id)).unwrap().unwrap().removed_at.is_some(), "no pending cleanup left");
+        // And the content lands with the approved job, as before.
+        let out = merge_now(a.id);
+        assert_eq!(out["merged"], true, "{out}");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn own_commit_and_content_carrying_merge_stay_reviewed_as_today() {
+        // #1980: the other two shapes keep the gate — a commit of one's own on top of a merged
+        // branch, and a merge that itself carries content (a conflict resolution / evil change).
+        let root = repo("ownchanges");
+        let db = db_for(&root);
+        add_reviewer(&db);
+        let a = job(&db, "kaan");
+        let wa = prepare(&db, &a).unwrap().unwrap();
+        std::fs::write(wa.path.join("b.txt"), "b\n").unwrap();
+        commit(&wa.path, "b ekle");
+        finish(&db, a.id);
+        // Merge + own commit.
+        let q = job(&db, "ayla");
+        let wq = prepare(&db, &q).unwrap().unwrap();
+        git(&wq.path, &["merge", "--no-ff", "--no-edit", &wa.branch]).unwrap();
+        std::fs::write(wq.path.join("c.txt"), "c\n").unwrap();
+        commit(&wq.path, "c ekle");
+        finish(&db, q.id);
+        assert_eq!(own_changes(&wq), OwnChanges::Own);
+        let out = merge(&db, &lead(&db), q.id, false, false, &|_| false).unwrap();
+        assert_eq!((out["merged"].as_bool(), state(&out)), (Some(false), "yok"), "a review is asked for, as today: {out}");
+        // A merge amended with content of its own.
+        let p = job(&db, "bora");
+        let wp = prepare(&db, &p).unwrap().unwrap();
+        git(&wp.path, &["merge", "--no-ff", "--no-edit", &wa.branch]).unwrap();
+        std::fs::write(wp.path.join("b.txt"), "b\nçözüm\n").unwrap();
+        git(&wp.path, &["add", "-A"]).unwrap();
+        git(&wp.path, &["commit", "-q", "--amend", "--no-edit"]).unwrap();
+        finish(&db, p.id);
+        assert_eq!(own_changes(&wp), OwnChanges::Own, "the merge's extra content is its own change");
+        let out = merge(&db, &lead(&db), p.id, false, false, &|_| false).unwrap();
+        assert_eq!((out["merged"].as_bool(), state(&out)), (Some(false), "yok"), "{out}");
     }
 
     #[test]

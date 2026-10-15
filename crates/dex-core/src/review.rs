@@ -156,6 +156,17 @@ pub fn gate(conn: &Connection, target: i64, sha: &str) -> Result<Gate, String> {
     Ok(Gate::Missing { reviewed: latest(conn, target)?.map(|r| r.sha).filter(|s| s != sha) })
 }
 
+/// #1980: every commit some review approved (`onay`), whichever job it belonged to.
+pub fn approved_shas(conn: &Connection) -> Result<Vec<String>, String> {
+    let mut st = conn.prepare("SELECT DISTINCT sha FROM delegation_reviews WHERE verdict = 'onay'").map_err(e)?;
+    let rows = st.query_map([], |r| r.get::<_, String>(0)).map_err(e)?;
+    let mut out = Vec::new();
+    for s in rows {
+        out.push(s.map_err(e)?);
+    }
+    Ok(out)
+}
+
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(8)]
 }
