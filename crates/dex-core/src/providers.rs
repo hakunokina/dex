@@ -55,22 +55,34 @@ pub fn get(id: &str) -> Option<&'static ProviderDef> {
     PROVIDERS.iter().find(|p| p.id == id)
 }
 
+/// Görev #120: sürümlü kimlikler (`claude --model` tam adı kabul eder). Takma adlar
+/// (CLI'nın "en güncel"i) eski kayıtlar için geçerli kalır, seçicide sunulmaz.
+const CLAUDE_MODELS: &[ModelDef] = &[
+    m("claude-fable-5-1", "Fable 5.1"),
+    m(CLAUDE_STRONG, "Opus 5.5"),
+    m(CLAUDE_MID, "Sonnet 5.5"),
+    m(CLAUDE_LIGHT, "Haiku 4.5"),
+    alias("opus", "opus (takma ad — en güncel Opus)"),
+    alias("sonnet", "sonnet (takma ad — en güncel Sonnet)"),
+    alias("haiku", "haiku (takma ad — en güncel Haiku)"),
+];
+
 pub static PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         id: "anthropic",
         label: "Claude",
         base_url: None,
-        // Görev #120: sürümlü kimlikler (`claude --model` tam adı kabul eder). Takma adlar
-        // (CLI'nın "en güncel"i) eski kayıtlar için geçerli kalır, seçicide sunulmaz.
-        models: &[
-            m("claude-fable-5-1", "Fable 5.1"),
-            m(CLAUDE_STRONG, "Opus 5.5"),
-            m(CLAUDE_MID, "Sonnet 5.5"),
-            m(CLAUDE_LIGHT, "Haiku 4.5"),
-            alias("opus", "opus (takma ad — en güncel Opus)"),
-            alias("sonnet", "sonnet (takma ad — en güncel Sonnet)"),
-            alias("haiku", "haiku (takma ad — en güncel Haiku)"),
-        ],
+        models: CLAUDE_MODELS,
+        env: &[],
+        live: false,
+    },
+    // #2019: ikinci Claude abonelik hesabı — aynı CLI ve modeller, kendi `CLAUDE_CONFIG_DIR`'ı
+    // (`claude_accounts`; env'i pty.rs basar). Jeton kasada değil, CLI'ın kimlik dosyasında.
+    ProviderDef {
+        id: "anthropic-2",
+        label: "Claude 2",
+        base_url: None,
+        models: CLAUDE_MODELS,
         env: &[],
         live: false,
     },
@@ -178,7 +190,12 @@ pub fn set_live(catalog: std::collections::BTreeMap<String, Vec<LiveModel>>) -> 
 /// Seçilebilir katalog: sabit liste (sıra/etiket korunur; ilki varsayılan) + canlı listedeki yeniler.
 pub fn models(def: &ProviderDef) -> Vec<ModelInfo> {
     let live = LIVE.read().unwrap_or_else(|e| e.into_inner());
-    merge(def, live.get(def.id).map(Vec::as_slice).unwrap_or_default())
+    merge(def, live.get(catalog_id(def)).map(Vec::as_slice).unwrap_or_default())
+}
+
+/// #2019: Claude hesapları Anthropic'in canlı kataloğunu paylaşır (aynı modeller).
+fn catalog_id(def: &ProviderDef) -> &'static str {
+    if crate::claude_accounts::is_claude(def.id) { "anthropic" } else { def.id }
 }
 
 fn merge(def: &ProviderDef, live: &[LiveModel]) -> Vec<ModelInfo> {
@@ -195,7 +212,7 @@ fn merge(def: &ProviderDef, live: &[LiveModel]) -> Vec<ModelInfo> {
 /// Model bu sağlayıcıda geçerli mi (sabit + canlı; legacy dahil). Canlı sağlayıcıda (yerel) sunucu karar verir.
 pub fn has_model(def: &ProviderDef, model: &str) -> bool {
     def.models.iter().any(|m| m.id == model)
-        || LIVE.read().unwrap_or_else(|e| e.into_inner()).get(def.id).is_some_and(|l| l.iter().any(|m| m.id == model))
+        || LIVE.read().unwrap_or_else(|e| e.into_inner()).get(catalog_id(def)).is_some_and(|l| l.iter().any(|m| m.id == model))
 }
 
 // ── Çocuk env'i ──────────────────────────────────────────────────────────────
@@ -219,7 +236,8 @@ fn spawn_env_with(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<Option<Vec<(String, String)>>, String> {
-    let Some(id) = provider.filter(|p| *p != "anthropic") else {
+    // Claude hesapları env'e dokunmaz (ek hesabın `CLAUDE_CONFIG_DIR`'ı pty.rs'te).
+    let Some(id) = provider.filter(|p| !crate::claude_accounts::is_claude(p)) else {
         return Ok(None);
     };
     let def = get(id).ok_or_else(|| format!("bilinmeyen sağlayıcı: {id}"))?;
@@ -513,6 +531,9 @@ pub struct ProviderInfo {
     pub models: Vec<ModelInfo>,
     pub has_token: bool,
     pub token_mask: Option<String>,
+    /// #2019: ek Claude hesabının bağlantısı (Core doldurur); başka sağlayıcıda yok.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<crate::claude_accounts::Account>,
 }
 
 pub fn list() -> Result<Vec<ProviderInfo>, String> {
@@ -533,6 +554,7 @@ pub fn list() -> Result<Vec<ProviderInfo>, String> {
                 models: models(p),
                 has_token: token.as_deref().map(|t| !t.is_empty()).unwrap_or(false),
                 token_mask: token.as_deref().map(mask),
+                account: None,
             }
         })
         .collect())
@@ -807,6 +829,11 @@ mod tests {
     fn anthropic_touches_nothing() {
         assert!(spawn_env(None, Some("sonnet")).unwrap().is_none());
         assert!(spawn_env(Some("anthropic"), Some("opus")).unwrap().is_none());
+        // #2019: ikinci hesap da uç/jeton basmaz; yalnız kendi config dizini (pty.rs).
+        assert!(spawn_env(Some("anthropic-2"), Some("opus")).unwrap().is_none());
+        let two = get("anthropic-2").unwrap();
+        assert_eq!((two.label, two.base_url), ("Claude 2", None));
+        assert!(has_model(two, CLAUDE_STRONG) && has_model(two, "opus"), "modeller Claude ile aynı");
     }
 
     #[test]

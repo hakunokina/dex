@@ -20,8 +20,9 @@ pub struct ChainView {
     pub exhausted: Vec<Exhausted>,
 }
 
-/// Varsayılan zincir: Claude Code sağlayıcıları.
-pub const DEFAULT_CHAIN: &[&str] = &["anthropic", "muse", "glm", "local"];
+/// Varsayılan zincir: Claude Code sağlayıcıları. #2019: ikinci Claude hesabı asıl hesabın hemen
+/// arkasında (bağlı değilse jetonsuz sayılıp atlanır).
+pub const DEFAULT_CHAIN: &[&str] = &["anthropic", "anthropic-2", "muse", "glm", "local"];
 
 const CHAIN_ORDER_KEY: &str = "chain_order";
 const CHAIN_DISABLED_KEY: &str = "chain_disabled";
@@ -425,7 +426,8 @@ pub fn earliest_reset(conn: &Connection) -> Result<Option<i64>, String> {
 
 // ── Zincir sırası (Ayarlar) ──────────────────────────────────────────────────
 
-/// Kayıtlı sıra (yoksa varsayılan). Bilinmeyen id'ler düşer, eksik bilinenler sona eklenir.
+/// Kayıtlı sıra (yoksa varsayılan). Bilinmeyen id'ler düşer, eksik bilinenler sona eklenir;
+/// #2019: eksik ikinci Claude hesabı sona değil asıl Claude'un hemen arkasına girer.
 pub fn order(conn: &Connection) -> Vec<String> {
     let raw: Option<String> = conn
         .query_row("SELECT value FROM settings WHERE key = ?1", [CHAIN_ORDER_KEY], |r| r.get(0))
@@ -435,8 +437,12 @@ pub fn order(conn: &Connection) -> Vec<String> {
     let mut stored: Vec<String> = raw.and_then(|v| serde_json::from_str(&v).ok()).unwrap_or_default();
     stored.retain(|p| valid_target(p));
     for p in DEFAULT_CHAIN {
-        if !stored.contains(&p.to_string()) {
-            stored.push(p.to_string());
+        if stored.contains(&p.to_string()) {
+            continue;
+        }
+        match stored.iter().position(|s| s == "anthropic").filter(|_| *p == "anthropic-2") {
+            Some(i) => stored.insert(i + 1, p.to_string()),
+            None => stored.push(p.to_string()),
         }
     }
     stored
@@ -564,7 +570,7 @@ pub fn map_model(provider: &str, model: &str) -> String {
                 "muse-spark-1.3".into()
             }
         }
-        "anthropic" => match model {
+        "anthropic" | "anthropic-2" => match model {
             m if m.starts_with("claude-") || matches!(m, "opus" | "sonnet" | "haiku") => model.into(),
             // Başka sağlayıcıdan (muse/glm/local) geçiş: CLI kendi varsayılan modelini seçer.
             _ => crate::providers::CLAUDE_DEFAULT.into(),
@@ -721,15 +727,37 @@ mod tests {
     #[test]
     fn order_defaults_validates_and_dedups() {
         let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
-        assert_eq!(order(&c), vec!["anthropic", "muse", "glm", "local"]);
+        assert_eq!(order(&c), vec!["anthropic", "anthropic-2", "muse", "glm", "local"]);
         assert_eq!(set_order(&c, &["glm".into(), "glm".into(), "anthropic".into(), "local".into()]).unwrap(),
-            vec!["glm", "anthropic", "local", "muse"]);
+            vec!["glm", "anthropic", "anthropic-2", "local", "muse"]);
         assert!(set_order(&c, &[]).is_err());
         assert!(set_order(&c, &["bogus".into()]).is_err());
         // Kaldırılan hedefler (Codex motoru, gateway) artık zincire yazılamaz.
         assert!(set_order(&c, &["codex".into()]).is_err());
         assert!(set_order(&c, &["gateway".into()]).is_err());
-        assert_eq!(order(&c), vec!["glm", "anthropic", "local", "muse"], "reddedilen yazım kaydı değiştirmez");
+        assert_eq!(order(&c), vec!["glm", "anthropic", "anthropic-2", "local", "muse"], "reddedilen yazım kaydı değiştirmez");
+    }
+
+    /// #2019: ikinci hesaptan önce kaydedilmiş sıra: yeni hesap asıl Claude'un hemen arkasına girer,
+    /// kayıt değişmez; kullanıcı taşıdıysa yeri korunur.
+    #[test]
+    fn second_claude_joins_right_after_claude() {
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        c.execute("INSERT INTO settings (key, value) VALUES ('chain_order', '[\"muse\",\"anthropic\",\"glm\",\"local\"]')", []).unwrap();
+        assert_eq!(order(&c), vec!["muse", "anthropic", "anthropic-2", "glm", "local"]);
+        let raw: String = c.query_row("SELECT value FROM settings WHERE key = 'chain_order'", [], |r| r.get(0)).unwrap();
+        assert_eq!(raw, r#"["muse","anthropic","glm","local"]"#, "okuma kaydı yeniden yazmaz");
+        set_order(&c, &["anthropic-2".into(), "muse".into(), "anthropic".into()]).unwrap();
+        assert_eq!(order(&c), vec!["anthropic-2", "muse", "anthropic", "glm", "local"]);
+        // Claude 2 dolunca sıradaki Muse; Claude 2 bağlı değilse atlanır.
+        let c = crate::db::open(std::path::Path::new(":memory:")).unwrap();
+        assert_eq!(pick_next(&c, "anthropic", &|_| true).unwrap().as_deref(), Some("anthropic-2"));
+        assert_eq!(pick_next(&c, "anthropic-2", &|_| true).unwrap().as_deref(), Some("muse"));
+        assert_eq!(pick_next(&c, "anthropic", &|p| p != "anthropic-2").unwrap().as_deref(), Some("muse"));
+        mark_exhausted(&c, "anthropic-2", Some(now_ms() + 3_600_000), "kota").unwrap();
+        assert_eq!(pick_next(&c, "anthropic", &|_| true).unwrap().as_deref(), Some("muse"), "tükenmiş Claude 2 atlanır");
+        assert_eq!(map_model("anthropic-2", "claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(map_model("anthropic-2", "muse-spark-1.3"), "default");
     }
 
     #[test]

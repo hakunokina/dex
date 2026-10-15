@@ -74,15 +74,19 @@ fn parse_models(v: &serde_json::Value) -> Vec<(String, String)> {
 /// Claude Code'un OAuth erişim jetonu: `<CLAUDE_CONFIG_DIR|~/.claude>/.credentials.json`, yoksa
 /// işletim sistemi kasasındaki `Claude Code-credentials` girdisi (aynı JSON). Yalnız okunur.
 pub(crate) fn claude_token() -> Option<String> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from).or_else(|| {
-        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-        Some(std::path::PathBuf::from(home).join(".claude"))
-    });
+    let dir = crate::claude_accounts::main_dir();
     let from_file = dir.and_then(|d| std::fs::read_to_string(d.join(".credentials.json")).ok());
     let raw = from_file.or_else(|| {
         let user = std::env::var("USERNAME").or_else(|_| std::env::var("USER")).ok()?;
         crate::secrets::get("Claude Code-credentials", &user).ok().flatten()
     })?;
+    oauth_access(&serde_json::from_str(&raw).ok()?, now_ms())
+}
+
+/// #2019: ek Claude hesabının (kendi `CLAUDE_CONFIG_DIR`'ı) erişim jetonu — yalnız o dizindeki
+/// `.credentials.json` (kasa yedeği yok: ek hesap dosyada durur). Yalnız okunur, bellekte kalır.
+pub(crate) fn claude_token_in(dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(".credentials.json")).ok()?;
     oauth_access(&serde_json::from_str(&raw).ok()?, now_ms())
 }
 

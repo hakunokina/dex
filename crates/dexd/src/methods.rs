@@ -232,6 +232,8 @@ handlers! {
             |core, p| ok(core.provider_local_set_base_url(&arg::<String>(p, "url")?))
         },
         "provider_local_status" => |core, _| ok(core.provider_local_status()),
+        // #2019: the second Claude account's sign-out (sign-in is a `claude-login` PTY).
+        "claude_account_remove" => |core, p| ok(core.claude_account_remove(&arg::<String>(p, "id")?)),
         "provider_local_add" => |core, p| ok(core.provider_local_add(&arg::<String>(p, "name")?)),
         "provider_local_delete" => {
             |core, p| ok(core.provider_local_delete(&arg::<String>(p, "name")?))

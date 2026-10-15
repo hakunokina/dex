@@ -862,6 +862,7 @@ function colorsOf(p: OfficeTheme): Colors {
 /** Provider badge colours (patron, 2026-10-14): Anthropic brand orange, Muse blue, GLM black, local green. */
 const PROVIDER_LOOK: Record<string, { color: string; fill?: string }> = {
   anthropic: { color: "#D97757" },
+  "anthropic-2": { color: "#D97757" },
   muse: { color: "#3B82F6" },
   glm: { color: "#F5F5F5", fill: "#000000" },
   local: { color: "#22C55E" },
@@ -869,7 +870,7 @@ const PROVIDER_LOOK: Record<string, { color: string; fill?: string }> = {
 
 function providerOf(agent: Agent, p: OfficeTheme): { label: string; color: string; fill?: string } {
   const provider = agent.activeProvider ?? agent.provider ?? "anthropic";
-  const label = provider === "local" ? "LOCAL" : provider.toUpperCase();
+  const label = provider === "local" ? "LOCAL" : provider === "anthropic-2" ? "ANTHROPIC 2" : provider.toUpperCase();
   return { label, ...(PROVIDER_LOOK[provider] ?? { color: p.amber }) };
 }
 

@@ -1,12 +1,14 @@
 // #54/#1861: sağ kenar kullanım şeridi. Veri dexd'den (usage_get + usage-snapshot olayı): sağlayıcı
 // başına 5 saatlik (dış yay) ve haftalık (iç yay) kalan kota, bugünün token'ı. Ayarlar → Genel'den
 // kapanır/açılır. #139: şerit yer ayırmaz, sahnenin üstünde yüzer.
-import { test, expect, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+import { test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
 // Gerçek ölçüm makinenin kimliklerine bağlı: görüntü __dexFake ile verilir (measuredAt sayfada damgalanır).
 const LIVE = {
   providers: [
     { id: "anthropic", fiveHour: { remainingPercent: 66, resetsAt: "2099-01-01T12:00:00.000Z" }, weekly: { remainingPercent: 41, resetsAt: "2099-01-05T00:00:00.000Z" }, note: null as string | null, measuredAt: 0 as number | null, todayTokens: 200_000_000 },
+    // #2019: ikinci Claude hesabı (bağlıyken) Claude'un hemen arkasında, kendi ölçümüyle.
+    { id: "anthropic-2", fiveHour: { remainingPercent: 30, resetsAt: "2099-01-01T14:00:00.000Z" }, weekly: { remainingPercent: 70, resetsAt: "2099-01-06T00:00:00.000Z" }, note: null, measuredAt: 0, todayTokens: 0 },
     { id: "glm", fiveHour: { remainingPercent: 100, resetsAt: null }, weekly: { remainingPercent: 8, resetsAt: null }, note: null, measuredAt: 0, todayTokens: 21_700_000 },
     { id: "muse", fiveHour: null, weekly: null, note: "Muse anahtar ucu kullanım bildirmiyor", measuredAt: null, todayTokens: 0 },
   ],
@@ -70,6 +72,13 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   await expect(claude.locator('.usage-pct[data-window="fiveHour"]')).toHaveText("66%");
   await expect(claude.locator('.usage-pct[data-window="weekly"]')).toHaveText("41%");
   await expect(claude).toHaveAttribute("aria-label", /^Claude\n5 saat: %66 kalan, sıfırlanma .+\nHaftalık: %41 kalan, sıfırlanma /);
+  // #2019: iki Claude halkası ayrı kota; ikincisi aynı logoda "2" rozetiyle.
+  const claude2 = strip.locator('[data-provider="anthropic-2"]');
+  await expect(claude2.locator('.usage-pct[data-window="fiveHour"]')).toHaveText("30%");
+  await expect(claude2.locator('.usage-pct[data-window="weekly"]')).toHaveText("70%");
+  await expect(claude2).toHaveAttribute("aria-label", /^Claude 2\n5 saat: %30 kalan, sıfırlanma .+\nHaftalık: %70 kalan, sıfırlanma /);
+  await expect(claude2.locator(".usage-badge")).toHaveText("2");
+  await expect(claude.locator(".usage-badge")).toHaveCount(0);
   // Ton iki pencereden az kalanına göre: GLM'in haftalığı %8 → kritik.
   await expect(strip.locator('[data-provider="glm"]')).toHaveClass(/critical/);
   const muse = strip.locator('[data-provider="muse"]');
@@ -121,14 +130,15 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
     };
     return { id: p.dataset.provider, mask: getComputedStyle(mark).maskImage, size: Math.round(mark.getBoundingClientRect().width), five: fill("fiveHour"), week: fill("weekly") };
   }));
-  expect(marks.map((m) => m.id)).toEqual(["anthropic", "glm", "muse"]);
+  expect(marks.map((m) => m.id)).toEqual(["anthropic", "anthropic-2", "glm", "muse"]);
   for (const m of marks) {
     expect(m.mask, m.id).toMatch(/^url\(/);
     expect(m.size, m.id).toBe(15);
   }
   expect(marks[0]).toMatchObject({ five: "rgb(204, 124, 94)", week: "rgb(204, 124, 94)" });
-  expect(marks[1].five, "--text").toBe("rgb(213, 216, 221)");
-  expect(marks[2]).toMatchObject({ five: null, week: null });
+  expect(marks[1]).toMatchObject({ five: "rgb(204, 124, 94)", week: "rgb(204, 124, 94)" });
+  expect(marks[2].five, "--text").toBe("rgb(213, 216, 221)");
+  expect(marks[3]).toMatchObject({ five: null, week: null });
 
   // dexd'nin olayı görüntüyü değiştirir (poll yok).
   await app.evaluate((s) => {
@@ -151,6 +161,58 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   await toggle.check();
   await expect(strip).toBeVisible();
   await app.getByRole("button", { name: "Ayarlar panelini kapat" }).click();
+});
+
+// #2019: şeritteki ikinci Claude halkasının hesabı Ayarlar → Sağlayıcılar'dan bağlanır. Giriş gerçek
+// `claude auth login`'i dexd'nin `claude-login` PTY'sinde açar (burada spawn sahte: CLI açılmaz);
+// bağlıyken e-posta görünür, bağlantı onayla kaldırılır.
+test("Claude 2: Ayarlar → Sağlayıcılar'dan bağlanır, girişi terminalde açar, onayla kaldırılır", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, `Claude 2 ${test.info().workerIndex}`);
+  const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
+  await app.reload();
+  await openTeam(app, team.name);
+  await paneOf(app, leader.name);
+  // Ayarlar takımın dock'unda açılır; başka takımın gizli sahnesindeki panel sayılmaz.
+  const stage = app.locator(".team-stage:not(.hidden)");
+  await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
+  await stage.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Sağlayıcılar" }).click();
+  // Gerçek dexd (izole ev dizini): hesap bağlı değil.
+  const card = stage.locator('[data-setting="provider-anthropic-2"]');
+  await expect(card).toContainText("Claude 2");
+  await expect(card).toContainText("Bağlı değil");
+  await expect(card.getByRole("button", { name: "Bağlantıyı kaldır" })).toHaveCount(0);
+
+  await app.evaluate(() => { window.__dexFake = { ...window.__dexFake, pty_spawn: null }; });
+  await card.getByRole("button", { name: "Hesabı bağla" }).click();
+  await expect(card.locator(".set-login-term .term-host")).toBeVisible();
+  await expect.poll(async () => (await calls(app)).find((c) => c.cmd === "pty_spawn" && c.args.cmd === "claude-login")?.args)
+    .toMatchObject({ id: "claude-login-anthropic-2", provider: "anthropic-2" });
+  await card.getByRole("button", { name: "Kapat", exact: true }).click();
+  await expect(card.locator(".set-login-term")).toHaveCount(0);
+
+  // Bağlı hesap (sahte liste; dexd'nin `providers-changed` olayı kartı tazeler): e-posta, onaylı kaldırma.
+  await app.evaluate(() => {
+    window.__dexFake = {
+      ...window.__dexFake,
+      provider_list: [
+        { id: "anthropic", label: "Claude", baseUrl: null, hasToken: false, tokenMask: null, models: [] },
+        { id: "anthropic-2", label: "Claude 2", baseUrl: null, hasToken: true, tokenMask: null, models: [], account: { connected: true, email: "ikinci@example.com" } },
+      ],
+      claude_account_remove: null,
+    };
+    const sock = (window.__dexSockets ?? []).filter((w) => w.readyState === WebSocket.OPEN).at(-1);
+    if (!sock) throw new Error("açık soket yok");
+    sock.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ event: "providers-changed", payload: null }) }));
+  });
+  await expect(card).toContainText("Bağlı · ikinci@example.com");
+  await expect(card.getByRole("button", { name: "Yeniden bağla" })).toBeVisible();
+  await card.getByRole("button", { name: "Bağlantıyı kaldır" }).click();
+  const confirm = app.getByRole("alertdialog", { name: "Claude 2 bağlantısı kaldırılsın mı?" });
+  await expect(confirm.getByRole("button", { name: "Vazgeç" })).toBeFocused();
+  await confirm.getByRole("button", { name: "Bağlantıyı kaldır" }).click();
+  await expect(confirm).toHaveCount(0);
+  expect((await calls(app)).filter((c) => c.cmd === "claude_account_remove").at(-1)?.args).toEqual({ id: "anthropic-2" });
+  await expect(card).toContainText("Bağlantı kaldırıldı.");
 });
 
 // #311: GPU hücresi (gpu_overview köprüde hazır) ve worker'ın işi LLM yüzünden beklerse tek toast.

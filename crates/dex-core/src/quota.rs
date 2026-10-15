@@ -49,7 +49,12 @@ pub struct Breach {
 
 impl Breach {
     pub fn label(&self) -> String {
-        format!("Claude %{:.0} ({})", self.percent.floor(), self.window)
+        self.label_for("Claude")
+    }
+
+    /// #2019: hesabın etiketiyle ("Claude 2 %85 (5 sa)").
+    pub fn label_for(&self, who: &str) -> String {
+        format!("{who} %{:.0} ({})", self.percent.floor(), self.window)
     }
 }
 
@@ -86,12 +91,18 @@ pub fn parse_usage(v: &serde_json::Value) -> Result<Usage, String> {
     })
 }
 
-/// Gerçek kaynak: abonelik OAuth jetonuyla kullanım uç noktası.
-pub struct OAuthUsage;
+/// Gerçek kaynak: abonelik OAuth jetonuyla kullanım uç noktası. `None` = asıl hesap
+/// (`model_news::claude_token`); `Some(dir)` = #2019 ek hesabın config dizini.
+pub struct OAuthUsage(pub Option<std::path::PathBuf>);
 
 impl UsageSource for OAuthUsage {
     fn read(&self) -> Result<Usage, String> {
-        let token = crate::model_news::claude_token().ok_or("Claude OAuth jetonu yok ya da süresi geçmiş")?;
+        let token = match &self.0 {
+            None => crate::model_news::claude_token(),
+            Some(dir) if !crate::claude_accounts::connected(dir) => return Err("hesap bağlı değil".into()),
+            Some(dir) => crate::model_news::claude_token_in(dir),
+        };
+        let token = token.ok_or("Claude OAuth jetonu yok ya da süresi geçmiş")?;
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(std::time::Duration::from_secs(3))
             .timeout(std::time::Duration::from_secs(10))
@@ -176,6 +187,46 @@ impl State {
     }
 }
 
+/// #2019: Claude hesabı başına ([`crate::claude_accounts::ACCOUNTS`]) son ölçüm ve kaynağı.
+pub struct Accounts(Vec<Account>);
+
+type Account = (&'static str, std::sync::Mutex<State>, std::sync::Mutex<std::sync::Arc<dyn UsageSource>>);
+
+impl Accounts {
+    /// Testte kaynaklar ağa çıkmaz ([`NoUsage`]); gerçekte her hesap kendi jetonuyla.
+    pub fn new(data_dir: &std::path::Path) -> Self {
+        Self(
+            crate::claude_accounts::ACCOUNTS
+                .iter()
+                .map(|&id| {
+                    let source: std::sync::Arc<dyn UsageSource> = if cfg!(test) {
+                        std::sync::Arc::new(NoUsage)
+                    } else {
+                        std::sync::Arc::new(OAuthUsage(crate::claude_accounts::config_dir(data_dir, id)))
+                    };
+                    (id, std::sync::Mutex::default(), std::sync::Mutex::new(source))
+                })
+                .collect(),
+        )
+    }
+
+    /// Hesabın ölçüm durumu; Claude hesabı değilse `None`.
+    pub fn of(&self, provider: &str) -> Option<&std::sync::Mutex<State>> {
+        self.0.iter().find(|(id, ..)| *id == provider).map(|(_, state, _)| state)
+    }
+
+    fn source(&self, provider: &str) -> Option<std::sync::Arc<dyn UsageSource>> {
+        self.0.iter().find(|(id, ..)| *id == provider).map(|(.., source)| source.lock().unwrap().clone())
+    }
+
+    #[cfg(test)]
+    fn set_source(&self, provider: &str, source: std::sync::Arc<dyn UsageSource>) {
+        if let Some((.., s)) = self.0.iter().find(|(id, ..)| *id == provider) {
+            *s.lock().unwrap() = source;
+        }
+    }
+}
+
 /// Kademe: iki pencereden yüksek doluluk %50 altı → 10 dk, %50–70 → 3 dk, %70+ → 60 sn.
 pub fn tier_delay(u: &Usage) -> u64 {
     let pct = u.five_hour.max(u.seven_day);
@@ -201,56 +252,76 @@ pub fn next_delay(prev: u64, read: Option<&Usage>) -> u64 {
 const FIRST_POLL_MS: u64 = 5_000;
 
 impl crate::Core {
-    /// Arka plan ölçümü: çekirdek yaşadıkça [`Self::quota_tick`], aralık [`next_delay`] ile.
+    /// Arka plan ölçümü: Claude hesabı başına bir iş parçacığı; çekirdek yaşadıkça
+    /// [`Self::quota_tick_for`], aralık [`next_delay`] ile.
     pub(crate) fn quota_watch(&self) {
-        let weak = self.weak_self.clone();
-        std::thread::spawn(move || {
-            let mut delay = FIRST_POLL_MS;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-                let Some(core) = weak.upgrade() else { return };
-                if core.instance.lock().unwrap().is_none() {
-                    return; // shutdown
+        for provider in crate::claude_accounts::ACCOUNTS {
+            let weak = self.weak_self.clone();
+            std::thread::spawn(move || {
+                let mut delay = FIRST_POLL_MS;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    let Some(core) = weak.upgrade() else { return };
+                    if core.instance.lock().unwrap().is_none() {
+                        return; // shutdown
+                    }
+                    let read = core
+                        .quota_tick_for(provider)
+                        .then(|| core.quota.of(provider).and_then(|q| q.lock().unwrap().last.clone()))
+                        .flatten();
+                    delay = next_delay(delay, read.as_ref().map(|(_, u)| u));
                 }
-                let read = core.quota_tick().then(|| core.quota.lock().unwrap().last.clone()).flatten();
-                delay = next_delay(delay, read.as_ref().map(|(_, u)| u));
-            }
-        });
+            });
+        }
     }
 
-    /// Bir ölçüm + eşik kararı. `false` = okunamadı (son ölçüm durur, bayatlarsa eşik bilinmiyor).
+    /// Asıl Claude hesabının ölçümü ([`Self::quota_tick_for`]).
+    #[cfg(test)]
     pub(crate) fn quota_tick(&self) -> bool {
-        let source = self.quota_source.lock().unwrap().clone();
+        self.quota_tick_for("anthropic")
+    }
+
+    /// Bir hesabın ölçümü + eşik kararı. `false` = okunamadı (son ölçüm durur, bayatlarsa eşik
+    /// bilinmiyor). Hata nedeni `usage_record`'da yalnız değişince loglanır.
+    pub(crate) fn quota_tick_for(&self, provider: &'static str) -> bool {
+        let (Some(state), Some(source)) = (self.quota.of(provider), self.quota.source(provider)) else { return false };
         let read = source.read();
         // #1861: aynı ölçüm kullanım şeridine de gider (ikinci sorgu yok).
-        self.usage_record("anthropic", read.as_ref().map(crate::usage::Limits::from).map_err(Clone::clone));
+        self.usage_record(provider, read.as_ref().map(crate::usage::Limits::from).map_err(Clone::clone));
         let now = crate::model_news::now_ms();
         let ok = match read {
             Ok(u) => {
-                self.quota.lock().unwrap().last = Some((now, u));
+                state.lock().unwrap().last = Some((now, u));
                 true
             }
-            Err(err) => {
-                eprintln!("dex: Claude kullanımı okunamadı: {err}");
-                false
-            }
+            Err(_) => false,
         };
-        let breach = self.quota.lock().unwrap().breach_at(now);
+        let breach = state.lock().unwrap().breach_at(now);
         match breach {
-            Some(b) => self.quota_switch(&b),
-            None => self.quota.lock().unwrap().warned = false,
+            Some(b) => self.quota_switch(provider, &b),
+            None => state.lock().unwrap().warned = false,
         }
         // #1033: %100 tükenme ayrı bölüm: sürdükçe "hedef yok" notu ölçüm başına tekrarlanmaz.
-        let mut q = self.quota.lock().unwrap();
+        let mut q = state.lock().unwrap();
         if !q.full_at(now) {
             q.warned_full = false;
         }
         ok
     }
 
+    /// #2019: hesabın taze ölçümü eşiği aşıyor mu (zincir seçimi bu hesaba worker taşımaz).
+    pub(crate) fn quota_breached(&self, provider: &str) -> bool {
+        self.quota.of(provider).is_some_and(|q| q.lock().unwrap().breach_at(crate::model_news::now_ms()).is_some())
+    }
+
     #[cfg(test)]
     pub(crate) fn quota_set_source(&self, source: std::sync::Arc<dyn UsageSource>) {
-        *self.quota_source.lock().unwrap() = source;
+        self.quota.set_source("anthropic", source);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quota_set_source_for(&self, provider: &str, source: std::sync::Arc<dyn UsageSource>) {
+        self.quota.set_source(provider, source);
     }
 }
 

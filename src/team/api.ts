@@ -85,6 +85,14 @@ export interface ProviderInfo {
   models: ProviderModel[];
   hasToken: boolean;
   tokenMask: string | null;
+  /** #2019: an extra Claude subscription account (its own CLI login); absent elsewhere. */
+  account?: ClaudeAccount;
+}
+/** #2019: `hasToken` of such an account = connected (the CLI's credentials file exists). */
+export interface ClaudeAccount {
+  connected: boolean;
+  /** The CLI's account e-mail, when it recorded one. */
+  email: string | null;
 }
 export interface ProviderImportRow {
   provider: string;
@@ -97,6 +105,8 @@ export interface ProviderImportRow {
 export const listProviders = (host: string) => callHost<ProviderInfo[]>(host, "provider_list");
 export const importProviders = (host: string) => callHost<ProviderImportRow[]>(host, "provider_import_routes");
 export const setProviderToken = (host: string, id: string, token: string) => callHost<void>(host, "provider_set_token", { id, token });
+/** #2019: sign the extra Claude account out (its sign-in is the `claude-login` PTY). */
+export const removeClaudeAccount = (host: string, id: string) => callHost<void>(host, "claude_account_remove", { id });
 
 /** DEX-25: the local LiteLLM server — its model list is live, never a static catalog. */
 export interface LocalModel {

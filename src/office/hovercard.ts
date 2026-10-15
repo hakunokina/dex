@@ -24,7 +24,7 @@ const STATUS_COLOR: Record<AgentStatus, string> = {
 const KIND_TEXT: Record<string, string> = { leader: "Lider", worker: "Worker" };
 
 /** DEX-13: non-anthropic agents show which provider serves their model. */
-const PROVIDER_TEXT: Record<string, string> = { glm: "GLM", muse: "Muse", local: "Yerel LLM" };
+const PROVIDER_TEXT: Record<string, string> = { glm: "GLM", muse: "Muse", local: "Yerel LLM", "anthropic-2": "Anthropic (Claude 2)" };
 
 function fmtDur(ms: number): string {
   const s = Math.floor(ms / 1000);

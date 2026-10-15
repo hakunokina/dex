@@ -3,7 +3,8 @@
 //! dexd verir (`usage_get` + `usage-snapshot` olayı): UI kaynağı bilmez, uzak dexd'de de çalışır.
 //!
 //! Kota kaynakları (hepsi hesap geneli; Dex dışındaki kullanım dahil):
-//! - Claude: `quota.rs`'nin `/api/oauth/usage` ölçümü. İkinci sorgu yok; `quota_tick` buraya yazar.
+//! - Claude: `quota.rs`'nin `/api/oauth/usage` ölçümü. İkinci sorgu yok; `quota_tick_for` buraya yazar.
+//!   #2019: ikinci hesap (`anthropic-2`) kendi jetonuyla ayrı ölçülür; bağlı değilse şeritte yok.
 //! - GLM: `GET api.z.ai/api/monitor/usage/quota/limit`, Dex'in GLM jetonuyla (`dex-provider/glm`).
 //!   Token pencereleri (`TOKENS_LIMIT`/`CREDIT_LIMIT`) süreye göre sıralanır: en kısası 5 sa, en
 //!   uzunu haftalık; tek pencere ≤6 sa ise 5 sa sayılır. Aylık MCP (`TIME_LIMIT`) şeride girmez.
@@ -31,7 +32,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 /// Şeritteki sağlayıcılar (Dex kimlikleri), bu sırayla.
-pub const PROVIDERS: [&str; 3] = ["anthropic", "glm", "muse"];
+pub const PROVIDERS: [&str; 4] = ["anthropic", "anthropic-2", "glm", "muse"];
 
 const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
 const MUSE_MINT_URL: &str = "https://api.meta.ai/muse-code/key";
@@ -516,7 +517,18 @@ impl crate::Core {
         let since = local_midnight(chrono::Local::now());
         let tokens = self.cost_tokens_since(since, ingest).ok();
         let readings = self.usage.readings.lock().unwrap();
-        build(&readings, tokens.as_ref(), crate::model_news::now_ms())
+        let mut snap = build(&readings, tokens.as_ref(), crate::model_news::now_ms());
+        // #2019: bağlı olmayan ek Claude hesabının halkası yok.
+        snap.providers.retain(|p| {
+            crate::claude_accounts::config_dir(&self.paths.data_dir, p.id).is_none_or(|d| crate::claude_accounts::connected(&d))
+        });
+        snap
+    }
+
+    /// #2019: hesabın bağlantısı kalktı — son ölçümü unutulur, görüntü yayınlanır.
+    pub(crate) fn usage_forget(&self, id: &str) {
+        self.usage.readings.lock().unwrap().remove(id);
+        self.usage_publish();
     }
 
     /// Şeridin anlık görüntüsü (dosya okumaz; kuyruklar ölçüm iş parçacıklarında okunur).
@@ -701,7 +713,8 @@ mod tests {
         let tokens: BTreeMap<String, u64> = [("anthropic".into(), 1_000), ("local".into(), 5)].into();
         let s = build(&readings, Some(&tokens), now);
         assert_eq!(s.providers.iter().map(|p| p.id).collect::<Vec<_>>(), PROVIDERS);
-        let [claude, glm, muse] = &s.providers[..] else { panic!() };
+        let [claude, claude2, glm, muse] = &s.providers[..] else { panic!() };
+        assert_eq!(claude2.note.as_deref(), Some("henüz ölçülmedi"), "ikinci hesap ayrı satır");
         assert_eq!((&claude.limits, claude.note.as_deref(), claude.measured_at), (&limits, None, Some(now - 1_000)));
         assert_eq!((&glm.limits, glm.note.as_deref()), (&Limits::default(), Some("z.ai kota ucu HTTP 500")), "bayat ölçüm gösterilmez");
         assert_eq!(muse.note.as_deref(), Some("henüz ölçülmedi"));
@@ -709,7 +722,7 @@ mod tests {
         assert_eq!(build(&readings, None, now).today_tokens, None, "okunamayan token uydurulmaz");
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["providers"][0]["fiveHour"]["remainingPercent"], 40.0);
-        assert_eq!(v["providers"][1]["weekly"], Value::Null);
+        assert_eq!(v["providers"][2]["weekly"], Value::Null);
     }
 
     #[test]
