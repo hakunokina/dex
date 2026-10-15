@@ -1,6 +1,6 @@
 import { isolatedTest as test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
-test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünüm ve kaldırma", async ({ app, dexd }) => {
+test("Asistan: üye ekleme, Core grubunda 4. sekme, doğrudan yazım, dar görünüm ve kaldırma", async ({ app, dexd }) => {
   const team = await newTeam(dexd, "Asistan paneli");
   const leader = (await teamAgents(dexd, team.id)).find(a => a.kind === "leader")!;
   await app.reload();
@@ -12,7 +12,19 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
     const names = [...el.querySelectorAll(".dex-tab-name")].map(tab => tab.textContent).sort().join("|");
     return { names, x, y, width, height };
   }).sort((a, b) => a.names.localeCompare(b.names)));
-  const before = await region(leader.name).boundingBox();
+  const stage = app.locator(".team-stage:not(.hidden)");
+  const tabName = (name: string) => app.locator(".dex-tab-name", { hasText: new RegExp(`^${name}$`) });
+  const tabOf = (name: string) => stage.locator(".dv-tab").filter({ has: tabName(name) });
+  // Core's group, tabs in order.
+  const coreGroup = () => stage.locator(".dv-groupview").filter({ has: tabName(leader.name) });
+  const coreTabs = () => coreGroup().locator(".dex-tab-name").allTextContents();
+  const saveLayout = () => app.evaluate(async teamId => {
+    const { boundApi } = await import("/src/layout/panels.ts");
+    const { getSnapshot } = await import("/src/layout/store.ts");
+    const state = getSnapshot();
+    return { ...state, version: 2, teams: { ...state.teams, [teamId]: { ...state.teams[teamId], dock: boundApi(teamId)!.toJSON() } } };
+  }, team.id);
+  const before = await coreGroup().boundingBox();
   const beforeGroups = await groups();
   await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
   const newTeamForm = app.getByRole("dialog", { name: "Yeni takım", exact: true });
@@ -34,12 +46,15 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
   await expect(settings.getByRole("combobox", { name: `${worker.name} rolü`, exact: true }).locator('option[value="assistant"]')).toBeDisabled();
   await expect(settings.getByRole("combobox", { name: `${leader.name} rolü`, exact: true }).locator('option[value="assistant"]')).toHaveCount(0);
   await app.locator('.team-stage:not(.hidden) .dv-tab').filter({ hasText: /^Kart$/ }).click();
+  // #1840: Echo joins Core's tabs last, without a column of its own and without taking Core's place.
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu", "Echo-1"]);
+  await expect(region(leader.name)).toBeVisible();
+  await expect(region("Echo-1")).toBeHidden();
+  expect((await groups()).length).toBe(beforeGroups.length);
+  expect(Math.abs((await coreGroup().boundingBox())!.width - before!.width)).toBeLessThan(2);
+  await tabOf("Echo-1").click();
   let pane = await paneOf(app, "Echo-1");
   await expect(pane.getByRole("button", { name: "İzleme", exact: true })).toHaveCount(0);
-  const leadBox = (await region(leader.name).boundingBox())!;
-  const echoBox = (await region("Echo-1").boundingBox())!;
-  expect(echoBox.x).toBeGreaterThanOrEqual(leadBox.x + leadBox.width - 1);
-  expect(Math.abs(echoBox.y - leadBox.y)).toBeLessThan(2);
   await pane.getByRole("button", { name: "Claude'u başlat", exact: true }).focus();
   await app.keyboard.press("Enter");
   await expect(pane.locator(".xterm-rows")).toContainText("fake-claude hazir");
@@ -54,14 +69,12 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
   await expect(pane.locator(".xterm-rows")).toContainText("RX:PATRON_PANEL");
   await app.reload();
   await openTeam(app, team.name);
-  pane = await paneOf(app, "Echo-1");
+  // A narrow window keeps Core's tabs, with no sideways scroll.
   await app.setViewportSize({ width: 720, height: 700 });
-  await expect.poll(async () => {
-    const lead = (await region(leader.name).boundingBox())!;
-    const echo = (await region("Echo-1").boundingBox())!;
-    return { below: echo.y >= lead.y + lead.height - 1, lead, echo };
-  }).toMatchObject({ below: true });
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu", "Echo-1"]);
   await expect.poll(() => app.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await tabOf("Echo-1").click();
+  pane = await paneOf(app, "Echo-1");
   await pane.getByRole("tab", { name: "Sohbet", exact: true }).focus();
   await app.keyboard.press("Enter");
   await expect(pane.getByRole("textbox", { name: "Ajana mesaj gönder", exact: true })).toBeVisible();
@@ -76,7 +89,8 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
   await row.getByRole("menuitem", { name: "Üyeyi sil" }).click();
   await app.getByRole("alertdialog").getByRole("button", { name: "Üyeyi sil" }).click();
   await expect(region("Echo-1")).toHaveCount(0);
-  const after = (await region(leader.name).boundingBox())!;
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu"]);
+  const after = (await coreGroup().boundingBox())!;
   expect(Math.abs(after.width - before!.width)).toBeLessThan(2);
   expect(Math.abs(after.x - before!.x)).toBeLessThan(2);
   const afterGroups = await groups();
@@ -86,8 +100,8 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
     Math.sign(g.x - other.x), Math.sign(g.y - other.y),
   ]));
   expect(order(afterGroups)).toEqual(order(beforeGroups));
-  // A newly added assistant opens by itself; closed by the patron, it stays closed through resizes
-  // and reloads, and only the rack brings it back.
+  // A newly added assistant opens by itself as Core's last tab; closed by the patron, it stays closed
+  // through reloads, and only the rack brings it back.
   await role.selectOption("assistant");
   await settings.getByRole("button", { name: "Ekle", exact: true }).click();
   let next = { id: "", name: "" };
@@ -97,12 +111,11 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
     return next.id;
   }).not.toBe("");
   await app.locator('.team-stage:not(.hidden) .dv-tab').filter({ hasText: /^Kart$/ }).click();
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu", next.name]);
+  await tabOf(next.name).click();
   await paneOf(app, next.name);
   await app.locator(".team-stage:not(.hidden)").getByRole("button", { name: `${next.name} sekmesini kapat`, exact: true }).focus();
   await app.keyboard.press("Enter");
-  await expect(region(next.name)).toHaveCount(0);
-  await app.setViewportSize({ width: 1300, height: 900 });
-  await app.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
   await expect(region(next.name)).toHaveCount(0);
   // The debounced layout_save must carry the closed pane and the assistant it was opened for.
   await expect.poll(async () => {
@@ -112,9 +125,35 @@ test("Asistan: üye ekleme, Core yanında panel, doğrudan yazım, dar görünü
   }).toEqual({ open: false, assistant: next.id });
   await app.reload();
   await openTeam(app, team.name);
-  await paneOf(app, leader.name);
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu"]);
   await expect(region(next.name)).toHaveCount(0);
   await app.getByRole("group", { name: "Takım ajanları" }).locator(`[data-agent="${next.id}"]`).focus();
   await app.keyboard.press("Enter");
   await paneOf(app, next.name);
+  // A layout saved before #1840 kept Echo in its own column right of Core: it joins Core's tabs once,
+  // Core gets its width back; moved by the patron afterwards, it stays where it was put.
+  const move = (legacy: boolean) => app.evaluate(async ({ teamId, leaderId, echoId, legacy }) => {
+    const { boundApi, agentPanelId } = await import("/src/layout/panels.ts");
+    const api = boundApi(teamId)!;
+    const lead = api.getPanel(agentPanelId(leaderId))!;
+    const share = lead.group.api.width / api.width;
+    const echo = api.getPanel(agentPanelId(echoId))!;
+    echo.api.moveTo({ group: lead.group, position: "right", skipSetActive: true });
+    if (legacy) echo.api.updateParameters({ assistant: undefined, assistantDirection: "right", assistantLeader: lead.id, assistantLeadShare: share });
+    return echo.group !== lead.group;
+  }, { teamId: team.id, leaderId: leader.id, echoId: next.id, legacy });
+  const wide = (await coreGroup().boundingBox())!.width;
+  expect(await move(true)).toBe(true);
+  await dexd.call("layout_save", { layout: await saveLayout() });
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect.poll(coreTabs).toEqual([leader.name, "Ortak not", "Takım notu", next.name]);
+  // Within a sash of the width it had before the split.
+  await expect.poll(async () => Math.abs((await coreGroup().boundingBox())!.width - wide)).toBeLessThan(4);
+  expect(await move(false)).toBe(true);
+  await dexd.call("layout_save", { layout: await saveLayout() });
+  await app.reload();
+  await openTeam(app, team.name);
+  await paneOf(app, next.name);
+  expect(await coreTabs()).toEqual([leader.name, "Ortak not", "Takım notu"]);
 });
