@@ -98,6 +98,17 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overla
   await expect.poll(async () => (await dexd.call<{ parts: Part[] }>("prompt_parts")).parts.find((p) => p.id === "dex-rules")!.overridden).toBe(false);
   await expect(item(rules)).not.toContainText("değiştirildi");
 
+  // An unsaved draft: closing asks (awaited, #2062); İptal keeps the overlay and the draft, Tamam closes.
+  await text.press("Control+End");
+  await text.pressSequentially(" taslak");
+  let asked = false;
+  app.once("dialog", (d) => { asked = true; void d.dismiss(); });
+  await dialog.getByRole("button", { name: "Kapat" }).click();
+  await expect.poll(() => asked).toBe(true);
+  await expect(dialog).toBeVisible();
+  await expect(text).toHaveValue(/ taslak$/);
+  app.once("dialog", (d) => void d.accept());
+
   await app.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
   await expect(open).toBeFocused();
