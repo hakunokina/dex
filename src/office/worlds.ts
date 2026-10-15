@@ -9,6 +9,7 @@ import { getQuestions, leaderPending, workerQuestion } from "../questions";
 import { getProposals } from "../team/Proposals";
 import { applyStep, type Step, type StepEvent } from "./companion/coreState";
 import { stalledFor } from "../stall";
+import { workerProgress } from "../progress";
 import { slowReply } from "../firstReply";
 import { membersOf, subscribe, getTeamsSnapshot } from "../team/store";
 import { agentToday } from "../usage/costStore";
@@ -38,6 +39,10 @@ const liveData: WorldData = {
   result: (agentId) => unreadResult(getDelegations(), agentId),
   question: (agentId) => workerQuestion(getQuestions(), agentId),
   stalled: stalledFor,
+  progress: (id) => {
+    const p = workerProgress(id, getDelegations());
+    return p && p.done / p.total;
+  },
   slow: (id) => slowReply(id) !== null,
   start: requestStart,
   cost: (id) => costText(agentToday(id)?.total, false),

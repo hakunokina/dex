@@ -16,7 +16,8 @@ import { soundEvent } from "./sound";
 const hot = import.meta.hot;
 
 const KEY = "dex.stallMinutes";
-const DEFAULT_MINUTES = 10;
+// #2055: 20 dk — a worker on a long job is told about once, not nudged (the backend sends one note per silence).
+const DEFAULT_MINUTES = 20;
 /** Palette choices; 0 = off. */
 export const STALL_CHOICES = [0, 5, 10, 20, 30];
 

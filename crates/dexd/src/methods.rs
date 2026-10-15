@@ -216,6 +216,7 @@ handlers! {
             |core, p| ok(core.delegation_session_exited(&arg::<String>(p, "agentId")?))
         },
         "delegation_seen" => |core, p| ok(core.delegation_seen(&arg::<String>(p, "agentId")?)),
+        "delegation_progress" => |core, _| ok(Ok::<_, String>(core.delegation_progress())),
         "question_list" => |core, _| ok(core.question_list()),
         "question_answer" => {
             |core, p| ok(core.question_answer(arg(p, "id")?, &arg::<String>(p, "text")?))

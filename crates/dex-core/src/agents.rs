@@ -94,6 +94,11 @@ impl States {
         self.0.lock().unwrap().get(id).cloned().unwrap_or_else(|| State { agent_id: id.into(), ..Default::default() })
     }
 
+    /// When the agent's last hook came (ms; 0: none yet).
+    pub(crate) fn hook_at(&self, id: &str) -> u64 {
+        self.0.lock().unwrap().get(id).map_or(0, |s| s.hook_at)
+    }
+
     pub fn list(&self) -> Vec<State> {
         let mut states: Vec<_> = self.0.lock().unwrap().values().cloned().collect();
         states.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -650,6 +655,22 @@ pub fn effort_env(effort: Option<crate::effort::Effort>, env: &mut Vec<(String, 
     }
 }
 
+/// #2055: CLI 2.1.300 offers its task list (TaskCreate…/TodoWrite) to Claude 5 models only on
+/// opt-in; a worker's list is its job's progress (`progress.rs`). Workers on the claude engine only
+/// (any provider); no rule asks for a list. A value the patron set stays.
+fn todo_tools_env(engine: &str, kind: &str, env: &mut Vec<(String, String)>) {
+    const KEY: &str = "CLAUDE_CODE_ENABLE_TODO_TOOLS";
+    if kind != "worker" || !std::path::Path::new(engine).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("claude")) {
+        return;
+    }
+    // An inherited value is the patron's unless Dex runs nested in Claude (pty.rs strips those).
+    let inherited = std::env::var_os(KEY).is_some() && std::env::var_os("CLAUDECODE").is_none();
+    if inherited || env.iter().any(|(k, _)| k == KEY) {
+        return;
+    }
+    env.push((KEY.into(), "1".into()));
+}
+
 fn leader_colors_env(
     skills: &crate::skills::Skills,
     engine: &str,
@@ -851,6 +872,7 @@ impl crate::Core {
             let mut env = options.env.clone();
             effort_env(options.effort, &mut env);
             leader_colors_env(&self.skills, &engine, &agent.kind, std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok().as_deref(), &mut env)?;
+            todo_tools_env(&engine, &agent.kind, &mut env);
             env
         };
         // #838 D: the binding is on record before the CLI's first hook. #284: a start that resumes
@@ -1898,6 +1920,24 @@ mod tests {
         leader_colors_env(&skills, "claude", "leader", None, &mut env).unwrap();
         assert_eq!(env[1].1, dir, "empty env must not inject a current-directory path");
         skills.remove_all();
+    }
+
+    #[test]
+    fn todo_tools_open_only_for_claude_workers_and_keep_a_set_value() {
+        if std::env::var_os("CLAUDE_CODE_ENABLE_TODO_TOOLS").is_some() { return; }
+        let key = |env: &[(String, String)]| env.iter().find(|(k, _)| k == "CLAUDE_CODE_ENABLE_TODO_TOOLS").map(|(_, v)| v.clone());
+        for (engine, kind) in [("claude", "leader"), ("codex", "worker"), ("shell", "worker")] {
+            let mut env = Vec::new();
+            todo_tools_env(engine, kind, &mut env);
+            assert_eq!(key(&env), None, "{engine}/{kind}");
+        }
+        let mut env = Vec::new();
+        todo_tools_env("C:/x/claude.exe", "worker", &mut env);
+        todo_tools_env("claude", "worker", &mut env);
+        assert_eq!(env, vec![("CLAUDE_CODE_ENABLE_TODO_TOOLS".to_string(), "1".to_string())]);
+        let mut env = vec![("CLAUDE_CODE_ENABLE_TODO_TOOLS".to_string(), "0".to_string())];
+        todo_tools_env("claude", "worker", &mut env);
+        assert_eq!(key(&env).as_deref(), Some("0"));
     }
 
     #[test]

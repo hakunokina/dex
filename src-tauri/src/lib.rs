@@ -195,6 +195,7 @@ pub fn run() {
             delegate::delegation_session_exited,
             delegate::delegation_seen,
             delegate::delegation_stalled,
+            delegate::delegation_progress,
             delegate::question_list,
             delegate::question_answer,
             providers::provider_list,

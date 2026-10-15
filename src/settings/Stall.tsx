@@ -16,7 +16,7 @@ export function StallSection() {
       <Row
         id="stall"
         label="Süre"
-        description="Bu süre sessiz kalan çalışan ajan 'takılmış olabilir' diye işaretlenir. Varsayılan: 10 dk."
+        description="Bu süre sessiz kalan çalışan ajan 'takılmış olabilir' diye işaretlenir. Varsayılan: 20 dk."
         control={
           <>
             <select
