@@ -73,7 +73,7 @@ cmp -s "$ICON_SRC/mipmap-xxxhdpi/ic_launcher.png" "$ICON_DST/mipmap-xxxhdpi/ic_l
 # #1719 Echo cevapları: bildirim köprüsü (jeton / bildirimden açılış / tarayıcı) + FCM servisi.
 for k in PushPlugin DexMessagingService; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
 # #1859 Günlük motivasyon: WorkManager işi (host'tan çek → JezLauncher ContentProvider) + saf plan
-# mantığı ve JVM birim testi (gen/ app/src/test; `./gradlew :app:testDebugUnitTest`).
+# mantığı ve JVM birim testi (gen/ app/src/test; `./gradlew :app:testArmDebugUnitTest`).
 for k in MotivationPlan MotivationWorker; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
 TDST=src-tauri/gen/android/app/src/test/java/com/hakunokina/dex/hosttokens
 mkdir -p "$TDST" && cp src-tauri/android/MotivationPlanTest.kt "$TDST/"

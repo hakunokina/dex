@@ -1,5 +1,5 @@
 // #1859 MotivationPlan birim testleri (JVM; build-apk.sh gen/ app/src/test altına kopyalar).
-// Koşma: gen/android içinde `./gradlew :app:testDebugUnitTest --tests '*MotivationPlanTest'`.
+// Koşma: gen/android içinde `./gradlew :app:testArmDebugUnitTest --tests '*MotivationPlanTest'`.
 
 package com.hakunokina.dex.hosttokens
 
