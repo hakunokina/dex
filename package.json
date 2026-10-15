@@ -26,6 +26,7 @@
     "deploy:install": "node scripts/deploy-install.mjs",
     "deploy:status": "node scripts/deploy-status.mjs",
     "test:e2e": "playwright test",
+    "screenshots": "playwright test -c scripts/screenshots/playwright.config.ts",
     "gate": "node scripts/gate.mjs",
     "dexd:dev": "node scripts/dexd-dev.mjs"
   },
