@@ -454,7 +454,7 @@ pub fn refresh(root: &Path) -> Result<RefreshOut, String> {
 pub fn prompt_line(root: &Path) -> Option<String> {
     if root.join(MAP_FILE).is_file() {
         Some(format!(
-            "Proje haritası: `{}/.dex/map.md` — işe başlamadan ilgili bölümü oku.",
+            "Proje haritası: `{}/.dex/map.md` — iş karışık gelirse ya da nereden başlayacağını bilmiyorsan bak; hemen bakmak zorunda değilsin, işin ortasında da açabilirsin.",
             root.display()
         ))
     } else {
@@ -613,6 +613,6 @@ mod tests {
         assert!(prompt_line(&f.dir).is_none());
         refresh(&f.dir).unwrap();
         let line = prompt_line(&f.dir).unwrap();
-        assert!(line.starts_with("Proje haritası: `") && line.ends_with(".dex/map.md` — işe başlamadan ilgili bölümü oku."), "{line}");
+        assert!(line.starts_with("Proje haritası: `") && line.ends_with(".dex/map.md` — iş karışık gelirse ya da nereden başlayacağını bilmiyorsan bak; hemen bakmak zorunda değilsin, işin ortasında da açabilirsin."), "{line}");
     }
 }

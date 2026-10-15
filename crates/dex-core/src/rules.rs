@@ -804,7 +804,7 @@ Bu projede `.dex/stack.md` yok; tespit edilen: Godot. Patronla birlikte taslağ�
         }
         std::fs::create_dir_all(d.join(".dex")).unwrap();
         std::fs::write(d.join(crate::repomap::MAP_FILE), "x").unwrap();
-        let expected = format!("Proje haritası: `{}/.dex/map.md` — işe başlamadan ilgili bölümü oku.", d.display());
+        let expected = format!("Proje haritası: `{}/.dex/map.md` — iş karışık gelirse ya da nereden başlayacağını bilmiyorsan bak; hemen bakmak zorunda değilsin, işin ortasında da açabilirsin.", d.display());
         for id in ["timur", "ayla"] {
             assert!(system_prompt(&c, id, Some((&s, &o))).contains(&expected), "{id}");
         }
