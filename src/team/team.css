@@ -206,7 +206,7 @@
 .host-banner .core-start-err { margin-left: auto; color: var(--red); }
 .host-banner .core-start-err + button { margin-left: 0; }
 .host-banner .core-drift-actions { margin-left: var(--sp-2); display: flex; gap: 6px; align-items: center; }
-.host-banner .core-drift-actions button { margin-left: 0; }
+.host-banner .core-drift-actions button { margin-left: 0; height: 18px; min-height: 0; padding: 0 9px; font-size: var(--fs-xs); line-height: 1; border-radius: var(--r-pill); }
 .host-empty .core-start-err { color: var(--red); white-space: normal; }
 /* #203: why the core is down — one line, the whole text on hover. */
 .core-down-why { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); font-size: var(--fs-xs); }

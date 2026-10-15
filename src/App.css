@@ -375,6 +375,8 @@ svg.lucide { width: var(--icon); height: var(--icon); stroke-width: var(--icon-s
 .ctx-meter.ctx-high .ctx-bar > span { background: var(--orange); }
 .ctx-meter.ctx-critical { color: var(--red-hi); font-weight: var(--fw-semibold); }
 .ctx-meter.ctx-critical .ctx-bar > span { background: var(--red); }
+/* Context ve Temiz oturum: sekmelerden yarım punto küçük, satırda bir tık aşağıda. */
+.pane-view-toggle .ctx-meter, .pane-view-toggle .pane-reset { font-size: calc(var(--fs-xs) - .5px); position: relative; top: 1px; }
 /* Temiz oturum: context göstergesiyle aynı eşik rengi (urgent ayrıca zemin alır). */
 .pane-view-toggle .pane-reset.ctx-warn { color: var(--amber); }
 .pane-view-toggle .pane-reset.ctx-high { color: var(--orange); }
