@@ -45,7 +45,14 @@ class HostTokensPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun keepUrl(args: TokenArgs) {
         val url = args.url?.trim() ?: return
-        if (validUrl(url) && urls.getString(args.id, null) != url) urls.edit().putString(args.id, url).apply()
+        if (!validUrl(url) || urls.getString(args.id, null) == url) return
+        urls.edit().putString(args.id, url).apply()
+        // #1877: açılışta load()'un kurduğu iş adres yazılmadan koşmuş olabilir; yeni adresle yeniden kur.
+        try {
+            MotivationWork.ensure(activity.applicationContext)
+        } catch (e: Exception) {
+            // Sabah işi kurulamadı; jeton köprüsü çalışmaya devam eder.
+        }
     }
 
     private fun argsOrReject(invoke: Invoke): TokenArgs? {
@@ -114,9 +121,18 @@ class HostTokensPlugin(private val activity: Activity) : Plugin(activity) {
             )
         }
 
-        fun tokens(context: Context): SharedPreferences = encrypted(context, PREFS)
+        // #1877: plugin ve MotivationWorker aynı örneği kullanır. İki ayrı EncryptedSharedPreferences
+        // ilk açılışta aynı dosyanın keyset'ini yarışarak üretebilir; kaybedenin yazdığı girdi çözülemez.
+        private var tokensPrefs: SharedPreferences? = null
+        private var urlsPrefs: SharedPreferences? = null
 
-        fun urls(context: Context): SharedPreferences = encrypted(context, URLS)
+        @Synchronized
+        fun tokens(context: Context): SharedPreferences =
+            tokensPrefs ?: encrypted(context.applicationContext, PREFS).also { tokensPrefs = it }
+
+        @Synchronized
+        fun urls(context: Context): SharedPreferences =
+            urlsPrefs ?: encrypted(context.applicationContext, URLS).also { urlsPrefs = it }
 
         fun validUrl(url: String): Boolean =
             url.length <= 512 && (url.startsWith("ws://") || url.startsWith("wss://"))

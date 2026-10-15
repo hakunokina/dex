@@ -58,9 +58,34 @@ class MotivationPlanTest {
     }
 
     @Test
-    fun noRetryWhenEveryHostRefusedOrNoHost() {
+    fun noRetryWhenEveryHostRefused() {
         assertFalse(MotivationPlan.retry(listOf(Miss.SKIP, Miss.SKIP), false))
-        assertFalse(MotivationPlan.retry(emptyList(), false))
+    }
+
+    // #1877: güncelleme sonrası ilk açılışta adresler native depoya yazılmadan iş koşar.
+    @Test
+    fun retriesWhenNoHostYetUntilNoon() {
+        assertTrue(MotivationPlan.retry(emptyList(), false))
+        assertFalse(MotivationPlan.retry(emptyList(), true))
+    }
+
+    @Test
+    fun fetchOnlyBeforeNoonAndWhenNotWritten() {
+        assertTrue(MotivationPlan.shouldFetch(null, at(2026, 10, 15, 9, 58), tz))
+        assertTrue(MotivationPlan.shouldFetch("2026-10-14", at(2026, 10, 15, 11, 59), tz))
+        assertFalse(MotivationPlan.shouldFetch("2026-10-15", at(2026, 10, 15, 9, 58), tz))
+        // Geç kalan backoff denemesi (13:45): ağa çıkmadan biter.
+        assertFalse(MotivationPlan.shouldFetch(null, at(2026, 10, 15, 13, 45), tz))
+        assertFalse(MotivationPlan.shouldFetch("2026-10-14", at(2026, 10, 15, 12), tz))
+    }
+
+    @Test
+    fun nextAfterRunIsAlwaysTomorrow() {
+        // Saat geri alınıp 04:45'ten önce koşsa da bugünü (koşan iş) değil yarını kurar.
+        assertEquals(at(2026, 10, 16, 4, 45), MotivationPlan.nextAfterRun(at(2026, 10, 15, 3, 50), tz))
+        assertEquals(at(2026, 10, 16, 4, 45), MotivationPlan.nextAfterRun(at(2026, 10, 15, 4, 45), tz))
+        assertEquals(at(2026, 10, 16, 4, 45), MotivationPlan.nextAfterRun(at(2026, 10, 15, 10, 0), tz))
+        assertEquals(at(2027, 1, 1, 4, 45), MotivationPlan.nextAfterRun(at(2026, 12, 31, 23, 59), tz))
     }
 
     @Test
