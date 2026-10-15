@@ -1,9 +1,9 @@
 // Bu cihaz › Genel › Görünüm: yoğunluk, terminal yazı boyutu, kullanım şeridi.
-// Üçü de bu cihazın tercihi (localStorage); değişiklik anında uygulanır.
+// Hepsi bu cihazın tercihi (localStorage); değişiklik anında uygulanır.
 import { useEffect, useState } from "react";
 import { density, setDensity, type Density } from "../density";
 import { setTermSize, termSize, ZOOM_EVENT } from "../termZoom";
-import { setStripVisible, useStripVisible } from "../usage/store";
+import { setStripPlace, setStripVisible, useStripPlace, useStripVisible } from "../usage/store";
 import { Row } from "./kit/Row";
 import { Section } from "./kit/Section";
 import { Segmented } from "./kit/Segmented";
@@ -13,6 +13,7 @@ export function AppearanceSection() {
   const [value, setValue] = useState<Density>(density);
   const [size, setSize] = useState(termSize);
   const visible = useStripVisible();
+  const place = useStripPlace();
   useEffect(() => {
     const on = (e: Event) => setSize((e as CustomEvent<number>).detail);
     window.addEventListener(ZOOM_EVENT, on);
@@ -50,10 +51,24 @@ export function AppearanceSection() {
       />
       <Row
         id="strip"
-        label="Sağ kenarda göster"
-        description="Kullanım şeridi: sağ kenarda sağlayıcı kotaları (5 saat / haftalık) ve bugünün token'ı."
+        label="Kullanım şeridini göster"
+        description="Sağlayıcı kotaları (5 saat / haftalık), GPU ve bugünün token'ı."
         control={
-          <Switch label="Sağ kenarda göster" checked={visible} onChange={setStripVisible} />
+          <Switch label="Kullanım şeridini göster" checked={visible} onChange={setStripVisible} />
+        }
+      />
+      <Row
+        id="strip-place"
+        label="Kullanım şeridi"
+        description="Sağ ya da sol kenarda dikey; üst başlıkta pencere düğmelerinin solunda yatay (takım çipleri yer açar)."
+        control={
+          <Segmented
+            label="Kullanım şeridi"
+            value={place}
+            disabled={!visible}
+            options={[{ value: "right", label: "Sağ" }, { value: "left", label: "Sol" }, { value: "top", label: "Üst başlık" }]}
+            onChange={setStripPlace}
+          />
         }
       />
     </Section>

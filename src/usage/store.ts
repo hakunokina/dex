@@ -1,12 +1,14 @@
 // #54/#1861: kullanım şeridinin durumu. Veri sunucudan (dexd usage_get + usage-snapshot olayı; poll
 // yok), sunucu başına; şerit etkin takımın sunucusunu gösterir. Görünürlük bu cihazın tercihi
-// (localStorage, varsayılan açık).
+// (localStorage, varsayılan açık); #2034: konumu da (sağ/sol/üst başlık, varsayılan sağ).
 import { useEffect, useSyncExternalStore } from "react";
 import { callHost, hostSupports, onHostUp } from "../api/hosts";
 import { kept, listenKept } from "../hot";
+import { parsePlace, type StripPlace } from "./place";
 import type { UsageSnapshot, UsageStatus } from "./types";
 
 const KEY = "dex.usageStrip";
+const PLACE_KEY = "dex.usageStripPlace";
 const VISIBLE_EVENT = "dex:usage-strip";
 const hot = import.meta.hot;
 
@@ -82,3 +84,19 @@ function subscribeVisible(f: () => void) {
 }
 
 export const useStripVisible = () => useSyncExternalStore(subscribeVisible, stripVisible);
+
+export function stripPlace(): StripPlace {
+  try {
+    return parsePlace(localStorage.getItem(PLACE_KEY));
+  } catch { /* storage blocked: the default */ }
+  return "right";
+}
+
+export function setStripPlace(place: StripPlace) {
+  try {
+    localStorage.setItem(PLACE_KEY, place);
+  } catch { /* still applies for this run */ }
+  window.dispatchEvent(new Event(VISIBLE_EVENT));
+}
+
+export const useStripPlace = () => useSyncExternalStore(subscribeVisible, stripPlace);
