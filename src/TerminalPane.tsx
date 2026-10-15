@@ -21,6 +21,7 @@ import "./project/project.css";
 import { useAgentContext } from "./usage/contextStore";
 import { contextLevel } from "./usage/contextFormat";
 import { ContextMeter } from "./usage/ContextMeter";
+import { askConfirm } from "./confirm";
 
 // S5-B: the chat mounts only when its tab opens (the terminal stays mounted underneath).
 const ChatView = lazy(() => import("./chat/ChatView"));
@@ -346,7 +347,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
       "konuşma geçmişi yeni oturuma taşınmaz." +
       (out ? `\n\nLider ${out} devretmenin sonucunu bekliyor; sonuçlar yeni oturuma teslim edilir ama bağlamı kaybolur.` : "") +
       "\n\nDevam edilsin mi?";
-    if (!confirm(text)) return;
+    if (!(await askConfirm(text))) return;
     setAsking(true);
     // No session: the core starts the fresh one at once.
     if (!runningRef.current) freshRef.current = true;
@@ -363,8 +364,9 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
   // No note in time: the patron resets anyway or keeps the session.
   useEffect(() => {
     if (!agent || reset?.phase !== "timeout") return;
-    const force = confirm("Devir notu gelmedi.\n\nYine de sıfırlansın mı? (İptal: sıfırlama iptal edilir, oturum sürer)");
-    void resetAct(force ? "force" : "cancel").catch((e) => setAgentError(agent.id, `Sıfırlanamadı: ${e}`));
+    void askConfirm("Devir notu gelmedi.\n\nYine de sıfırlansın mı? (İptal: sıfırlama iptal edilir, oturum sürer)")
+      .then((force) => resetAct(force ? "force" : "cancel"))
+      .catch((e) => setAgentError(agent.id, `Sıfırlanamadı: ${e}`));
   }, [reset?.phase]);
 
   // FIX-3: first reply late (backend watchdog) — one line + retry / cancel; the PTY stays.
@@ -473,8 +475,8 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
         <div className="pane-alert pane-slow" role="status">
           <span>⏸ Oturum {projectNameOf(sessions[agent.id]?.projectId)} projesinde; #{blocked.id} ({projectNameOf(blocked.projectId)}) işi bekliyor.</span>
           <button className="pane-act" title="Bu oturum kapanır; bekleyen iş kendi projesinde yeni oturumla başlar"
-            onClick={() => {
-              if (confirm("Oturum kapatılsın mı?\n\nBekleyen iş kendi projesinde yeni bir oturumla başlar; bu konuşma yeni oturuma taşınmaz.")) void killPty(agent.id);
+            onClick={async () => {
+              if (await askConfirm("Oturum kapatılsın mı?\n\nBekleyen iş kendi projesinde yeni bir oturumla başlar; bu konuşma yeni oturuma taşınmaz.")) void killPty(agent.id);
             }}>
             Oturumu kapat
           </button>

@@ -248,6 +248,11 @@ export function installBridge(cfg: BridgeConfig) {
     if (cmd === "plugin:notification|is_permission_granted") return false;
     if (cmd === "plugin:notification|request_permission") return "denied";
     if (cmd === "plugin:dialog|open") return cfg.pick;
+    // src/confirm.ts: the native yes/no as the browser's own, so specs answer it with `page.on("dialog")`.
+    if (cmd === "plugin:dialog|message") {
+      const [ok, cancel] = (args.buttons as { OkCancelCustom?: [string, string] } | undefined)?.OkCancelCustom ?? ["Ok", "Cancel"];
+      return window.confirm(String(args.message)) ? ok : cancel;
+    }
     if (cmd.startsWith("plugin:window|")) return cmd.endsWith("|is_maximized") ? false : null;
     if (cmd.startsWith("plugin:")) return null;
     // #150: the core is the worker's dexd; #151: "not running" while LOCAL_DOWN_KEY is set.
