@@ -930,7 +930,6 @@ mod tests {
             ("echo 'cargo test'", false),
             ("npm test", false),
         ] {
-            assert_eq!(full(cmd), denied, "{cmd}");
             // Bash consumes unquoted backslashes; its actual executable-path cases are above.
             let tools: &[&str] = if cmd == r"C:\Rust\bin\cargo.exe test --lib" {
                 &["PowerShell"]
@@ -938,6 +937,9 @@ mod tests {
                 &["Bash", "PowerShell"]
             };
             for tool in tools {
+                // Explicit dialect: `full` follows the host shell (Bash off Windows).
+                let d = crate::permit::dialect(tool);
+                assert_eq!(full_suite_denial_in_shell(cmd, None, d).is_some(), denied, "{tool}: {cmd}");
                 let body = json!({ "tool_name": tool, "tool_input": { "command": cmd } });
                 for agent in ["kaan", "ayla", "timur", "unknown"] {
                     let out = on_pre_tool(&c, agent, &body);
