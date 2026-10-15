@@ -294,6 +294,8 @@ impl Core {
         // Backend orchestration is ready; active plans resume exactly once per Core start.
         core.plan_resume()?;
         core.chain_schedule_existing();
+        // #1987: saklanan son Muse okuması belleğe (ölçüm iş parçacıkları başlamadan).
+        core.usage_restore_muse();
         core.quota_watch();
         core.usage_watch();
         #[cfg(not(test))]
