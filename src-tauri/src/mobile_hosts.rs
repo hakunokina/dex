@@ -79,6 +79,7 @@ async fn call<R: Runtime>(
     method: &str,
     id: &str,
     token: Option<&str>,
+    url: Option<&str>,
 ) -> Result<Option<String>, String> {
     let handle = app
         .try_state::<HostTokens<R>>()
@@ -89,6 +90,10 @@ async fn call<R: Runtime>(
     let mut payload = serde_json::json!({ "id": id });
     if let Some(t) = token {
         payload["token"] = serde_json::json!(t);
+    }
+    // #1859: the host's address next to its token, for the native morning job (MotivationWorker).
+    if let Some(u) = url {
+        payload["url"] = serde_json::json!(u);
     }
     let method = method.to_string();
     tauri::async_runtime::spawn_blocking(move || {
@@ -102,9 +107,13 @@ async fn call<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn host_token_get<R: Runtime>(app: AppHandle<R>, id: String) -> Result<Option<String>, String> {
+pub async fn host_token_get<R: Runtime>(
+    app: AppHandle<R>,
+    id: String,
+    url: Option<String>,
+) -> Result<Option<String>, String> {
     check(&id)?;
-    call(&app, "get", &id, None).await
+    call(&app, "get", &id, None, url.as_deref()).await
 }
 
 #[tauri::command]
@@ -112,16 +121,17 @@ pub async fn host_token_set<R: Runtime>(
     app: AppHandle<R>,
     id: String,
     token: String,
+    url: Option<String>,
 ) -> Result<(), String> {
     check(&id)?;
     let t = token.trim().to_string();
-    call(&app, "set", &id, Some(&t)).await.map(|_| ())
+    call(&app, "set", &id, Some(&t), url.as_deref()).await.map(|_| ())
 }
 
 #[tauri::command]
 pub async fn host_token_delete<R: Runtime>(app: AppHandle<R>, id: String) -> Result<(), String> {
     check(&id)?;
-    call(&app, "delete", &id, None).await.map(|_| ())
+    call(&app, "delete", &id, None, None).await.map(|_| ())
 }
 
 /// Bekleyen Android paylaşımı (`{ text?, subject?, image?: { mime, base64 }, error? }`); yoksa `{}`.

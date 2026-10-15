@@ -238,6 +238,16 @@ function save() {
   localStorage.setItem(KEY, JSON.stringify(remoteHosts()));
 }
 
+/** #1859: the address handed to the Android token store next to the token, so the native morning job
+ *  can reach the host while the app is closed. Same policy as the socket; an invalid one is not sent. */
+function nativeUrl(url: string): string | undefined {
+  try {
+    return normalizeUrl(url);
+  } catch {
+    return undefined;
+  }
+}
+
 const newHostId = () => `h${crypto.getRandomValues(new Uint32Array(1))[0].toString(16).padStart(8, "0").slice(0, 6)}`;
 export { normalizeUrl } from "./connectionPolicy";
 
@@ -249,7 +259,8 @@ export function initHosts(): Promise<void> {
     if (!WEB || WEB_TOKEN_STORAGE) await migrateLegacy();
     for (const rec of saved()) {
       if (reg.remotes.has(rec.id)) continue;
-      const token = await callLocal<string | null>("host_token_get", { id: rec.id }).catch(() => null);
+      // `url`: hosts paired before #1859 get their address into the native store on this start.
+      const token = await callLocal<string | null>("host_token_get", { id: rec.id, url: nativeUrl(rec.url) }).catch(() => null);
       open(rec, token);
     }
   })();
@@ -265,7 +276,7 @@ async function migrateLegacy() {
   }
   if (old?.url && old.token) {
     const rec: HostRec = { id: newHostId(), name: "Sunucu", url: old.url, device: old.device ?? "" };
-    await callLocal("host_token_set", { id: rec.id, token: old.token });
+    await callLocal("host_token_set", { id: rec.id, token: old.token, url: nativeUrl(rec.url) });
     localStorage.setItem(KEY, JSON.stringify([...saved(), rec]));
   }
   localStorage.removeItem(LEGACY_KEY);
@@ -280,7 +291,7 @@ export async function addHost(name: string, address: string, code: string, devic
   })) throw "bu adres zaten ekli";
   const { token, device } = await pairDevice(url, code, deviceName);
   const rec: HostRec = { id: newHostId(), name: name.trim() || url.replace(/^wss?:\/\//, ""), url, device };
-  await callLocal("host_token_set", { id: rec.id, token });
+  await callLocal("host_token_set", { id: rec.id, token, url });
   open(rec, token);
   save();
   return rec;
@@ -291,7 +302,7 @@ export async function repairHost(id: string, code: string, deviceName: string) {
   const r = reg.remotes.get(id);
   if (!r) throw "bu sunucu kaldırılmış";
   const { token, device } = await pairDevice(r.rec.url, code, deviceName);
-  await callLocal("host_token_set", { id, token });
+  await callLocal("host_token_set", { id, token, url: nativeUrl(r.rec.url) });
   r.t?.close();
   for (const l of reg.listeners) void l.offs.get(id)?.then((f) => f?.());
   open({ ...r.rec, device }, token);
