@@ -309,6 +309,11 @@ pub fn parse_anthropic_reset(message: &str) -> Option<i64> {
     if let Some(i) = text.find("reset at ").or_else(|| text.find("resets at ")) {
         // "reset at"ten sonraki ilk zaman jetonu ("3pm", "1790…"); mesajdaki erken sayılar atlanır.
         let after = &text[i..];
+        // Muse: "resets at 2026-10-19T00:00:00Z." (RFC 3339; metin küçük harfe çevrildi, t/z kabul).
+        let iso: String = after.split_once(" at ").map(|(_, r)| r).unwrap_or("").chars().take_while(|c| !c.is_whitespace()).collect();
+        if let Some(t) = parse_rfc3339(iso.trim_end_matches('.')) {
+            return Some(t);
+        }
         let tok: String = after
             .chars()
             .skip_while(|c| !c.is_ascii_digit())
@@ -691,6 +696,9 @@ mod tests {
         assert_eq!(parse_anthropic_reset("just slow down"), None);
         // Muse epoch'u da okur.
         assert_eq!(parse_muse_reset("quota resets at 1009886400").unwrap(), 1_009_886_400_000);
+        // Muse 429 metni: RFC 3339 saat (5 sa varsayılanına düşmemeli).
+        let msg = "API Error: Request rejected (429) · Subscription quota exhausted. Your usage window resets at 2002-01-01T12:00:00Z.";
+        assert_eq!(parse_muse_reset(msg).unwrap(), 1_009_886_400_000);
     }
 
     #[test]
