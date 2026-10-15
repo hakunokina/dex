@@ -3,7 +3,9 @@
          tanıtılmış imzalı release APK alır) + Android 11+ paket görünürlüğü. Sabitler: MotivationWorker.kt
          (JezLauncher nesnesi); değişirse ikisi birlikte değişir. -->
     <uses-permission android:name="dev.jez.launcher.permission.SET_MOTIVATION" />
+    <uses-permission android:name="dev.jez.launcher.debug.permission.SET_MOTIVATION" />
     <queries>
         <provider android:authorities="dev.jez.launcher.motivation" />
+        <provider android:authorities="dev.jez.launcher.debug.motivation" />
     </queries>
     <!-- dex-motivation:end -->

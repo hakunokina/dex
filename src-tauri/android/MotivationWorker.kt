@@ -35,12 +35,15 @@ import java.util.concurrent.TimeUnit
  *  SecurityException. Launcher son 7 günü saklar; aynı tarih üzerine yazılır. */
 object JezLauncher {
     const val AUTHORITY = "dev.jez.launcher.motivation"
-
-    /** Launcher'ın debug sürümü; Dex release authority'yi kullanır, manifeste yalnız o girer. */
-    const val DEBUG_AUTHORITY = "dev.jez.launcher.debug.motivation"
     const val PERMISSION = "dev.jez.launcher.permission.SET_MOTIVATION"
+
+    /** Launcher'ın debug sürümü; release bulunmazsa ona yazılır (ikisi de manifestte). */
+    const val DEBUG_AUTHORITY = "dev.jez.launcher.debug.motivation"
+    const val DEBUG_PERMISSION = "dev.jez.launcher.debug.permission.SET_MOTIVATION"
     const val METHOD = "setMotivation"
-    val URI: Uri = Uri.parse("content://$AUTHORITY")
+
+    /** Sırayla denenecek authority'ler: önce release, sonra debug. */
+    val AUTHORITIES = listOf(AUTHORITY, DEBUG_AUTHORITY)
 }
 
 /** Sabah işini kurar; her gün kendi adını taşır (`dex-motivation-<gün>`), böylece kayma birikmez. */
@@ -148,10 +151,11 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
         b.putString("noon", l.noon)
         b.putString("evening", l.evening)
         // Bilinmeyen authority de IllegalArgumentException verir: "geçersiz set"ten ayırmak için önce bak.
-        if (ctx.packageManager.resolveContentProvider(JezLauncher.AUTHORITY, 0) == null) return false to "launcher yok"
+        val authority = JezLauncher.AUTHORITIES.firstOrNull { ctx.packageManager.resolveContentProvider(it, 0) != null }
+            ?: return false to "launcher yok"
         // Hata metinleri sabit ve kısa: istisna mesajı host'a gitmez.
         return try {
-            ctx.contentResolver.call(JezLauncher.URI, JezLauncher.METHOD, null, b)
+            ctx.contentResolver.call(Uri.parse("content://$authority"), JezLauncher.METHOD, null, b)
             true to null
         } catch (e: SecurityException) {
             false to "izin yok"

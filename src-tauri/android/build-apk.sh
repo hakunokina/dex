@@ -114,7 +114,7 @@ awk -v f="$MOT" '
   /dex-motivation:begin/, /dex-motivation:end/ { next }
   !done && /^[[:space:]]*<application([[:space:]>]|$)/ { while ((getline l < f) > 0) print l; done = 1 }
   { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
-for k in AUTHORITY PERMISSION; do
+for k in AUTHORITY PERMISSION DEBUG_AUTHORITY DEBUG_PERMISSION; do
   v="$(grep -oE "const val $k = \"[^\"]+\"" src-tauri/android/MotivationWorker.kt | cut -d'"' -f2)"
   [ -n "$v" ] && grep -q "\"$v\"" "$MOT" || { echo "motivation.xml ile MotivationWorker.kt JezLauncher.$k uyuşmuyor"; exit 1; }
   [ "$(grep -c "\"$v\"" "$M")" = 1 ] || { echo "manifest'e JezLauncher $k eklenemedi"; exit 1; }
