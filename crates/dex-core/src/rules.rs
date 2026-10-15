@@ -44,6 +44,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 - Tam test paketi — hangi araçla olursa olsun (tarayıcı/uçtan uca, oyun motoru, mobil emülatör, …) — yalnız QA'nın işi (plan sonunda ya da patron isteyince); diğer roller yalnız ilgili tek dosya/test.
 - Uygulayıcı örnekleri: Playwright'ta tarayıcı/uçtan uca test yalnız UI akışını değiştiren işte ve yalnız ilgili tek test; Godot GUT'ta ilgili tek dosya/test. Kayıtlı uygulayıcılar tam paketi QA dışına reddeder.
 - [QA] QA: bilinmeyen/plansız bir tam-paket çalıştırıcı görürsen `ask_leader` ile \"kural planı öner\" yükseltmesi yap.
+- [Lider] Lider tarayıcı/e2e testi koşmaz (politika reddeder); kendi küçük işinde yalnız tip kontrolü.
 - [Lider] Test bütçesi planı eksikse patrona öner. Patron onayıyla zamanı geldiğinde plan yazdır. Otomatik kural ekleme yok.
 - Kırmızıyı testi gevşeterek yeşile çevirme.
 
@@ -379,7 +380,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let c = db();
         let (s, o) = mem();
-        for (agent, expected) in [("timur", "a83b5668a70fa745e0f9736904ee7268e919a4f3d2b9edf7b28f803a89852d52"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
+        for (agent, expected) in [("timur", "5e39c1ff89c7ffafffc6adc85ebd072c369ab16bfe62ce01ee22f247c5581a75"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
             let t = system_prompt(&c, agent, Some((&s, &o)));
             assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
         }
