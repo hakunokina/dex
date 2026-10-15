@@ -4,8 +4,8 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   beatAt, chaikin, clockAt, coreVeins, dropAt, ECHO_BESIDE, echoBeside, echoDrift, echoLight, facingOf, footprint, glScale, GL_MAX_PIXELS, GL_MAX_SCALE,
-  keyAzimuth, labelRect, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook, smoothRoute,
-  spotOf, textBlock, workerLight,
+  keyAzimuth, labelRect, LASER, laserAngle, lasing, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook,
+  smoothRoute, spotOf, strandTone, textBlock, workerLight,
 } from "./symbioteCard.ts";
 
 const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} ≉ ${b}`);
@@ -118,6 +118,46 @@ describe("canlılık (#2020: yalnız çalışan yol kırmızı)", () => {
   });
   it("çalışan kesenin atışı ≤ 3 Hz", () => {
     assert.ok(peaksPerSecond((t) => sacLook(workerLight("working", null, null, t, false), 1).size) <= 3);
+  });
+});
+
+describe("damar rengi ve lazer (#2036: damar hep kırmızı, takım rengi yalnız Core gözünde)", () => {
+  const done = { status: "done" }, failed = { status: "failed" };
+  const tone = (status: string, result: { status: string } | null, question: unknown, dropping = false) =>
+    strandTone(workerLight(status, result, question, 0, true).tone, question, result, dropping);
+  it("çalışan, boşta ve kapalı damar tema kırmızısı; takım tonu yok", () => {
+    for (const t of [tone("working", null, null), tone("idle", null, null), tone("offline", null, null), strandTone(null, null, null, false)]) {
+      assert.equal(t, "red");
+    }
+  });
+  it("soru / teslim / hata durum renkleri korunur; yürüyen damla kendi rengini taşır", () => {
+    assert.equal(tone("idle", null, { id: 1 }), "amber");
+    assert.equal(tone("idle", done, null), "green");
+    assert.equal(tone("idle", failed, null), "redHi");
+    assert.equal(tone("idle", null, { id: 1 }, true), "amber");
+    assert.equal(tone("idle", done, null, true), "green");
+    assert.equal(tone("idle", failed, null, true), "redHi");
+    assert.equal(tone("idle", { status: "done_no_report" }, null, true), "amber");
+  });
+  it("lazer yalnız çalışan kesede; soru, sonuç, boşta, kapalı ve uyanan kesede yok", () => {
+    const has = (status: string, result: { status: string } | null, question: unknown, job = false) => {
+      const l = workerLight(status, result, question, 0, false);
+      return lasing(l, lifeOf(l, job));
+    };
+    assert.equal(has("working", null, null), true);
+    for (const off of [has("idle", null, null), has("offline", null, null), has("waiting", null, null), has("working", null, { id: 1 }),
+      has("working", done, null), has("working", failed, null)]) assert.equal(off, false);
+    const waking = { ...workerLight("offline", null, null, 0, false), tone: "red" as const, k: 0.4, offline: false };
+    assert.equal(lasing(waking, lifeOf(waking, false)), false);
+  });
+  it(`lazer sakin döner (1 tur / ${LASER.period} sn), azaltılmış harekette durur`, () => {
+    assert.ok(LASER.period >= 1.5 && LASER.period <= 2);
+    const a = laserAngle(0, false, 3), b = laserAngle(LASER.period / 4, false, 3);
+    near((b - a + Math.PI * 2) % (Math.PI * 2), Math.PI / 2, 1e-9);
+    near(laserAngle(LASER.period * 7, false, 3), a, 1e-9);
+    for (const t of [0, 0.4, 9.3]) assert.equal(laserAngle(t, true, 3), laserAngle(0, true, 3));
+    // Komşu keseler aynı açıda başlamaz.
+    assert.notEqual(laserAngle(0, false, 1), laserAngle(0, false, 2));
   });
 });
 

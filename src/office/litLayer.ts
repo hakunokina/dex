@@ -6,7 +6,7 @@
 // draws the 2D fallback) until `webglcontextrestored` rebuilds it.
 import type { Body } from "./companion/coreXL";
 import type { Point } from "./placement";
-import { LOOK, beatAt, coreVeins, keyAzimuth, lightDir, linear, pathLength, scale, type Rect, type Rgb } from "./symbioteCard";
+import { LASER, LOOK, beatAt, coreVeins, keyAzimuth, lightDir, linear, pathLength, scale, type Rect, type Rgb } from "./symbioteCard";
 
 export interface MapSet { n: ImageBitmap; c: ImageBitmap; x: ImageBitmap }
 export interface CardMaps { bg: MapSet; worker: MapSet; echo: MapSet }
@@ -33,14 +33,16 @@ export interface BodyDraw {
   /** Height range of the body's map (CSS px). */
   height: number;
 }
+/** #2036: a working sac's laser (CSS px): orbit centre, its x radius (y: × the sac's aspect), the head's angle (rad). */
+export interface Laser { x: number; y: number; r: number; angle: number }
 /** World units: the strand relief, Core anchors and the calm zones under labels. */
 export interface Strands { key: string; routes: Point[][]; cores: Body[]; calm: Rect[] }
 export interface LitScene {
   time: number; reduced: boolean;
   /** The pulse's origin (CSS px): the first Core. */
   core: { x: number; y: number } | null;
-  lights: PointLight[]; shadows: Shadow[]; flows: Flow[]; bodies: BodyDraw[];
-  /** The active-work band's colour (the team's). */
+  lights: PointLight[]; shadows: Shadow[]; flows: Flow[]; bodies: BodyDraw[]; lasers: Laser[];
+  /** The active-work band's colour (#2036: the theme red, every team). */
   flowColor: Rgb;
   strands: Strands;
 }
@@ -51,6 +53,9 @@ const MAX_SHADOWS = 16;
 const MAX_FLOWS = 32;
 /** The flow id of strands past MAX_FLOWS. */
 const OVER_FLOW = 255;
+/** #2036: lasers past it are not drawn (the sac's red still reads working). Ground FS uniforms: ~196 of 224. */
+const MAX_LASERS = 16;
+const glf = (v: number) => v.toFixed(4);
 
 const HEADER = `#version 300 es
 precision highp float;
@@ -118,6 +123,7 @@ uniform vec3 uEmit; uniform vec2 uCore; uniform float uBeat; uniform float uVig;
 uniform int uNB; uniform vec4 uBS[${MAX_SHADOWS}]; uniform vec4 uBX[${MAX_SHADOWS}];
 uniform int uNR; uniform vec4 uRoute[${MAX_FLOWS}]; uniform vec4 uLife[${MAX_FLOWS}]; uniform vec3 uFlowCol;
 uniform vec4 uLH[${MAX_LIGHTS / 4}];
+uniform int uNLas; uniform vec4 uLas[${MAX_LASERS}];
 out vec4 outColor;
 
 void main() {
@@ -182,6 +188,19 @@ void main() {
     if (i >= uNL) break;
     float hk = uLH[i / 4][i % 4];
     if (hk > 0.0) E += uLC[i].rgb * hk * exp(-pow(length(css - uLP[i].xy) / uLP[i].w, 2.0));
+  }
+  // #2036: a working sac's laser (the work band's red) — a short lit arc orbiting it, the tail fading behind its head.
+  for (int i = 0; i < ${MAX_LASERS}; i++) {
+    if (i >= uNLas) break;
+    vec4 L = uLas[i];
+    vec2 q = (css - L.xy) / vec2(L.z, L.z * ${glf(LOOK.worker.aspect)});
+    float d = abs(length(q) - 1.0) * L.z;
+    if (d > 8.0 * uUnit) continue;
+    float behind = mod(L.w - atan(q.y, q.x), 6.2831853);
+    float tail = pow(max(0.0, 1.0 - behind / ${glf(LASER.tail)}), 1.6);
+    float head = exp(-pow(min(behind, 6.2831853 - behind) * L.z / (3.0 * uUnit), 2.0));
+    float line = exp(-pow(d / (${glf(LASER.width)} * uUnit), 2.0)) + 0.3 * exp(-pow(d / (4.0 * uUnit), 2.0));
+    E += uFlowCol * line * (1.2 * tail + 1.0 * head);
   }
 
   vec3 P = vec3(css, (hgt * 4.0 + s0 * 3.0) * uUnit);
@@ -456,7 +475,7 @@ export class LitLayer {
       this.strandKey = strandKey;
     }
     if (scene.reduced) {
-      const key = `${strandKey}|${this.canvas.width}x${this.canvas.height}|${JSON.stringify([scene.core, scene.lights, scene.shadows, scene.flows, scene.bodies])}`;
+      const key = `${strandKey}|${this.canvas.width}x${this.canvas.height}|${JSON.stringify([scene.core, scene.lights, scene.shadows, scene.flows, scene.bodies, scene.lasers])}`;
       if (key === this.lastKey) return;
       this.lastKey = key;
     } else this.lastKey = "";
@@ -504,6 +523,9 @@ export class LitLayer {
       gl.uniform4fv(g.u("uLife"), flows.flatMap((r) => [...r.color, r.life]));
     }
     gl.uniform3fv(g.u("uFlowCol"), scene.flowColor);
+    const lasers = scene.lasers.slice(0, MAX_LASERS);
+    gl.uniform1i(g.u("uNLas"), lasers.length);
+    if (lasers.length) gl.uniform4fv(g.u("uLas"), lasers.flatMap((l) => [l.x, l.y, l.r, l.angle]));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     const b = this.body;

@@ -95,6 +95,20 @@ test("all eight XL expressions draw one centred red eye and preserve the mouth",
   }
 });
 
+test("#2036: the frame's eye colour paints only the eye; mouth, rim and boot rim keep their colours", () => {
+  for (const id of ["idle", "ask", "done"] as const) {
+    const { fills, strokes } = record(id, { eye: "#d2b6ff" });
+    assert.equal(fills.filter(p => p.color === "#ff0000").length, 0, id);
+    const eye = id === "done" ? strokes.filter(p => p.color === "#d2b6ff") : fills.filter(p => p.color === "#d2b6ff");
+    assert.equal(eye.length, 1, id);
+    assert.ok(strokes.some(p => p.color === palette.mouth), id);
+  }
+  const boot = record("idle", { eye: "#d2b6ff", boot: 0.5 });
+  assert.ok(boot.strokes.some(p => p.color === "#ff0000"));
+  // Omitted: the eye stays --red-hi (Ana Takım unchanged).
+  assert.equal(record("idle").fills.filter(p => p.color === "#ff0000").length, 1);
+});
+
 test("contact shadow precedes the body and fixed highlight/rim remain with reduced motion", () => {
   for (const reduced of [false, true]) {
     const { fills, strokes, gradients, images } = record("idle", { reduced });

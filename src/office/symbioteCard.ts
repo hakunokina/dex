@@ -115,6 +115,30 @@ export function lifeOf(light: Light, job: boolean): number {
   return light.offline || light.mark ? 1 : Math.max(0, Math.min(1, light.k));
 }
 
+/**
+ * #2036 (patron): a strand's colour. A travelling drop's wins (question amber, done green, failed redHi), else
+ * the worker's mark tone; plain work and dormant strands in the theme red — never the team's (Core's eye is).
+ */
+export function strandTone(workerTone: Tone | null, question: unknown, result: { status: string } | null, dropping: boolean): Tone {
+  if (dropping) return question ? "amber" : result?.status === "done" ? "green" : result?.status === "failed" ? "redHi" : "amber";
+  return !workerTone || workerTone === "muted" ? "red" : workerTone;
+}
+
+/**
+ * #2036 (patron): the short red laser orbiting a working sac — on the focus ring's ellipse (`orbit` × D / fh),
+ * one calm turn per `period` s, its tail `tail` rad behind the head; `width` = the line's half width (units).
+ */
+export const LASER = { orbit: 0.62, period: 1.75, tail: 1.1, width: 1.1 };
+
+/** Only plain work carries the laser (a question / result / idle / offline / waking sac does not). */
+export const lasing = (light: Light, life: number) => light.tone === "red" && light.k >= 1 && !light.offline && life > 0;
+
+/** The laser head's angle (rad, clockwise on screen) from its seed's phase; held there under reduced motion. */
+export function laserAngle(time: number, reduced: boolean, seed: number) {
+  const phase = ((seed * 0.618034) % 1) * Math.PI * 2;
+  return reduced ? phase : (phase + (time / LASER.period) * Math.PI * 2) % (Math.PI * 2);
+}
+
 /** #2020: a worker sac by its light and life: dormant ones shrink, dim and grey; live ones swell and glow. */
 export function sacLook(light: Light, life: number) {
   const w = LOOK.worker;

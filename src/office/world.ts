@@ -11,10 +11,11 @@ import { chipNameStyle, coreLabel, OFFLINE_NAME_ALPHA, teamSignature } from "./l
 import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, type FragmentBox } from "./symbiote";
 import { drawCoreName, ellipsis, measureCoreName, roundRect } from "./coreName";
 import {
-  LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, lifeOf, linear, markAlpha, markAt, pathLength, pointAt,
-  routeToBody, sacLook, scale, smoothRoute, spotOf, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot, type Tone,
+  LASER, LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, laserAngle, lasing, lifeOf, linear, markAlpha, markAt,
+  pathLength, pointAt, routeToBody, sacLook, scale, smoothRoute, spotOf, strandTone, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot,
+  type Tone,
 } from "./symbioteCard";
-import type { BodyDraw, Flow, LitScene, PointLight, Shadow } from "./litLayer";
+import type { BodyDraw, Flow, Laser, LitScene, PointLight, Shadow } from "./litLayer";
 import type { OfficeTheme } from "./theme";
 
 /** The world before Office measures its panel (#270: then the panel in world units). */
@@ -72,7 +73,7 @@ interface View {
 type EchoPlace = ReturnType<typeof echoBeside> & { box: Rect };
 
 /** #2020: a strand this frame: its life, colour and the returning drop (`along`). */
-interface StrandState { trace: Trace; job: boolean; life: number; tone: Tone | "team"; along: number | null }
+interface StrandState { trace: Trace; job: boolean; life: number; tone: Tone; along: number | null }
 
 const MOVE_SPEED = 8;
 const BOOT_SECONDS = 0.7;
@@ -107,7 +108,7 @@ export class World {
   /** #411: the team's name (Office keeps it current) — the leaders' "Ana Core" label and the board's signature. */
   teamName = "";
   /** #1958: the last draw's lit scene (CSS px) for Office's light layer. */
-  scene: LitScene = { time: 0, reduced: false, core: null, lights: [], shadows: [], flows: [], bodies: [], strands: { key: "", routes: [], cores: [], calm: [] }, flowColor: [0, 0, 0] };
+  scene: LitScene = { time: 0, reduced: false, core: null, lights: [], shadows: [], flows: [], bodies: [], lasers: [], strands: { key: "", routes: [], cores: [], calm: [] }, flowColor: [0, 0, 0] };
 
   constructor(agents: Agent[], private data: WorldData) {
     this.sync(agents);
@@ -364,10 +365,8 @@ export class World {
       const question = this.data.question(trace.workerId);
       const result = this.data.result(trace.workerId);
       const along = dropAt(question, result, time, this.reduced);
-      // The drop's colour wins (it travels on the strand); else the worker's tone, plain work in the team's.
-      const tone: Tone | "team" = along !== null
-        ? (question ? "amber" : result?.status === "done" ? "green" : result?.status === "failed" ? "redHi" : "amber")
-        : !view || view.light.tone === "muted" || view.light.tone === "red" ? "team" : view.light.tone;
+      // The drop's colour wins (it travels on the strand); else the worker's tone, plain work in the theme red (#2036).
+      const tone = strandTone(view?.light.tone ?? null, question, result, along !== null);
       return { trace, job, life: Math.max(view?.life ?? 0, job ? 1 : 0), tone, along };
     });
     return [...states.filter((s) => s.life <= 0), ...states.filter((s) => s.life > 0)];
@@ -513,6 +512,8 @@ export class World {
       edge: p.edge,
       mono: p.mono,
       weight: core?.weight,
+      // #2036 (patron): the team's colour lives in Core's eye (the strands stay red).
+      eye: p.teamHi,
     };
     drawCoreXL(ctx, body.x, body.y, body.s, look, frame, pal);
     ctx.restore();
@@ -680,6 +681,7 @@ export class World {
     const shadows: Shadow[] = [];
     const bodies: BodyDraw[] = [];
     const flows: Flow[] = [];
+    const lasers: Laser[] = [];
     let origin: { x: number; y: number } | null = null;
     const cores: Body[] = [];
     const calm: Rect[] = [];
@@ -691,7 +693,7 @@ export class World {
       origin ??= { x: body.x * u, y: body.y * u };
       lights.push({
         x: body.x * u, y: body.y * u, z: body.s * 0.55 * u, r: LOOK.core.radius * (body.s / XL_BODY) * u,
-        color: scale(c.redHi, coreEyeK(state, LOOKS[state].glow, core?.lidNow ?? 0)), spec: 0.6,
+        color: scale(c.eye, coreEyeK(state, LOOKS[state].glow, core?.lidNow ?? 0)), spec: 0.6,
       });
       // The relief and calm zones follow the layout targets (rebuilt only when it changes).
       const at = coreBody({ x: chip.tx, y: chip.ty, w: chip.w, h: chip.h })!;
@@ -732,6 +734,9 @@ export class World {
             color: scale(c[light.tone], 0.9 * light.k * (0.35 + 0.65 * light.pulse)), spec: 0.3, halo: 0.35 * sac.halo,
           });
         }
+        if (lasing(light, life)) {
+          lasers.push({ x: bx * u, y: by * u, r: D * LASER.orbit * u, angle: laserAngle(time, this.reduced, this.chips.indexOf(chip)) });
+        }
       }
       // calm zone under the label, at the layout target (Echo beside Core: under its body)
       const place = this.echoes.get(chip.agent.id);
@@ -751,7 +756,7 @@ export class World {
     // The flow ids follow this order: a strand turning live re-draws the id layer.
     const order = strandStates.map((s) => `${this.traces.indexOf(s.trace)}${s.life > 0 ? "+" : ""}`).join(",");
     const strands = { key: `${this.traceKey}|${calm.map((r) => r.h).join(",")}|${order}`, routes: strandStates.map((s) => s.trace.route), cores, calm };
-    return { time, reduced: this.reduced, core: origin, lights, shadows, flows, bodies, strands, flowColor: scale(c.team, 1.1) };
+    return { time, reduced: this.reduced, core: origin, lights, shadows, flows, bodies, lasers, strands, flowColor: scale(c.red, 1.1) };
   }
 
   /** The flat stand-in for the lit layer: membrane, Core glow, strands, drops and radial bodies. */
@@ -787,7 +792,8 @@ export class World {
       ctx.fill();
     }
     ctx.restore();
-    for (const { spot, echo, light, status, hot, life } of views) {
+    for (const view of views) {
+      const { spot, echo, light, status, hot, life } = view;
       const sac = echo ? null : sacLook(light, life);
       const k = (hot ? 1.05 : 1) * (sac ? sac.size : 1);
       const rx = (spot.D / 2) * k, ry = (spot.fh / 2) * k;
@@ -814,14 +820,30 @@ export class World {
       ctx.fillStyle = fill; ctx.fill();
       ctx.lineWidth = 1; ctx.strokeStyle = p.edge; ctx.stroke();
       ctx.restore();
+      if (!echo && lasing(light, life)) drawLaser(ctx, spot, laserAngle(time, this.reduced, this.chips.indexOf(view.chip)), p.red);
     }
   }
+}
+
+/** #2036: the laser's flat stand-in — its tail as fading arcs on the orbit, the head brightest. */
+function drawLaser(ctx: CanvasRenderingContext2D, spot: Spot, angle: number, color: string) {
+  const rx = spot.D * LASER.orbit, ry = spot.fh * LASER.orbit;
+  const steps = 6;
+  ctx.save();
+  ctx.lineCap = "round"; ctx.lineWidth = LASER.width * 1.6;
+  ctx.strokeStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 6;
+  for (let i = 0; i < steps; i++) {
+    const a1 = angle - (i / steps) * LASER.tail, a0 = angle - ((i + 1) / steps) * LASER.tail;
+    ctx.globalAlpha = (1 - i / steps) ** 1.6;
+    ctx.beginPath(); ctx.ellipse(spot.bx, spot.by, rx, ry, 0, a0, a1); ctx.stroke();
+  }
+  ctx.restore();
 }
 
 /** Under the labels: a soft dark halo (HANDOFF §10, with the calm zone it keeps AA). */
 const LABEL_SHADOW = "rgba(0,0,0,.85)";
 
-type Colors = Record<Tone | "team" | "echo", Rgb>;
+type Colors = Record<Tone | "eye" | "echo", Rgb>;
 const colorCache = new WeakMap<OfficeTheme, Colors>();
 
 /** The theme's colours in linear RGB, once per theme read. */
@@ -830,7 +852,7 @@ function colorsOf(p: OfficeTheme): Colors {
   if (!c) {
     c = {
       green: linear(p.green), redHi: linear(p.redHi), amber: linear(p.amber), red: linear(p.red), muted: linear(p.muted),
-      team: linear(p.team), echo: linear(LOOK.echo.color),
+      eye: linear(p.teamHi), echo: linear(LOOK.echo.color),
     };
     colorCache.set(p, c);
   }

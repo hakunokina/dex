@@ -258,6 +258,8 @@ export interface CoreXLFrame {
   mono: string;
   /** Delayed weight shift in body units; omitted by standalone renderers. */
   weight?: { x: number; y: number };
+  /** #2036 (patron): the eye's colour (the Kart: the team's); omitted: `--red-hi`. The rest of Core is unchanged. */
+  eye?: string;
 }
 
 let contactShadow: ImageBitmap | null = null;
@@ -351,7 +353,8 @@ export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number
   const fading = f.from !== null && f.age < XL_FADE_MS;
   const color = fading ? mixColor(f.from!, target, f.age / XL_FADE_MS) : target;
   const glow = XL_GLOW[look.id] * (fading ? f.age / XL_FADE_MS : 1);
-  const colorEye = pal.tokens["--red-hi"] ?? color;
+  const red = pal.tokens["--red-hi"] ?? color;
+  const colorEye = f.eye || red;
   const grow = f.reduced ? 1 : 1 + 0.025 * f.hover;
   ctx.save();
   ctx.translate(cx, cy);
@@ -366,7 +369,7 @@ export function drawCoreXL(ctx: CanvasRenderingContext2D, cx: number, cy: number
   for (let i = 1; i < contour.length; i++) ctx.lineTo(contour[i].x, contour[i].y);
   ctx.closePath();
   drawBodyLighting(ctx, pal, 58, size >= 40 ? texture : null, contour);
-  ctx.strokeStyle = f.boot > 0 ? colorEye : f.edge;
+  ctx.strokeStyle = f.boot > 0 ? red : f.edge;
   ctx.lineWidth = 1.2;
   ctx.stroke();
   drawEyeXL(ctx, look, colorEye, Math.max(10, glow), XL_EYE.x, f.pupil, f.lid, pal);
