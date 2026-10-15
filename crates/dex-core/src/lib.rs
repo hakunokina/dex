@@ -28,6 +28,7 @@ pub mod leader_reset;
 pub mod mcp;
 pub mod memory;
 pub mod model_news;
+pub mod motivation;
 pub mod notes;
 pub mod paths;
 pub mod private_fs;

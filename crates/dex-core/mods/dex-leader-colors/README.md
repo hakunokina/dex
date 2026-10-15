@@ -14,7 +14,8 @@ kullanıcı mesajında (panoya yapışan Dex satırı) hem asistan yanıtında. 
 - Devretme bitti yeşil `#3fb950`, başarısız/RAPORSUZ kırmızı `#f85149`
 - İnceleme onay yeşil, düzelt/bekliyor turuncu `#d29922`
 - Soru sarı `#e3b341`, Cevap yeşil, Plan mavi `#58a6ff`, Üye mor `#bc8cff`
-  (reddedildi kırmızı), Not gri `#8b949e`, Sistem camgöbeği `#39c5cf`
+  (reddedildi kırmızı), Not gri `#8b949e`, Sistem camgöbeği `#39c5cf`,
+  Motivasyon pembe `#f778ba`
 
 Başlık kalın ve renklidir; gövde renksiz Markdown ve renkli sol şerittir.
 Başlıksız mesajlar ve `isSummary` blokları `next(e)` ile aynen devam eder.

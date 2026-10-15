@@ -421,6 +421,7 @@ impl crate::Core {
         let weak = self.weak_self.clone();
         std::thread::spawn(move || {
             let mut checked = None;
+            let mut motivated = None;
             loop {
                 let now = chrono::Local::now();
                 let day = now.date_naive().to_string();
@@ -439,7 +440,14 @@ impl crate::Core {
                             serde_json::json!({"reason":"db_error"}),
                         );
                     }
-                    checked = Some(day);
+                    checked = Some(day.clone());
+                }
+                // #1858: same loop, same per-minute wake; the DB claim keeps it once a day.
+                if motivated.as_ref() != Some(&day) && now.time() >= crate::motivation::due_at() {
+                    if core.motivation_tick(now.naive_local()).is_err() {
+                        crate::diagnostics::event("motivation", serde_json::json!({"reason":"db_error"}));
+                    }
+                    motivated = Some(day);
                 }
                 drop(core); // The sleeping watcher does not keep a shutdown Core alive.
                 std::thread::sleep(next_wake(chrono::Local::now()));
