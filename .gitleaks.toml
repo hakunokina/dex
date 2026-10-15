@@ -230,6 +230,10 @@ keywords = ["@"]
 description = "Documentation SSH domains"
 regexes = ['''(?i)^(?:ssh://|ssh[ \t]+)?[^@]+@(?:(?:[a-z0-9-]+\.)*example\.com|(?:[a-z0-9-]+\.)*invalid)(?::[^\s]*)?(?:/[^\s]*)?$''']
 
+[[rules.allowlists]]
+description = "Binary images: compressed bytes can spell user@host:path by chance (other rules still scan them)"
+paths = ['''(?i)\.(?:webp|png|jpe?g|gif)$''']
+
 # Exact public/synthetic endpoints used by permit parser tests (audit #1379 N3).
 [[rules.allowlists]]
 description = "Exact synthetic permit SSH endpoints"
