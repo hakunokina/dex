@@ -1,10 +1,10 @@
 // #47: the Kart's one-line toolbar — the active team's status count and the team/app controls
 // that used to sit in the top bar. Kart closed → the palette has the same commands.
 import { useEffect, useState } from "react";
-import { Brain, Cpu, Plus, Settings, SquareKanban, SquareTerminal, Users } from "lucide-react";
+import { Brain, Plus, Settings, SquareKanban, Users } from "lucide-react";
 import { AGENTS, getStatus } from "../agents";
 import { toggleBoard, useBoardOpen } from "../board/store";
-import { openPanel, openShell } from "../layout/panels";
+import { openPanel } from "../layout/panels";
 import { openTeamMenu } from "../team/TeamBar";
 import { useTeamCost } from "../usage/costStore";
 import { COST_HINT, breakdownParts, costText, warningText } from "../usage/costFormat";
@@ -13,7 +13,7 @@ import { useDelegations } from "../delegations";
 import { roleQueueSummary } from "../delegationsModel";
 import { useTeams } from "../team/store";
 
-export function OfficeBar({ teamId, active, onFocus }: { teamId: string; active: boolean; onFocus: (id: string) => void }) {
+export function OfficeBar({ teamId, active }: { teamId: string; active: boolean }) {
   const [counts, setCounts] = useState({ working: 0, idle: 0 });
   const boardOpen = useBoardOpen();
   const cost = useTeamCost(active ? teamId : null);
@@ -57,16 +57,6 @@ export function OfficeBar({ teamId, active, onFocus }: { teamId: string; active:
       {/* #70: the board button left the top bar; the palette and ` still open it too. */}
       <button className={`office-bar-btn${boardOpen ? " on" : ""}`} onClick={toggleBoard} aria-pressed={boardOpen} title="Görevler (` · terminaldeyken Ctrl+`)" aria-label="Görevler">
         <SquareKanban />
-      </button>
-      {/* #916: which agent runs what, CPU/RAM; idle Playwright/browser children can be closed there. */}
-      <button className="office-bar-btn" onClick={() => void openPanel(teamId, "procs")} title="Süreçler (ajanların CPU/RAM'i)" aria-label="Süreçler">
-        <Cpu />
-      </button>
-      {/* #65: a team with no shell open has no group header "+" — this is the way in that's always there. */}
-      <button className="office-bar-btn" onClick={() => {
-        void openShell(teamId).then(id => { if (id) onFocus(id); });
-      }} title="Yeni terminal" aria-label="Yeni terminal">
-        <SquareTerminal />
       </button>
       <button className="office-bar-btn" onClick={() => void openTeamMenu("new")} title="Yeni takım" aria-label="Yeni takım">
         <Plus />

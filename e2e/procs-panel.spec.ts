@@ -33,9 +33,13 @@ test("Süreç paneli: ağır ajan üstte, alt süreci onayla kapatır, kapalıyk
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
 
-  const button = app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Süreçler" });
-  await button.click();
   const stage = app.locator(".team-stage:not(.hidden)");
+  // Terminal grubunun başlığındaki aç/kapa düğmesi; Kart araçlarında artık yok.
+  await expect(app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Süreçler" })).toHaveCount(0);
+  const button = stage.getByRole("button", { name: "Süreçler", exact: true });
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await button.click();
+  await expect(button).toHaveAttribute("aria-pressed", "true");
   const group = stage.locator(".dv-groupview").filter({ has: app.getByRole("tab", { name: "Süreçler", exact: true }) });
   await expect(group.getByRole("tab", { name: "Terminal", exact: true })).toHaveCount(1);
   const panel = app.getByRole("complementary", { name: "Süreçler" });
@@ -82,8 +86,12 @@ test("Süreç paneli: ağır ajan üstte, alt süreci onayla kapatır, kapalıyk
   await app.setViewportSize({ width: 420, height: 720 });
   expect(await panel.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
 
-  // Tek örnek: tekrar açmak aynı sekmeyi etkinleştirir.
+  // Aç/kapa: açıkken düğme paneli kapatır, tekrar basınca tek örnek olarak geri açılır.
   await button.click();
+  await expect(stage.getByRole("tab", { name: "Süreçler", exact: true })).toHaveCount(0);
+  await expect(button).toHaveAttribute("aria-pressed", "false");
+  await button.focus();
+  await app.keyboard.press("Enter");
   await expect(stage.getByRole("tab", { name: "Süreçler", exact: true })).toHaveCount(1);
   await expect(stage.getByRole("tab", { name: "Süreçler", exact: true })).toHaveAttribute("aria-selected", "true");
   // Panelin kapat düğmesi klavyeyle çalışır; kapalıyken yeni istek yok.
@@ -116,7 +124,7 @@ test("Süreç paneli: Görevler bağımsız, gizli sekme yenilemez, yenilemede s
   await paneOf(app, leader.name);
 
   const bar = app.getByRole("group", { name: "Kart araçları" });
-  const procsBtn = bar.getByRole("button", { name: "Süreçler" });
+  const procsBtn = app.locator(".team-stage:not(.hidden)").getByRole("button", { name: "Süreçler", exact: true });
   const procs = app.getByRole("complementary", { name: "Süreçler" });
   const board = app.locator("aside.board");
   await bar.getByRole("button", { name: "Görevler" }).click();
@@ -148,7 +156,6 @@ test("Süreç paneli: Görevler bağımsız, gizli sekme yenilemez, yenilemede s
   await expect(procs).toBeVisible();
 
   // Terminal sekmesi görünürken Süreçler yeni istek göndermez.
-  await procsBtn.click();
   const stage = app.locator(".team-stage:not(.hidden)");
   const procsTab = stage.getByRole("tab", { name: "Süreçler", exact: true });
   await stage.locator(".dv-tab").and(stage.getByRole("tab", { name: "Terminal", exact: true })).click();
@@ -189,14 +196,20 @@ test("Süreç paneli: Terminal yokken açılır, gizli takım istek atmaz, pane 
   await openTeam(app, team.name);
   const stage = app.locator(".team-stage:not(.hidden)");
   await stage.getByRole("button", { name: "Terminali kapat", exact: true }).click();
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Süreçler" }).click();
+  // Terminal yok → başlık düğmesi yok; palet açar.
+  await expect(stage.getByRole("button", { name: "Süreçler", exact: true })).toHaveCount(0);
+  await app.keyboard.press("Control+Shift+P");
+  await app.getByPlaceholder(/Komut ara/).fill("Süreç panelini aç");
+  await app.keyboard.press("Enter");
   await expect(stage.getByRole("tab", { name: "Süreçler", exact: true })).toHaveCount(1);
   await expect(stage.locator(".procs-agent-head")).toHaveCount(1);
   await openTeam(app, other.name);
   const n = (await calls(app)).filter(c => c.cmd === "agent_processes").length;
   await app.waitForTimeout(3500);
   expect((await calls(app)).filter(c => c.cmd === "agent_processes")).toHaveLength(n);
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Süreçler" }).click();
+  await app.keyboard.press("Control+Shift+P");
+  await app.getByPlaceholder(/Komut ara/).fill("Süreç panelini aç");
+  await app.keyboard.press("Enter");
   await expect(stage.locator(".procs-agent-head")).toHaveCount(1);
   const ids = await app.locator(".procs-agent-head").evaluateAll(els => els.map(el => el.id));
   expect(ids).toHaveLength(2);
