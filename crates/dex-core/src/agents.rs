@@ -1109,6 +1109,8 @@ impl crate::Core {
         if !kind {
             return None;
         }
+        // Yanlış "kota" tetiklerini ayırt etmek için sağlayıcının asıl hata metni (transcript'e yazılmıyor).
+        eprintln!("dex: {agent}: zincir tetiği ({current}, {reason}): error={:?} msg={:?}", field("error"), msg.chars().take(300).collect::<String>());
         let reset = if reason == "unreachable" {
             Some(
                 std::time::SystemTime::now()
