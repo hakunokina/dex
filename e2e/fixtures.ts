@@ -14,8 +14,14 @@ export interface Dexd {
   token: string;
   /** The dexd `--root`: team folders must be inside it. */
   projects: string;
-  /** Stop the process and start a fresh core with the same data, endpoint and pairing. */
-  restart(): Promise<void>;
+  /** Its `--data-dir` (the core's own files: `dex.live.json`, …). */
+  data: string;
+  /**
+   * Stop the process and start a fresh core with the same data, endpoint and pairing. `clean`: as
+   * after a clean exit (no live snapshot left); `crash`: as after a crash — the new core resumes
+   * the agents its live snapshot names (#1875).
+   */
+  restart(how?: "clean" | "crash"): Promise<void>;
   /** A core method straight over the protocol (seeding, backend-side checks). */
   call<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
 }
@@ -88,15 +94,18 @@ async function startDexd(): Promise<{ dexd: Dexd; stop: () => Promise<void> }> {
   const code = execFileSync(DEXD, ["pair", ...args], { env, encoding: "utf8" }).trim();
   const { token } = (await rpc(url, null, "auth.pair", { protocol: 1, code, name: "e2e" })) as { token: string };
   paired = { url, token };
-  const restart = async () => {
+  const restart = async (how: "clean" | "crash" = "clean") => {
     // Shells are outside the core's job; agents must die with the actual process, not pty_kill.
     await stopProcess(true);
+    // `dexd serve` exits cleanly on Ctrl+C only, which cannot be sent to a child here: the kill is a
+    // crash to the core. What a clean exit leaves different (Core::shutdown) is no live snapshot.
+    if (how === "clean") rmSync(join(data, "dex.live.json"), { force: true });
     const restartedUrl = await launch(new URL(url).host);
     if (restartedUrl !== url) throw new Error(`dexd restart endpoint changed: ${restartedUrl}`);
     // The persisted pairing still authenticates to the new process; no browser reload is needed.
     await rpc(url, token, "server_info", {});
   };
-  return { dexd: { url, token, projects, restart, call: (m, p = {}) => rpc(url, token, m, p) as Promise<never> }, stop };
+  return { dexd: { url, token, projects, data, restart, call: (m, p = {}) => rpc(url, token, m, p) as Promise<never> }, stop };
 }
 
 // eslint-disable-next-line no-empty-pattern

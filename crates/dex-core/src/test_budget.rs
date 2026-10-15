@@ -17,10 +17,12 @@ use std::path::{Path, PathBuf};
 pub const DENY: &str = "Tüm e2e paketini koşma; ilgili spec'i ver ya da QA'ya bırak (Dex test bütçesi). \
     Örn. `npx playwright test tests/x.spec.ts --workers=1` ya da `--grep \"<test adı>\"`.";
 
-const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
+pub const DENY_LEADER: &str = "Dex politikası: lider tarayıcı/e2e testi koşamaz — tip kontrolü yeter; e2e QA'nın işi.";
+
+pub(crate) const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
     Örn. `godot --headless -s addons/gut/gut_cmdln.gd -gtest=res://tests/e2e/test_x.gd -gexit`.";
 
-const DENY_RUST: &str = "Tüm Rust paketini koşma; dokunduğun modülün filtresini ekle: \
+pub(crate) const DENY_RUST: &str = "Tüm Rust paketini koşma; dokunduğun modülün filtresini ekle: \
     `cargo test -p dex-core --lib <modül>`; tam paket QA'nın işi (Dex test bütçesi).";
 
 struct Enforcer {
@@ -69,7 +71,8 @@ pub(crate) fn unplanned_runners(root: &Path) -> Vec<&'static str> {
     RUNNERS.iter().filter(|r| r.enforcer.is_none() && (r.markers)(&markers)).map(|r| r.name).collect()
 }
 
-/// Hook side: Some(deny answer) when a non-QA agent's shell command would run the whole suite.
+/// Hook side: Some(deny answer) when a non-QA agent's shell command would run the whole suite,
+/// or a leader's would run any e2e test (#1876).
 pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<String> {
     let tool = body.get("tool_name").and_then(Value::as_str).unwrap_or("");
     if !matches!(tool, "Bash" | "PowerShell") {
@@ -77,16 +80,19 @@ pub fn on_pre_tool(conn: &Connection, agent: &str, body: &Value) -> Option<Strin
     }
     let command = body.get("tool_input")?.get("command")?.as_str()?;
     let cwd = body.get("cwd").and_then(Value::as_str).map(PathBuf::from);
-    let reason = check(command, cwd, 0, crate::permit::dialect(tool))?;
-    let role: Option<String> = conn
-        .query_row("SELECT role_slug FROM agents WHERE id = ?1", [agent], |r| r.get(0))
+    let d = crate::permit::dialect(tool);
+    let (kind, role): (Option<String>, Option<String>) = conn
+        .query_row("SELECT kind, role_slug FROM agents WHERE id = ?1", [agent], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()
         .ok()
         .flatten()
-        .flatten();
-    if role.as_deref() == Some("qa") {
-        return None;
-    }
+        .unwrap_or_default();
+    let leader = if kind.as_deref() == Some("leader") { leader_e2e_denial(command, cwd.as_deref(), d) } else { None };
+    let reason = match leader {
+        Some(reason) => reason,
+        None if role.as_deref() == Some("qa") => return None,
+        None => check(command, cwd, 0, d)?,
+    };
     Some(
         json!({ "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -110,13 +116,25 @@ pub(crate) fn full_suite_denial_in_shell(command: &str, cwd: Option<&Path>, d: O
     check(command, cwd.map(Path::to_path_buf), 0, d)
 }
 
-fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
-    for enforcer in RUNNERS.iter().filter_map(|r| r.enforcer.as_ref()) {
-        for seg in (enforcer.segments)(command, d) {
-            if (enforcer.recognises)(&strip_env(&seg)) {
-                return Some(enforcer.deny);
-            }
-        }
+/// #1876: a leader runs no browser/e2e test at all — a spec or a grep included.
+pub(crate) fn leader_e2e_denial(command: &str, cwd: Option<&Path>, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
+    walk(command, cwd.map(Path::to_path_buf), 0, d, &|line, d| {
+        e2e_command_words(line, d).iter().any(|seg| runs_playwright_test(&strip_env(seg))).then_some(DENY_LEADER)
+    })
+}
+
+fn check(command: &str, cwd: Option<PathBuf>, depth: u8, d: Option<crate::permit::Dialect>) -> Option<&'static str> {
+    walk(command, cwd, depth, d, &|line, d| {
+        RUNNERS.iter().filter_map(|r| r.enforcer.as_ref()).find(|enforcer| {
+            (enforcer.segments)(line, d).iter().any(|seg| (enforcer.recognises)(&strip_env(seg)))
+        }).map(|enforcer| enforcer.deny)
+    })
+}
+
+/// `hit` on the command line itself, then on the package.json scripts it calls (`cd <dir>` followed).
+fn walk(command: &str, mut cwd: Option<PathBuf>, depth: u8, d: Option<crate::permit::Dialect>, hit: &dyn Fn(&str, Option<crate::permit::Dialect>) -> Option<&'static str>) -> Option<&'static str> {
+    if let Some(reason) = hit(command, d) {
+        return Some(reason);
     }
     for seg in segments(command) {
         let words = strip_env(&seg);
@@ -134,7 +152,7 @@ fn check(command: &str, mut cwd: Option<PathBuf>, depth: u8, d: Option<crate::pe
                 if let Some(body) = cwd.as_deref().and_then(|c| package_script(c, &script)) {
                     // npm/pnpm/yarn append the extra args to the script's command line.
                     let line = if extra.is_empty() { body } else { format!("{body} {}", extra.join(" ")) };
-                    if let Some(reason) = check(&line, cwd.clone(), depth + 1, d) {
+                    if let Some(reason) = walk(&line, cwd.clone(), depth + 1, d, hit) {
                         return Some(reason);
                     }
                 }
@@ -382,6 +400,11 @@ const VALUE_FLAGS: &[&str] = &[
     "--browser", "--update-snapshots", "--tsconfig", "--ignore-snapshots-dir",
 ];
 
+/// `… playwright test …` in the segment, filtered or not.
+fn runs_playwright_test(words: &[String]) -> bool {
+    words.windows(2).any(|w| is_playwright(&w[0]) && w[1] == "test")
+}
+
 /// `… playwright test …` in the segment with neither a positional filter nor a grep.
 fn unfiltered_playwright(words: &[String]) -> bool {
     let Some(at) = words.windows(2).position(|w| is_playwright(&w[0]) && w[1] == "test") else {
@@ -531,7 +554,9 @@ mod tests {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         let input = json!({ "command": cmd });
         let body = json!({ "tool_name": tool, "tool_input": input, "cwd": cwd });
-        for agent in ["kaan", "ayla", "timur", "unknown"] {
+        // #1876: the leader (timur) is also denied a filtered e2e run, with its own reason.
+        let leader = leader_e2e_denial(cmd, cwd, crate::permit::dialect(tool)).or(reason);
+        for (agent, reason) in [("kaan", reason), ("ayla", reason), ("timur", leader), ("unknown", reason)] {
             let out = on_pre_tool(&c, agent, &body);
             assert_eq!(out.is_some(), reason.is_some(), "{tool}: {agent}: {cmd}");
             if let Some(out) = out {
@@ -546,9 +571,13 @@ mod tests {
         let budget_reason = |out: crate::permit::Verdict| match out {
             crate::permit::Verdict::Deny(why) if why.contains(DENY) => Some(DENY),
             crate::permit::Verdict::Deny(why) if why.contains(DENY_GUT) => Some(DENY_GUT),
+            crate::permit::Verdict::Deny(why) if why.contains(DENY_LEADER) => Some(DENY_LEADER),
             _ => None,
         };
         assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), reason, "permit: {tool}: {cmd}");
+        ctx.leader = true;
+        assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), leader, "leader permit: {tool}: {cmd}");
+        ctx.leader = false;
         ctx.qa = true;
         assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), None, "QA permit: {tool}: {cmd}");
     }
@@ -1090,6 +1119,14 @@ mod tests {
         ] {
             assert!(!full(c), "{c}");
         }
+        // #1876: a leader's e2e run is denied filtered or not, through scripts as well.
+        let leader = |c: &str| leader_e2e_denial(c, Some(&dir), None).is_some();
+        for c in ["npx playwright test e2e/x.spec.ts --workers=1", "npx playwright test --grep \"ad\"", "npm run e2e -- tests/x.spec.ts", "npm run e2e:smoke", "cd web && npm run e2e", "CI=1 pnpm exec playwright test a.spec.ts"] {
+            assert!(leader(c), "{c}");
+        }
+        for c in ["npx tsc --noEmit", "cargo test -p dex-core --lib x", "npm run unit", "npx playwright install chromium", "echo 'npx playwright test'"] {
+            assert!(!leader(c), "{c}");
+        }
         // No cwd → scripts can't be resolved: allowed (documented miss, not a false positive).
         assert!(!runs_full_suite("npm run e2e", None));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1099,14 +1136,21 @@ mod tests {
     fn hook_denies_everyone_but_qa() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         let body = json!({ "tool_name": "Bash", "tool_input": { "command": "npx playwright test" } });
-        for agent in ["kaan", "ayla", "timur"] {
+        for (agent, reason) in [("kaan", DENY), ("ayla", DENY), ("timur", DENY_LEADER)] {
             let out: Value = serde_json::from_str(&on_pre_tool(&c, agent, &body).expect(agent)).unwrap();
             assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
-            assert!(out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("QA'ya bırak"));
+            assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], reason, "{agent}");
         }
         assert!(on_pre_tool(&c, "bora", &body).is_none(), "qa runs the suite");
         let spec = json!({ "tool_name": "Bash", "tool_input": { "command": "npx playwright test a.spec.ts" } });
         assert!(on_pre_tool(&c, "kaan", &spec).is_none());
+        // #1876: a leader runs no e2e test at all, a single spec included; type checks stay free.
+        let out: Value = serde_json::from_str(&on_pre_tool(&c, "timur", &spec).expect("leader spec")).unwrap();
+        assert_eq!(out["hookSpecificOutput"]["permissionDecisionReason"], DENY_LEADER);
+        for command in ["npx tsc --noEmit", "cargo test -p dex-core --lib x", "npx playwright show-report"] {
+            let body = json!({ "tool_name": "Bash", "tool_input": { "command": command } });
+            assert!(on_pre_tool(&c, "timur", &body).is_none(), "{command}");
+        }
         let other = json!({ "tool_name": "Write", "tool_input": { "command": "npx playwright test" } });
         assert!(on_pre_tool(&c, "kaan", &other).is_none());
     }
