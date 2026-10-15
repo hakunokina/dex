@@ -19,7 +19,7 @@ import { focusSetting, selectSettingsTab, type SettingsTab } from "../settings/t
 import { movePlaysFx, workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
-import { assistantDirection, opensAssistant } from "./assistantPlacement";
+import { opensAssistant } from "./assistantPlacement";
 
 const hot = import.meta.hot;
 const apis = kept(hot, "apis", () => new Map<string, DockviewApi>());
@@ -205,18 +205,14 @@ function centerFloat(api: DockviewApi, p: IDockviewPanel) {
 /** Worker/shell cells narrower than this stack as tabs instead of splitting further. */
 const MIN_CELL_W = 420;
 
-function assistantOrigin(api: DockviewApi, leader: IDockviewPanel | undefined) {
-  return leader && api.width > 0 ? { assistantLeader: leader.id, assistantLeadShare: leader.group.api.width / api.width } : {};
-}
-
 /** Where a newly opened panel goes: next to its own kind first, else its default neighbour. */
 function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
   const kind = kindOf(teamId, spec.id);
   if (kind === "assistant") {
-    const leader = api.panels.find(p => kindOf(teamId, p.id) === "leader");
-    const direction = assistantDirection(window.innerWidth);
-    return api.addPanel({ ...spec, params: { ...spec.params, assistantDirection: direction, ...assistantOrigin(api, leader) },
-      position: { ...(leader ? { referencePanel: leader } : {}), direction } });
+    // #1840: the last tab of Core's group (Core | Ortak not | Takım notu | Echo), not a column of its own.
+    const anchor = api.panels.find(p => kindOf(teamId, p.id) === "leader") ?? api.panels.find(p => isNotes(p.id));
+    return api.addPanel({ ...spec, params: { ...spec.params, assistant: true },
+      position: anchor ? { referenceGroup: anchor.group } : { direction: "right" } });
   }
   if (kind === "worker") {
     const pair = workerRowsOf(teamId, api);
@@ -475,7 +471,7 @@ const SHELLS_H = 0.3;
 
 /**
  * #50 default screen — the root splits into columns, so the leader keeps the full height:
- *   office ........... | leader + notes (tabs)
+ *   office ........... | leader + notes + assistant (tabs)
  *   workers grid ..... |
  *   shells ........... |
  * A second leader splits under the first, more leaders tab onto the second; without a leader the
@@ -546,10 +542,10 @@ function buildDefault(teamId: string, api: DockviewApi) {
 }
 
 /**
- * Membership and viewport changes reuse the same agent slot and the existing session. Dex opens the
- * pane once per assistant (or on `fresh` default layouts); after the patron closes it, only the rack does.
+ * Membership changes reuse the same agent slot and the existing session. Dex opens the pane once per
+ * assistant (or on `fresh` default layouts); after the patron closes it, only the rack does.
  */
-export function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = false) {
+function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = false) {
   const assistant = membersOf(teamId).find(a => a.roleSlug === "assistant");
   if (!assistant || !api.totalPanels) return;
   const spec = agentSpec(teamId, assistant.id)!;
@@ -557,19 +553,23 @@ export function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = fal
   const opens = fresh || opensAssistant(assistant.id, assistantOffered(teamId));
   setAssistantOffered(teamId, assistant.id);
   if (!pane && !opens) return;
-  const direction = assistantDirection(window.innerWidth);
-  if (pane?.params?.assistantDirection === direction) return;
-  // Floating placement belongs to the patron.
-  if (pane && pane.api.location.type !== "grid") return;
+  // An open pane stays where it is — the patron's drags included.
+  if (pane && !pane.params?.assistantDirection) return;
   quietly(teamId, () => {
-    if (!pane) add(teamId, api, { ...spec, inactive: true });
-    else {
-      const leader = api.panels.find(p => kindOf(teamId, p.id) === "leader");
-      if (!leader) return;
-      const origin = pane.params?.assistantLeader ? {} : assistantOrigin(api, leader);
-      pane.api.moveTo({ group: leader.group, position: direction === "below" ? "bottom" : "right", skipSetActive: true });
-      pane.api.updateParameters({ assistantDirection: direction, ...origin });
+    if (!pane) {
+      add(teamId, api, { ...spec, inactive: true });
+      return;
     }
+    // #1840: layouts saved before the tab put the assistant in a column of its own next to Core; it
+    // joins Core's tabs once and Core gets its width back. Floating placement belongs to the patron.
+    const leader = api.panels.find(p => kindOf(teamId, p.id) === "leader");
+    if (leader && pane.api.location.type === "grid" && pane.group !== leader.group) {
+      const alone = pane.group.panels.length === 1;
+      pane.api.moveTo({ group: leader.group, position: "center", skipSetActive: true });
+      const share = pane.params?.assistantLeadShare;
+      if (alone && typeof share === "number" && share > 0 && share < 1) leader.group.api.setSize({ width: api.width * share });
+    }
+    pane.api.updateParameters({ assistant: true, assistantDirection: undefined, assistantLeader: undefined, assistantLeadShare: undefined });
   });
 }
 
@@ -577,16 +577,8 @@ export function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = fal
 export function reconcile(teamId: string, api: DockviewApi) {
   const agents = new Set(membersOf(teamId).map(a => agentPanelId(a.id)));
   const shells = new Set((getSnapshot().teams[teamId]?.shells ?? []).map(s => shellPanelId(s.id)));
-  const stale = api.panels.filter(p => (p.id.startsWith("agent:") && (!agents.has(p.id) || p.params?.assistantDirection && kindOf(teamId, p.id) !== "assistant")) || (p.id.startsWith("shell:") && !shells.has(p.id)));
-  if (stale.length) quietly(teamId, () => {
-    const origins = stale.map(p => ({ leader: p.params?.assistantLeader, share: p.params?.assistantLeadShare }));
-    stale.forEach(p => api.removePanel(p));
-    for (const { leader, share } of origins) {
-      if (typeof leader === "string" && typeof share === "number" && share > 0 && share < 1) {
-        api.getPanel(leader)?.group.api.setSize({ width: api.width * share });
-      }
-    }
-  });
+  const stale = api.panels.filter(p => (p.id.startsWith("agent:") && (!agents.has(p.id) || (p.params?.assistant || p.params?.assistantDirection) && kindOf(teamId, p.id) !== "assistant")) || (p.id.startsWith("shell:") && !shells.has(p.id)));
+  if (stale.length) quietly(teamId, () => stale.forEach(p => api.removePanel(p)));
   syncAssistantPanel(teamId, api);
 }
 
