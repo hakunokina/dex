@@ -11,8 +11,8 @@ import { chipNameStyle, coreLabel, OFFLINE_NAME_ALPHA, teamSignature } from "./l
 import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, type FragmentBox } from "./symbiote";
 import { drawCoreName, ellipsis, measureCoreName, roundRect } from "./coreName";
 import {
-  LASER, LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, laserAngle, lasing, lifeOf, linear, markAlpha, markAt,
-  pathLength, pointAt, progressRect, routeToBody, sacLook, scale, smoothRoute, spotOf, strandTone, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot,
+  LASER, LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, laserHead, laserTrack, lasing, lifeOf, linear, markAlpha, markAt,
+  pathLength, pointAt, progressRect, routeToBody, sacLook, scale, smoothRoute, spotOf, strandTone, textBlock, trackPoint, workerLight, type Light, type Rect, type Rgb, type Spot,
   type Tone,
 } from "./symbioteCard";
 import type { BodyDraw, Flow, Laser, LitScene, PointLight, Shadow } from "./litLayer";
@@ -303,10 +303,18 @@ export class World {
       if (echo) return { agent: chip.agent, x: echo.bx, y: echo.by, top: echo.D / 2 + 8, body };
       return { agent: chip.agent, x: chip.x, y: chip.y, top: chip.h / 2, body };
     });
-    for (const view of views) this.drawLabel(ctx, view, palette, time);
+    // #2068 (patron): a working worker's laser circles its label box (as drawn: the rows' widths).
+    const lasers: Laser[] = [];
+    for (const view of views) {
+      const box = this.drawLabel(ctx, view, palette, time);
+      if (box && !view.echo && lasing(view.light, view.life)) {
+        lasers.push({ ...laserTrack(box), head: laserHead(time, this.reduced, this.chips.indexOf(view.chip)) });
+      }
+    }
+    if (fallback) for (const laser of lasers) drawLaser(ctx, laser, palette.red);
     this.drawDropMarks(ctx, palette, time);
     this.drawSignature(ctx, palette);
-    this.scene = this.litScene(views, strands, palette, time);
+    this.scene = this.litScene(views, strands, lasers, palette, time);
     return anchors;
   }
 
@@ -551,8 +559,9 @@ export class World {
   /**
    * #1958 §7: a body's label beside it (provider badge, glyph + name, role, cost pill), the status mark
    * on the body's outer top corner, the stall clock / slow glass on the inner one, the focus ring.
+   * Returns a worker's label box as drawn (badge to the last row, its widest row), none without one.
    */
-  private drawLabel(ctx: CanvasRenderingContext2D, view: View, p: OfficeTheme, time: number) {
+  private drawLabel(ctx: CanvasRenderingContext2D, view: View, p: OfficeTheme, time: number): Rect | null {
     const { chip, spot, light } = view;
     const leader = chip.agent.kind === "leader";
     const block = textBlock(spot, chip.h, !!this.data.cost(chip.agent.id));
@@ -573,6 +582,7 @@ export class World {
       ctx.beginPath(); ctx.arc(0, 0, 32, 0, Math.PI * 2); ctx.fill();
       ctx.restore();
     }
+    let box: Rect | null = null;
     if (!echo && maxW >= 12) {
       ctx.save();
       ctx.textBaseline = "middle";
@@ -589,6 +599,7 @@ export class World {
       ctx.strokeStyle = provider.fill ? p.edge : provider.color; ctx.lineWidth = 1; ctx.stroke();
       ctx.fillStyle = provider.color; ctx.textAlign = "left";
       ctx.fillText(pt, px + 4, py + 5.5);
+      let rowW = pw;
       ctx.shadowColor = LABEL_SHADOW; ctx.shadowBlur = 3;
       // glyph + name (#451: the name's colour follows the kind; an offline leader is dimmed, not greyed)
       const style = chipNameStyle(leader, light.offline);
@@ -605,12 +616,15 @@ export class World {
       ctx.fillStyle = nameColor; ctx.textAlign = right ? "right" : "left";
       ctx.fillText(name, right ? spot.textR - glyphW : spot.textL + glyphW, block.nameY);
       ctx.restore();
+      rowW = Math.max(rowW, glyphW + ctx.measureText(name).width);
       const role = chip.agent.roleName || chip.agent.title;
       if (block.rows >= 2 && role) {
         ctx.font = `600 9px ${p.mono}`;
         ctx.fillStyle = light.offline ? p.muted : p.text2;
         ctx.textAlign = right ? "right" : "left";
-        ctx.fillText(ellipsis(ctx, role.toLocaleUpperCase("tr-TR"), maxW), right ? spot.textR : spot.textL, block.roleY);
+        const roleText = ellipsis(ctx, role.toLocaleUpperCase("tr-TR"), maxW);
+        ctx.fillText(roleText, right ? spot.textR : spot.textL, block.roleY);
+        rowW = Math.max(rowW, ctx.measureText(roleText).width);
       }
       // Patron (#232): no cost → no pill at all.
       if (block.rows >= 3) {
@@ -620,7 +634,10 @@ export class World {
         const cw = Math.min(maxW, ctx.measureText(cost).width + 10);
         if (right) drawTokenPill(ctx, cost, spot.textR - cw, spot.textR, block.costY, p);
         else drawTokenPill(ctx, cost, spot.textL, spot.textL + cw, block.costY, p);
+        rowW = Math.max(rowW, cw);
       }
+      const label = labelRect(spot, block);
+      let bottom = label.y + label.h;
       const progress = leader ? null : this.data.progress(chip.agent.id);
       if (progress !== null) {
         ctx.shadowBlur = 0;
@@ -629,8 +646,11 @@ export class World {
         ctx.fillStyle = p.edge; ctx.fill();
         roundRect(ctx, r.x, r.y, r.w * Math.max(0, Math.min(1, progress)), r.h, r.h / 2);
         ctx.fillStyle = p.green; ctx.fill();
+        bottom = r.y + r.h;
       }
       ctx.restore();
+      rowW = Math.min(rowW, maxW);
+      box = { x: right ? spot.textR - rowW : spot.textL, y: py, w: rowW, h: bottom - py };
     }
     if (light.mark) {
       const color = p[light.tone];
@@ -660,6 +680,7 @@ export class World {
       ctx.beginPath(); ctx.ellipse(spot.bx, spot.by, spot.D * 0.62, spot.fh * 0.62 + 2, 0, 0, Math.PI * 2); ctx.stroke();
       ctx.restore();
     }
+    return box;
   }
 
   /** #2020: Echo's provider badge on its body's top edge, its name and role (+ cost) under it (Core's look). */
@@ -685,14 +706,14 @@ export class World {
   }
 
   /** §4–§9 in CSS px: lights, shadows, strand flows and body quads for the lit layer. */
-  private litScene(views: View[], strandStates: StrandState[], p: OfficeTheme, time: number): LitScene {
+  private litScene(views: View[], strandStates: StrandState[], labelLasers: Laser[], p: OfficeTheme, time: number): LitScene {
     const u = this.unit;
     const c = colorsOf(p);
     const lights: PointLight[] = [];
     const shadows: Shadow[] = [];
     const bodies: BodyDraw[] = [];
     const flows: Flow[] = [];
-    const lasers: Laser[] = [];
+    const lasers = labelLasers.map((l) => ({ x: l.x * u, y: l.y * u, w: l.w * u, h: l.h * u, r: l.r * u, head: l.head }));
     let origin: { x: number; y: number } | null = null;
     const cores: Body[] = [];
     const calm: Rect[] = [];
@@ -744,9 +765,6 @@ export class World {
             x: bx * u, y: by * u, z: D * 0.45 * u, r: D * (0.9 + (LOOK.worker.halo - 0.9) * life) * u,
             color: scale(c[light.tone], 0.9 * light.k * (0.35 + 0.65 * light.pulse)), spec: 0.3, halo: 0.35 * sac.halo,
           });
-        }
-        if (lasing(light, life)) {
-          lasers.push({ x: bx * u, y: by * u, r: D * LASER.orbit * u, angle: laserAngle(time, this.reduced, this.chips.indexOf(chip)) });
         }
       }
       // calm zone under the label, at the layout target (Echo beside Core: under its body)
@@ -831,22 +849,24 @@ export class World {
       ctx.fillStyle = fill; ctx.fill();
       ctx.lineWidth = 1; ctx.strokeStyle = p.edge; ctx.stroke();
       ctx.restore();
-      if (!echo && lasing(light, life)) drawLaser(ctx, spot, laserAngle(time, this.reduced, this.chips.indexOf(view.chip)), p.red);
     }
   }
 }
 
-/** #2036: the laser's flat stand-in — its tail as fading arcs on the orbit, the head brightest. */
-function drawLaser(ctx: CanvasRenderingContext2D, spot: Spot, angle: number, color: string) {
-  const rx = spot.D * LASER.orbit, ry = spot.fh * LASER.orbit;
-  const steps = 6;
+/** #2036/#2068: the laser's flat stand-in — its tail as fading pieces along the label's track, the head brightest. */
+function drawLaser(ctx: CanvasRenderingContext2D, laser: Laser, color: string) {
+  const steps = 6, per = 4;
   ctx.save();
-  ctx.lineCap = "round"; ctx.lineWidth = LASER.width * 1.6;
+  ctx.lineCap = "round"; ctx.lineJoin = "round"; ctx.lineWidth = LASER.width * 1.6;
   ctx.strokeStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 6;
   for (let i = 0; i < steps; i++) {
-    const a1 = angle - (i / steps) * LASER.tail, a0 = angle - ((i + 1) / steps) * LASER.tail;
     ctx.globalAlpha = (1 - i / steps) ** 1.6;
-    ctx.beginPath(); ctx.ellipse(spot.bx, spot.by, rx, ry, 0, a0, a1); ctx.stroke();
+    ctx.beginPath();
+    for (let j = 0; j <= per; j++) {
+      const at = trackPoint(laser, laser.head - ((i + j / per) / steps) * LASER.tail);
+      if (j) ctx.lineTo(at.x, at.y); else ctx.moveTo(at.x, at.y);
+    }
+    ctx.stroke();
   }
   ctx.restore();
 }

@@ -4,8 +4,8 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   beatAt, chaikin, clockAt, coreVeins, dropAt, ECHO_BESIDE, echoBeside, echoDrift, echoLight, facingOf, footprint, glScale, GL_MAX_PIXELS, GL_MAX_SCALE,
-  keyAzimuth, labelRect, LASER, progressRect, laserAngle, lasing, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook,
-  smoothRoute, spotOf, strandTone, textBlock, workerLight,
+  keyAzimuth, labelRect, LASER, progressRect, laserHead, laserTrack, lasing, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook,
+  smoothRoute, spotOf, strandTone, textBlock, trackLength, trackPoint, workerLight,
 } from "./symbioteCard.ts";
 
 const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} ≉ ${b}`);
@@ -152,12 +152,48 @@ describe("damar rengi ve lazer (#2036: damar hep kırmızı, takım rengi yalnı
   });
   it(`lazer sakin döner (1 tur / ${LASER.period} sn), azaltılmış harekette durur`, () => {
     assert.ok(LASER.period >= 1.5 && LASER.period <= 2);
-    const a = laserAngle(0, false, 3), b = laserAngle(LASER.period / 4, false, 3);
-    near((b - a + Math.PI * 2) % (Math.PI * 2), Math.PI / 2, 1e-9);
-    near(laserAngle(LASER.period * 7, false, 3), a, 1e-9);
-    for (const t of [0, 0.4, 9.3]) assert.equal(laserAngle(t, true, 3), laserAngle(0, true, 3));
-    // Komşu keseler aynı açıda başlamaz.
-    assert.notEqual(laserAngle(0, false, 1), laserAngle(0, false, 2));
+    const a = laserHead(0, false, 3), b = laserHead(LASER.period / 4, false, 3);
+    near((b - a + 1) % 1, 0.25, 1e-9);
+    near(laserHead(LASER.period * 7, false, 3), a, 1e-9);
+    for (const t of [0, 0.4, 9.3]) assert.equal(laserHead(t, true, 3), laserHead(0, true, 3));
+    // Komşu etiketler aynı yerde başlamaz.
+    assert.notEqual(laserHead(0, false, 1), laserHead(0, false, 2));
+  });
+});
+
+describe("lazer yolu (#2068: etiket kutusunun çevresinde)", () => {
+  const box = { x: 100, y: 50, w: 80, h: 40 };
+  const t = laserTrack(box);
+  it("yol kutunun pad kadar dışında, köşeler yuvarlak", () => {
+    assert.deepEqual({ x: t.x, y: t.y, w: t.w, h: t.h }, { x: 100 - LASER.pad, y: 50 - LASER.pad, w: 80 + 2 * LASER.pad, h: 40 + 2 * LASER.pad });
+    assert.equal(t.r, LASER.radius);
+    // Kısa kutuda köşe yarıçapı kısa kenarın yarısını aşmaz.
+    assert.equal(laserTrack({ x: 0, y: 0, w: 30, h: 2 }).r, (2 + 2 * LASER.pad) / 2);
+  });
+  it("her nokta kutunun birkaç px dışında; tur kapanır", () => {
+    for (let i = 0; i < 200; i++) {
+      const p = trackPoint(t, i / 200);
+      const out = Math.max(box.x - p.x, p.x - box.x - box.w, box.y - p.y, p.y - box.y - box.h);
+      // Kenarlarda pad, yuvarlak köşede biraz daha yakın; metne hiç değmez.
+      assert.ok(out >= 2 && out <= LASER.pad + 1e-6, `${i}: ${p.x},${p.y} kutuya çok yakın (${out})`);
+      assert.ok(p.x >= t.x - 1e-9 && p.x <= t.x + t.w + 1e-9 && p.y >= t.y - 1e-9 && p.y <= t.y + t.h + 1e-9);
+    }
+    const a = trackPoint(t, 0), b = trackPoint(t, 1);
+    near(a.x, b.x); near(a.y, b.y);
+    near(a.x, t.x + t.r); near(a.y, t.y);
+  });
+  it("saat yönünde, yay uzunluğuyla eşit hızda: üst → sağ → alt → sol", () => {
+    const L = trackLength(t), sw = t.w - 2 * t.r, sh = t.h - 2 * t.r, q = (Math.PI * t.r) / 2;
+    const at = (s: number) => trackPoint(t, s / L);
+    near(at(sw / 2).y, t.y); near(at(sw / 2).x, t.x + t.w / 2);
+    near(at(sw + q + sh / 2).x, t.x + t.w); near(at(sw + q + sh / 2).y, t.y + t.h / 2);
+    near(at(sw + 2 * q + sh + sw / 2).y, t.y + t.h); near(at(sw + 2 * q + sh + sw / 2).x, t.x + t.w / 2);
+    near(at(2 * sw + 3 * q + sh + sh / 2).x, t.x); near(at(2 * sw + 3 * q + sh + sh / 2).y, t.y + t.h / 2);
+    // Köşe ortası: yuvarlak köşenin üstünde.
+    const c = at(sw + q / 2);
+    near(Math.hypot(c.x - (t.x + t.w - t.r), c.y - (t.y + t.r)), t.r);
+    // Komşu örnekler eşit aralıklı (yay uzunluğu parametresi).
+    for (let i = 0; i < 100; i++) near(Math.hypot(at((i + 1) * L / 100).x - at(i * L / 100).x, at((i + 1) * L / 100).y - at(i * L / 100).y), L / 100, 0.05);
   });
 });
 

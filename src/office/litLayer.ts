@@ -33,8 +33,8 @@ export interface BodyDraw {
   /** Height range of the body's map (CSS px). */
   height: number;
 }
-/** #2036: a working sac's laser (CSS px): orbit centre, its x radius (y: × the sac's aspect), the head's angle (rad). */
-export interface Laser { x: number; y: number; r: number; angle: number }
+/** #2068: a working worker's laser (CSS px): its track round the label box (top-left, size, corner radius), the head's place on the lap (0–1). */
+export interface Laser { x: number; y: number; w: number; h: number; r: number; head: number }
 /** World units: the strand relief, Core anchors and the calm zones under labels. */
 export interface Strands { key: string; routes: Point[][]; cores: Body[]; calm: Rect[] }
 export interface LitScene {
@@ -53,7 +53,7 @@ const MAX_SHADOWS = 16;
 const MAX_FLOWS = 32;
 /** The flow id of strands past MAX_FLOWS. */
 const OVER_FLOW = 255;
-/** #2036: lasers past it are not drawn (the sac's red still reads working). Ground FS uniforms: ~196 of 224. */
+/** #2036: lasers past it are not drawn (the sac's red still reads working). Ground FS uniforms: ~204 of 224. */
 const MAX_LASERS = 16;
 const glf = (v: number) => v.toFixed(4);
 
@@ -123,7 +123,7 @@ uniform vec3 uEmit; uniform vec2 uCore; uniform float uBeat; uniform float uVig;
 uniform int uNB; uniform vec4 uBS[${MAX_SHADOWS}]; uniform vec4 uBX[${MAX_SHADOWS}];
 uniform int uNR; uniform vec4 uRoute[${MAX_FLOWS}]; uniform vec4 uLife[${MAX_FLOWS}]; uniform vec3 uFlowCol;
 uniform vec4 uLH[${MAX_LIGHTS / 4}];
-uniform int uNLas; uniform vec4 uLas[${MAX_LASERS}];
+uniform int uNLas; uniform vec4 uLas[${MAX_LASERS}]; uniform vec4 uLasH[${MAX_LASERS / 2}];
 out vec4 outColor;
 
 void main() {
@@ -189,16 +189,35 @@ void main() {
     float hk = uLH[i / 4][i % 4];
     if (hk > 0.0) E += uLC[i].rgb * hk * exp(-pow(length(css - uLP[i].xy) / uLP[i].w, 2.0));
   }
-  // #2036: a working sac's laser (the work band's red) — a short lit arc orbiting it, the tail fading behind its head.
+  // #2068: a working worker's laser (the work band's red) — a short lit line circling its label box on a rounded
+  // track, the tail fading behind its head. Arc length s runs clockwise from the top edge's left end (trackPoint).
   for (int i = 0; i < ${MAX_LASERS}; i++) {
     if (i >= uNLas) break;
     vec4 L = uLas[i];
-    vec2 q = (css - L.xy) / vec2(L.z, L.z * ${glf(LOOK.worker.aspect)});
-    float d = abs(length(q) - 1.0) * L.z;
+    vec2 hr = (i % 2 == 0) ? uLasH[i / 2].xy : uLasH[i / 2].zw;
+    float r = hr.y;
+    vec2 q = css - (L.xy + 0.5 * L.zw), inner = 0.5 * L.zw - r;
+    vec2 w = abs(q) - inner;
+    float d = abs(length(max(w, 0.0)) + min(max(w.x, w.y), 0.0) - r);
     if (d > 8.0 * uUnit) continue;
-    float behind = mod(L.w - atan(q.y, q.x), 6.2831853);
-    float tail = pow(max(0.0, 1.0 - behind / ${glf(LASER.tail)}), 1.6);
-    float head = exp(-pow(min(behind, 6.2831853 - behind) * L.z / (3.0 * uUnit), 2.0));
+    float sw = 2.0 * inner.x, sh = 2.0 * inner.y, qa = 1.5707963 * r;
+    float len = 2.0 * (sw + sh) + 4.0 * qa;
+    float s;
+    if (w.x > 0.0 && w.y > 0.0) {
+      vec2 k = sign(q) * inner;
+      float a = atan(q.y - k.y, q.x - k.x);
+      if (q.x > 0.0 && q.y < 0.0) s = sw + (a + 1.5707963) * r;
+      else if (q.x > 0.0) s = sw + qa + sh + a * r;
+      else if (q.y > 0.0) s = 2.0 * sw + sh + 2.0 * qa + (a - 1.5707963) * r;
+      else s = 2.0 * (sw + sh) + 3.0 * qa + (a + 3.1415927) * r;
+    } else if (w.x > w.y) {
+      s = q.x > 0.0 ? sw + qa + inner.y + q.y : 2.0 * sw + sh + 3.0 * qa + inner.y - q.y;
+    } else {
+      s = q.y < 0.0 ? inner.x + q.x : sw + sh + 2.0 * qa + inner.x - q.x;
+    }
+    float behind = mod(hr.x * len - s, len);
+    float tail = pow(max(0.0, 1.0 - behind / (${glf(LASER.tail)} * len)), 1.6);
+    float head = exp(-pow(min(behind, len - behind) / (3.0 * uUnit), 2.0));
     float line = exp(-pow(d / (${glf(LASER.width)} * uUnit), 2.0)) + 0.3 * exp(-pow(d / (4.0 * uUnit), 2.0));
     E += uFlowCol * line * (1.2 * tail + 1.0 * head);
   }
@@ -525,7 +544,12 @@ export class LitLayer {
     gl.uniform3fv(g.u("uFlowCol"), scene.flowColor);
     const lasers = scene.lasers.slice(0, MAX_LASERS);
     gl.uniform1i(g.u("uNLas"), lasers.length);
-    if (lasers.length) gl.uniform4fv(g.u("uLas"), lasers.flatMap((l) => [l.x, l.y, l.r, l.angle]));
+    if (lasers.length) {
+      gl.uniform4fv(g.u("uLas"), lasers.flatMap((l) => [l.x, l.y, l.w, l.h]));
+      const heads = lasers.flatMap((l) => [l.head, l.r]);
+      if (heads.length % 4) heads.push(0, 0);
+      gl.uniform4fv(g.u("uLasH"), heads);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     const b = this.body;
