@@ -124,7 +124,7 @@ test("Notlar serbest: Takım notu sürüklenip ayrı gruba bölünür, reload so
   await expect.poll(notesTabs).toEqual([["Takım notu", "Ortak not"]]);
 });
 
-test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca Kart'taki düğme yenisini açar", async ({ app, dexd }) => {
+test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca paletten yenisi açılır", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Terminal ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   await app.reload();
@@ -133,10 +133,9 @@ test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca
   const rack = app.getByRole("group", { name: "Takım ajanları" });
   await expect(rack.getByRole("button", { name: new RegExp(leader.name) })).toBeVisible();
   const stageEl = app.locator(".team-stage:not(.hidden)");
-  const kartNew = stageEl.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni terminal" });
   const headerNew = stageEl.locator(".dex-group-action[aria-label='Yeni terminal']");
 
-  // #65: the default screen has a shell row at the bottom left, under the workers, with its "+".
+  // #65: the default screen has a shell row at the bottom left, under the workers, with its "Yeni terminal".
   const shellGroups = async () => (await groups(app)).filter((g) => g.tabs.includes("Terminal"));
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([1]);
   const all = await groups(app);
@@ -152,21 +151,22 @@ test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca
   await app.keyboard.press("Enter");
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([2]);
 
-  // All closed: no header "+" left, the Kart's button still opens one at the bottom left.
+  // All closed: no header action left, the palette still opens one at the bottom left.
   const close = app.getByRole("button", { name: "Terminali kapat" });
   while (await close.count()) await close.first().click();
   await expect.poll(shellGroups).toEqual([]);
   await expect(headerNew).toHaveCount(0);
-  await kartNew.click();
+  await expect(stageEl.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni terminal" })).toHaveCount(0);
+  await app.keyboard.press("Control+Shift+P");
+  await app.getByPlaceholder(/Komut ara/).fill("Terminal aç");
+  await app.keyboard.press("Enter");
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([1]);
   const after = await groups(app);
   const [sh2] = await shellGroups();
   expect(sh2.left).toBe(kart.left);
   expect(sh2.top + sh2.height).toBe(Math.max(...after.map((g) => g.top + g.height)));
-  // Palette: "Terminal aç" tabs onto it.
-  await app.keyboard.press("Control+Shift+P");
-  await app.getByPlaceholder(/Komut ara/).fill("Terminal aç");
-  await app.keyboard.press("Enter");
+  // The header's "Yeni terminal" is back and tabs onto it.
+  await headerNew.click();
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([2]);
 
   // Close them: a live PowerShell holds the team workdir and the fixture could not remove its temp root.

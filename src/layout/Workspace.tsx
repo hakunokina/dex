@@ -12,7 +12,7 @@ import {
   type GetTabContextMenuItemsParams, type resolveMessages,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
-import { Boxes, Brain, CircuitBoard, Cpu, Lock, NotebookPen, Play, Plus, Settings, Square, SquareKanban, SquareTerminal, StickyNote, Users, X } from "lucide-react";
+import { Boxes, Brain, CircuitBoard, Cpu, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, StickyNote, Users, X } from "lucide-react";
 import { hostOf } from "../api/hosts";
 import { requestStart } from "../launcher";
 import { killPty } from "../pty";
@@ -29,7 +29,7 @@ import { PanelBoundary } from "./PanelBoundary";
 import { OfficeBar } from "../office/OfficeBar";
 import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
 import {
-  agentPanelId, bindApi, boundApi, closeShell, growIntoCorner, isBulk, isNotes, load, NOTES, openPanel, openShell, reconcile,
+  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isNotes, load, NOTES, openPanel, openShell, reconcile,
   resetLayout, shellPanelId, unbindApi, type NotesPage,
 } from "./panels";
 import "./workspace.css";
@@ -62,11 +62,11 @@ interface Ctx {
 const WorkspaceCtx = createContext<Ctx>(null!);
 
 function OfficePanel() {
-  const { teamId, active, focusedId, onOfficeSelect, onFocus } = useContext(WorkspaceCtx);
+  const { teamId, active, focusedId, onOfficeSelect } = useContext(WorkspaceCtx);
   // The canvas animates only for the team on screen (DEX-16: its World keeps running elsewhere).
   return (
     <div className="panel-fill office-panel">
-      <OfficeBar teamId={teamId} active={active} onFocus={onFocus} />
+      <OfficeBar teamId={teamId} active={active} />
       <div className="office-stage">{active && lazyPanel(<Office key={teamId} teamId={teamId} focusedId={focusedId} onSelect={onOfficeSelect} />)}</div>
     </div>
   );
@@ -247,10 +247,18 @@ function FallbackTab(props: IDockviewPanelHeaderProps) {
   return <FixedTab {...props} />;
 }
 
-/** #46: a group holding a shell gets "Yeni terminal" on its header (#65: the Kart's toolbar always has one). */
-function GroupActions({ panels }: IDockviewHeaderActionsProps) {
+/** #46: a group holding a shell (or Süreçler) gets "Yeni terminal" and the Süreçler toggle on its header.
+ *  #65: with no shell open there's no header — the palette opens both ("Yeni terminal", "Süreç panelini aç"). */
+function GroupActions({ panels, containerApi }: IDockviewHeaderActionsProps) {
   const { teamId, onFocus } = useContext(WorkspaceCtx);
-  if (!panels.some(p => p.id.startsWith("shell:"))) return null;
+  const [procsOpen, setProcsOpen] = useState(() => !!containerApi.getPanel(FIXED.procs.id));
+  useEffect(() => {
+    const sync = () => setProcsOpen(!!containerApi.getPanel(FIXED.procs.id));
+    sync();
+    const subs = [containerApi.onDidAddPanel(sync), containerApi.onDidRemovePanel(sync)];
+    return () => subs.forEach(d => d.dispose());
+  }, [containerApi]);
+  if (!panels.some(p => p.id.startsWith("shell:") || p.id === FIXED.procs.id)) return null;
   return (
     <div className="dex-group-actions">
       <button className="dex-group-action" title="Yeni terminal" aria-label="Yeni terminal"
@@ -258,7 +266,17 @@ function GroupActions({ panels }: IDockviewHeaderActionsProps) {
         onClick={() => {
           void openShell(teamId).then(id => { if (id) onFocus(id); });
         }}>
-        <Plus />
+        <SquareTerminal />
+      </button>
+      {/* #916: which agent runs what, CPU/RAM; idle Playwright/browser children can be closed there. */}
+      <button className={`dex-group-action${procsOpen ? " on" : ""}`} aria-pressed={procsOpen}
+        title="Süreçler (ajanların CPU/RAM'i)" aria-label="Süreçler"
+        onPointerDown={e => e.stopPropagation()}
+        onClick={() => {
+          const p = containerApi.getPanel(FIXED.procs.id);
+          if (p) p.api.close(); else void openPanel(teamId, "procs");
+        }}>
+        <Cpu />
       </button>
     </div>
   );

@@ -78,6 +78,7 @@
 }
 .dex-group-action svg { width: 14px; height: 14px; }
 .dex-group-action:hover { color: var(--tab-fg-active); background: var(--tab-bg-hover); }
+.dex-group-action.on { color: var(--tab-fg-active); box-shadow: inset 0 -2px 0 var(--team); }
 .dex-group-action:focus-visible { outline: none; box-shadow: var(--ring); }
 
 /* #49: a float never outgrows the dock, also when the window shrinks under it (16 px margin);
