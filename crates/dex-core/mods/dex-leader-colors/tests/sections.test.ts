@@ -60,6 +60,7 @@ test('dexColor paints per type, failures red and fixes orange', () => {
   expect(dexColor('Dex-Üye', '[Dex-Üye] REDDEDİLDİ')).toBe('#f85149')
   expect(dexColor('Dex-Not', '[Dex-Not] not')).toBe('#8b949e')
   expect(dexColor('Dex-Sistem', '[Dex-Sistem] kota')).toBe('#39c5cf')
+  expect(dexColor('Dex-Motivasyon', '[Dex-Motivasyon] bugün')).toBe('#f778ba')
   expect(dexColor('Dex-Bilinmez', 'x')).toBe('#8b949e')
 })
 

@@ -458,6 +458,9 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE questions_v40 RENAME TO questions;
     CREATE INDEX questions_worker ON questions(worker, status);
     CREATE INDEX questions_leader ON questions(leader, status);",
+    // 41 (#1858): the patron's daily three lines, one row per local day. Additive, IF NOT EXISTS.
+    // Before commit: ROLLBACK. After commit: keep the table; revert only the application.
+    crate::motivation::SCHEMA,
 ];
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
@@ -690,7 +693,8 @@ mod job_model_migration_tests {
     #[test]
     fn cancelled_question_migration_twice_preserves_rows_and_clean_db() {
         let mut c = Connection::open_in_memory().unwrap();
-        for (i, sql) in MIGRATIONS.iter().take(MIGRATIONS.len() - 1).enumerate() {
+        let v40 = MIGRATIONS.iter().position(|sql| sql.starts_with("CREATE TABLE questions_v40")).unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(v40).enumerate() {
             c.execute_batch(sql).unwrap();
             c.pragma_update(None, "user_version", i + 1).unwrap();
         }
@@ -716,6 +720,35 @@ mod job_model_migration_tests {
         for _ in 0..2 { migrate(&mut clean).unwrap(); }
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
         println!("cancelled migration: preserved={before:?}; v39 + clean DB 2 runs; FK=0");
+    }
+
+    #[test]
+    fn motivation_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let version = MIGRATIONS.iter().position(|sql| *sql == crate::motivation::SCHEMA).unwrap();
+        for (i, sql) in MIGRATIONS[..version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch("INSERT INTO leader_notes(agent_id,text,created_at) VALUES('timur','keep',1);
+            INSERT INTO settings(key,value) VALUES('maintenance_day','\"2026-10-14\"');").unwrap();
+        let snapshot = |c: &Connection| -> (i64, i64, i64) {
+            (c.query_row("SELECT COUNT(*) FROM leader_notes", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT COUNT(*) FROM settings", [], |r| r.get(0)).unwrap(),
+             c.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0)).unwrap())
+        };
+        let before = snapshot(&c);
+        for _ in 0..2 { migrate(&mut c).unwrap(); assert_eq!(snapshot(&c), before); }
+        crate::motivation::set(&c, "2026-10-15", "a", "b", "c", 1).unwrap();
+        for _ in 0..2 {
+            c.execute_batch(crate::motivation::SCHEMA).unwrap();
+            assert_eq!(crate::motivation::get(&c, "2026-10-15").unwrap().unwrap().evening, "c");
+        }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        println!("motivation migration: preserved={before:?}; v{version} + clean DB 2 runs");
     }
 
     #[test]

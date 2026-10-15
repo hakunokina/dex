@@ -24,6 +24,8 @@ pub const NOT: &str = "Dex-Not";
 pub const SISTEM: &str = "Dex-Sistem";
 /// Kod incelemesi kararı (onay/düzelt/bekliyor).
 pub const INCELEME: &str = "Dex-İnceleme";
+/// Günlük motivasyon isteği (lidere, #1858).
+pub const MOTIVASYON: &str = "Dex-Motivasyon";
 
 /// `[Tür] gövde` satırını kurar.
 pub fn line(tag: &str, body: impl AsRef<str>) -> String {
@@ -71,6 +73,7 @@ mod tests {
             "[Dex-Devretme] Forge-1 #1745 · bitti — özet",
             "[Dex-Soru] Kaan #3 · soru #7 — neden?",
             "[Dex-Sistem] Oturumun sıfırlanacak.",
+            "[Dex-Motivasyon] Patron için bugünün (2026-10-15) 3 motivasyon cümlesini yaz",
             "  [Dex-Not] girintili",
         ] {
             assert!(is_dex_turn(ok), "{ok}");

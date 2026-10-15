@@ -65,6 +65,9 @@ handlers! {
         "inbox_reply_get" => |core,p| inbox(core.inbox_reply_get(arg(p,"id")?)),
         "push_register" => |core,p| inbox(core.push_register(&arg::<String>(p,"token")?,&arg::<String>(p,"platform")?)),
         "push_unregister" => |core,p| inbox(core.push_unregister(&arg::<String>(p,"token")?)),
+        // #1858: the phone pulls the patron's daily lines (no push) and reports delivery. Host only.
+        "motivation_today" => |core,_| inbox(core.motivation_today()),
+        "motivation_result" => |core,p| inbox(core.motivation_result(&arg::<String>(p,"date")?,arg(p,"ok")?,arg::<Option<String>>(p,"error")?.as_deref())),
         "agent_context" => |core,p| ok(core.agent_context(&arg::<String>(p,"agentId")?)),
         "team_context" => |core,p| ok(core.team_context(&arg::<String>(p,"teamId")?)),
         "usage_summary" => |core,p| ok(core.usage_summary(&arg::<String>(p,"teamId")?,arg(p,"since")?)),
@@ -313,6 +316,29 @@ mod tests {
         let reply=call(&core,"push_register",&serde_json::json!({"token":"fcm-device-1","platform":"android"})).unwrap();
         assert_eq!(reply,serde_json::json!({"ok":true,"pushConfigured":false}));
         assert_eq!(call(&core,"push_unregister",&serde_json::json!({"token":"fcm-device-1"})).unwrap(),serde_json::json!({"ok":true}));
+        core.shutdown();
+    }
+
+    #[test]
+    fn motivation_rpcs_pull_today_and_record_delivery() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/motivation-rpc-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let core=Core::start(Paths{data_dir:root.join("data"),config_dir:root.join("config")},Events::new(NullSink)).unwrap();
+        for m in ["motivation_today","motivation_result"] { assert!(METHODS.contains(&m), "{m}"); }
+        assert_eq!(call(&core,"motivation_today",&serde_json::json!({})).unwrap(),Value::Null);
+        let lines=core.motivation_set("sabah","öğle","akşam").unwrap();
+        let date=lines["date"].as_str().unwrap().to_string();
+        assert_eq!(call(&core,"motivation_today",&serde_json::json!({})).unwrap(),serde_json::json!({"date":date,"morning":"sabah","noon":"öğle","evening":"akşam"}));
+        assert_eq!(call(&core,"motivation_result",&serde_json::json!({"date":date,"ok":true})).unwrap(),serde_json::json!({"ok":true}));
+        assert_eq!(call(&core,"motivation_result",&serde_json::json!({"date":date,"ok":false,"error":"launcher yok"})).unwrap(),serde_json::json!({"ok":true}));
+        for (params,code) in [
+            (serde_json::json!({"ok":true}),"bad_request"),
+            (serde_json::json!({"date":date}),"bad_request"),
+            (serde_json::json!({"date":"15.10.2026","ok":true}),"motivation_date"),
+            (serde_json::json!({"date":"2000-01-01","ok":true}),"motivation_not_found"),
+            (serde_json::json!({"date":date,"ok":false,"error":"x".repeat(501)}),"motivation_error_long"),
+        ] {
+            assert_eq!(call(&core,"motivation_result",&params).unwrap_err().code,code,"{params}");
+        }
         core.shutdown();
     }
 

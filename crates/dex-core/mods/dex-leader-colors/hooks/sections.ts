@@ -18,6 +18,7 @@ export function dexColor(tag: string, line: string): string {
     case 'Dex-Üye': return /REDDEDİLDİ/.test(line) ? '#f85149' : '#bc8cff'
     case 'Dex-Not': return '#8b949e'
     case 'Dex-Sistem': return '#39c5cf'
+    case 'Dex-Motivasyon': return '#f778ba'
     default: return '#8b949e'
   }
 }

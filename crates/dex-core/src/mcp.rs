@@ -1738,7 +1738,13 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "additionalProperties": false, "properties": {} } },
         { "name": "map_refresh", "description": "YALNIZ LİDER. Projenin `.dex/map.md` repo haritası iskeletini tazeler (Scout-2'nin Genel bakış bölümü korunur). Birleştirme sonrası otomatik tazelenir; bu araç elle tetikleme içindir.",
           "annotations": { "readOnlyHint": false },
-          "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "project": project_schema() } } }
+          "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "project": project_schema() } } },
+        { "name": "motivation_set", "description": "YALNIZ LİDER. Patronun bugünkü 3 motivasyon cümlesini kaydeder (sabah 05–12, öğle 12–19, akşam 19–05); telefon dexd'den çeker. Her biri boş değil, tek satır, en çok 200 karakter; biri uymazsa hiçbiri kaydedilmez. Aynı gün tekrar çağrı üzerine yazar.",
+          "annotations": { "readOnlyHint": false },
+          "inputSchema": { "type": "object", "additionalProperties": false, "required": ["morning", "noon", "evening"], "properties": {
+              "morning": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS },
+              "noon": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS },
+              "evening": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS } } } }
     ]);
     // DEX-22: plan, plan_status, plan_cancel, propose_member (+ DEX-28 plan_retry).
     all.as_array_mut().unwrap().extend(crate::plan::tools());
@@ -1792,7 +1798,7 @@ fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
             return all;
         }
         if let Ok(c) = delegate::caller(&conn, agent) {
-            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note"); }
+            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note" && t["name"] != "motivation_set"); }
             all.as_array_mut().unwrap().extend(crate::gpu::tools_for(&conn, &c, job));
         }
     }
@@ -2269,6 +2275,18 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
             drop(conn);
             core.leader_reset_ready(&c.id)
         }
+        // #1858: the patron's daily lines; never logged.
+        "motivation_set" => {
+            lead_only("motivation_set")?;
+            let fields = args.as_object().ok_or("arguments nesne olmalı")?;
+            if let Some(key) = fields.keys().find(|k| !matches!(k.as_str(), "morning" | "noon" | "evening")) {
+                return Err(format!("bilinmeyen alan: {key}"));
+            }
+            let field = |k: &str| s(args, k).ok_or_else(|| format!("{k} gerekli (metin)"));
+            let (morning, noon, evening) = (field("morning")?, field("noon")?, field("evening")?);
+            drop(conn);
+            core.motivation_set(morning, noon, evening)
+        }
         // Plan #99 mapgen: repo haritası iskeletini elle tazeleme (lider).
         "map_refresh" => {
             lead_only("map_refresh")?;
@@ -2380,6 +2398,35 @@ fn summarize(core: &Core, d: delegate::Delegation) -> Result<Value, String> {
     };
     Ok(json!({ "delegationId": d.id, "to": d.to_agent, "toName": name, "targetRole": d.target_role, "queuePosition": d.queue_position, "status": d.status, "note": note, "summary": d.summary,
         "model": d.model, "modelApproval": d.model_approval, "actualModel": d.actual_model, "actualProvider": d.actual_provider, "actualEngine": d.actual_engine }))
+}
+
+#[cfg(test)]
+mod motivation_tests {
+    use super::*;
+
+    #[test]
+    fn motivation_set_is_leader_only_and_all_or_nothing() {
+        let storage = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("motivation-mcp-{}-{}", std::process::id(), crate::agents::next_seq()));
+        let core = Core::start(crate::Paths { data_dir: storage.join("data"), config_dir: storage.join("config") },
+            crate::Events::new(crate::events::NullSink)).unwrap();
+        assert!(tools_list_for_test(&core, "timur").iter().any(|t| t["name"] == "motivation_set"));
+        assert!(!tools_list_for_test(&core, "kaan").iter().any(|t| t["name"] == "motivation_set"));
+        let lines = json!({"morning": "sabah", "noon": "öğle", "evening": "akşam"});
+        let denied = call_with_args_for_test(&core, "kaan", "motivation_set", lines.clone());
+        assert_eq!(denied["isError"], true, "{denied}");
+        let bad = call_with_args_for_test(&core, "timur", "motivation_set", json!({"morning": "sabah", "noon": "a
+b", "evening": "akşam"}));
+        assert_eq!(bad["isError"], true, "{bad}");
+        assert!(bad["content"][0]["text"].as_str().unwrap().contains("noon tek satır"), "{bad}");
+        let extra = call_with_args_for_test(&core, "timur", "motivation_set", json!({"morning": "a", "noon": "b", "evening": "c", "night": "d"}));
+        assert_eq!(extra["isError"], true, "{extra}");
+        assert_eq!(core.motivation_today().unwrap(), None);
+        let ok = call_with_args_for_test(&core, "timur", "motivation_set", lines);
+        assert_eq!(ok["structuredContent"]["ok"], true, "{ok}");
+        assert_eq!(core.motivation_today().unwrap().unwrap().noon, "öğle");
+        core.shutdown();
+    }
 }
 
 #[cfg(test)]
