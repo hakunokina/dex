@@ -5,8 +5,8 @@ import { describe, it } from "node:test";
 import type { Agent } from "../agents";
 import { coreBody } from "./companion/coreXL.ts";
 import {
-  areaInset, BOARD_PAD_PX, boardRect, COLUMNS_FROM, EDGE_PX, fitUnit, labelBand, layout, MIN_FONT_PX, MIN_U, pickMode,
-  PIN_CLEAR, routes, SMALLEST_FONT, STACK_BELOW, type Mode, type Point, type Target,
+  areaInset, BOARD_PAD_PX, COLUMNS_FROM, crew, ECHO_GAP, ECHO_H, EDGE_PX, fitUnit, isEcho, labelBand, layout, MIN_FONT_PX, MIN_U,
+  ownershipKey, pickMode, PIN_CLEAR, routes, SMALLEST_FONT, STACK_BELOW, type Mode, type Point, type Target,
 } from "./placement.ts";
 
 const agent = (id: string, kind: "leader" | "worker" = "worker", roleName = id) => ({ id, name: id, kind, roleName }) as unknown as Agent;
@@ -46,11 +46,10 @@ function checkBoard(b: ReturnType<typeof board>) {
 const PANELS = [[420, 760], [480, 820], [640, 620], [950, 570], [1200, 600], [2400, 500], [1900, 1100], [3200, 1800]] as const;
 
 describe("kenar payı (#277)", () => {
-  it("panel → kart ≤ 6 px, kart → çip alanı ince şerit (delikler + köşe yazıları)", () => {
+  it("panel → çip alanı ince şerit (sabit CSS px)", () => {
     assert.ok(BOARD_PAD_PX >= 4 && BOARD_PAD_PX <= 6);
     for (const u of [MIN_U, 1.5, 2, 4]) {
-      assert.ok(Math.abs(boardRect(1000, 600, u).x * u - BOARD_PAD_PX) < 1e-9);
-      // Çip alanına kadar sabit şerit; pinlerin payı (PIN_CLEAR) hücrede, çiple ölçeklenir.
+      // Çip alanına kadar sabit şerit; rozetin payı (PIN_CLEAR) hücrede, çiple ölçeklenir.
       assert.ok(Math.abs(areaInset(u) * u - (BOARD_PAD_PX + EDGE_PX)) < 1e-9);
       assert.ok(BOARD_PAD_PX + EDGE_PX <= 18);
     }
@@ -203,5 +202,93 @@ describe("izler", () => {
       assert.ok(Math.abs(Math.abs(pts[0].x - core.x) - body.s / 2) < 1e-9);
       assert.ok(octilinear(pts));
     }
+  });
+});
+
+describe("Echo yuvası (#1958)", () => {
+  const echo = () => ({ ...agent("echo"), roleSlug: "assistant" }) as unknown as Agent;
+  const withEcho = (n: number, first = false) => {
+    const [core, ...rest] = team(n);
+    return first ? [core, echo(), ...rest] : [core, ...rest, echo()];
+  };
+  function echoBoard(cssW: number, cssH: number, n: number, first = false) {
+    const agents = withEcho(n, first);
+    const mode = pickMode(cssW / cssH, null);
+    const u = fitUnit(cssW, cssH, agents, [], mode);
+    const w = cssW / u, h = cssH / u;
+    return { u, w, h, mode, cssW, cssH, targets: layout(agents, [], w, h, mode, u) };
+  }
+
+  it("asistan isEcho; lider ve sıradan worker değil", () => {
+    assert.equal(isEcho(echo()), true);
+    assert.equal(isEcho(agent("w0")), false);
+    assert.equal(isEcho({ ...agent("core", "leader"), roleSlug: "assistant" } as unknown as Agent), false);
+  });
+
+  for (const [w, h] of [[1200, 600], [950, 570], [640, 620], [480, 820], [1900, 1100]] as const) for (const first of [false, true]) {
+    it(`${w}×${h}${first ? " (rol sırasında ilk)" : ""}: Echo Core etiketinin hemen altında, aynı eksende; sütunlara karışmaz`, () => {
+      const b = echoBoard(w, h, 6, first);
+      const core = b.targets.get("core")!;
+      const slot = b.targets.get("echo")!;
+      assert.ok(Math.abs(slot.x - core.x) < 1e-6, "aynı dikey eksen");
+      assert.ok(Math.abs(slot.w - core.w) < 1e-6, "Core sütunu genişliğinde");
+      const gap = (slot.y - slot.h / 2) - (core.y + core.h / 2);
+      assert.ok(Math.abs(gap - ECHO_GAP) < 1e-6, `Core'a yakın: ${gap}`);
+      // Worker'lar Echo'suz takımdaki yerleşimle aynı sayıda ve aynı tarafta (Echo bir sütun/sıra yuvası almaz).
+      const workers = [...b.targets].filter(([id]) => id !== "core" && id !== "echo").map(([, t]) => t);
+      assert.equal(workers.length, 6);
+      for (const t of workers) assert.ok(Math.abs(t.x - core.x) > core.w / 2 || Math.abs(t.y - core.y) > core.h / 2 + slot.h, "worker Core sütununda değil");
+      checkBoard(b);
+    });
+  }
+
+  it("tam boyda Echo yuvası; Core gövdesi 120 kalır", () => {
+    for (const [w, h] of [[1200, 600], [640, 620], [1900, 1100]] as const) {
+      const b = echoBoard(w, h, 6);
+      if (b.u === MIN_U) continue;
+      assert.ok(coreBody(b.targets.get("core")!)!.s >= 120 - 0.02);
+      assert.ok(b.targets.get("echo")!.h >= ECHO_H - 0.01);
+    }
+  });
+
+  it("Echo'nun izi yok; ownership anahtarı Echo'yu worker sırasına katmaz", () => {
+    const agents = withEcho(4, true);
+    const b = echoBoard(1200, 600, 4, true);
+    const core = b.targets.get("core")!;
+    const workers = crew(agents).workers.map((a) => ({ id: a.id, ...b.targets.get(a.id)! }));
+    assert.ok(!crew(agents).workers.some((a) => a.id === "echo"));
+    assert.deepEqual(crew(agents).echoes.map((a) => a.id), ["echo"]);
+    assert.ok(!routes({ id: "core", ...core }, workers).has("echo"));
+    assert.ok(!ownershipKey(agents, []).includes("echo"));
+  });
+
+  it("Echo'lu yalnız Core (boş takım) ve küçük paneller taşmaz", () => {
+    for (const [w, h, n] of [[500, 500, 0], [320, 300, 4], [260, 240, 2], [900, 380, 10], [360, 700, 12]] as const) {
+      const b = echoBoard(w, h, n);
+      assert.ok(b.targets.get("echo"), `${w}×${h}`);
+      checkBoard(b);
+    }
+  });
+
+  it("kısa Kart: önce Echo küçülür (iki satır), Core XL kalır; en küçük panelde de", () => {
+    // Varsayılan düzende Kart ~834×235 (1400×900 pencere) ve ~1146×298 (1920×1080).
+    const short = echoBoard(834, 235, 8);
+    assert.ok(short.targets.get("echo")!.h >= 28 - 1e-6);
+    assert.ok(coreBody(short.targets.get("core")!)!.s >= 74);
+    const wide = echoBoard(1146, 298, 8);
+    assert.equal(coreBody(wide.targets.get("core")!)!.s, 120);
+    for (const [w, h, n] of [[594, 165, 8], [280, 300, 3], [300, 200, 4], [240, 420, 2], [500, 180, 0]] as const) {
+      const b = echoBoard(w, h, n);
+      assert.ok(coreBody(b.targets.get("core")!), `${w}×${h}: Core çipe düştü`);
+      const core = b.targets.get("core")!, slot = b.targets.get("echo")!;
+      assert.ok(slot.y - slot.h / 2 >= core.y + core.h / 2, `${w}×${h}: Echo Core'un üstüne biniyor`);
+    }
+  });
+
+  it("çok liderli takımda Echo ilk Core'un altında", () => {
+    const agents = [agent("core", "leader"), agent("b", "leader"), agent("w0"), agent("w1"), echo()];
+    const t = layout(agents, [], 900, 500, "columns", MIN_U);
+    const slot = t.get("echo")!, core = t.get("core")!;
+    assert.ok(Math.abs(slot.x - core.x) < 1e-6 && slot.y > core.y);
   });
 });

@@ -2,31 +2,24 @@ import type { Agent, AgentStatus } from "../agents";
 import type { Delegation } from "../delegations";
 import type { Question } from "../questions";
 import { GLYPHS } from "./glyphs";
-import { drawCoreXL, drawCoreFragments, drawCoreFeet, type CorePalette } from "./companion/coreEngine";
+import { drawCoreXL, drawCoreFragments, drawCoreFeet, XL_BODY, type CorePalette } from "./companion/coreEngine";
 import { LOOKS, type Step } from "./companion/coreState";
 import { CoreXL, coreBody, XL_PIN, type Body, type Pointer } from "./companion/coreXL";
-import {
-  BOARD_PAD_PX, areaInset, boardRect, fitUnit, HOLE_AT_PX, HOLE_R_PX, LABEL_PX, LABELS_FROM_PX, layout, ownershipKey, latestOwners, pickMode,
-  routes, type Mode, type Point,
-} from "./placement";
-import { PCB_TILE_PX, workerSlices } from "./sprites";
-import { pcbImage, workerImage } from "./assets";
+import { areaInset, fitUnit, isEcho, layout, ownershipKey, latestOwners, pickMode, routes, type Mode, type Point } from "./placement";
+import { ECHO_FOOT, WORKER_FOOT } from "./assets";
 import { chipNameStyle, coreLabel, OFFLINE_NAME_ALPHA, teamSignature } from "./label";
 import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, type FragmentBox } from "./symbiote";
 import { drawCoreName, ellipsis, roundRect } from "./coreName";
+import {
+  LOOK, clockAt, coreEyeK, dropAt, echoDrift, echoLight, facingOf, labelRect, linear, markAlpha, markAt, pathLength, pointAt,
+  routeToBody, scale, smoothRoute, spotOf, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot, type Tone,
+} from "./symbioteCard";
+import type { BodyDraw, Flow, LitScene, PointLight, Shadow } from "./litLayer";
+import type { OfficeTheme } from "./theme";
 
 /** The world before Office measures its panel (#270: then the panel in world units). */
 export const W = 960;
 export const H = 540;
-
-export interface PcbTheme {
-  outside: string; board: string; boardEdge: string; grid: string; trace: string; traceHot: string;
-  chip: string; chipOff: string; chipEdge: string; pin: string; via: string; text: string; muted: string;
-  faint: string; red: string; redHi: string; redGlow: string; green: string; amber: string;
-  /** Modern §7: the team accent — traces, the Core / leader ring. Red stays for status and errors. */
-  team: string; teamHi: string; teamGlow: string;
-  font: string; mono: string; radius: number;
-}
 
 export interface WorldData {
   status: (id: string) => AgentStatus;
@@ -62,7 +55,14 @@ interface Chip {
   mode?: Mode;
 }
 
-interface Trace { leaderId: string; workerId: string; points: Point[] }
+/**
+ * A delegation strand (#1958: the soft curve of the octilinear route, ending on the body's Core-facing
+ * edge). `points` = the feet / droplets' path; `route` = from the Core's centre (tentacle, relief, drops).
+ */
+interface Trace { leaderId: string; workerId: string; points: Point[]; route: Point[]; length: number }
+
+/** One body on the membrane this frame: a worker's sac, Echo, or a leader too small for Core XL. */
+interface View { chip: Chip; spot: Spot; echo: boolean; light: Light; status: AgentStatus; hot: boolean }
 
 const MOVE_SPEED = 8;
 const BOOT_SECONDS = 0.7;
@@ -77,6 +77,9 @@ export class World {
   private cssW = 0;
   private cssH = 0;
   private traces: Trace[] = [];
+  private traceKey = "";
+  /** #1958: which way each body looks (columns: towards its Core). */
+  private facing = new Map<string, 1 | -1 | 0>();
   private ownership = "";
   private readonly delegationTouches = new DelegationTouches();
   private touches: { leader: string; worker: string; at: number }[] = [];
@@ -91,6 +94,8 @@ export class World {
   reduced = false;
   /** #411: the team's name (Office keeps it current) — the leaders' "Ana Core" label and the board's signature. */
   teamName = "";
+  /** #1958: the last draw's lit scene (CSS px) for Office's light layer. */
+  scene: LitScene = { time: 0, reduced: false, core: null, lights: [], shadows: [], flows: [], bodies: [], strands: { key: "", routes: [], cores: [], calm: [] } };
 
   constructor(agents: Agent[], private data: WorldData) {
     this.sync(agents);
@@ -147,20 +152,17 @@ export class World {
     const delegations = this.data.delegations();
     this.refreshLayout(delegations);
     this.time += dt;
-    let moved = false;
     for (const chip of this.chips) {
       const k = 1 - Math.exp(-MOVE_SPEED * dt);
       if (Math.abs(chip.tx - chip.x) > 0.05 || Math.abs(chip.ty - chip.y) > 0.05) {
         chip.x += (chip.tx - chip.x) * k;
         chip.y += (chip.ty - chip.y) * k;
-        moved = true;
       } else {
         chip.x = chip.tx;
         chip.y = chip.ty;
       }
       chip.boot = Math.max(0, chip.boot - dt);
     }
-    if (moved) this.rebuildTraces(delegations);
     for (const contact of this.delegationTouches.observe(delegations)) this.touch(contact.worker, contact.leader);
     this.touches = this.touches.filter(t => this.time * 1000 - t.at < TOUCH_MS);
     this.stepCores(dt, delegations);
@@ -212,7 +214,10 @@ export class World {
         pointer: this.pointer,
         workerAt: (worker) => {
           const target = this.chips.find((item) => item.agent.id === worker);
-          return target ? { x: target.x, y: target.y } : null;
+          if (!target) return null;
+          // #1958: the gaze goes to the body, not the label beside it.
+          const spot = this.spotOf(target);
+          return { x: spot.bx, y: spot.by };
         },
         hovered: this.hoverId === id,
         reduced: this.reduced,
@@ -221,7 +226,7 @@ export class World {
     for (const id of this.cores.keys()) if (!live.has(id)) this.cores.delete(id);
   }
 
-  /** Offline chip click: sweep its pins, then ask the existing pane bridge to start it. */
+  /** Offline chip click: sweep its light up, then ask the existing pane bridge to start it. */
   activate(agentId: string): boolean {
     const chip = this.chips.find((item) => item.agent.id === agentId);
     if (chip?.agent.kind === "worker") this.touch(agentId);
@@ -239,16 +244,10 @@ export class World {
   }
 
   isAnimated() {
-    const delegations = this.data.delegations();
-    this.refreshLayout(delegations);
-    // #252 spec §5.3: the big Core always moves a little (breath, pupils) unless motion is reduced.
-    if (!this.reduced && this.chips.some((chip) => this.bodyOf(chip))) return true;
-    return (!this.reduced && this.touches.length > 0) || this.chips.some((chip) => {
-      const status = this.data.status(chip.agent.id);
-      return chip.boot > 0 || status === "working" || status === "waiting" ||
-        Math.abs(chip.tx - chip.x) > 0.05 || Math.abs(chip.ty - chip.y) > 0.05 ||
-        this.data.result(chip.agent.id) !== null || this.data.question(chip.agent.id) !== null;
-    }) || delegations.some(this.data.active);
+    this.refreshLayout(this.data.delegations());
+    // #1958: the membrane's pulse, the bodies' light and Core's breath always move unless motion is reduced.
+    if (!this.reduced) return true;
+    return this.chips.some((chip) => chip.boot > 0 || Math.abs(chip.tx - chip.x) > 0.05 || Math.abs(chip.ty - chip.y) > 0.05);
   }
 
   needsAnimation() { return this.isAnimated(); }
@@ -262,23 +261,49 @@ export class World {
     this.touches.push({ leader: trace.leaderId, worker, at: this.time * 1000 });
   }
 
-  draw(ctx: CanvasRenderingContext2D, focusedId: string | null, palette: PcbTheme, core: CorePalette): Anchor[] {
+  /**
+   * The ink over the lit layer: contact tentacles, Core (droplets, feet, body, name), the bodies' labels
+   * and marks, the drops' `?`, the team's signature. `fallback`: no light layer (no WebGL2, lost context,
+   * maps loading) — the membrane, strands and bodies are drawn here first, flat.
+   */
+  draw(ctx: CanvasRenderingContext2D, focusedId: string | null, palette: OfficeTheme, core: CorePalette, fallback = false): Anchor[] {
     const delegations = this.data.delegations();
     this.refreshLayout(delegations);
     this.rebuildTraces(delegations);
-    drawBoard(ctx, palette, this.w, this.h, this.unit, teamSignature(this.teamName));
-    this.drawTraces(ctx, palette);
+    const time = this.reduced ? 0 : this.time;
+    const views = this.chips.filter((chip) => !this.bodyOf(chip)).map((chip) => this.viewOf(chip, time, chip.agent.id === focusedId));
+    if (fallback) this.drawFallback(ctx, palette, views, delegations, time);
+    this.drawContacts(ctx, palette);
     this.drawFragments(ctx, palette, core);
-    return this.chips.map((chip) => {
+    const anchors = this.chips.map((chip) => {
       const body = this.bodyOf(chip);
       if (body) this.drawCore(ctx, chip, body, palette, core);
-      else this.drawChip(ctx, chip, chip.agent.id === focusedId, palette);
       return { agent: chip.agent, x: chip.x, y: chip.y, top: chip.h / 2, body };
     });
+    for (const view of views) this.drawLabel(ctx, view, palette, time);
+    this.drawDropMarks(ctx, palette, time);
+    this.drawSignature(ctx, palette);
+    this.scene = this.litScene(views, delegations, palette, time);
+    return anchors;
+  }
+
+  /** The body's spot in the chip's slot at its current position. */
+  private spotOf(chip: Chip) {
+    return spotOf(chip, this.facing.get(chip.agent.id) ?? 0, isEcho(chip.agent));
+  }
+
+  private viewOf(chip: Chip, time: number, focused: boolean): View {
+    const id = chip.agent.id;
+    const status = this.data.status(id);
+    const echo = isEcho(chip.agent);
+    let light = workerLight(status, echo ? null : this.data.result(id), this.data.question(id), time, this.reduced);
+    // An offline click wakes the body: its light comes up in the team's red.
+    if (chip.boot > 0) light = { ...light, tone: "red", k: 1 - chip.boot / BOOT_SECONDS, pulse: 1, offline: false, mark: null, error: false };
+    return { chip, spot: this.spotOf(chip), echo, light, status, hot: focused || this.hoverId === id };
   }
 
   /** All fragments precede all chips and text; protected plates also constrain their paths. */
-  private drawFragments(ctx: CanvasRenderingContext2D, p: PcbTheme, pal: CorePalette) {
+  private drawFragments(ctx: CanvasRenderingContext2D, p: OfficeTheme, pal: CorePalette) {
     const inset = areaInset(this.unit);
     const board = { x: inset, y: inset, w: this.w - 2 * inset, h: this.h - 2 * inset };
     for (const chip of this.chips) {
@@ -288,8 +313,8 @@ export class World {
       // The provider badge is not a block: upper traces leave through it, and pieces drawn first slip under it.
       blocks.push({ x: body.x - (chip.w + 40) / 2, y: body.y + body.s / 2 + XL_PIN, w: chip.w + 40, h: 40 });
       const paths = fragmentPaths(body, this.traces.filter(t => t.leaderId === chip.agent.id).map(t => t.points), blocks, board);
-      drawCoreFragments(ctx, body, core.fragments.sample(paths, body, this.reduced), core.fragments.phase, pal, p.chipEdge);
-      drawCoreFeet(ctx, body, core.sampleFeet(paths, body, this.time * 1000, this.reduced || core.state === "sleep", ctx.canvas), pal, p.chipEdge);
+      drawCoreFragments(ctx, body, core.fragments.sample(paths, body, this.reduced), core.fragments.phase, pal, p.edge);
+      drawCoreFeet(ctx, body, core.sampleFeet(paths, body, this.time * 1000, this.reduced || core.state === "sleep", ctx.canvas), pal, p.edge);
     }
   }
 
@@ -313,60 +338,84 @@ export class World {
     this.rebuildTraces(delegations);
   }
 
+  /** Routes follow the layout targets: rebuilt (smoothed) only when a target or an owner changes. */
   private rebuildTraces(delegations: Delegation[]) {
+    const key = `${this.ownership}|${this.chips.map((c) => `${c.tx},${c.ty},${c.w},${c.h},${c.mode ?? ""}`).join(";")}`;
+    if (key === this.traceKey) return;
+    this.traceKey = key;
+    this.traces = [];
+    this.facing.clear();
     const leaders = this.chips.filter((chip) => chip.agent.kind === "leader");
-    if (!leaders.length) { this.traces = []; return; }
+    if (!leaders.length) return;
     const owners = latestOwners(delegations);
     const groups = new Map(leaders.map((leader) => [leader.agent.id, [] as Chip[]]));
-    this.chips.filter((chip) => chip.agent.kind === "worker").forEach((worker, index) => {
+    // #1958: Echo has no strand and is not in the round-robin (placement `crew`).
+    this.chips.filter((chip) => chip.agent.kind === "worker" && !isEcho(chip.agent)).forEach((worker, index) => {
       const leader = leaders.find((item) => item.agent.id === owners.get(worker.agent.id)) ?? leaders[index % leaders.length];
       groups.get(leader.agent.id)!.push(worker);
     });
-    this.traces = [];
+    const target = (chip: Chip) => ({ id: chip.agent.id, x: chip.tx, y: chip.ty, w: chip.w, h: chip.h });
+    let seed = 0;
     for (const leader of leaders) {
-      const box = (chip: Chip) => ({ id: chip.agent.id, x: chip.tx, y: chip.ty, w: chip.w, h: chip.h });
-      const paths = routes({ ...box(leader), mode: leader.mode }, (groups.get(leader.agent.id) ?? []).map(box));
-      for (const [workerId, points] of paths) this.traces.push({ leaderId: leader.agent.id, workerId, points });
+      const core = { ...target(leader), mode: leader.mode };
+      const body = coreBody(core);
+      const workers = groups.get(leader.agent.id) ?? [];
+      const paths = routes(core, workers.map(target));
+      for (const worker of workers) {
+        const raw = paths.get(worker.agent.id);
+        const facing = facingOf(target(worker), core, leader.mode, false);
+        this.facing.set(worker.agent.id, facing);
+        if (!raw) continue;
+        const points = smoothRoute(routeToBody(raw, spotOf(target(worker), facing, false)), seed++);
+        const route = body ? [{ x: body.x, y: body.y }, ...points] : points;
+        this.traces.push({ leaderId: leader.agent.id, workerId: worker.agent.id, points, route, length: pathLength(route) });
+      }
     }
   }
 
-  private drawTraces(ctx: CanvasRenderingContext2D, p: PcbTheme) {
-    const delegations = this.data.delegations();
-    ctx.lineWidth = 1.5;
-    ctx.lineCap = "square";
-    ctx.lineJoin = "bevel";
+  /** Contact tentacles along the strands (#1597: the product's own contour). */
+  private drawContacts(ctx: CanvasRenderingContext2D, p: OfficeTheme) {
+    if (this.reduced) return;
     for (const trace of this.traces) {
-      const active = delegations.find((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d));
-      makePath(ctx, trace.points);
-      ctx.strokeStyle = active ? p.traceHot : p.trace;
-      ctx.stroke();
-      trace.points.slice(1, -1).forEach((point) => drawVia(ctx, point.x, point.y, p));
-
-      const question = this.data.question(trace.workerId);
-      const result = this.data.result(trace.workerId);
       const contact = this.touches.find(t => t.worker === trace.workerId && t.leader === trace.leaderId);
-      if (contact && !this.reduced) {
-        const age = this.time * 1000 - contact.at;
-        const leader = this.chips.find(c => c.agent.id === trace.leaderId);
-        const body = leader && this.bodyOf(leader);
-        const route = body ? [{ x: body.x, y: body.y }, ...trace.points] : trace.points;
-        const contour = tentacleContour(route, reachAt(age), age);
-        if (contour.length) {
-          ctx.save();
-          makePath(ctx, contour); ctx.closePath();
-          ctx.fillStyle = "#030405"; ctx.fill();
-          ctx.strokeStyle = p.red; ctx.lineWidth = 0.8; ctx.stroke();
-          ctx.restore();
-        }
-      }
-      if (question) drawPacket(ctx, [...trace.points].reverse(), (this.time * 0.24 + question.id * 0.11) % 1, p.amber, 3.2, p.mono, "?");
-      else if (result) drawPacket(ctx, [...trace.points].reverse(), (this.time * 0.28 + result.id * 0.07) % 1,
-        result.status === "done" ? p.green : p.amber, 3.4, p.mono);
+      if (!contact) continue;
+      const age = this.time * 1000 - contact.at;
+      const contour = tentacleContour(trace.route, reachAt(age), age);
+      if (!contour.length) continue;
+      ctx.save();
+      makePath(ctx, contour); ctx.closePath();
+      ctx.fillStyle = "#030405"; ctx.fill();
+      ctx.strokeStyle = p.red; ctx.lineWidth = 0.8; ctx.stroke();
+      ctx.restore();
     }
+  }
+
+  /** A question drop carries its `?` (the lit layer draws the drop itself). */
+  private drawDropMarks(ctx: CanvasRenderingContext2D, p: OfficeTheme, time: number) {
+    for (const trace of this.traces) {
+      const question = this.data.question(trace.workerId);
+      const along = question ? dropAt(question, null, time, this.reduced) : null;
+      if (along === null) continue;
+      const at = pointAt(trace.route, along);
+      ctx.fillStyle = p.amber; ctx.font = `700 11px ${p.mono}`; ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+      ctx.fillText("?", at.x, at.y - 8);
+    }
+  }
+
+  /** #411: the team's name signed in the bottom-right corner (CSS px, as before). */
+  private drawSignature(ctx: CanvasRenderingContext2D, p: OfficeTheme) {
+    const signature = teamSignature(this.teamName);
+    const u = this.unit;
+    if (!signature || this.w * u < 320) return;
+    ctx.save();
+    ctx.font = `italic 500 ${11 / u}px ${p.font}`; ctx.textAlign = "right"; ctx.textBaseline = "alphabetic";
+    ctx.globalAlpha = 0.75; ctx.fillStyle = p.teamHi;
+    ctx.fillText(ellipsis(ctx, signature, this.w * 0.4), this.w - 16 / u, this.h - 12 / u);
+    ctx.restore();
   }
 
   /** #252: a leader as the big Core (spec §2–§5): body, then name + role (+ cost pill) under it. */
-  private drawCore(ctx: CanvasRenderingContext2D, chip: Chip, body: Body, p: PcbTheme, pal: CorePalette) {
+  private drawCore(ctx: CanvasRenderingContext2D, chip: Chip, body: Body, p: OfficeTheme, pal: CorePalette) {
     const core = this.cores.get(chip.agent.id);
     const look = LOOKS[core?.state ?? "idle"];
     const anim = this.time * 1000;
@@ -387,7 +436,7 @@ export class World {
       provider: providerOf(chip.agent, p),
       boot: chip.boot > 0 ? 1 - chip.boot / BOOT_SECONDS : 0,
       boardBg: p.board,
-      edge: p.chipEdge,
+      edge: p.edge,
       mono: p.mono,
       weight: core?.weight,
     };
@@ -402,21 +451,21 @@ export class World {
     ctx.save();
     // #451: offline only dims — the team-coloured name keeps ≥4.5:1.
     if (this.data.status(chip.agent.id) === "offline" && chip.boot <= 0) ctx.globalAlpha *= OFFLINE_NAME_ALPHA;
-    // #411: "Ana Core" in the team colour (--team-hi: ≥4.5:1 on the board for every accent); #430: over the plate.
+    // #411: "Ana Core" in the team colour; #1958: the calm zone under it keeps the membrane quiet.
     drawCoreName(ctx, {
       x: chip.x, nameY, roleY, maxW,
       name: this.nameOf(chip),
       role: (chip.agent.roleName || chip.agent.title || "").toLocaleUpperCase("tr-TR"),
       cost: this.data.cost(chip.agent.id),
-      plate: pcbImage() ? p.board : null,
+      plate: null,
       nameColor: p.teamHi, roleColor: p.muted, font: p.font, mono: p.mono,
     }, (text, minX, maxX, cy) => drawTokenPill(ctx, text, minX, maxX, cy, p));
     ctx.restore();
 
-    const box = { ...chip, x: body.x, y: body.y, w: body.s, h: body.s };
     const stalled = this.data.stalled(chip.agent.id);
-    if (stalled !== null) drawClock(ctx, box, p.amber);
-    if (this.data.slow(chip.agent.id)) drawGlass(ctx, box, p.amber, stalled !== null);
+    const at = { x: body.x + body.s / 2 + 10, y: body.y + body.s / 2 - 6 };
+    if (stalled !== null) drawClock(ctx, at.x, at.y, 5, p.amber);
+    if (this.data.slow(chip.agent.id)) drawGlass(ctx, at.x - (stalled !== null ? 14 : 0), at.y, 11, p.amber);
   }
 
   /** #411: a leader shows as "Ana Core"; workers keep their names. */
@@ -424,222 +473,244 @@ export class World {
     return chip.agent.kind === "leader" ? coreLabel(this.teamName, chip.agent.name) : chip.agent.name;
   }
 
-  private drawChip(ctx: CanvasRenderingContext2D, chip: Chip, focused: boolean, p: PcbTheme) {
-    const status = this.data.status(chip.agent.id);
-    const result = this.data.result(chip.agent.id);
-    const question = this.data.question(chip.agent.id);
-    const stalled = this.data.stalled(chip.agent.id);
-    const offline = status === "offline" && chip.boot <= 0;
+  /**
+   * #1958 §7: a body's label beside it (provider badge, glyph + name, role, cost pill), the status mark
+   * on the body's outer top corner, the stall clock / slow glass on the inner one, the focus ring.
+   */
+  private drawLabel(ctx: CanvasRenderingContext2D, view: View, p: OfficeTheme, time: number) {
+    const { chip, spot, light } = view;
     const leader = chip.agent.kind === "leader";
-    const look = chipLook(status, result, question, p);
-    const x = chip.x - chip.w / 2;
-    const y = chip.y - chip.h / 2;
-    const detailed = chip.h >= 28 && chip.w >= 52;
-    const labelled = chip.h >= 16 && chip.w >= 30;
-    const art = !leader && detailed ? workerArt(chip) : null;
-
-    ctx.save();
-    if (status === "working" || chip.boot > 0) {
-      const pulse = 0.16 + (Math.sin(this.time * 2.5) + 1) * 0.09;
-      ctx.shadowColor = p.redGlow;
-      ctx.shadowBlur = leader ? 22 + pulse * 22 : 14 + pulse * 18;
-    }
-    ctx.globalAlpha = offline ? 0.55 : 1;
-    const radius = leader ? p.radius * 0.75 : p.radius * 0.5;
-    if (art) {
-      // #401: worker.png (3-slice: body = chip box, pins outside), then a solid plate under the live labels.
-      for (const { src, dst } of art.slices) ctx.drawImage(art.img, src.x, src.y, src.w, src.h, dst.x, dst.y, dst.w, dst.h);
-      ctx.shadowBlur = 0;
-      roundRect(ctx, x + 3, y + 3, chip.w - 6, chip.h - 6, radius * 0.7);
-      ctx.save(); ctx.globalAlpha *= PLATE_ALPHA; ctx.fillStyle = offline ? p.chipOff : p.chip; ctx.fill(); ctx.restore();
-    }
-    roundRect(ctx, x, y, chip.w, chip.h, radius);
-    if (!art) {
-      ctx.fillStyle = offline ? p.chipOff : p.chip;
-      ctx.fill();
-    }
-    ctx.shadowBlur = 0;
-    // #229: status ring; at rest the leader keeps a dim team-coloured ring (Modern §7), the error ring is dashed.
-    ctx.save();
-    if (!look.ring && !focused && leader && !offline) ctx.globalAlpha *= 0.55;
-    ctx.strokeStyle = look.ring ?? (focused || (leader && !offline) ? p.team : p.chipEdge);
-    ctx.lineWidth = focused || look.ring ? 1.8 : 1;
-    if (look.error) ctx.setLineDash([4, 3]);
-    // #401: at rest the artwork's own rim is the edge; status and focus rings stay.
-    if (!art || focused || look.ring) ctx.stroke();
-    ctx.restore();
-
-    // The artwork has its pins; the offline click's red sweep still runs over them.
-    if (!art || chip.boot > 0) drawPins(ctx, chip, p, status, chip.boot);
-    if (detailed) drawProviderBadge(ctx, chip, p);
-    const glyph = glyphOf(chip.agent);
-    const glyphColor = offline ? p.muted : leader ? p.teamHi : p.text;
-    // #451: the name's colour follows the kind only; an offline Core is dimmed, not greyed.
-    const nameStyle = chipNameStyle(leader, offline);
-    const led = ledSpot(chip);
-    if (detailed) {
-      // #229: row1 = glyph + name, then the role line, row2 = LED (bottom-left) + token pill (bottom-right).
-      const pad = led.x - led.r - x;
-      const row2 = chip.h >= 40;
-      const row1Y = y + Math.max(12, chip.h * 0.22);
-      const roleY = row1Y + (leader ? 17 : 13);
-      const nameRight = x + chip.w - pad - (look.mark ? 10 : 0);
-      let nameX = x + pad;
-      const size = Math.min(leader ? 18 : 14, chip.h * 0.32);
-      if (glyph && size >= 8) {
-        drawGlyph(ctx, glyph, nameX, row1Y - size / 2, size, glyphColor);
-        nameX += size + 5;
-      }
-      ctx.textAlign = "left";
-      ctx.textBaseline = "middle";
-      ctx.fillStyle = p[nameStyle.color];
-      ctx.font = `${leader ? 600 : 550} ${leader ? 14 : 12}px ${p.font}`;
+    const block = textBlock(spot, chip.h, !!this.data.cost(chip.agent.id));
+    const right = spot.align === "right";
+    const maxW = spot.textR - spot.textL;
+    if (maxW >= 12) {
       ctx.save();
-      if (nameStyle.alpha !== null) ctx.globalAlpha = nameStyle.alpha;
-      ctx.fillText(ellipsis(ctx, this.nameOf(chip), nameRight - nameX), nameX, row1Y);
+      ctx.textBaseline = "middle";
+      if (light.offline) ctx.globalAlpha = 0.62;
+      // provider badge above the name, on the body's side of the block
+      const provider = providerOf(chip.agent, p);
+      ctx.font = `700 8px ${p.mono}`;
+      const pt = ellipsis(ctx, provider.label, maxW - 8);
+      const pw = ctx.measureText(pt).width + 8;
+      const px = right ? spot.textR - pw : spot.textL;
+      const py = block.top - 12;
+      roundRect(ctx, px, py, pw, 10, 3);
+      ctx.fillStyle = provider.fill ?? p.surface; ctx.fill();
+      ctx.strokeStyle = provider.fill ? p.edge : provider.color; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle = provider.color; ctx.textAlign = "left";
+      ctx.fillText(pt, px + 4, py + 5.5);
+      ctx.shadowColor = LABEL_SHADOW; ctx.shadowBlur = 3;
+      // glyph + name (#451: the name's colour follows the kind; an offline leader is dimmed, not greyed)
+      const style = chipNameStyle(leader, light.offline);
+      const nameColor = light.offline && !leader ? p.muted : p[style.color];
+      const glyph = glyphOf(chip.agent);
+      const size = 13;
+      const glyphW = glyph ? size + 5 : 0;
+      ctx.font = `550 12px ${p.font}`;
+      const name = ellipsis(ctx, this.nameOf(chip), maxW - glyphW);
+      const glyphColor = view.echo ? LOOK.echo.color : light.offline ? p.muted : leader ? p.teamHi : p.text;
+      if (glyph) drawGlyph(ctx, glyph, right ? spot.textR - size : spot.textL, block.nameY - size / 2, size, glyphColor);
+      ctx.save();
+      if (style.alpha !== null) ctx.globalAlpha = style.alpha;
+      ctx.fillStyle = nameColor; ctx.textAlign = right ? "right" : "left";
+      ctx.fillText(name, right ? spot.textR - glyphW : spot.textL + glyphW, block.nameY);
       ctx.restore();
       const role = chip.agent.roleName || chip.agent.title;
-      if (role) {
-        // Without row2 the LED sits on the role line's height: the role starts right of it.
-        const roleX = row2 ? x + pad : led.x + led.r + 4;
-        ctx.save();
-        ctx.globalAlpha *= 0.85;
+      if (block.rows >= 2 && role) {
         ctx.font = `600 9px ${p.mono}`;
-        ctx.fillText(ellipsis(ctx, role.toLocaleUpperCase("tr-TR"), x + chip.w - pad - roleX), roleX, roleY);
-        ctx.restore();
+        ctx.fillStyle = light.offline ? p.muted : p.text2;
+        ctx.textAlign = right ? "right" : "left";
+        ctx.fillText(ellipsis(ctx, role.toLocaleUpperCase("tr-TR"), maxW), right ? spot.textR : spot.textL, block.roleY);
       }
       // Patron (#232): no cost → no pill at all.
-      const cost = row2 ? this.data.cost(chip.agent.id) : "";
-      if (cost) drawTokenPill(ctx, cost, led.x + led.r + 6, x + chip.w - pad, led.y, p);
-    } else if (labelled) {
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillStyle = p[nameStyle.color];
-      ctx.font = `${leader ? 600 : 550} ${Math.max(7, Math.min(10, chip.h * 0.5))}px ${p.font}`;
-      ctx.save();
-      if (nameStyle.alpha !== null) ctx.globalAlpha = nameStyle.alpha;
-      ctx.fillText(ellipsis(ctx, this.nameOf(chip), chip.w - 12), chip.x, chip.y);
+      if (block.rows >= 3) {
+        ctx.shadowBlur = 0;
+        const cost = this.data.cost(chip.agent.id);
+        ctx.font = `600 10px ${p.mono}`;
+        const cw = Math.min(maxW, ctx.measureText(cost).width + 10);
+        if (right) drawTokenPill(ctx, cost, spot.textR - cw, spot.textR, block.costY, p);
+        else drawTokenPill(ctx, cost, spot.textL, spot.textL + cw, block.costY, p);
+      }
       ctx.restore();
-    } else if (glyph) {
-      // #229: tiny chips keep only the glyph (and the LED).
-      const size = Math.min(chip.h - 2, chip.w * 0.5, 14);
-      if (size >= 6) drawGlyph(ctx, glyph, chip.x - size / 2, chip.y - size / 2, size, glyphColor);
     }
+    if (light.mark) {
+      const color = p[light.tone];
+      const at = markAt(spot);
+      ctx.save();
+      ctx.globalAlpha = markAlpha(light.mark, time, this.reduced);
+      ctx.beginPath(); ctx.arc(at.x, at.y, 6.5, 0, Math.PI * 2);
+      ctx.fillStyle = p.surface; ctx.fill();
+      ctx.lineWidth = 1.4; ctx.strokeStyle = color;
+      if (light.error) ctx.setLineDash([3, 2]);
+      ctx.stroke();
+      ctx.fillStyle = color; ctx.font = `700 9px ${p.mono}`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(light.mark, at.x, at.y + 0.5);
+      ctx.restore();
+    }
+    const stalled = this.data.stalled(chip.agent.id);
+    const slow = this.data.slow(chip.agent.id);
+    if (stalled !== null || slow) {
+      const at = clockAt(spot);
+      const r = Math.max(2, Math.min(5, spot.D / 8));
+      if (stalled !== null) drawClock(ctx, at.x, at.y, r, p.amber);
+      if (slow) drawGlass(ctx, at.x - (stalled !== null ? (spot.facing === 1 ? -1 : 1) * (2 * r + 4) : 0), at.y, 2 * r + 1, p.amber);
+    }
+    if (view.hot) {
+      ctx.save();
+      ctx.setLineDash([3, 3]); ctx.lineWidth = 1.2; ctx.strokeStyle = p.teamHi;
+      ctx.beginPath(); ctx.ellipse(spot.bx, spot.by, spot.D * 0.62, spot.fh * 0.62 + 2, 0, 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+  }
 
-    drawLed(ctx, led, look, status, p, this.time, chip.boot);
-    if (look.mark) drawMark(ctx, chip, look.mark, look.markColor, this.time, p.mono, look.blink);
-    if (stalled !== null) drawClock(ctx, chip, p.amber);
-    if (this.data.slow(chip.agent.id)) drawGlass(ctx, chip, p.amber, stalled !== null);
+  /** §4–§9 in CSS px: lights, shadows, strand flows and body quads for the lit layer. */
+  private litScene(views: View[], delegations: Delegation[], p: OfficeTheme, time: number): LitScene {
+    const u = this.unit;
+    const c = colorsOf(p);
+    const lights: PointLight[] = [];
+    const shadows: Shadow[] = [];
+    const bodies: BodyDraw[] = [];
+    const flows: Flow[] = [];
+    let origin: { x: number; y: number } | null = null;
+    const cores: Body[] = [];
+    const calm: Rect[] = [];
+    for (const chip of this.chips) {
+      const body = this.bodyOf(chip);
+      if (!body) continue;
+      const core = this.cores.get(chip.agent.id);
+      const state = core?.state ?? "idle";
+      origin ??= { x: body.x * u, y: body.y * u };
+      lights.push({
+        x: body.x * u, y: body.y * u, z: body.s * 0.55 * u, r: LOOK.core.radius * (body.s / XL_BODY) * u,
+        color: scale(c.redHi, coreEyeK(state, LOOKS[state].glow, core?.lidNow ?? 0)), spec: 0.6,
+      });
+      // The relief and calm zones follow the layout targets (rebuilt only when it changes).
+      const at = coreBody({ x: chip.tx, y: chip.ty, w: chip.w, h: chip.h })!;
+      cores.push(at);
+      const maxW = Math.max(40, chip.w + 40);
+      calm.push({ x: at.x - maxW / 2, y: at.y + at.s / 2 + XL_PIN, w: maxW, h: 34 });
+    }
+    for (const { chip, spot, echo, light, status, hot } of views) {
+      const { bx, by, D, fh } = spot;
+      const grow = hot ? 1.05 : 1;
+      if (echo) {
+        const foot = ECHO_FOOT;
+        const { intensity, pulse } = echoLight(status, time, this.reduced);
+        const drift = echoDrift(time, this.reduced);
+        const size = (D / foot.w) * grow;
+        bodies.push({
+          kind: "echo", x: (bx - foot.cx * size) * u, y: (by - foot.cy * size + drift.dy) * u, size: size * u, rot: drift.rot,
+          state: c.echo, intensity, translucency: 1, alpha: LOOK.echo.alpha, desat: light.offline ? 0.75 : 0, pulse, height: D * 0.6 * u,
+        });
+        shadows.push({ x: bx * u, y: by * u, rx: D * 0.5 * u, ry: fh * 0.5 * u, lift: D * 0.55 * u, k: 0.55 });
+        lights.push({
+          x: bx * u, y: by * u, z: D * 0.7 * u, r: LOOK.echo.radius * (D / 40) * u,
+          color: scale(c.echo, LOOK.echo.light * (intensity / LOOK.echo.glow) * (0.6 + 0.4 * pulse)), spec: 0.4,
+        });
+      } else {
+        const foot = WORKER_FOOT;
+        const size = (D / foot.w) * grow * (light.offline ? LOOK.worker.sink : 1);
+        bodies.push({
+          kind: "worker", x: (bx - foot.cx * size) * u, y: (by - foot.cy * size) * u, size: size * u, rot: 0,
+          state: c[light.tone], intensity: light.offline ? 0 : light.k * LOOK.worker.light, translucency: LOOK.worker.translucency,
+          alpha: light.offline ? 0.72 : 1, desat: light.offline ? 0.75 : 0, pulse: light.pulse, height: D * LOOK.worker.heightK * u,
+        });
+        shadows.push({ x: bx * u, y: by * u, rx: D * 0.5 * u, ry: fh * 0.5 * u, lift: D * LOOK.worker.heightK * 0.35 * u, k: LOOK.worker.shadow });
+        if (light.k > 0.3 && !light.offline) {
+          lights.push({ x: bx * u, y: by * u, z: D * 0.45 * u, r: D * 0.9 * u, color: scale(c[light.tone], 0.9 * light.k * (0.35 + 0.65 * light.pulse)), spec: 0.3 });
+        }
+      }
+      // calm zone under the label, at the layout target
+      const target = spotOf({ x: chip.tx, y: chip.ty, w: chip.w, h: chip.h }, spot.facing, echo);
+      calm.push(labelRect(target, textBlock(target, chip.h, !!this.data.cost(chip.agent.id))));
+    }
+    // Strands: active work flows Core → worker; unread results / questions travel back as a lit drop.
+    for (const trace of this.traces) {
+      const job = delegations.some((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d));
+      const question = this.data.question(trace.workerId);
+      const result = this.data.result(trace.workerId);
+      const along = dropAt(question, result, time, this.reduced);
+      const packetColor = question ? c.amber : result?.status === "done" ? c.green : result?.status === "failed" ? c.redHi : c.amber;
+      if (along !== null) {
+        const at = pointAt(trace.route, along);
+        lights.push({ x: at.x * u, y: at.y * u, z: 8 * u, r: 26 * u, color: scale(packetColor, 1.1), spec: 0.5 });
+      }
+      flows.push({
+        flow: job && !this.reduced ? 1 : 0, packet: along ?? -1, length: trace.length * u, packetK: 3,
+        flowColor: scale(c.team, 1.1), packetColor,
+      });
+    }
+    const strands = { key: `${this.traceKey}|${calm.map((r) => r.h).join(",")}`, routes: this.traces.map((t) => t.route), cores, calm };
+    return { time, reduced: this.reduced, core: origin, lights, shadows, flows, bodies, strands };
+  }
+
+  /** The flat stand-in for the lit layer: membrane, Core glow, strands, drops and radial bodies. */
+  private drawFallback(ctx: CanvasRenderingContext2D, p: OfficeTheme, views: View[], delegations: Delegation[], time: number) {
+    ctx.fillStyle = LOOK.fallback.ground;
+    ctx.fillRect(0, 0, this.w, this.h);
+    for (const chip of this.chips) {
+      const body = this.bodyOf(chip);
+      if (!body) continue;
+      const glow = ctx.createRadialGradient(body.x, body.y, body.s * 0.2, body.x, body.y, body.s * 2.2);
+      glow.addColorStop(0, LOOK.fallback.glow); glow.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(body.x - body.s * 2.2, body.y - body.s * 2.2, body.s * 4.4, body.s * 4.4);
+    }
+    ctx.save();
+    ctx.lineCap = "round"; ctx.lineJoin = "round";
+    for (const trace of this.traces) {
+      makePath(ctx, trace.route);
+      ctx.strokeStyle = LOOK.fallback.strand; ctx.lineWidth = LOOK.strand.width * 0.7; ctx.stroke();
+      if (delegations.some((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d))) {
+        ctx.strokeStyle = p.team; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5; ctx.stroke(); ctx.globalAlpha = 1;
+      }
+      const question = this.data.question(trace.workerId);
+      const result = this.data.result(trace.workerId);
+      const along = dropAt(question, result, time, this.reduced);
+      if (along === null) continue;
+      const at = pointAt(trace.route, along);
+      ctx.beginPath(); ctx.arc(at.x, at.y, 3.4, 0, Math.PI * 2);
+      ctx.fillStyle = question ? p.amber : result?.status === "done" ? p.green : result?.status === "failed" ? p.redHi : p.amber;
+      ctx.fill();
+    }
     ctx.restore();
+    for (const { spot, echo, light, status, hot } of views) {
+      const k = (hot ? 1.05 : 1) * (light.offline ? LOOK.worker.sink : 1);
+      const rx = (spot.D / 2) * k, ry = (spot.fh / 2) * k;
+      const x = spot.bx, y = spot.by + (echo ? echoDrift(time, this.reduced).dy : 0);
+      // The core's light reaches further out the stronger (and the brighter in its rhythm) it is.
+      const strength = echo ? echoLight(status, time, this.reduced).intensity / 1.25 : light.offline ? 0 : Math.min(1, light.k) * (0.55 + 0.45 * light.pulse);
+      const fill = ctx.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
+      fill.addColorStop(0, echo ? LOOK.echo.color : light.offline ? p.muted : p[light.tone]);
+      fill.addColorStop(0.2 + 0.45 * strength, LOOK.fallback.strand);
+      fill.addColorStop(1, LOOK.fallback.ground);
+      ctx.save();
+      ctx.globalAlpha = echo ? LOOK.echo.alpha : light.offline ? 0.72 : 1;
+      ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+      ctx.fillStyle = fill; ctx.fill();
+      ctx.lineWidth = 1; ctx.strokeStyle = p.edge; ctx.stroke();
+      ctx.restore();
+    }
   }
 }
 
-function drawBoard(ctx: CanvasRenderingContext2D, p: PcbTheme, w: number, h: number, u: number, signature: string) {
-  const board = boardRect(w, h, u);
-  ctx.fillStyle = p.outside;
-  ctx.fillRect(0, 0, w, h);
-  roundRect(ctx, board.x, board.y, board.w, board.h, p.radius);
-  ctx.fillStyle = p.board; ctx.fill(); ctx.strokeStyle = p.boardEdge; ctx.lineWidth = 1; ctx.stroke();
-  ctx.save(); roundRect(ctx, board.x, board.y, board.w, board.h, p.radius); ctx.clip();
-  const texture = pcbPattern(ctx, u, board.x, board.y);
-  if (texture) {
-    // #401: the tiled PCB replaces the grid; dimmed so labels and traces keep their contrast.
-    ctx.globalAlpha = PCB_ALPHA; ctx.fillStyle = texture; ctx.fillRect(board.x, board.y, board.w, board.h);
-  } else {
-    ctx.strokeStyle = p.grid; ctx.lineWidth = 0.6;
-    for (let x = board.x + 24; x < board.x + board.w; x += 24) { ctx.beginPath(); ctx.moveTo(x, board.y); ctx.lineTo(x, board.y + board.h); ctx.stroke(); }
-    for (let y = board.y + 24; y < board.y + board.h; y += 24) { ctx.beginPath(); ctx.moveTo(board.x, y); ctx.lineTo(board.x + board.w, y); ctx.stroke(); }
+/** Under the labels: a soft dark halo (HANDOFF §10, with the calm zone it keeps AA). */
+const LABEL_SHADOW = "rgba(0,0,0,.85)";
+
+type Colors = Record<Tone | "team" | "echo", Rgb>;
+const colorCache = new WeakMap<OfficeTheme, Colors>();
+
+/** The theme's colours in linear RGB, once per theme read. */
+function colorsOf(p: OfficeTheme): Colors {
+  let c = colorCache.get(p);
+  if (!c) {
+    c = {
+      green: linear(p.green), redHi: linear(p.redHi), amber: linear(p.amber), red: linear(p.red), muted: linear(p.muted),
+      team: linear(p.team), echo: linear(LOOK.echo.color),
+    };
+    colorCache.set(p, c);
   }
-  ctx.restore();
-  // #277: holes and labels in the thin edge strip (fixed CSS px), tucked into the corners.
-  const at = (BOARD_PAD_PX + HOLE_AT_PX) / u;
-  for (const [x, y] of [[at, at], [w - at, at], [at, h - at], [w - at, h - at]]) {
-    ctx.beginPath(); ctx.arc(x, y, HOLE_R_PX / u, 0, Math.PI * 2); ctx.fillStyle = p.outside; ctx.fill();
-    ctx.beginPath(); ctx.arc(x, y, (HOLE_R_PX - 2) / u, 0, Math.PI * 2); ctx.strokeStyle = p.boardEdge; ctx.lineWidth = 1 / u; ctx.stroke();
-  }
-  if (w * u < LABELS_FROM_PX) return;
-  const textX = at + (HOLE_R_PX + 6) / u;
-  const baseY = h - (BOARD_PAD_PX + 5) / u;
-  ctx.fillStyle = p.faint; ctx.font = `600 ${LABEL_PX / u}px ${p.mono}`; ctx.textBaseline = "alphabetic";
-  ctx.textAlign = "left"; ctx.fillText("DEX  /  AGENT FABRIC", textX, baseY);
-  ctx.textAlign = "right"; ctx.fillText("REV.39", w - textX, baseY);
-  if (!signature) return;
-  // #411: the team's name signed in the bottom-right, just left of REV.39 — never over the left label.
-  const gap = 14 / u;
-  const leftEnd = textX + ctx.measureText("DEX  /  AGENT FABRIC").width + gap;
-  const right = w - textX - ctx.measureText("REV.39").width - gap;
-  ctx.font = `italic 500 ${(LABEL_PX + 2) / u}px ${p.font}`;
-  const text = ellipsis(ctx, signature, right - leftEnd);
-  if (!text || right - leftEnd < 40 / u) return;
-  ctx.save();
-  ctx.globalAlpha = 0.75; ctx.fillStyle = p.teamHi;
-  ctx.fillText(text, right, baseY);
-  ctx.restore();
-}
-
-/** #401: texture over the board fill, and the plate under a worker's labels (contrast as on the plain chip). */
-const PCB_ALPHA = 0.55;
-const PLATE_ALPHA = 0.88;
-
-const patterns = new WeakMap<CanvasRenderingContext2D, { img: HTMLImageElement; pattern: CanvasPattern }>();
-
-/** The PCB tile repeating from the board's corner, 256 CSS px per tile (null: not decoded yet). */
-function pcbPattern(ctx: CanvasRenderingContext2D, u: number, x: number, y: number): CanvasPattern | null {
-  const img = pcbImage();
-  if (!img) return null;
-  let cached = patterns.get(ctx);
-  if (!cached || cached.img !== img) {
-    const pattern = ctx.createPattern(img, "repeat");
-    if (!pattern) return null;
-    patterns.set(ctx, (cached = { img, pattern }));
-  }
-  const k = PCB_TILE_PX / u / img.width;
-  cached.pattern.setTransform(new DOMMatrix([k, 0, 0, k, x, y]));
-  return cached.pattern;
-}
-
-function workerArt(chip: Chip) {
-  const img = workerImage();
-  const slices = img && workerSlices({ x: chip.x - chip.w / 2, y: chip.y - chip.h / 2, w: chip.w, h: chip.h });
-  return img && slices ? { img, slices } : null;
-}
-
-function drawPins(ctx: CanvasRenderingContext2D, chip: Chip, p: PcbTheme, status: AgentStatus, boot: number) {
-  const detailed = chip.h >= 24 && chip.w >= 40;
-  const count = detailed ? (chip.agent.kind === "leader" ? 10 : 7) : 0;
-  const sweep = boot > 0 ? Math.floor((1 - boot / BOOT_SECONDS) * count * 2) : -1;
-  for (let i = 0; i < count; i++) {
-    const px = chip.x - chip.w / 2 + (i + 1) * chip.w / (count + 1);
-    ctx.fillStyle = sweep >= i ? p.red : status === "offline" ? p.faint : p.pin;
-    ctx.fillRect(px - 1.5, chip.y - chip.h / 2 - 5, 3, 5);
-    ctx.fillStyle = sweep >= count + count - i - 1 ? p.red : status === "offline" ? p.faint : p.pin;
-    ctx.fillRect(px - 1.5, chip.y + chip.h / 2, 3, 5);
-  }
-  const vertical = detailed ? Math.max(3, Math.floor(count / 2)) : chip.h >= 9 ? 2 : 0;
-  const pinH = detailed ? 3 : Math.max(1, Math.min(2, chip.h / 4));
-  for (let i = 0; i < vertical; i++) {
-    const py = chip.y - chip.h / 2 + (i + 1) * chip.h / (vertical + 1);
-    ctx.fillStyle = status === "offline" ? p.faint : p.pin;
-    ctx.fillRect(chip.x - chip.w / 2 - 5, py - pinH / 2, 5, pinH); ctx.fillRect(chip.x + chip.w / 2, py - pinH / 2, 5, pinH);
-  }
-}
-
-/**
- * #229: readable provider label straddling the chip's top edge (was the corner triangle + active code).
- * The chain's active target wins over the configured one, as before.
- */
-function drawProviderBadge(ctx: CanvasRenderingContext2D, chip: Chip, p: PcbTheme) {
-  const { label, color, fill } = providerOf(chip.agent, p);
-  ctx.font = `700 8px ${p.mono}`;
-  const text = ellipsis(ctx, label, chip.w - 28);
-  const w = ctx.measureText(text).width + 8;
-  const x = chip.x - chip.w / 2 + 8;
-  const y = chip.y - chip.h / 2 - 5;
-  roundRect(ctx, x, y, w, 10, 3);
-  ctx.fillStyle = fill ?? p.board; ctx.fill();
-  ctx.strokeStyle = fill ? p.chipEdge : color; ctx.lineWidth = 1; ctx.stroke();
-  ctx.fillStyle = color; ctx.textAlign = "left"; ctx.textBaseline = "middle";
-  ctx.fillText(text, x + 4, y + 5.5);
+  return c;
 }
 
 /** Provider badge colours (patron, 2026-10-14): Anthropic brand orange, Muse blue, GLM black, local green. */
@@ -650,18 +721,18 @@ const PROVIDER_LOOK: Record<string, { color: string; fill?: string }> = {
   local: { color: "#22C55E" },
 };
 
-function providerOf(agent: Agent, p: PcbTheme): { label: string; color: string; fill?: string } {
+function providerOf(agent: Agent, p: OfficeTheme): { label: string; color: string; fill?: string } {
   const provider = agent.activeProvider ?? agent.provider ?? "anthropic";
   const label = provider === "local" ? "LOCAL" : provider.toUpperCase();
   return { label, ...(PROVIDER_LOOK[provider] ?? { color: p.amber }) };
 }
 
-/** #229 spec: the only theme-less constants (readable on both boards). */
+/** #229 spec: the only theme-less constants (readable on the dark membrane). */
 const PILL_FILL = "rgba(255,255,255,.06)";
 const PILL_EDGE = "rgba(255,255,255,.09)";
 
-/** #229: token pill right-aligned on row2, ellipsized inside [minX, maxX] — never onto the role line. */
-function drawTokenPill(ctx: CanvasRenderingContext2D, text: string, minX: number, maxX: number, cy: number, p: PcbTheme) {
+/** #229: token pill right-aligned in [minX, maxX], ellipsized — never onto the role line. */
+function drawTokenPill(ctx: CanvasRenderingContext2D, text: string, minX: number, maxX: number, cy: number, p: OfficeTheme) {
   ctx.font = `600 10px ${p.mono}`;
   const value = ellipsis(ctx, text, maxX - minX - 10);
   const w = ctx.measureText(value).width + 10;
@@ -670,19 +741,6 @@ function drawTokenPill(ctx: CanvasRenderingContext2D, text: string, minX: number
   ctx.strokeStyle = PILL_EDGE; ctx.lineWidth = 1; ctx.stroke();
   ctx.fillStyle = p.text; ctx.textAlign = "right"; ctx.textBaseline = "middle";
   ctx.fillText(value, maxX - 5, cy + 0.5);
-}
-
-interface Look { ring: string | null; led: string | null; mark: string | null; markColor: string; blink: boolean; error: boolean }
-
-/** #229 status → ring + LED + mark. An unread result wins, then a question / waiting (one amber look), then working. */
-function chipLook(status: AgentStatus, result: Delegation | null, question: Question | null, p: PcbTheme): Look {
-  const none: Look = { ring: null, led: null, mark: null, markColor: p.text, blink: false, error: false };
-  if (result?.status === "done") return { ...none, ring: p.green, led: p.green, mark: "✓", markColor: p.green };
-  if (result?.status === "failed") return { ...none, ring: p.redHi, led: p.redHi, mark: "!", markColor: p.redHi, error: true };
-  if (question || status === "waiting") return { ...none, ring: p.amber, led: p.amber, mark: "?", markColor: p.amber, blink: true };
-  if (result) return { ...none, ring: p.amber, led: p.amber, mark: "!", markColor: p.amber }; // done_no_report
-  if (status === "working") return { ...none, ring: p.red, led: p.red };
-  return none;
 }
 
 type GlyphPaths = Array<{ path: Path2D; fill: boolean }>;
@@ -712,49 +770,15 @@ function drawGlyph(ctx: CanvasRenderingContext2D, glyph: GlyphPaths, x: number, 
   ctx.restore();
 }
 
-type LedSpot = { x: number; y: number; r: number };
-
-function ledSpot(chip: Chip): LedSpot {
-  const r = Math.max(1, Math.min(3, chip.h / 5, chip.w / 8));
-  const insetX = Math.max(r + 2, Math.min(11, chip.w / 4));
-  const insetY = Math.max(r + 1, Math.min(10, chip.h / 3));
-  return { x: chip.x - chip.w / 2 + insetX, y: chip.y + chip.h / 2 - insetY, r };
-}
-
-function drawLed(ctx: CanvasRenderingContext2D, spot: LedSpot, look: Look, status: AgentStatus, p: PcbTheme, time: number, boot: number) {
-  let color = p.faint; let alpha = 0.35;
-  if (look.led) { color = look.led; alpha = look.blink ? (Math.floor(time * 6) % 2 ? 1 : 0.12) : 1; }
-  else if (status === "idle") { color = p.red; alpha = 0.45; }
-  else if (boot > 0) { color = p.red; alpha = 1 - boot / BOOT_SECONDS; }
-  ctx.save(); ctx.globalAlpha *= alpha; ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = alpha > 0.7 ? Math.min(8, spot.r * 3) : 0;
-  ctx.beginPath(); ctx.arc(spot.x, spot.y, spot.r, 0, Math.PI * 2); ctx.fill(); ctx.restore();
-}
-
-function drawMark(ctx: CanvasRenderingContext2D, chip: Chip, value: string, color: string, time: number, mono: string, blink = false) {
-  if (blink && Math.floor(time * 6) % 2 === 0) return;
-  const compact = chip.h < 24 || chip.w < 40;
-  const fontSize = compact ? Math.max(6, Math.min(9, chip.h * 0.7)) : 13;
-  // #229: top-right inside the chip (was outside its right edge).
-  ctx.fillStyle = color; ctx.font = `700 ${fontSize}px ${mono}`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-  ctx.fillText(value, compact ? chip.x + chip.w / 2 - fontSize / 2 : chip.x + chip.w / 2 - 9,
-    compact ? chip.y : chip.y - chip.h / 2 + 10);
-}
-
-function drawClock(ctx: CanvasRenderingContext2D, chip: Chip, color: string) {
-  const compact = chip.h < 24 || chip.w < 40;
-  const radius = Math.max(2, Math.min(5, chip.h / 4));
-  const x = compact ? chip.x + chip.w / 2 - radius - 2 : chip.x + chip.w / 2 + 10;
-  const y = compact ? chip.y : chip.y + chip.h / 2 - 6;
+function drawClock(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, color: string) {
+  ctx.save();
   ctx.strokeStyle = color; ctx.lineWidth = Math.min(1.4, radius / 2); ctx.beginPath(); ctx.arc(x, y, radius, 0, Math.PI * 2);
   ctx.moveTo(x, y - radius * 0.6); ctx.lineTo(x, y); ctx.lineTo(x + radius * 0.5, y + radius * 0.3); ctx.stroke();
+  ctx.restore();
 }
 
-/** FIX-4: the dock's amber hourglass (Rack `SlowGlass`), in the clock's slot — left of it when both show. */
-function drawGlass(ctx: CanvasRenderingContext2D, chip: Chip, color: string, besideClock: boolean) {
-  const compact = chip.h < 24 || chip.w < 40;
-  const size = 2 * Math.max(2, Math.min(5, chip.h / 4)) + 1;
-  const cx = (compact ? chip.x + chip.w / 2 - size / 2 - 2 : chip.x + chip.w / 2 + 10) - (besideClock ? size + 3 : 0);
-  const cy = compact ? chip.y : chip.y + chip.h / 2 - 6;
+/** FIX-4: the dock's amber hourglass (Rack `SlowGlass`), `size` wide, centred on (cx, cy). */
+function drawGlass(ctx: CanvasRenderingContext2D, cx: number, cy: number, size: number, color: string) {
   const k = size / 12;
   ctx.save();
   ctx.translate(cx - size / 2, cy - size / 2);
@@ -764,28 +788,6 @@ function drawGlass(ctx: CanvasRenderingContext2D, chip: Chip, color: string, bes
   ctx.restore();
 }
 
-function drawVia(ctx: CanvasRenderingContext2D, x: number, y: number, p: PcbTheme) {
-  ctx.beginPath(); ctx.arc(x, y, 2.2, 0, Math.PI * 2); ctx.fillStyle = p.board; ctx.fill(); ctx.strokeStyle = p.via; ctx.lineWidth = 1; ctx.stroke();
-}
-
 function makePath(ctx: CanvasRenderingContext2D, points: Point[]) {
   ctx.beginPath(); ctx.moveTo(points[0].x, points[0].y); for (let i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
-}
-
-function drawPacket(ctx: CanvasRenderingContext2D, points: Point[], progress: number, color: string, radius: number, mono: string, label?: string) {
-  const p = pointAt(points, progress); ctx.save(); ctx.fillStyle = color; ctx.shadowColor = color; ctx.shadowBlur = 10;
-  ctx.beginPath(); ctx.arc(p.x, p.y, radius, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0;
-  if (label) { ctx.fillStyle = color; ctx.font = `700 11px ${mono}`; ctx.textAlign = "center"; ctx.fillText(label, p.x, p.y - 8); }
-  ctx.restore();
-}
-
-function pointAt(points: Point[], t: number) {
-  const lengths = points.slice(1).map((point, i) => Math.hypot(point.x - points[i].x, point.y - points[i].y));
-  const total = lengths.reduce((sum, n) => sum + n, 0); let distance = t * total;
-  for (let i = 0; i < lengths.length; i++) {
-    if (distance <= lengths[i]) { const k = lengths[i] ? distance / lengths[i] : 0;
-      return { x: points[i].x + (points[i + 1].x - points[i].x) * k, y: points[i].y + (points[i + 1].y - points[i].y) * k }; }
-    distance -= lengths[i];
-  }
-  return points[points.length - 1];
 }

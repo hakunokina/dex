@@ -2,6 +2,7 @@
 .office-box {
   position: absolute;
   inset: 0;
+  background: #0d0709; /* symbioteCard LOOK.fallback.ground: no flash before the first frame */
 }
 
 /* #252: the decision balloon right above the office's big Core (Office.tsx places it every frame:
@@ -62,8 +63,8 @@
 .office-bar-btn.on { color: var(--text); background: var(--surface-2); box-shadow: inset 0 -2px 0 var(--team); }
 .office-bar-btn svg { width: 14px; height: 14px; }
 
-.pcb-demo { width: 100vw; height: 100vh; padding: 18px; background: var(--bg); }
-.pcb-demo canvas { display: block; width: 100%; height: 100%; }
+/* #1958: the lit membrane (WebGL2) under the ink canvas; never takes input, hidden from AT. */
+.office-lit { position: absolute; inset: 0; width: 100%; height: 100%; display: block; pointer-events: none; }
 
 /* Chip hover card — raised popover, soft edges, small red accent. */
 .office-card {
