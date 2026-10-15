@@ -4,6 +4,8 @@ import react from "@vitejs/plugin-react";
 import process from "node:process";
 // @ts-expect-error type error without @types/node package
 import { execFileSync } from "node:child_process";
+// @ts-expect-error type error without @types/node package
+import { fileURLToPath } from "node:url";
 const host = process.env.TAURI_DEV_HOST;
 
 // #151: this UI's build, as crates/dex-core/build_commit.rs stamps dexd's (DEX_BUILD_COMMIT* env
@@ -49,7 +51,9 @@ export default defineConfig(() => ({
       : undefined,
     watch: {
       // 3. tell Vite to ignore watching the Rust side (workspace: src-tauri, crates, root target)
-      ignored: ["**/src-tauri/**", "**/crates/**", "**/target/**"],
+      // #2021: and this root's .dex (worktrees' tsconfig.json add/unlink → full page reload on every
+      // delegate/merge). Absolute, not "**/.dex/**": e2e's Vite runs from inside .dex/wt/<x>.
+      ignored: ["**/src-tauri/**", "**/crates/**", "**/target/**", `${fileURLToPath(new URL("./.dex", import.meta.url)).replace(/\\/g, "/")}/**`],
     },
   },
 }));
