@@ -155,6 +155,11 @@ impl crate::Core {
         if self.agent_states.pre_session(agent) {
             return Ok(None);
         }
+        // A pending chat queue goes first, by rule rather than by timer: its paste starts a turn
+        // whose Stop wakes the inbox again. Read under the delivery gate that chat pushes under.
+        if self.chat_queues.lock().unwrap().get(agent).is_some_and(|q| !q.is_empty()) {
+            return Ok(None);
+        }
         with(&self.db, |c| c.execute("UPDATE inbox_messages SET pasted=1 WHERE receipt_id=?1", [id]).map(|_| ()).map_err(|e| e.to_string()))?;
         if let Err(e) = self.paste_admitted(agent, &prompt, &turn) {
             with(&self.db, |c| c.execute("UPDATE inbox_messages SET pasted=0 WHERE receipt_id=?1", [id]).map(|_| ()).map_err(|e| e.to_string()))?;
@@ -465,6 +470,9 @@ mod tests {
         while bytes.lock().unwrap().iter().filter(|b| **b == b'\r').count() < 2 && std::time::Instant::now() < end {
             std::thread::sleep(Duration::from_millis(20));
         }
+        // The submits' retry timers deliver under this gate too: hold it, as every product
+        // caller does, so the manual deliveries below are the only ones.
+        let _gate = core.inbox_gate.lock().unwrap();
         for text in ["second", "third"] {
             core.agent_states.hook("ayla", Some(Status::Idle), None);
             assert!(core.inbox_deliver_locked("ayla").unwrap().is_some());
@@ -474,6 +482,58 @@ mod tests {
         let expected = ["Patron paylaştı:\nfirst", "panel", "Patron paylaştı:\nsecond", "Patron paylaştı:\nthird"]
             .map(|p| format!("\x1b[200~{p}\x1b[201~\r")).join("");
         assert_eq!(actual, expected, "each paste must have its own Enter, preserving inbox FIFO");
+        assert_eq!(with(&core.db, |c| c.query_row("SELECT COUNT(*) FROM inbox_messages", [], |r| r.get::<_,i64>(0)).map_err(|e| e.to_string())).unwrap(), 0);
+    }
+
+    /// A queued chat goes before a queued share by rule, not by timer; once the chat's turn
+    /// stops, product events alone deliver the share (no starvation).
+    #[test]
+    fn queued_chat_goes_first_and_its_stop_wakes_the_inbox() {
+        use crate::agents::Status;
+        use std::{io::Write, sync::{Arc, Mutex}, time::Duration};
+        struct Stop(Arc<crate::Core>);
+        impl Drop for Stop {
+            fn drop(&mut self) { self.0.ptys.kill("ayla"); self.0.shutdown(); }
+        }
+        struct Input { _original: Box<dyn Write + Send>, bytes: Arc<Mutex<Vec<u8>>> }
+        impl Write for Input {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.bytes.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("inbox-chat-first-{}-{}", std::process::id(), crate::diagnostics::now_ms()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        let _stop = Stop(core.clone());
+        with(&core.db, |c| c.execute("UPDATE agents SET role_slug='assistant' WHERE id='ayla'", []).map(|_| ()).map_err(|e| e.to_string())).unwrap();
+        crate::agents::CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        core.agent_spawn("ayla", Default::default()).unwrap();
+        crate::agents::CAPTURE.with(|c| c.borrow_mut().take());
+        core.agent_states.hook("ayla", Some(Status::Idle), Some("chat-first"));
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        core.ptys.input_writer_for_test("ayla", |original| Box::new(Input { _original: original, bytes: bytes.clone() }));
+        let enters = |n: usize| {
+            let end = std::time::Instant::now() + Duration::from_secs(10);
+            while bytes.lock().unwrap().iter().filter(|b| **b == b'\r').count() < n && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        core.agent_states.hook("ayla", Some(Status::Working), None);
+        assert_eq!(core.chat_send("ayla", "panel").unwrap(), "queued");
+        let mut share = input(); share.text = Some("share".into());
+        assert!(core.inbox_submit(share).unwrap().queued);
+        let idle = core.agent_states.hook("ayla", Some(Status::Idle), None);
+        assert_eq!(core.inbox_deliver_locked("ayla").unwrap(), None, "idle, but the queued chat goes first");
+        crate::hooks::after_turn_ended(&core, "ayla", "Stop", &idle);
+        enters(1);
+        let idle = core.agent_states.hook("ayla", Some(Status::Idle), None);
+        crate::hooks::after_turn_ended(&core, "ayla", "Stop", &idle);
+        enters(2);
+        let actual = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let expected = ["panel", "Patron paylaştı:\nshare"].map(|p| format!("\x1b[200~{p}\x1b[201~\r")).join("");
+        assert_eq!(actual, expected, "chat first, then the share on the chat turn's Stop");
+        core.inbox_prompt_received("ayla", "Patron paylaştı:\nshare");
         assert_eq!(with(&core.db, |c| c.query_row("SELECT COUNT(*) FROM inbox_messages", [], |r| r.get::<_,i64>(0)).map_err(|e| e.to_string())).unwrap(), 0);
     }
     fn input() -> Submit { Submit { team_id: "default".into(), client_id: None, text: Some("bir\niki\u{1b}[201~\u{0}".into()), image: None } }
