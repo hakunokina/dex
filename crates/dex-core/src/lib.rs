@@ -151,6 +151,8 @@ pub struct Core {
     /// #427/#447: turns past the gate (`Core::admit`), not shown yet (restart.rs: a drain's blocker
     /// until they are — the job is not `running`, the agent not Working yet).
     admitted: std::sync::atomic::AtomicUsize,
+    /// #1875: the live snapshot (`dex.live.json`) a crash leaves for the next core.
+    live: Mutex<restart::Live>,
     /// #427 (tests): run once inside the next dispatch, right after its drain check.
     #[cfg(test)]
     dispatch_pause: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -253,6 +255,7 @@ impl Core {
             worker_note_receipts: worker_notes::Receipts::default(),
             draining: Default::default(),
             admitted: Default::default(),
+            live: Mutex::default(),
             #[cfg(test)]
             dispatch_pause: Mutex::default(),
             #[cfg(test)]
@@ -267,14 +270,24 @@ impl Core {
             weak_self: weak.clone(),
         });
         // #161: a restart (drained, an update) left its marker: the queue stays, its leaders come back.
-        let restarted = restart::take(&core.paths.data_dir);
+        // #1875: no marker, but a fresh live snapshot — the last core went down unplanned (a crash,
+        // an installer's kill): the same. A clean exit (shutdown, no window) leaves neither.
+        // Both are taken: a live file left beside a marker is no later crash's.
+        let live = restart::take_live(&core.paths.data_dir);
+        let restarted = restart::take(&core.paths.data_dir).or(live);
         let keep_queued = restarted.is_some();
+        // #1875: the running jobs of workers cut mid-turn stay running; their sessions come back.
+        let kept = match &restarted {
+            Some(m) => with(&core.db, |c| restart::kept_jobs(c, &m.busy))?,
+            None => Vec::new(),
+        };
+        let kept_ids: Vec<i64> = kept.iter().map(|(id, _)| *id).collect();
         // Before reconcile closes them: plan items in flight get delegated again (on `plan_resume`).
-        with(&core.db, |c| plan::requeue_interrupted(c, keep_queued))?;
+        with(&core.db, |c| plan::requeue_interrupted_keeping(c, keep_queued, &kept_ids))?;
         plan::watch(kicks, core.db.clone(), core.events.clone(), core.ptys.clone());
         // DEX-30: no session survives a restart, so bulk model changes left waiting land now.
         with(&core.db, teams::apply_all_pending)?;
-        let n = with(&core.db, |c| delegate::reconcile_on_start(c, keep_queued))?;
+        let n = with(&core.db, |c| delegate::reconcile_on_start_keeping(c, keep_queued, &kept_ids))?;
         if n > 0 {
             eprintln!("dex: {n} açık devretme kapatıldı (önceki oturumdan)");
         }
@@ -285,12 +298,14 @@ impl Core {
         core.usage_watch();
         #[cfg(not(test))]
         core.maintenance_watch();
+        #[cfg(not(test))]
+        core.live_watch();
         core.gpu_refresh_later();
         if let Some(m) = restarted {
             let weak = core.weak_self.clone();
             std::thread::spawn(move || {
                 if let Some(core) = weak.upgrade() {
-                    core.restart_resume(m);
+                    core.restart_resume(m, kept);
                 }
             });
         }
@@ -311,6 +326,8 @@ impl Core {
     /// Removes the per-process files (claude sessions of this process die with it anyway).
     pub fn shutdown(&self) {
         self.team_idle.lock().unwrap().clear();
+        // #1875: a clean exit: the next start is not a crash's.
+        self.live_close();
         diagnostics::event("shutdown", serde_json::json!({}));
         self.hooks.remove_settings();
         self.mcp.remove_config();

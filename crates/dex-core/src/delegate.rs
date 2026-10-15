@@ -1538,6 +1538,13 @@ fn on_exit(conn: &Connection, agent: &str) -> Result<(Vec<Delegation>, Option<De
 /// #161 `keep_queued`: a clean restart (restart.rs) — a queued job was never delivered and the new
 /// core delivers it; only `running` rows close.
 pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize, String> {
+    reconcile_on_start_keeping(conn, keep_queued, &[])
+}
+
+/// [`reconcile_on_start`], #1875: `kept` — running jobs whose worker was cut mid-turn by a restart
+/// (restart.rs `kept_jobs`) stay running; the new core resumes their sessions.
+pub fn reconcile_on_start_keeping(conn: &Connection, keep_queued: bool, kept: &[i64]) -> Result<usize, String> {
+    let kept = serde_json::to_string(kept).map_err(|e| e.to_string())?;
     let n = conn.execute(
         "UPDATE delegations SET
              summary = IFNULL(summary, CASE status WHEN 'running' THEN 'Dex kapandı; worker rapor vermeden durdu'
@@ -1545,8 +1552,9 @@ pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize,
              status = CASE status WHEN 'running' THEN 'done_no_report' ELSE 'failed' END,
              notified = 0, delivered_at = NULL, read_at = NULL, seen_at = NULL, updated_at = ?1
          WHERE status IN ('queued','running') AND model_approval IS NOT 'pending' AND (?2 = 0 OR status = 'running')
-           AND NOT (status='queued' AND to_agent='' AND id IN (SELECT delegation_id FROM delegation_role_queue))",
-        params![now(), keep_queued],
+           AND NOT (status='queued' AND to_agent='' AND id IN (SELECT delegation_id FROM delegation_role_queue))
+           AND id NOT IN (SELECT value FROM json_each(?3))",
+        params![now(), keep_queued, kept],
     )
     .map_err(e)?;
     // Yeniden başlatmada kapanan incelemeler panoda "Sürüyor"da kalmaz.
@@ -1568,6 +1576,28 @@ pub fn reconcile_on_start(conn: &Connection, keep_queued: bool) -> Result<usize,
     )
     .map_err(e)?;
     Ok(n)
+}
+
+/// #1875: a job kept running over a restart whose worker's session could not come back: closed
+/// as the restart would have closed it ([`reconcile_on_start`]), so the leader hears of it.
+pub(crate) fn close_unresumed(db: &Db, ev: &Events, id: i64, error: &str) -> Result<Delegation, String> {
+    let d = with(db, |conn| {
+        let n = conn
+            .execute(
+                "UPDATE delegations SET status = 'done_no_report', summary = IFNULL(summary, ?2),
+                     notified = 0, delivered_at = NULL, read_at = NULL, seen_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND status = 'running'",
+                params![id, format!("Dex yeniden başladı; worker oturumu geri açılamadı: {error}"), now()],
+            )
+            .map_err(e)?;
+        if n > 0 {
+            crate::review::finish_task(conn, id)?;
+            sync_task(conn, id)?;
+        }
+        get(conn, id)
+    })?;
+    emit_changed(ev, Some(&d));
+    Ok(d)
 }
 
 /// The patron opened the worker's pane (DEX-19): its finished results no longer need the dock mark.
