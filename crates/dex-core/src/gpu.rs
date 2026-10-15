@@ -173,16 +173,18 @@ pub fn seen(conn: &Connection) -> Seen {
 /// Lider kurallarına giden bölüm (yalnız bağlı ve ajan türü varken). Adres/token yok.
 pub fn leader_rules(conn: &Connection) -> Option<String> {
     let s = seen(conn);
-    (s.connected && !s.types.is_empty()).then(|| {
-        format!(
-            "## GPU kaynağı\n\
-             - Dex'e bağlı GPU kaynağı var; kaynak (ajana açık türler): {}. Adres ve token sende yok; doğrudan kullanmak yasak.\n\
-             - `gpu_status` diskteki, servis edilen (patronun) ve ajana açık modelleri ayrı gösterir. Ajana kapalı bir model işe yarayacaksa patrona açılmasını önerebilirsin.\n\
-             - Bir iş gerektiriyorsa `gpu_request` (types, workerId, reason, budget?) ile patrondan iste; durum `gpu_status`. \
-             Patron onaylarsa sonuçla gelen izin id'sini `delegate`'e `gpuGrant` olarak ekle; araçlar yalnız o işin worker'ına açılır.",
-            s.types.join(", ")
-        )
-    })
+    (s.connected && !s.types.is_empty()).then(|| leader_text(&s.types.join(", ")))
+}
+
+/// [`leader_rules`]' text for `types`; the prompt-part list (Plan #114) shows it with a placeholder.
+pub(crate) fn leader_text(types: &str) -> String {
+    format!(
+        "## GPU kaynağı\n\
+         - Dex'e bağlı GPU kaynağı var; kaynak (ajana açık türler): {types}. Adres ve token sende yok; doğrudan kullanmak yasak.\n\
+         - `gpu_status` diskteki, servis edilen (patronun) ve ajana açık modelleri ayrı gösterir. Ajana kapalı bir model işe yarayacaksa patrona açılmasını önerebilirsin.\n\
+         - Bir iş gerektiriyorsa `gpu_request` (types, workerId, reason, budget?) ile patrondan iste; durum `gpu_status`. \
+         Patron onaylarsa sonuçla gelen izin id'sini `delegate`'e `gpuGrant` olarak ekle; araçlar yalnız o işin worker'ına açılır."
+    )
 }
 
 // ---- durum (Core'da) ----

@@ -68,15 +68,26 @@ Takım ortak: {shared} · Sana özel: {own}. İndeks oturum başında gelir; ayr
 
 /// Placed after this `## Hafıza` line (absent for the reviewer) only when the context has its own scopes.
 const SCOPE_ANCHOR: &str = "- Aynı konuda kayıt varsa güncelle; yanlışı sil. Takımı ilgilendiren ortak klasöre.";
-const SCOPE_TAIL: &str = "kadro/genel çalışma tercihi → takım shared; ajan alışkanlığı → private. Aynı slug farklı scope'larda olabilir; scope/proje id'siyle nitelikli bağlantı kullan, kör [[slug]] birleşimi yapma.";
+pub(crate) const SCOPE_TAIL: &str = "kadro/genel çalışma tercihi → takım shared; ajan alışkanlığı → private. Aynı slug farklı scope'larda olabilir; scope/proje id'siyle nitelikli bağlantı kullan, kör [[slug]] birleşimi yapma.";
+
+/// The light test level's `## Test bütçesi` (#1147): the section, then the leader's extra line.
+pub(crate) const LIGHT_TEST: (&str, &str) = (
+    "## Test bütçesi\n- Test düzeyi: hafif — yalnız derleme + tip kontrolü (ör. cargo check, tsc --noEmit); birim, tarayıcı/uçtan uca ve QA tam paket yok; patron uygulamada test eder.",
+    "\n- Hafif test düzeyinde QA tam turu planlama.",
+);
 
 /// `DEX_RULES` for one agent. `kind` = `agents.kind`; unknown kind gets neither tagged line.
 /// `memory` = (shared, own) dirs; `roles` = `roles::catalog_text` (only the leader's line carries it).
 /// `role` = `agents.role_slug`.
 pub fn dex_rules(kind: Option<&str>, role: Option<&str>, memory: Option<(&Path, &Path)>, roles: &str) -> String {
+    dex_rules_with(DEX_RULES, kind, role, memory, roles)
+}
+
+/// [`dex_rules`] over `template`: `DEX_RULES` or the patron's override (Plan #114, `prompts.rs`).
+fn dex_rules_with(template: &str, kind: Option<&str>, role: Option<&str>, memory: Option<(&Path, &Path)>, roles: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut in_memory = false;
-    for line in DEX_RULES.lines() {
+    for line in template.lines() {
         if let Some(h) = line.strip_prefix("## ") {
             in_memory = h == "Hafıza";
         }
@@ -120,7 +131,9 @@ pub fn dex_rules(kind: Option<&str>, role: Option<&str>, memory: Option<(&Path, 
 }
 
 /// Katman 1 + Katman 2 for the agent; the whole system-prompt text Dex adds. Order: role text,
-/// `## Proje yığını` (resolved repo root `.dex/stack.md`, #322), rules, leader extras (GPU, stack note).
+/// `## Proje yığını` (resolved repo root `.dex/stack.md`, #322), rules, leader extras (GPU, stack
+/// note), job context, the leader's system append (Plan #114). Rules and role text take the
+/// patron's overrides.
 pub fn system_prompt(conn: &Connection, agent: &str, memory: Option<(&Path, &Path)>) -> String {
     build_system_prompt(conn, agent, memory, crate::stack::team_cwd(conn, agent).as_deref(), None)
 }
@@ -156,12 +169,14 @@ fn build_system_prompt(
         return format!("{}\n\n{rules}", crate::roles::prompt_for_agent(conn, agent).unwrap_or_default());
     }
     let roles = if kind.as_deref() == Some("leader") { crate::roles::catalog_text_for_profile(conn, &team_profile) } else { String::new() };
-    let mut rules = dex_rules(kind.as_deref(), role.as_deref(), memory, &roles);
+    let template = crate::prompts::override_body(conn, crate::prompts::RULES_PART);
+    let mut rules = dex_rules_with(template.as_deref().unwrap_or(DEX_RULES), kind.as_deref(), role.as_deref(), memory, &roles);
     if education { rules = education_rules(&rules); }
     if !education && test_level == "light" {
         if let (Some(start), Some(end)) = (rules.find("## Test bütçesi"), rules.find("## Teslim")) {
-            let leader_note = if kind.as_deref() == Some("leader") { "\n- Hafif test düzeyinde QA tam turu planlama." } else { "" };
-            rules.replace_range(start..end, &format!("## Test bütçesi\n- Test düzeyi: hafif — yalnız derleme + tip kontrolü (ör. cargo check, tsc --noEmit); birim, tarayıcı/uçtan uca ve QA tam paket yok; patron uygulamada test eder.{leader_note}\n\n"));
+            let (light, leader_note) = LIGHT_TEST;
+            let leader_note = if kind.as_deref() == Some("leader") { leader_note } else { "" };
+            rules.replace_range(start..end, &format!("{light}{leader_note}\n\n"));
         }
     }
     // The old/single-project text (project share = team share, or no project path given) stays
@@ -225,10 +240,16 @@ fn build_system_prompt(
     if let Some(ctx) = ctx {
         rules.push_str(&context_block(ctx));
     }
-    match crate::roles::prompt_for_agent(conn, agent) {
+    let mut out = match crate::roles::prompt_for_agent(conn, agent) {
         Some(role) => format!("{role}\n\n{rules}"),
         None => rules,
+    };
+    if kind.as_deref() == Some("leader") {
+        if let Some(extra) = crate::prompts::system_append_for(conn, agent) {
+            out.push_str(&format!("\n\n{}\n{extra}", crate::prompts::SYSTEM_HEAD));
+        }
     }
+    out
 }
 
 /// Reuse the tagged mechanics and memory text verbatim; the dev source/rendering stays unchanged.
@@ -255,7 +276,7 @@ fn education_rules(rules: &str) -> String {
     out.join("\n")
 }
 
-fn assistant_rules(memory: Option<(&Path, &Path)>) -> String {
+pub(crate) fn assistant_rules(memory: Option<(&Path, &Path)>) -> String {
     let mut out = vec!["# Dex çalışma kuralları".to_string(), "Patron: insan, son söz onun.".into(), "".into(), "## Çalışma".into()];
     for line in DEX_RULES.lines().filter(|l| l.starts_with("- Sırrı") || l.starts_with("- Geri alınamaz")) { out.push(line.into()); }
     out.push("- Cevabını kendi panelinde doğrudan patrona ver; onayı ve belirsizliği patrona sor.".into());
