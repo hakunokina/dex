@@ -1,6 +1,7 @@
-// #2040: the team note page — the patron's note plus the leader's two appends (system prompt, every
+// #2040: the team note — the patron's note plus the leader's two appends (system prompt, every
 // message) and the door to Dex's own prompt parts. The appends save like the note (debounced, on blur,
 // on leaving the page); a change the leader only picks up on restart shows the amber band.
+// #2086: one "Notlar" panel — the shared note (every team) over the team note and its appends.
 import { lazy, Suspense, useEffect, useId, useRef, useState } from "react";
 import { ScrollText } from "lucide-react";
 import { callHost, hostSupports, splitId, useHosts } from "../api/hosts";
@@ -15,18 +16,21 @@ const PromptPartsDialog = lazy(() => import("./PromptParts").then(m => ({ defaul
 
 const SAVE_MS = 500;
 
-export function TeamNotes({ teamId, placeholder }: { teamId: string; placeholder: string }) {
+export function NotesPage({ teamId }: { teamId: string }) {
   const host = splitId(teamId)[0];
   useHosts(); // a host's hello (its methods) arrives after the first render
   const lp = useLeaderPrompt(teamId);
-  const leader = useTeams().agents.find(a => a.teamId === teamId && a.kind === "leader");
+  const teams = useTeams();
+  const leader = teams.agents.find(a => a.teamId === teamId && a.kind === "leader");
+  const teamName = teams.teams.find(t => t.id === teamId)?.name ?? "Bu takım";
+  const uid = useId();
   const [partsOpen, setPartsOpen] = useState(false);
   const opener = useRef<HTMLButtonElement>(null);
   const appends = hostSupports(host, "leader_prompt_get");
   const parts = hostSupports(host, "prompt_parts");
 
   return (
-    <div className="team-notes">
+    <div className="notes-page">
       {lp?.pendingRestart && (
         <div className="pane-alert notes-band" role="status">
           <span>⚠ Lider oturumu yeniden başlamadan değişiklikler uygulanmaz.</span>
@@ -38,7 +42,14 @@ export function TeamNotes({ teamId, placeholder }: { teamId: string; placeholder
           )}
         </div>
       )}
-      <NotesEditor scope={teamId} placeholder={placeholder} />
+      <section className="notes-sec" aria-labelledby={`${uid}-shared`}>
+        <h3 id={`${uid}-shared`} className="notes-sec-head">Ortak not <span>tüm takımlar</span></h3>
+        <NotesEditor scope="shared" placeholder="Ortak notlar — tüm takımlarda aynı, yalnız sen görürsün" />
+      </section>
+      <section className="notes-sec" aria-labelledby={`${uid}-team`}>
+        <h3 id={`${uid}-team`} className="notes-sec-head">Takım notu <span>{teamName}</span></h3>
+        <NotesEditor scope={teamId} placeholder={`${teamName} notları — yalnız sen görürsün`} />
+      </section>
       {(appends || parts) && (
         <section className="notes-appends" aria-label="Lider eklemeleri">
           <div className="notes-appends-head">

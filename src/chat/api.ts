@@ -21,6 +21,8 @@ export interface ChatMessage {
   thinking?: boolean;
   ts?: number | null;
   tool?: ToolCard | null;
+  /** #2086: the patron's per-message append this prompt really got (from the transcript). */
+  append?: string | null;
 }
 
 export interface ChatPage {

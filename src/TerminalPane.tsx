@@ -21,6 +21,8 @@ import "./project/project.css";
 import { useAgentContext } from "./usage/contextStore";
 import { contextLevel } from "./usage/contextFormat";
 import { ContextMeter } from "./usage/ContextMeter";
+import { useLeaderPrompt } from "./layout/noteMarks";
+import { appendLabel, hasText } from "./layout/notePrompts";
 import { askConfirm } from "./confirm";
 
 // S5-B: the chat mounts only when its tab opens (the terminal stays mounted underneath).
@@ -425,6 +427,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
         <span className="project-chip" title="Bu oturumun projesi">{project}</span>
       )}
       {ctx && agent && <ContextMeter ctx={ctx} compact={agent.kind === "worker"} />}
+      {agent?.kind === "leader" && view === "term" && <MessageAppendChip teamId={teamId} />}
       {agent && !patronWritable(agent) && view === "term" && (
         <button
           className={`pane-write ${writable ? "on" : ""}`}
@@ -538,3 +541,14 @@ export const STATUS_LABEL: Record<AgentStatus, string> = {
   working: "çalışıyor",
   waiting: "bekliyor",
 };
+
+/** #2086: the team note's "Her mesaja ekle", faint beside the leader's context meter; the full text on hover/focus. */
+function MessageAppendChip({ teamId }: { teamId: string }) {
+  const text = (useLeaderPrompt(teamId)?.messageAppend ?? "").trim();
+  if (!hasText(text)) return null;
+  return (
+    <span className="pane-append" tabIndex={0} title={text} aria-label={`Her mesaja ek: ${text}`}>
+      {appendLabel(text, 32)}
+    </span>
+  );
+}

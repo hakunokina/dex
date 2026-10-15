@@ -2,7 +2,7 @@
 // #50: the root splits into columns — Kart over the workers on the left, the leader full height at
 // ~40% on the right with the notes as its tabs; emptying the bottom-right of a two-row layout lets
 // the group above it grow to full height. The team tabs run leftwards from the DEX logo.
-// #46: the notes pages are free panels — split apart by dragging, kept across a reload, reopened from the palette.
+// #46/#2086: the notes are one free panel — an old two-page layout folds into it, reopened from the palette.
 import type { Page } from "@playwright/test";
 import { isolatedTest as test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
@@ -42,7 +42,7 @@ test("Düzeni sıfırla: solda Kart üstte worker'lar altta, sağda lider tam bo
   const full = await stage(app);
   const has = (name: string) => async () => (await groups(app)).filter((g) => g.tabs.some((t) => t.includes(name))).length;
   await expect.poll(has("Kart")).toBe(1);
-  await expect.poll(has("Ortak not")).toBe(1);
+  await expect.poll(has("Notlar")).toBe(1);
   for (const w of workers) await expect.poll(has(w.name)).toBe(1);
   expect((await groups(app)).some((g) => g.tabs.some((t) => t.includes("Raf")))).toBe(false);
 
@@ -51,7 +51,7 @@ test("Düzeni sıfırla: solda Kart üstte worker'lar altta, sağda lider tam bo
   expect(lead.width / full.width).toBeGreaterThan(0.37);
   expect(lead.width / full.width).toBeLessThan(0.43);
   expect(lead.height).toBeGreaterThan(full.height - 10);
-  expect(lead.tabs).toEqual(expect.arrayContaining(["Ortak not", "Takım notu"]));
+  expect(lead.tabs).toEqual(expect.arrayContaining(["Notlar"]));
   expect(Math.max(...all.map((g) => g.left + g.width))).toBe(lead.left + lead.width);
   const kart = all.find((g) => g.tabs.includes("Kart"))!;
   expect(kart.tabs).toEqual(["Kart", "Takım", "Ayarlar"]);
@@ -72,56 +72,49 @@ test("Düzeni sıfırla: solda Kart üstte worker'lar altta, sağda lider tam bo
   console.log("LEADER", JSON.stringify({ cols: size.cols, rows: size.rows }));
 });
 
-test("Notlar serbest: Takım notu sürüklenip ayrı gruba bölünür, reload sonrası korunur, kapatılınca paletten döner", async ({ app, dexd }) => {
+test("Notlar tek panel: eski iki sayfalı kayıtlı düzen tek Notlar'a göçer, boş grup kalmaz, kapatılınca paletten döner", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Notlar ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
-  await app.reload();
-  await openTeam(app, team.name);
+  // Before #2086: Kart | [leader, Ortak not] with "Takım notu" split off under it in a group of its own.
+  const panels = Object.fromEntries([
+    { id: "office", contentComponent: "office", tabComponent: "fixed", title: "Kart" },
+    { id: `agent:${leader.id}`, contentComponent: "agent", tabComponent: "agent", title: leader.name, params: { agentId: leader.id } },
+    { id: "notes:shared", contentComponent: "notes", tabComponent: "notes", title: "Ortak not", params: { page: "shared" } },
+    { id: "notes:team", contentComponent: "notes", tabComponent: "notes", title: "Takım notu", params: { page: "team" } },
+  ].map((p) => [p.id, p]));
+  const leaf = (id: string, views: string[], size: number) => ({ type: "leaf", data: { id, views, activeView: views[0] }, size });
+  const dock = {
+    grid: {
+      orientation: "HORIZONTAL", width: 1400, height: 800,
+      root: { type: "branch", size: 800, data: [
+        leaf("1", ["office"], 800),
+        { type: "branch", size: 600, data: [leaf("2", [`agent:${leader.id}`, "notes:shared"], 500), leaf("3", ["notes:team"], 300)] },
+      ] },
+    },
+    panels, activeGroup: "3",
+  };
+  await app.goto("about:blank"); // no page left to save its own layout over this one
+  await dexd.call("layout_save", { layout: { version: 2, active: team.id, teams: { [team.id]: { dock, shells: [] } }, sessions: {} } });
+  await app.goto("/");
   await paneOf(app, leader.name);
-  const palette = async (cmd: string) => {
-    await app.keyboard.press("Control+Shift+P");
-    await app.getByPlaceholder(/Komut ara/).fill(cmd);
-    await app.keyboard.press("Enter");
-  };
-  await palette("Düzeni sıfırla");
-  const notesTabs = async () =>
-    (await groups(app)).map((g) => g.tabs.filter((t) => t.includes(" not"))).filter((t) => t.length).sort();
-  await expect.poll(notesTabs).toEqual([["Ortak not", "Takım notu"]]);
 
-  // Drag "Takım notu" by its tab onto its own group's right edge: a split, no floor, no lock.
-  const box = (await groups(app)).find((g) => g.tabs.includes("Ortak not"))!;
-  const tab = app.locator(".team-stage:not(.hidden) .dv-tab", { hasText: "Takım notu" });
-  const t = (await tab.boundingBox())!;
-  await app.mouse.move(t.x + t.width / 2, t.y + t.height / 2);
-  await app.mouse.down();
-  const to = { x: box.left + box.width - 8, y: box.top + box.height / 2 };
-  await app.mouse.move(to.x - 40, to.y, { steps: 10 });
-  await app.mouse.move(to.x, to.y, { steps: 5 });
-  await app.mouse.up();
-  await expect.poll(notesTabs).toEqual([["Ortak not"], ["Takım notu"]]);
-  const split = (await groups(app)).filter((g) => g.tabs.some((t) => t.includes(" not")));
-  expect(split[0].top).toBe(split[1].top);
+  const notesTabs = async () => (await groups(app)).map((g) => g.tabs.filter((t) => t.includes("Notlar"))).filter((t) => t.length);
+  await expect.poll(notesTabs).toEqual([["Notlar"]]);
+  const all = await groups(app);
+  expect(all.map((g) => g.tabs.length)).toEqual([1, 2]); // Kart | leader + Notlar — the emptied group is gone
+  expect(all[1].tabs).toEqual([leader.name, "Notlar"].map((t) => expect.stringContaining(t)));
+  const stageEl = app.locator(".team-stage:not(.hidden)");
+  await stageEl.locator(".dv-tab", { hasText: "Notlar" }).click();
+  await expect(stageEl.getByRole("heading", { name: /Ortak not/ })).toBeVisible();
+  await expect(stageEl.getByRole("heading", { name: /Takım notu/ })).toBeVisible();
 
-  // Persisted: the debounced layout_save carries the two pages in two groups; a reload keeps them.
-  const savedNotes = async () => {
-    const save = (await calls(app)).filter((c) => c.cmd === "layout_save").at(-1);
-    const dock = (save?.args.layout as { teams?: Record<string, { dock?: { grid?: { root?: unknown } } }> } | undefined)?.teams?.[team.id]?.dock;
-    type Node = { type: string; data: Node[] | { views: string[] } };
-    const leaves = (n: Node | undefined): string[][] =>
-      !n ? [] : n.type === "branch" ? (n.data as Node[]).flatMap(leaves) : [(n.data as { views: string[] }).views];
-    return leaves(dock?.grid?.root as Node | undefined).map((v) => v.filter((id) => id.startsWith("notes:"))).filter((v) => v.length).sort();
-  };
-  await expect.poll(savedNotes).toEqual([["notes:shared"], ["notes:team"]]);
-  await app.reload();
-  await openTeam(app, team.name);
-  // #50: the pages started as the leader's tabs, so its group may now show "Ortak not" — wait on the notes.
-  await expect.poll(notesTabs).toEqual([["Ortak not"], ["Takım notu"]]);
-
-  // Closable like any panel; the palette brings it back onto the other page.
-  await app.getByRole("button", { name: "Ortak not sekmesini kapat" }).click();
-  await expect.poll(notesTabs).toEqual([["Takım notu"]]);
-  await palette("Notları aç");
-  await expect.poll(notesTabs).toEqual([["Takım notu", "Ortak not"]]);
+  // Closable like any panel; the palette brings it back.
+  await app.getByRole("button", { name: "Notlar sekmesini kapat" }).click();
+  await expect.poll(notesTabs).toEqual([]);
+  await app.keyboard.press("Control+Shift+P");
+  await app.getByPlaceholder(/Komut ara/).fill("Notları aç");
+  await app.keyboard.press("Enter");
+  await expect.poll(notesTabs).toEqual([["Notlar"]]);
 });
 
 test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca paletten yenisi açılır", async ({ app, dexd }) => {
@@ -273,7 +266,8 @@ test("İki satırlı kayıtlı düzen: sağ-alt grup boşalınca üstündeki lid
   await expect.poll(async () => (await tabsOf(leader.name)).height).toBeGreaterThan(full.height - 10);
   const all = await groups(app);
   const lead = await tabsOf(leader.name);
-  expect(lead.tabs).toEqual([leader.name, "Ortak not", "Takım notu"].map((t) => expect.stringContaining(t)));
+  // #2086: the saved two pages came back as the one "Notlar" tab in their place.
+  expect(lead.tabs).toEqual([leader.name, "Notlar"].map((t) => expect.stringContaining(t)));
   expect(Math.max(...all.map((g) => g.left + g.width))).toBe(lead.left + lead.width);
   // The rest stays as it was, on the left: Kart over w1 + w2.
   expect(all).toHaveLength(3);

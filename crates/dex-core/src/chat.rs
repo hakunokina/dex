@@ -26,6 +26,9 @@ pub struct ChatMessage {
     pub thinking: bool,
     pub ts: Option<u64>,
     pub tool: Option<ToolCard>,
+    /// #2086: the patron's per-message append this prompt really got (its UPS hook context).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
 }
 
 /// `ok`: `None` = running, `Some(true)` = ✓, `Some(false)` = ✗. Input is a one-line summary;
@@ -157,10 +160,10 @@ impl Collector {
         }
         if let Some(t) = tool.clone() {
             self.tools.insert(id.clone(), self.out.len());
-            self.out.push(ChatMessage { id, seq: self.seq, role: role.into(), text, thinking, ts, tool: Some(t) });
+            self.out.push(ChatMessage { id, seq: self.seq, role: role.into(), text, thinking, ts, tool: Some(t), append: None });
             return;
         }
-        self.out.push(ChatMessage { id, seq: self.seq, role: role.into(), text, thinking, ts, tool: None });
+        self.out.push(ChatMessage { id, seq: self.seq, role: role.into(), text, thinking, ts, tool: None, append: None });
     }
 
     fn tool_result(&mut self, call_id: &str, result: String, ok: bool) {
@@ -171,6 +174,32 @@ impl Collector {
             }
         }
     }
+}
+
+/// #2086: the patron's message append in a claude `hook_additional_context` row of the UserPromptSubmit
+/// hook — written right after its prompt, core's part last under [`crate::prompts::MESSAGE_HEAD`].
+/// `[Dex-…]` turns get none, so their rows carry no head.
+fn message_append(v: &Value) -> Option<String> {
+    let a = &v["attachment"];
+    if v["type"] != "attachment" || v["isSidechain"].as_bool().unwrap_or(false)
+        || a["type"] != "hook_additional_context" || a["hookEvent"] != "UserPromptSubmit" {
+        return None;
+    }
+    let head = format!("{}
+", crate::prompts::MESSAGE_HEAD);
+    let texts: Vec<&str> = match &a["content"] {
+        Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+        Value::String(s) => vec![s.as_str()],
+        _ => Vec::new(),
+    };
+    texts.iter().rev()
+        .find_map(|s| s.rfind(&head).map(|i| s[i + head.len()..].trim().to_string()))
+        .filter(|t| !t.is_empty())
+}
+
+/// The message an append row belongs to: its prompt, the last message so far when that is the patron's.
+fn prompt_of(out: &mut [ChatMessage]) -> Option<&mut ChatMessage> {
+    out.last_mut().filter(|m| m.role == "user" && m.tool.is_none() && m.append.is_none())
 }
 
 fn parse_claude(v: &Value, c: &mut Collector) {
@@ -236,6 +265,11 @@ fn parse_claude(v: &Value, c: &mut Collector) {
                     }
                     _ => {}
                 }
+            }
+        }
+        Some("attachment") => {
+            if let (Some(text), Some(m)) = (message_append(v), prompt_of(&mut c.out)) {
+                m.append = Some(text);
             }
         }
         _ => {}
@@ -518,6 +552,22 @@ impl Watches {
     }
 }
 
+/// One live row's messages to send. `prompt` holds the last patron prompt so its append row (the next
+/// rows) patches it: then the prompt goes out again with the same id, the client replaces it in place.
+fn live_row(prompt: &mut Option<ChatMessage>, v: &Value, seq: u64) -> Vec<ChatMessage> {
+    let mut c = Collector { out: prompt.take().into_iter().collect(), tools: HashMap::new(), seq };
+    let base = c.out.len();
+    parse_claude(v, &mut c);
+    let appended = base == 1 && c.out[0].append.is_some();
+    let fresh = c.out.split_off(if appended { 0 } else { base });
+    *prompt = match fresh.last() {
+        Some(m) if !appended => Some(m.clone()).filter(|m| m.role == "user" && m.tool.is_none()),
+        Some(_) => None,
+        None => c.out.pop(), // nothing new: the prompt still waits for its append
+    };
+    fresh
+}
+
 /// Replaced watches exit on the next wakeup; the timeout bounds a parked thread to ~30 s
 /// after its sender is gone (a file event usually ends it sooner).
 fn watch_loop(core: Weak<crate::Core>, agent: String, engine: String, path: PathBuf, process: Option<(u64, u64)>, rx: mpsc::Receiver<()>, ready: mpsc::Sender<()>) {
@@ -541,6 +591,8 @@ fn watch_loop(core: Weak<crate::Core>, agent: String, engine: String, path: Path
     let head = std::fs::read(&path).unwrap_or_default();
     let (mut offset, mut seq) = (head.len() as u64, head.iter().filter(|b| **b == b'\n').count() as u64);
     let mut partial = String::new();
+    // #2086: the last live patron prompt, until its append row (or anything else) follows.
+    let mut prompt: Option<ChatMessage> = None;
     if engine == "claude" {
         if let Some(core) = core.upgrade() {
             for row in claude_tail_rows(&head) {
@@ -592,13 +644,11 @@ fn watch_loop(core: Weak<crate::Core>, agent: String, engine: String, path: Path
         }
         offset += bytes.len() as u64;
         partial.push_str(&String::from_utf8_lossy(&bytes));
-        let emit = |text: &str, seq: u64| {
+        let mut emit = |text: &str, seq: u64| {
             if let Ok(v) = serde_json::from_str::<Value>(text) {
                 core.worker_notes_observed(&agent, &engine, &path, &v, process.map(|p| p.0));
-                let mut c = Collector { out: Vec::new(), tools: HashMap::new(), seq };
                 core.claude_transcript_row(&agent, &v, process.map(|p| p.0));
-                parse_claude(&v, &mut c);
-                for m in c.out {
+                for m in live_row(&mut prompt, &v, seq) {
                     let _ = core.events.emit("chat-message", &serde_json::json!({ "agentId": agent, "message": m }));
                 }
                 if claude_interrupted(&v) {
@@ -1129,6 +1179,54 @@ b
         assert!(!claude_interrupted(&row(r#"{"type":"user","isSidechain":true,"message":{"content":"[Request interrupted by user]"}}"#)), "subagent");
         assert!(!claude_interrupted(&row(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#)));
         assert!(!claude_interrupted(&row(r#"{"type":"user","message":{"content":"neden [Request interrupted by user] yazıyor?"}}"#)), "quoted by the patron");
+    }
+
+    fn append_row(content: &str) -> String {
+        serde_json::json!({"type":"attachment","uuid":"x","attachment":{"type":"hook_additional_context","hookEvent":"UserPromptSubmit","content":[content]}}).to_string()
+    }
+
+    #[test]
+    fn patron_prompt_carries_the_append_it_really_got() {
+        let head = crate::prompts::MESSAGE_HEAD;
+        let rows = [
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"ekli soru"}}"#.to_string(),
+            r#"{"type":"attachment","uuid":"r1","attachment":{"type":"total_tokens_reminder","text":"x"}}"#.to_string(),
+            append_row(&format!("# Dex bağlamı
+{head}
+Kısa tut.
+")),
+            r#"{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"tamam"}]}}"#.to_string(),
+            r#"{"type":"user","uuid":"u2","message":{"role":"user","content":"eksiz soru"}}"#.to_string(),
+            r#"{"type":"assistant","uuid":"a2","message":{"content":[{"type":"text","text":"peki"}]}}"#.to_string(),
+            // A Dex turn: core adds only its own context, no head.
+            r#"{"type":"user","uuid":"u3","message":{"role":"user","content":"[Dex-Sonuç] iş bitti"}}"#.to_string(),
+            append_row("# Dex: sonuç bağlamı"),
+            // A stray append row after an assistant message touches nothing.
+            r#"{"type":"assistant","uuid":"a3","message":{"content":[{"type":"text","text":"okudum"}]}}"#.to_string(),
+            append_row(&format!("{head}
+yetim")),
+        ];
+        let m = collect(&rows.join("
+"));
+        let got: Vec<(&str, Option<&str>)> = m.iter().map(|x| (x.text.as_str(), x.append.as_deref())).collect();
+        assert_eq!(got, [
+            ("ekli soru", Some("Kısa tut.")), ("tamam", None), ("eksiz soru", None), ("peki", None),
+            ("[Dex-Sonuç] iş bitti", None), ("okudum", None),
+        ]);
+        assert!(serde_json::to_value(&m[2]).unwrap().get("append").is_none(), "no append → no field");
+
+        // Live: the prompt goes out bare, then once more (same id) with its append; nothing else repeats.
+        let mut held = None;
+        let live: Vec<Vec<(String, Option<String>)>> = rows.iter().enumerate()
+            .map(|(i, r)| live_row(&mut held, &serde_json::from_str(r).unwrap(), i as u64 + 1)
+                .into_iter().map(|x| (x.id, x.append)).collect())
+            .collect();
+        assert_eq!(live[0], [("u1".to_string(), None)]);
+        assert!(live[1].is_empty());
+        assert_eq!(live[2], [("u1".to_string(), Some("Kısa tut.".to_string()))]);
+        assert_eq!(live[3], [("a1".to_string(), None)]);
+        assert!(live[7].is_empty() && live[9].is_empty(), "Dex turn and stray rows emit nothing: {live:?}");
+        assert!(held.is_none());
     }
 
     #[test]

@@ -9,6 +9,7 @@ import { writePty } from "../pty";
 import { renderMarkdown } from "./md";
 import { buildFeed, currentTool, dayLabel, reconcileOutgoing, timeLabel, type FeedItem, type Outgoing } from "./group";
 import { parsePrompt, shortLabel } from "./prompt";
+import { appendLabel } from "../layout/notePrompts";
 import "./chat.css";
 
 interface Props {
@@ -101,11 +102,14 @@ function Activity({ item }: { item: Extract<FeedItem, { kind: "activity" }> }) {
   );
 }
 
-function Bubble({ role, text, ts, note, tone }: { role: string; text: string; ts?: number | null; note?: string; tone?: string }) {
+function Bubble({ role, text, ts, note, tone, append }: {
+  role: string; text: string; ts?: number | null; note?: string; tone?: string; append?: string | null;
+}) {
   return (
     <div className={`chat-row ${role === "user" ? "me" : "them"} ${tone ?? ""}`}>
       <div className="chat-bubble">
         <Markdown text={text} />
+        {append && <p className="chat-append" title={append}>{appendLabel(append, 160)}</p>}
         <div className="chat-meta">
           <Stamp ts={ts} />
           {note && <span className="chat-note">{note}</span>}
@@ -333,7 +337,7 @@ export default function ChatView({ agentId, onNeedTerminal }: Props) {
         {feed.map((it) => {
           if (it.kind === "day") return <p key={it.key} className="chat-day">{dayLabel(it.ts, now)}</p>;
           if (it.kind === "activity") return <Activity key={it.key} item={it} />;
-          return <Bubble key={it.key} role={it.m.role} text={it.m.text} ts={it.m.ts} />;
+          return <Bubble key={it.key} role={it.m.role} text={it.m.text} ts={it.m.ts} append={it.m.append} />;
         })}
         {outgoing.map((o) => (
           <div key={o.id} className={`chat-row me chat-pending ${o.state}`}>

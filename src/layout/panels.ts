@@ -15,6 +15,7 @@ import { newShellCwd, resolveShellCwd } from "../project/store";
 import { projectErrorText } from "../project/model";
 import { toast } from "../toast/store";
 import { remapDock, type FavoriteTarget } from "./favorite";
+import { migrateNotesDock, NOTES_ID, NOTES_TITLE } from "./notesDock";
 import { focusSetting, selectSettingsTab, type SettingsTab } from "../settings/tab";
 import { movePlaysFx, workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
@@ -144,17 +145,14 @@ export const FIXED: Record<"office" | "board" | "settings" | "team" | "memory" |
   memory: { id: "memory", component: "memory", tabComponent: "fixed", title: "Hafıza" },
 };
 
-// ---- Notes: two pages, free panels (#46; DEX-41's locked group is gone) ----
+// ---- Notes: a free panel (#46; DEX-41's locked group is gone). #2086: the shared and the team page
+// are one "Notlar" panel; saved docks with the old two pages migrate in `notesDock`. ----
 
-export type NotesPage = "shared" | "team";
-export const NOTES: Record<NotesPage, Spec> = {
-  shared: { id: "notes:shared", component: "notes", tabComponent: "notes", title: "Ortak not", params: { page: "shared" } },
-  team: { id: "notes:team", component: "notes", tabComponent: "notes", title: "Takım notu", params: { page: "team" } },
-};
-const isNotes = (panelId: string) => panelId.startsWith("notes:");
+export const NOTES: Spec = { id: NOTES_ID, component: "notes", tabComponent: "notes", title: NOTES_TITLE };
+const isNotes = (panelId: string) => panelId === NOTES_ID;
 export { isNotes, quietly };
 
-/** The notes' share of the workspace in the default screen, and when reopened with neither page open. */
+/** The notes' share of the workspace in the default screen, and when reopened. */
 const NOTES_W = 0.38;
 const NOTES_H = 0.4;
 
@@ -209,7 +207,7 @@ const MIN_CELL_W = 420;
 function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
   const kind = kindOf(teamId, spec.id);
   if (kind === "assistant") {
-    // #1840: the last tab of Core's group (Core | Ortak not | Takım notu | Echo), not a column of its own.
+    // #1840: the last tab of Core's group (Core | Notlar | Echo), not a column of its own.
     const anchor = api.panels.find(p => kindOf(teamId, p.id) === "leader") ?? api.panels.find(p => isNotes(p.id));
     return api.addPanel({ ...spec, params: { ...spec.params, assistant: true },
       position: anchor ? { referenceGroup: anchor.group } : { direction: "right" } });
@@ -236,9 +234,7 @@ function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
     return p;
   }
   if (kind === "notes") {
-    // #46: onto the other page wherever the patron put it, else back in the bottom-right corner.
-    const other = api.panels.find(p => isNotes(p.id));
-    if (other) return api.addPanel({ ...spec, position: { referenceGroup: other.group } });
+    // #46: back in the bottom-right corner.
     const corner = cornerGroup(api);
     const p = api.addPanel({ ...spec, ...(corner ? { position: { referenceGroup: corner, direction: "below" as const } } : {}) });
     if (api.height) p.group.api.setSize({ height: Math.round(api.height * NOTES_H) });
@@ -332,11 +328,8 @@ export async function openShell(teamId: string): Promise<string | null> {
 
 export const revealShell = (teamId: string, shellId: string) => open(teamId, shellSpec(shellId));
 
-/** #46: reopen a closed notes page (both: the shared one comes forward). */
-export function openNotes(teamId: string) {
-  open(teamId, NOTES.team);
-  return open(teamId, NOTES.shared);
-}
+/** #46: reopen the closed notes panel (or bring it forward). */
+export const openNotes = (teamId: string) => open(teamId, NOTES);
 
 function quietly(teamId: string, f: () => void) {
   bulk.add(teamId);
@@ -406,7 +399,7 @@ function favoriteTarget(teamId: string, shellCount: number): FavoriteTarget {
 function showFavorite(teamId: string, api: DockviewApi): boolean {
   const fav = getFavorite();
   if (!fav) return false;
-  const { dock } = remapDock(fav.dock, fav, favoriteTarget(teamId, fav.shells.length));
+  const { dock } = remapDock(migrateNotesDock(fav.dock), fav, favoriteTarget(teamId, fav.shells.length));
   workerRows.delete(api);
   quietly(teamId, () => {
     try {
@@ -420,7 +413,7 @@ function showFavorite(teamId: string, api: DockviewApi): boolean {
   const rack = api.getPanel("rack");
   if (rack) api.removePanel(rack);
   api.getPanel("office")?.api.setTitle("Kart");
-  for (const n of Object.values(NOTES)) api.getPanel(n.id)?.api.setTitle(n.title ?? "");
+  api.getPanel(NOTES.id)?.api.setTitle(NOTES.title ?? "");
   if (api.totalPanels === 0) buildDefault(teamId, api);
   lockOffice(api);
   return true;
@@ -435,7 +428,7 @@ export function applyFavoriteLayout(teamId: string): boolean {
   if (!fav) return false;
   const api = apis.get(teamId);
   if (api) return showFavorite(teamId, api);
-  const { dock } = remapDock(fav.dock, fav, favoriteTarget(teamId, fav.shells.length));
+  const { dock } = remapDock(migrateNotesDock(fav.dock), fav, favoriteTarget(teamId, fav.shells.length));
   setDock(teamId, dock);
   return true;
 }
@@ -499,9 +492,8 @@ function buildDefault(teamId: string, api: DockviewApi) {
     api.addPanel({ ...agentSpec(teamId, id)!, inactive: true, position: { referenceGroup: two!.group } });
   }
   const notes = lead
-    ? api.addPanel({ ...NOTES.shared, inactive: true, position: { referenceGroup: lead.group } })
-    : put(NOTES.shared, office, "right");
-  api.addPanel({ ...NOTES.team, inactive: true, position: { referenceGroup: notes.group } });
+    ? api.addPanel({ ...NOTES, inactive: true, position: { referenceGroup: lead.group } })
+    : put(NOTES, office, "right");
 
   const workers = members.filter(a => a.kind === "worker" && isAssignable(a)).map(a => agentSpec(teamId, a.id)!);
   // #65: a team without a shell gets one — its group carries "Yeni terminal", as on the patron's first team.
@@ -594,7 +586,7 @@ export function load(teamId: string, api: DockviewApi) {
   quietly(teamId, () => {
     if (saved) {
       try {
-        api.fromJSON(saved);
+        api.fromJSON(migrateNotesDock(saved));
       } catch (e) {
         console.warn("dockview düzeni okunamadı, varsayılana dönülüyor:", e);
         api.clear();
@@ -607,13 +599,11 @@ export function load(teamId: string, api: DockviewApi) {
     if (api.totalPanels === 0) buildDefault(teamId, api);
     // Saved pre-DEX-39 layouts carry their serialized title; migrate it without resetting layout.
     api.getPanel("office")?.api.setTitle("Kart");
-    // FIX-3: notes tabs were "Ortak"/"Takım" (the latter clashed with the Takım panel).
-    for (const n of Object.values(NOTES)) api.getPanel(n.id)?.api.setTitle(n.title ?? "");
-    // #46: DEX-41 saved its notes group locked (no drops); the pages are free panels now.
-    for (const n of Object.values(NOTES)) {
-      const g = api.getPanel(n.id)?.group;
-      if (g) g.locked = false;
-    }
+    // FIX-3/#2086: a saved title wins over the spec's; the notes tab is "Notlar".
+    const notes = api.getPanel(NOTES.id);
+    notes?.api.setTitle(NOTES.title ?? "");
+    // #46: DEX-41 saved its notes group locked (no drops); the notes are a free panel now.
+    if (notes) notes.group.locked = false;
     if (getFavorite()) lockOffice(api);
   });
   centerFloats(api);
