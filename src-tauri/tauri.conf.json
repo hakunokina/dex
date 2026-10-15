@@ -17,6 +17,7 @@
         "height": 960,
         "minWidth": 1100,
         "minHeight": 640,
+        "maximized": true,
         "theme": "Dark",
         "decorations": false,
         "backgroundColor": "#0e0f11"
