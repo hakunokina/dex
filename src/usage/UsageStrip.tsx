@@ -43,7 +43,7 @@ function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id
   // TM dock'u gibi: halka marka renginde, harcanan kısım o rengin soluk tonu, ortada logo metin renginde.
   const brand = m.color.startsWith("#") ? m.color : undefined;
   return (
-    <div className={`usage-prov ${sev}`} title={title} data-provider={p.id} tabIndex={0}
+    <div className={`usage-prov ${sev}`} aria-label={title} data-provider={p.id} tabIndex={0}
       onMouseEnter={(e) => onHover(p.id, e.currentTarget.getBoundingClientRect())}
       onMouseLeave={() => onHover(null, null)}
       onFocus={(e) => onHover(p.id, e.currentTarget.getBoundingClientRect())}

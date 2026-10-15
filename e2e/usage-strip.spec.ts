@@ -69,12 +69,12 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   const claude = strip.locator('[data-provider="anthropic"]');
   await expect(claude.locator('.usage-pct[data-window="fiveHour"]')).toHaveText("66%");
   await expect(claude.locator('.usage-pct[data-window="weekly"]')).toHaveText("41%");
-  await expect(claude).toHaveAttribute("title", /^Claude\n5 saat: %66 kalan, sıfırlanma .+\nHaftalık: %41 kalan, sıfırlanma /);
+  await expect(claude).toHaveAttribute("aria-label", /^Claude\n5 saat: %66 kalan, sıfırlanma .+\nHaftalık: %41 kalan, sıfırlanma /);
   // Ton iki pencereden az kalanına göre: GLM'in haftalığı %8 → kritik.
   await expect(strip.locator('[data-provider="glm"]')).toHaveClass(/critical/);
   const muse = strip.locator('[data-provider="muse"]');
   await expect(muse.locator(".usage-pct")).toHaveText(["--", "--"]);
-  await expect(muse).toHaveAttribute("title", "Muse Code — şu an veri yok (Muse anahtar ucu kullanım bildirmiyor)");
+  await expect(muse).toHaveAttribute("aria-label", "Muse Code — şu an veri yok (Muse anahtar ucu kullanım bildirmiyor)");
 
   // #118: şerit sağa yaslı ama dikeyde ortalı (içerik kısayken üstte değil ortada yüzer).
   const centered = await app.evaluate(() => {
