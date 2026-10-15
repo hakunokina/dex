@@ -10,6 +10,7 @@ package com.hakunokina.dex.hosttokens
 import android.content.Context
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
@@ -52,11 +53,12 @@ object MotivationWork {
     private const val PREFS = "dex-motivation"
     private const val LAST = "last-written"
 
-    /** Yarınki (ya da bugünkü, 04:45 öncesiyse) 04:45 işi; 04:45–12:00 arası ve bugün yazılmadıysa hemen. */
-    fun ensure(context: Context) {
+    /** Yarınki (ya da bugünkü, 04:45 öncesiyse) 04:45 işi; 04:45–12:00 arası ve bugün yazılmadıysa hemen.
+     *  `afterRun`: koşan işten çağrı — sonraki iş hep ertesi gün (MotivationPlan.nextAfterRun). */
+    fun ensure(context: Context, afterRun: Boolean = false) {
         val now = System.currentTimeMillis()
         val tz = TimeZone.getDefault()
-        val next = MotivationPlan.nextRun(now, tz)
+        val next = if (afterRun) MotivationPlan.nextAfterRun(now, tz) else MotivationPlan.nextRun(now, tz)
         enqueue(context, MotivationPlan.day(next, tz), next - now)
         val today = MotivationPlan.day(now, tz)
         if (MotivationPlan.inWindow(now, tz) && lastWritten(context) != today) enqueue(context, today, 0)
@@ -84,6 +86,11 @@ object MotivationWork {
 
 class MotivationWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
 
+    private companion object {
+        /** İz: yalnız sabit kısa nedenler; jeton, adres ve cümleler loglanmaz. */
+        const val LOG = "DexMotivation"
+    }
+
     private class Lines(val date: String, val morning: String, val noon: String, val evening: String)
 
     override fun doWork(): Result {
@@ -92,23 +99,27 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
         val tz = TimeZone.getDefault()
         // Önce ertesi günün işi: bu koşu nasıl biterse bitsin zincir kopmaz.
         try {
-            MotivationWork.ensure(ctx)
+            MotivationWork.ensure(ctx, afterRun = true)
         } catch (e: Exception) {
             // Uygulamanın bir sonraki açılışında yeniden kurulur.
         }
         val today = MotivationPlan.day(now, tz)
-        if (MotivationWork.lastWritten(ctx) == today) return Result.success()
+        if (!MotivationPlan.shouldFetch(MotivationWork.lastWritten(ctx), now, tz)) return Result.success()
         val misses = mutableListOf<MotivationPlan.Miss>()
         val hosts = try {
             HostTokensPlugin.hosts(ctx)
         } catch (e: Exception) {
+            Log.w(LOG, "host listesi okunamadı: ${e.javaClass.simpleName}")
             return Result.success() // Keystore/şifreli tercihler açılamadı; yarın yeniden.
         }
+        // Boş liste = adresler henüz yazılmadı (ilk açılış): retry; HostTokensPlugin.keepUrl da yeniden kurar.
         for ((url, token) in hosts) {
             val miss = fromHost(ctx, url, token, today) ?: return Result.success()
             misses += miss
         }
-        return if (MotivationPlan.retry(misses, MotivationPlan.pastWindow(now, tz))) Result.retry() else Result.success()
+        val retry = MotivationPlan.retry(misses, MotivationPlan.pastWindow(System.currentTimeMillis(), tz))
+        if (hosts.isEmpty()) Log.i(LOG, if (retry) "host adresi yok; tekrar denenecek" else "host adresi yok")
+        return if (retry) Result.retry() else Result.success()
     }
 
     /** null: kayıt bu host'tan geldi ve yazma denendi (sonuç ne olursa olsun bugünün işi biter). */
@@ -126,12 +137,14 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
                     rpc.call("motivation_result", result)
                 } catch (e: HostRpc.Failure) {
                     // Yazma sonucu değişmez; bildirilemedi.
+                    Log.w(LOG, "motivation_result bildirilemedi: ${e.message}")
                 }
                 return null
             }
         } catch (e: HostRpc.Unreachable) {
             return MotivationPlan.Miss.UNREACHABLE
         } catch (e: HostRpc.Refused) {
+            Log.w(LOG, "host reddetti: ${e.message}")
             return MotivationPlan.Miss.SKIP
         }
     }
@@ -176,7 +189,8 @@ class HostRpc private constructor(private val ws: WebSocket, private val inbox: 
     /** Ağ: bağlanamadı, koptu, zaman aşımı → tekrar denenir. */
     class Unreachable(why: String) : Failure(why)
 
-    /** Host reddetti (jeton tanınmıyor, metot yok, RPC hatası) → tekrar denenmez. */
+    /** Host reddetti (jeton tanınmıyor, metot yok, RPC hatası) → tekrar denenmez. Mesaj sabit ve kısa
+     *  (worker loglar): jeton/adres/içerik taşımaz. */
     class Refused(why: String) : Failure(why)
 
     private class Closed(val code: Int)
