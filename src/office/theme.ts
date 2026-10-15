@@ -3,7 +3,7 @@
 export interface OfficeTheme {
   text: string; text2: string; muted: string; faint: string;
   red: string; redHi: string; redGlow: string; green: string; amber: string;
-  /** The team accent: active strands, the Core's name and the focus ring. Red stays for status and errors. */
+  /** The team accent: Core's eye and name, the focus ring. Red stays for strands (#2036), status and errors. */
   team: string; teamHi: string; teamGlow: string;
   /** Plates under badges and marks. */
   surface: string;
