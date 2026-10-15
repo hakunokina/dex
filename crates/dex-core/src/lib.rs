@@ -933,6 +933,13 @@ impl Core {
             if emit { delegate::emit_changed(&self.events, Some(&d)); }
             return Ok(d);
         }
+        // #2044: the pool counts a reported job as a free worker; one still running to its Stop
+        // hands the job to an idle colleague of its role, if any.
+        let d = if d.target_role.is_some() && self.agent_states.get(&d.to_agent).in_turn() {
+            with(&self.db, |c| delegate::rebalance_role_job(c, d.id, &|a| self.agent_states.get(a).in_turn()))?.unwrap_or(d)
+        } else {
+            d
+        };
         // #161: draining — the job waits in the queue; the restarted core (or the drain's end)
         // delivers it. #427/#447: past the gate, this dispatch holds the restart until it ends.
         let Some(turn) = self.admit(&d.to_agent) else {
@@ -2511,6 +2518,37 @@ mod queue_tests {
         core.shutdown();
         drop(core);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2044: the pool took kaan (its job reported, the session still runs to Stop); dispatch
+    /// hands the job to the idle frontend worker instead of queueing it behind kaan's turn.
+    #[test]
+    fn pool_job_claimed_for_a_worker_mid_turn_goes_to_an_idle_colleague() {
+        let (core, root) = core("rebalance");
+        with(&core.db, |c| {
+            c.execute("INSERT INTO agents (id, team_id, name, kind, title, model, shirt, hair, skin, sort, role_slug)
+                       VALUES ('deniz', 'default', 'Deniz', 'worker', 'Geliştirici', 'sonnet', '#000', '#000', '#000', 9, 'frontend')", [])
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        set(&core, agents::Status::Working);
+        core.drain(true); // stop right after the choice: no session starts in a test
+        let d = with(&core.db, |c| {
+            let from = delegate::caller(c, "timur")?;
+            let tx = c.unchecked_transaction().map_err(|e| e.to_string())?;
+            let d = delegate::insert(&tx, delegate::NewDelegation {
+                from: &from, to_agent: "kaan".into(), team_id: "default".into(),
+                service_team_id: None, prompt: "havuz".into(), task_id: None, patron_words: None, effort: None,
+            })?;
+            delegate::queue_role(&tx, d.id, "frontend", None)?;
+            let d = delegate::assign_role_job(&tx, d.id)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(d)
+        })
+        .unwrap();
+        assert_eq!(d.to_agent, "kaan", "the DB sees kaan free: team order");
+        assert_eq!(core.delegation_dispatch(d).unwrap().to_agent, "deniz");
+        done(core, root);
     }
 
     #[test]

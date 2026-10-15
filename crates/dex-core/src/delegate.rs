@@ -308,6 +308,25 @@ pub(crate) fn queue_role(
     Ok(())
 }
 
+/// `role` workers with no open job (team order). The DB knows jobs, not sessions: a worker that
+/// reported is listed while its session still runs to Stop — [`rebalance_role_job`] covers that.
+fn free_role_workers(
+    conn: &Connection,
+    team: &str,
+    role: &str,
+    exclude: Option<&str>,
+    only_agent: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut st = conn.prepare(
+        "SELECT a.id FROM agents a WHERE a.team_id=?1 AND a.kind='worker' AND a.role_slug=?2
+           AND (?3 IS NULL OR a.id<>?3) AND (?4 IS NULL OR a.id=?4)
+           AND NOT EXISTS(SELECT 1 FROM delegations d WHERE d.to_agent=a.id AND d.status IN ('queued','running'))
+         ORDER BY a.sort,a.id",
+    ).map_err(e)?;
+    let rows = st.query_map(params![team, role, exclude, only_agent], |r| r.get(0)).map_err(e)?;
+    rows.collect::<Result<_, _>>().map_err(e)
+}
+
 fn claim_role_jobs(
     conn: &Connection,
     only_agent: Option<&str>,
@@ -340,12 +359,7 @@ fn claim_role_jobs(
             blocked.insert((team, role));
             continue;
         }
-        let worker: Option<String> = conn.query_row(
-            "SELECT a.id FROM agents a WHERE a.team_id=?1 AND a.kind='worker' AND a.role_slug=?2
-               AND (?3 IS NULL OR a.id<>?3) AND (?4 IS NULL OR a.id=?4)
-               AND NOT EXISTS(SELECT 1 FROM delegations d WHERE d.to_agent=a.id AND d.status IN ('queued','running'))
-             ORDER BY a.sort,a.id LIMIT 1", params![team,role,exclude,only_agent], |r| r.get(0)
-        ).optional().map_err(e)?;
+        let worker = free_role_workers(conn, &team, &role, exclude.as_deref(), only_agent)?.into_iter().next();
         let Some(worker) = worker else {
             blocked.insert((team, role));
             continue;
@@ -386,6 +400,43 @@ pub(crate) fn assign_role_jobs(conn: &Connection) -> Result<Vec<Delegation>, Str
 pub(crate) fn assign_role_job(conn: &Connection, id: i64) -> Result<Delegation, String> {
     claim_role_jobs(conn, None, Some(id))?;
     get(conn, id)
+}
+
+/// #2044: a pool job claimed for a worker whose session is mid-turn (`busy`: report → Stop, a
+/// conversation) moves to the first free worker of its role that is not. `None`: no such worker;
+/// the job stays and its worker's Stop delivers it.
+pub(crate) fn rebalance_role_job(
+    conn: &Connection,
+    id: i64,
+    busy: &dyn Fn(&str) -> bool,
+) -> Result<Option<Delegation>, String> {
+    let d = get(conn, id)?;
+    let (Some(role), "queued") = (d.target_role.as_deref(), d.status.as_str()) else { return Ok(None) };
+    if d.to_agent.is_empty() || !busy(&d.to_agent) {
+        return Ok(None);
+    }
+    let exclude: Option<String> = conn
+        .query_row("SELECT exclude_agent FROM delegation_role_queue WHERE delegation_id=?1", [id], |r| r.get(0))
+        .map_err(e)?;
+    let Some(worker) = free_role_workers(conn, &d.team_id, role, exclude.as_deref(), None)?
+        .into_iter()
+        .find(|w| *w != d.to_agent && !busy(w))
+    else {
+        return Ok(None);
+    };
+    let tx = conn.unchecked_transaction().map_err(e)?;
+    let moved = tx.execute(
+        "UPDATE delegations SET to_agent=?3,updated_at=?4 WHERE id=?1 AND to_agent=?2 AND status='queued'",
+        params![id, d.to_agent, worker, now()],
+    ).map_err(e)?;
+    if moved == 0 {
+        return Ok(None);
+    }
+    if let Some(task) = d.task_id {
+        tx.execute("UPDATE tasks SET agent_id=?2 WHERE id=?1", params![task, worker]).map_err(e)?;
+    }
+    tx.commit().map_err(e)?;
+    get(conn, id).map(Some)
 }
 
 /// Bound queue always precedes the pool, regardless of the pool row's age.
@@ -1698,6 +1749,49 @@ mod tests {
             role_target(&c, "default", "backend").unwrap(),
             ("backend".into(), "ayla".into())
         );
+    }
+
+    /// #2044: busy A + idle B → B; everyone busy → the job stays (A's Stop delivers it);
+    /// everyone with an open job → it waits in the pool.
+    #[test]
+    fn rebalance_moves_a_pool_job_off_a_worker_mid_turn() {
+        let c = mem();
+        c.execute(
+            "INSERT INTO agents (id, team_id, name, kind, title, model, shirt, hair, skin, sort, role_slug)
+             VALUES ('deniz', 'default', 'Deniz', 'worker', 'Geliştirici', 'sonnet', '#000', '#000', '#000', 9, 'backend')",
+            [],
+        )
+        .unwrap();
+        let lead = leader(&c);
+        let task = crate::db::tasks::create(&c, crate::db::tasks::NewTask {
+            title: "havuz".into(), description: String::new(), status: None, agent_id: None, team_id: Some("default".into()),
+        })
+        .unwrap();
+        let pooled = |prompt: &str| {
+            let tx = c.unchecked_transaction().unwrap();
+            let d = insert(&tx, NewDelegation {
+                from: &lead, to_agent: "ayla".into(), team_id: "default".into(), service_team_id: None,
+                prompt: prompt.into(), task_id: Some(task.id), patron_words: None, effort: None,
+            })
+            .unwrap();
+            queue_role(&tx, d.id, "backend", None).unwrap();
+            let d = assign_role_job(&tx, d.id).unwrap();
+            tx.commit().unwrap();
+            d
+        };
+        let one = pooled("bir");
+        assert_eq!(one.to_agent, "ayla", "the DB sees both free: team order");
+        assert!(rebalance_role_job(&c, one.id, &|_| false).unwrap().is_none(), "ayla idle: stays");
+        assert!(rebalance_role_job(&c, one.id, &|_| true).unwrap().is_none(), "all mid-turn: stays");
+        let moved = rebalance_role_job(&c, one.id, &|a| a == "ayla").unwrap().unwrap();
+        assert_eq!(moved.to_agent, "deniz");
+        assert_eq!(crate::db::tasks::get(&c, task.id).unwrap().agent_id.as_deref(), Some("deniz"));
+        let two = pooled("iki");
+        assert_eq!(two.to_agent, "ayla");
+        assert!(rebalance_role_job(&c, two.id, &|a| a == "ayla").unwrap().is_none(), "deniz has a job");
+        let three = pooled("üç");
+        assert!(three.to_agent.is_empty(), "both have a job: pool");
+        assert!(rebalance_role_job(&c, three.id, &|_| true).unwrap().is_none());
     }
 
     #[test]
