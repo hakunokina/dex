@@ -19,10 +19,10 @@ pub const DENY: &str = "Tüm e2e paketini koşma; ilgili spec'i ver ya da QA'ya 
 
 pub const DENY_LEADER: &str = "Dex politikası: lider tarayıcı/e2e testi koşamaz — tip kontrolü yeter; e2e QA'nın işi.";
 
-const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
+pub(crate) const DENY_GUT: &str = "Tüm GUT paketini koşma; ilgili test dosyasını ver ya da QA'ya bırak (Dex test bütçesi). \
     Örn. `godot --headless -s addons/gut/gut_cmdln.gd -gtest=res://tests/e2e/test_x.gd -gexit`.";
 
-const DENY_RUST: &str = "Tüm Rust paketini koşma; dokunduğun modülün filtresini ekle: \
+pub(crate) const DENY_RUST: &str = "Tüm Rust paketini koşma; dokunduğun modülün filtresini ekle: \
     `cargo test -p dex-core --lib <modül>`; tam paket QA'nın işi (Dex test bütçesi).";
 
 struct Enforcer {
@@ -571,9 +571,13 @@ mod tests {
         let budget_reason = |out: crate::permit::Verdict| match out {
             crate::permit::Verdict::Deny(why) if why.contains(DENY) => Some(DENY),
             crate::permit::Verdict::Deny(why) if why.contains(DENY_GUT) => Some(DENY_GUT),
+            crate::permit::Verdict::Deny(why) if why.contains(DENY_LEADER) => Some(DENY_LEADER),
             _ => None,
         };
         assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), reason, "permit: {tool}: {cmd}");
+        ctx.leader = true;
+        assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), leader, "leader permit: {tool}: {cmd}");
+        ctx.leader = false;
         ctx.qa = true;
         assert_eq!(budget_reason(crate::permit::decide(tool, &input, &ctx)), None, "QA permit: {tool}: {cmd}");
     }

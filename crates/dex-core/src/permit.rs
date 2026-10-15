@@ -973,12 +973,10 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
     }
-    // #1876: a leader runs no e2e test at all; the others not the whole suite (QA does).
-    let budget = if ctx.leader {
-        crate::test_budget::leader_e2e_denial(command, ctx.cwd.as_deref(), d)
-    } else {
-        crate::test_budget::full_suite_denial_in_shell(command, ctx.cwd.as_deref(), d).filter(|_| !ctx.qa)
-    };
+    // #1876: a leader runs no e2e test at all; nobody but QA the whole suite (test_budget::on_pre_tool).
+    let budget = crate::test_budget::leader_e2e_denial(command, ctx.cwd.as_deref(), d)
+        .filter(|_| ctx.leader)
+        .or_else(|| crate::test_budget::full_suite_denial_in_shell(command, ctx.cwd.as_deref(), d).filter(|_| !ctx.qa));
     if let Some(reason) = budget {
         verdicts.push(Verdict::Deny(reason.into()));
     }
@@ -3386,6 +3384,16 @@ mod tests {
         }
         for command in ["npx tsc --noEmit", "cargo test -p dex-core --lib x"] {
             assert_eq!(decide("Bash", &json!({ "command": command }), &c), Verdict::Allow, "{command}");
+        }
+        // #1879: the e2e rule adds to the leader's full-suite budget, it does not replace it.
+        for (command, reason) in [
+            ("cargo test", crate::test_budget::DENY_RUST),
+            ("godot -s addons/gut/gut_cmdln.gd -gdir=res://tests -ginclude_subdirs", crate::test_budget::DENY_GUT),
+        ] {
+            match decide("Bash", &json!({ "command": command }), &c) {
+                Verdict::Deny(why) => assert!(why.starts_with(reason), "{command}: {why}"),
+                v => panic!("{command}: {v:?}"),
+            }
         }
     }
 
