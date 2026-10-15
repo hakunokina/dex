@@ -1,5 +1,8 @@
 //! The patron's notes (DEX-41): one Markdown body per scope — `shared` (every team sees it) or a
-//! team id. Personal to the patron: never part of an agent's prompt or memory.
+//! team id. Never injected into an agent's prompt or memory. The shared note is the patron's
+//! alone; a team's note is also read and rewritten by that team's leader on demand
+//! (`team_note_get` / `team_note_set`, Plan #114) — never by a worker. The leader's prompt
+//! appends shown beside the team note live in `prompts.rs`, written by the patron only.
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;

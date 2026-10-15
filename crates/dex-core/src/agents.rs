@@ -587,7 +587,7 @@ fn agent_launch(conn: &Connection, data_dir: &std::path::Path, agent: &crate::te
     } else {
         crate::rules::system_prompt_for_context(conn, &agent.id, &ctx)
     };
-    Ok(crate::pty::AgentLaunch { job: b.delegation_id, memory, prompt })
+    Ok(crate::pty::AgentLaunch { job: b.delegation_id, memory, prompt, print: crate::prompts::fingerprint(conn, &agent.id) })
 }
 
 /// #838 G (#906): a job of the session's own project pasted into its live bound session becomes
@@ -4242,5 +4242,26 @@ mod launch_tests {
         let (r, _) = captured(|| e.core.agent_spawn("kaan", StartOptions { fresh: true, ..Default::default() }));
         r.unwrap();
         assert_eq!(launches().pop().unwrap().memory.write, [mem.join("shared"), mem.join("agents").join("kaan")]);
+    }
+
+    /// Plan #114: a leader's start carries its system append and the print of its patron inputs
+    /// (recorded once the session runs); a worker's carries neither.
+    #[test]
+    fn a_leader_start_carries_its_append_and_print() {
+        let e = env("leader-print", false);
+        e.core.leader_prompt_set("default", Some("Patron sistem eki"), Some("mesaj")).unwrap();
+        launches();
+        let (r, _) = captured(|| e.core.agent_spawn("timur", StartOptions { fresh: true, ..Default::default() }));
+        r.unwrap();
+        let leader = launches().pop().unwrap();
+        assert!(leader.prompt.ends_with(&format!("{}\nPatron sistem eki", crate::prompts::SYSTEM_HEAD)), "{}", leader.prompt);
+        assert_eq!(leader.print, crate::db::with(&e.core.db, |c| Ok(crate::prompts::fingerprint(c, "timur"))).unwrap());
+        assert!(leader.print.is_some());
+        stop(&e.core, "timur");
+        let (r, _) = captured(|| e.core.agent_spawn("kaan", StartOptions { fresh: true, ..Default::default() }));
+        r.unwrap();
+        let worker = launches().pop().unwrap();
+        assert!(worker.print.is_none() && !worker.prompt.contains("Patron sistem eki"));
+        stop(&e.core, "kaan");
     }
 }

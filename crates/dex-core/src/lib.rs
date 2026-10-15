@@ -37,6 +37,7 @@ pub mod desktop_storage;
 pub mod permit;
 pub mod plan;
 pub mod proc;
+pub mod prompts;
 pub mod proposals;
 pub mod push;
 pub mod projects;
@@ -487,6 +488,8 @@ impl Core {
             // DEX-22: plan / member-proposal notes for the leader ride along.
             plan::with_notes_pending(&self.db, agent, event, out, pending.as_ref())
         });
+        // Plan #114: the patron's per-message append rides the leader's own prompts.
+        let out = if event == "UserPromptSubmit" { prompts::with_message_append(&self.db, agent, body, out) } else { out };
         if event == "PreToolUse" { diagnostics::permit_hook_reply(agent, body, out.as_deref()); }
         if let Some(pending) = pending.filter(|_| is_blocked(&out)) {
             if let (Some(stop), Some(reply)) = (stop, out.as_deref().and_then(|o| serde_json::from_str::<Value>(o).ok())) {
@@ -1362,6 +1365,54 @@ impl Core {
         let n = with(&self.db, |c| notes::set(c, scope, body))?;
         let _ = self.events.emit("notes-changed", &n);
         Ok(n)
+    }
+
+    // ---- leader prompts (Plan #114; `leader-prompt-changed` carries a team's view) ----
+
+    pub fn leader_prompt_get(&self, team: &str) -> Result<prompts::LeaderPrompt, String> {
+        with(&self.db, |c| prompts::get(c, team))
+    }
+
+    /// The patron's appends; `None` keeps a field.
+    pub fn leader_prompt_set(&self, team: &str, system: Option<&str>, message: Option<&str>) -> Result<prompts::LeaderPrompt, String> {
+        let p = with(&self.db, |c| prompts::set(c, team, system, message))?;
+        let _ = self.events.emit("leader-prompt-changed", &p);
+        Ok(p)
+    }
+
+    pub fn prompt_parts(&self) -> Result<prompts::Parts, String> {
+        with(&self.db, prompts::parts)
+    }
+
+    pub fn prompt_part_set(&self, id: &str, text: &str) -> Result<prompts::PromptPart, String> {
+        let p = with(&self.db, |c| prompts::part_set(c, id, text))?;
+        self.prompt_part_changed(&p);
+        Ok(p)
+    }
+
+    pub fn prompt_part_reset(&self, id: &str) -> Result<prompts::PromptPart, String> {
+        let p = with(&self.db, |c| prompts::part_reset(c, id))?;
+        self.prompt_part_changed(&p);
+        Ok(p)
+    }
+
+    /// `prompt-parts-changed`, then every leader's view: an override may reach it.
+    fn prompt_part_changed(&self, p: &prompts::PromptPart) {
+        let _ = self.events.emit("prompt-parts-changed", p);
+        let views = with(&self.db, |c| prompts::leader_teams(c)?.iter().map(|t| prompts::get(c, t)).collect::<Result<Vec<_>, _>>());
+        for v in views.unwrap_or_default() {
+            let _ = self.events.emit("leader-prompt-changed", &v);
+        }
+    }
+
+    /// A leader session started with the system prompt built from `print`.
+    pub(crate) fn leader_prompt_applied(&self, agent: &str, print: &str) {
+        match with(&self.db, |c| prompts::get(c, &prompts::record_applied(c, agent, print)?)) {
+            Ok(v) => {
+                let _ = self.events.emit("leader-prompt-changed", &v);
+            }
+            Err(err) => log::warn!("leader prompt applied: {err}"),
+        }
     }
 
     // ---- PTYs ----

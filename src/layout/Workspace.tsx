@@ -26,6 +26,8 @@ import { AgentMarks, useAgentStatus } from "./Rack";
 import { Heartbeat } from "./AgentHeartbeat";
 import { SlotPanel } from "./host";
 import { PanelBoundary } from "./PanelBoundary";
+import { useLeaderPrompt, useNoteBody } from "./noteMarks";
+import { noteFilled } from "./notePrompts";
 import { OfficeBar } from "../office/OfficeBar";
 import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
 import {
@@ -39,6 +41,7 @@ const BoardView = lazy(() => import("../board/Board").then(m => ({ default: m.Bo
 const SettingsView = lazy(() => import("../settings/Settings").then(m => ({ default: m.SettingsView })));
 const TeamPanel = lazy(() => import("../team/TeamBar").then(m => ({ default: m.TeamPanel })));
 const NotesEditor = lazy(() => import("./Notes").then(m => ({ default: m.NotesEditor })));
+const TeamNotes = lazy(() => import("./TeamNotes").then(m => ({ default: m.TeamNotes })));
 const Procs = lazy(() => import("../procs/Procs").then(m => ({ default: m.Procs })));
 const MemoryView = lazy(() => import("../memory/MemoryMap").then(m => ({ default: m.MemoryMap })));
 
@@ -96,9 +99,9 @@ function ShellPanel({ api, params }: IDockviewPanelProps<{ shellId: string }>) {
 
 function NotesPanel({ params }: IDockviewPanelProps<{ page: NotesPage }>) {
   const { teamId } = useContext(WorkspaceCtx);
-  const team = params.page === "team";
-  return lazyPanel(<NotesEditor scope={team ? teamId : "shared"}
-    placeholder={team ? `${getTeam(teamId)?.name ?? "Bu takım"} notları — yalnız sen görürsün` : "Ortak notlar — tüm takımlarda aynı, yalnız sen görürsün"} />);
+  return lazyPanel(params.page === "team"
+    ? <TeamNotes teamId={teamId} placeholder={`${getTeam(teamId)?.name ?? "Bu takım"} notları — yalnız sen görürsün`} />
+    : <NotesEditor scope="shared" placeholder="Ortak notlar — tüm takımlarda aynı, yalnız sen görürsün" />);
 }
 
 /** S4: limits and first-reply thresholds are the team's host's (a remote team → its server). */
@@ -226,13 +229,19 @@ function TabClose({ api, title }: { api: IDockviewPanelHeaderProps["api"]; title
     onClick={e => { e.stopPropagation(); api.close(); }}><X /></button>;
 }
 
-/** #46: a free panel like the others; closed, the palette's "Notları aç" brings it back. */
+/** #46: a free panel like the others; closed, the palette's "Notları aç" brings it back.
+ *  #2040: the name is red while the page holds something (the team page: its appends too). */
 function NotesTab({ api }: IDockviewPanelHeaderProps) {
-  const Icon = api.id === NOTES.shared.id ? NotebookPen : StickyNote;
+  const { teamId } = useContext(WorkspaceCtx);
+  const shared = api.id === NOTES.shared.id;
+  const Icon = shared ? NotebookPen : StickyNote;
+  const body = useNoteBody(shared ? "shared" : teamId);
+  const lp = useLeaderPrompt(teamId);
+  const filled = noteFilled(body, shared ? null : lp);
   return (
-    <div className="dex-tab" title={`Notlar · ${api.title}`}>
+    <div className="dex-tab" title={`Notlar · ${api.title}${filled ? " · dolu" : " · boş"}`}>
       <Icon className="dex-tab-icon" />
-      <span className="dex-tab-name">{api.title}</span>
+      <span className={`dex-tab-name notes-tab-name${filled ? " filled" : ""}`}>{api.title}</span>
       <TabClose api={api} title={`${api.title} sekmesini kapat`} />
     </div>
   );
