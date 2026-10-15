@@ -464,6 +464,10 @@ const MIGRATIONS: &[&str] = &[
     // 42 (Plan #114): the leader's appends, prompt-part overrides, the applied print. Additive,
     // IF NOT EXISTS. Before commit: ROLLBACK. After commit: keep the tables; revert the application.
     crate::prompts::SCHEMA,
+    // 43 (#2048): a leader's cancel/reassign of a job not started yet, waiting for the patron.
+    // Additive, IF NOT EXISTS. Before commit: ROLLBACK. After commit: keep the table; revert only
+    // the application (reject the pending cards, see job_change::SCHEMA).
+    crate::job_change::SCHEMA,
 ];
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.

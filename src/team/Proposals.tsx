@@ -25,6 +25,16 @@ export interface Proposal {
   status: "pending" | "approved" | "rejected";
   agentId: string | null;
   createdAt: number;
+  /** #2048: a leader's cancel/reassign of a job not started yet (the reason carries the details). */
+  change?: "cancel" | "reassign" | null;
+}
+
+/** What a card asks the patron: its title, the leader's ask (null: the member/model line), the notification. */
+export function proposalKind(p: Pick<Proposal, "delegationId" | "change">) {
+  if (p.change === "cancel") return { title: "İş iptali", ask: "başlamamış bir işi iptal etmek istiyor", notify: "iş iptali onayı istiyor" };
+  if (p.change === "reassign") return { title: "İş aktarma", ask: "başlamamış bir işi başka worker'a aktarmak istiyor", notify: "iş aktarma onayı istiyor" };
+  if (p.delegationId) return { title: `İş #${p.delegationId} model onayı`, ask: null, notify: "iş modeli onayı istiyor" };
+  return { title: "Üye önerisi", ask: null, notify: "yeni üye öneriyor" };
 }
 
 async function listProposals(host: string): Promise<Proposal[]> {
@@ -50,7 +60,7 @@ async function notifyNew(rows: Proposal[]) {
   if (!ok) ok = (await requestPermission()) === "granted";
   if (!ok) return;
   for (const p of fresh) {
-    sendNotification({ title: `${p.leaderName} ${p.delegationId ? "iş modeli onayı istiyor" : "yeni üye öneriyor"}`, body: `${p.roleName} · ${p.teamName}\n${p.reason.slice(0, 160)}` });
+    sendNotification({ title: `${p.leaderName} ${proposalKind(p).notify}`, body: `${p.change ? "" : `${p.roleName} · `}${p.teamName}\n${p.reason.slice(0, 160)}` });
   }
 }
 
@@ -124,24 +134,32 @@ export function Card({ p, onError }: { p: Proposal; onError?: (e: string) => voi
       onError?.(String(e));
     }
   };
+  const kind = proposalKind(p);
+  const member = !p.delegationId && !p.change;
   return (
-    <div className="proposal" role="alertdialog" aria-label={`${p.leaderName} ${p.delegationId ? "iş modeli onayı istiyor" : "üye öneriyor"}`}>
+    <div className="proposal" role="alertdialog" aria-label={`${p.leaderName} ${member ? "üye öneriyor" : kind.notify}`}>
       <h4>
-        {p.delegationId ? `İş #${p.delegationId} model onayı` : "Üye önerisi"} <span className="proposal-team">{p.teamName}</span>
+        {kind.title} <span className="proposal-team">{p.teamName}</span>
       </h4>
-      <p className="proposal-who">
-        <b>{p.leaderName}</b> {p.delegationId ? <><b>{p.name}</b> ({p.roleName}) için model istiyor</> : <>takıma bir <b>{p.roleName}</b> istiyor</>}
-        <span className="proposal-model">{p.delegationId || p.provider === "anthropic" ? p.model : `${p.provider}/${p.model}`}</span>
-      </p>
+      {kind.ask ? (
+        <p className="proposal-who">
+          <b>{p.leaderName}</b> {kind.ask}
+        </p>
+      ) : (
+        <p className="proposal-who">
+          <b>{p.leaderName}</b> {p.delegationId ? <><b>{p.name}</b> ({p.roleName}) için model istiyor</> : <>takıma bir <b>{p.roleName}</b> istiyor</>}
+          <span className="proposal-model">{p.delegationId || p.provider === "anthropic" ? p.model : `${p.provider}/${p.model}`}</span>
+        </p>
+      )}
       <p className="proposal-reason">{p.reason}</p>
-      {!p.delegationId && <label>
+      {member && <label>
         Ad
         <input value={name} placeholder="boş → otomatik" onChange={(e) => setName(e.target.value)} aria-label="Yeni üyenin adı" />
       </label>}
       {error && <p className="team-err">{error}</p>}
       <div className="proposal-actions">
         <button disabled={busy} data-key="r" aria-keyshortcuts="R" onClick={() => void answer(false)}>Reddet</button>
-        <button className="primary" disabled={busy} data-key="e" aria-keyshortcuts="E" onClick={() => void answer(true)}>{p.delegationId ? "Onayla" : "Ekle"}</button>
+        <button className="primary" disabled={busy} data-key="e" aria-keyshortcuts="E" onClick={() => void answer(true)}>{member ? "Ekle" : "Onayla"}</button>
       </div>
     </div>
   );

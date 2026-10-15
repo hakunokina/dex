@@ -12,6 +12,7 @@ pub mod dexmsg;
 pub mod diagnostics;
 pub mod effort;
 pub mod job_model;
+pub mod job_change;
 pub mod delegate;
 pub mod events;
 pub mod first_reply;
@@ -100,6 +101,8 @@ pub struct Core {
     /// FIX-4: agents started with `--resume`, until a hook proves the session opened.
     resume_watch: Mutex<std::collections::HashMap<String, agents::ResumeWatch>>,
     agent_start_gate: Mutex<()>,
+    /// #2048: jobs a dispatch is starting now; a patron-approved job change leaves them alone.
+    starting: job_change::Starting,
     /// Serializes turn admission with automatic leader/report close; never held by a live Turn.
     admission_gate: Mutex<HashMap<String, restart::Admission>>,
     /// DEX-17: zincir geçişi sürerken kuyruk sevkiyatı durur (öldürülen PTY'nin `pty_exited`'i
@@ -227,6 +230,7 @@ impl Core {
             first_reply: first_reply::Watch::default(),
             resume_watch: Mutex::default(),
             agent_start_gate: Mutex::new(()),
+            starting: job_change::Starting::default(),
             admission_gate: Mutex::default(),
             chain_guard: Mutex::default(),
             chain_resets: Mutex::default(),
@@ -1002,6 +1006,10 @@ impl Core {
                 Ok(d)
             }
             agents::Delivery::Start => {
+                // #2048: from here the job is starting; a job change approved meanwhile waits it out.
+                let Some(_starting) = self.starting.begin(&self.db, &d)? else {
+                    return with(&self.db, |c| delegate::get(c, d.id));
+                };
                 // Görev #20: a worker's job starts in a fresh session (no --resume).
                 let options = if worker {
                     // Görev #144: the job's own worktree. #838 G: none (none planned, or it failed) —
@@ -1068,6 +1076,9 @@ impl Core {
                 Ok(d)
             }
             agents::Delivery::Paste => {
+                let Some(_starting) = self.starting.begin(&self.db, &d)? else {
+                    return with(&self.db, |c| delegate::get(c, d.id));
+                };
                 // #1779: patron oturumuna yapışan iş de kendi dalına bağlanır — yoksa kayıt
                 // "kendi worktree'sinde çalışmadı" sayılır, inceleme/birleştirme açılmaz.
                 // Oturum korunur (öldürülmez); canlı PTY'nin cwd'si değişmez, worker
@@ -2712,6 +2723,93 @@ mod queue_tests {
         let running = format!("#{} kaan üzerinde koşuyor", d.id);
         assert!(core.drain_blockers().unwrap().contains(&running) && !core.drain_blockers().unwrap().contains(&paused));
         assert!(core.quiet_blockers().unwrap().contains(&running));
+        done(core, root);
+    }
+
+    /// #2048: the leader's change is a patron card only; approved, a queued job moves to its new
+    /// worker and is delivered there. Worker sessions neither see nor call the tools.
+    #[test]
+    fn approved_reassign_delivers_the_job_to_its_new_worker() {
+        let (core, root) = core("jobchange");
+        set(&core, agents::Status::Idle);
+        let names = |agent: &str| crate::mcp::tools_list_for_test(&core, agent).iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+        assert!(names("timur").contains(&"delegation_reassign".to_string()) && names("timur").contains(&"delegation_cancel".to_string()));
+        assert!(!names("ayla").iter().any(|n| job_change::TOOLS.contains(&n.as_str())), "hidden from workers");
+        let d = with(&core.db, |c| {
+            let from = delegate::caller(c, "timur")?;
+            delegate::insert(c, delegate::NewDelegation {
+                from: &from, to_agent: "ayla".into(), team_id: "default".into(),
+                service_team_id: None, prompt: "echo aktarıldı".into(), task_id: None, patron_words: None, effort: None,
+            })
+        })
+        .unwrap();
+        let args = serde_json::json!({ "delegationId": d.id, "agentId": "kaan", "reason": "ayla meşgul" });
+        let refused = crate::mcp::call_with_args_for_test(&core, "ayla", "delegation_reassign", args.clone());
+        assert_eq!(refused["isError"], true, "{refused}");
+        let asked = crate::mcp::call_with_args_for_test(&core, "timur", "delegation_reassign", args);
+        assert_eq!(asked["structuredContent"]["status"], "pending", "{asked}");
+        assert_eq!(with(&core.db, |c| delegate::get(c, d.id)).unwrap().to_agent, "ayla", "not before the patron");
+        let card = core.proposal_list().unwrap().into_iter().find(|p| p.change.as_deref() == Some("reassign")).unwrap();
+        assert_eq!(core.proposal_decide(card.id, true, None).unwrap().status, "approved");
+        let after = with(&core.db, |c| delegate::get(c, d.id)).unwrap();
+        assert_eq!(after.to_agent, "kaan");
+        assert_eq!(status_within(&core, d.id, Duration::from_secs(8)), "running", "delivered to the new worker");
+        done(core, root);
+    }
+
+    /// #2048 race, approval first: a dispatch past its checks finds the job cancelled and does not
+    /// start it.
+    #[test]
+    fn cancel_approved_before_the_start_keeps_the_job_from_starting() {
+        let (core, root) = core("jobcancel");
+        set(&core, agents::Status::Idle);
+        let (reached, at_pause) = std::sync::mpsc::channel();
+        let (go, resume) = std::sync::mpsc::channel::<()>();
+        *core.dispatch_pause.lock().unwrap() = Some(Box::new(move || {
+            reached.send(()).unwrap();
+            resume.recv().unwrap();
+        }));
+        let c = core.clone();
+        let job = std::thread::spawn(move || delegate(&c, "echo iptal"));
+        at_pause.recv_timeout(Duration::from_secs(5)).unwrap();
+        let id = with(&core.db, |c| c.query_row("SELECT MAX(id) FROM delegations", [], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())).unwrap();
+        let card = with(&core.db, |c| {
+            job_change::request(c, &delegate::caller(c, "timur")?, "cancel", &serde_json::json!({ "delegationId": id, "reason": "r" }))
+        })
+        .unwrap();
+        core.proposal_decide(card.id, true, None).unwrap();
+        go.send(()).unwrap();
+        assert_eq!(job.join().unwrap().status, "failed");
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(with(&core.db, |c| delegate::get(c, id)).unwrap().status, "failed", "never started");
+        done(core, root);
+    }
+
+    /// #2048 race, start first: an approval that comes while the job is being started is not
+    /// applied; the job runs and the leader hears why.
+    #[test]
+    fn cancel_approved_during_the_start_is_not_applied() {
+        let (core, root) = core("jobstarting");
+        set(&core, agents::Status::Idle);
+        let (reached, at_pause) = std::sync::mpsc::channel();
+        let (go, resume) = std::sync::mpsc::channel::<()>();
+        *core.paste_pause.lock().unwrap() = Some(Box::new(move || {
+            reached.send(()).unwrap();
+            resume.recv().unwrap();
+        }));
+        let c = core.clone();
+        let job = std::thread::spawn(move || delegate(&c, "echo sürüyor"));
+        at_pause.recv_timeout(Duration::from_secs(5)).unwrap();
+        let id = with(&core.db, |c| c.query_row("SELECT MAX(id) FROM delegations", [], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())).unwrap();
+        let card = with(&core.db, |c| {
+            job_change::request(c, &delegate::caller(c, "timur")?, "cancel", &serde_json::json!({ "delegationId": id, "reason": "r" }))
+        })
+        .unwrap();
+        core.proposal_decide(card.id, true, None).unwrap();
+        let note = with(&core.db, |c| plan::take_notes(c, "timur")).unwrap().unwrap_or_default();
+        assert!(note.contains("UYGULANMADI") && note.contains("başlatılıyor"), "{note}");
+        go.send(()).unwrap();
+        assert_eq!(job.join().unwrap().status, "running");
         done(core, root);
     }
 
