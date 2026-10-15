@@ -797,6 +797,11 @@ impl Core {
         let (d, w, is_review) = with(&self.db, |c| Ok((delegate::get(c, id)?, worktree::get(c, id)?, review::is_review(c, id)?)))?;
         let Some(w) = w.filter(|w| w.merged_at.is_none() && !is_review) else { return Ok(None) };
         let Some((sha, team)) = worktree::tip(&w) else { return Ok(None) };
+        // #1980: no change of its own (only other branches merged in) → nothing to review here;
+        // the merged-in work is reviewed on its own branch.
+        if matches!(worktree::own_changes(&w), worktree::OwnChanges::None { .. }) {
+            return Ok(None);
+        }
         let opened = with(&self.db, |c| review::open(c, &d, &w, &sha, &team))?;
         if let review::Opened::Started(r) = &opened {
             let _ = self.events.emit("tasks-changed", &());
