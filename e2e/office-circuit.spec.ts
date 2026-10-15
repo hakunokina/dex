@@ -87,7 +87,7 @@ test("Simbiyot: dar Kart klavye ile worker açar; Core çizim bütçesi", async 
     let jobs: { id: number; fromAgent: string; toAgent: string; status: string }[] = [];
     const data = {
       status: () => "idle", delegations: () => jobs, active: j => j.status === "running",
-      result: () => null, question: () => null, stalled: () => null, slow: () => false,
+      result: () => null, question: () => null, stalled: () => null, progress: () => null, slow: () => false,
       start: () => false, cost: () => "", proposals: () => [], escalated: () => 0,
       workerAsks: () => 0, steps: () => [], agentError: () => null,
     };

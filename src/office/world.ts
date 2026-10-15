@@ -12,7 +12,7 @@ import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, t
 import { drawCoreName, ellipsis, measureCoreName, roundRect } from "./coreName";
 import {
   LASER, LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, laserAngle, lasing, lifeOf, linear, markAlpha, markAt,
-  pathLength, pointAt, routeToBody, sacLook, scale, smoothRoute, spotOf, strandTone, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot,
+  pathLength, pointAt, progressRect, routeToBody, sacLook, scale, smoothRoute, spotOf, strandTone, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot,
   type Tone,
 } from "./symbioteCard";
 import type { BodyDraw, Flow, Laser, LitScene, PointLight, Shadow } from "./litLayer";
@@ -29,6 +29,8 @@ export interface WorldData {
   result: (agentId: string) => Delegation | null;
   question: (agentId: string) => Question | null;
   stalled: (id: string) => number | null;
+  /** #2055: the worker's running job progress (0–1, from its own task list), or null. */
+  progress: (id: string) => number | null;
   /** FIX-4: the first reply is late (FIX-3 watchdog). */
   slow: (id: string) => boolean;
   start: (id: string) => boolean;
@@ -618,6 +620,15 @@ export class World {
         const cw = Math.min(maxW, ctx.measureText(cost).width + 10);
         if (right) drawTokenPill(ctx, cost, spot.textR - cw, spot.textR, block.costY, p);
         else drawTokenPill(ctx, cost, spot.textL, spot.textL + cw, block.costY, p);
+      }
+      const progress = leader ? null : this.data.progress(chip.agent.id);
+      if (progress !== null) {
+        ctx.shadowBlur = 0;
+        const r = progressRect(spot, block);
+        roundRect(ctx, r.x, r.y, r.w, r.h, r.h / 2);
+        ctx.fillStyle = p.edge; ctx.fill();
+        roundRect(ctx, r.x, r.y, r.w * Math.max(0, Math.min(1, progress)), r.h, r.h / 2);
+        ctx.fillStyle = p.green; ctx.fill();
       }
       ctx.restore();
     }

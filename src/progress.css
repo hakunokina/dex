@@ -1,0 +1,16 @@
+/* #2055: a running job's progress (the worker's own task list). */
+.progress-bar {
+  position: relative; display: inline-block; flex: none; width: 48px; height: 4px;
+  border-radius: 2px; background: var(--line); overflow: hidden; vertical-align: middle;
+}
+.progress-bar > i { position: absolute; inset: 0 auto 0 0; background: var(--green); border-radius: 2px; }
+.progress-row { display: flex; align-items: center; gap: var(--sp-1); margin-top: 3px; min-width: 0; }
+.progress-text {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-2); font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
+}
+.progress-chip {
+  display: inline-flex; align-items: center; gap: 3px; color: var(--text-2);
+  font: var(--fw-semibold) var(--fs-xs) var(--font-mono); font-variant-numeric: tabular-nums;
+}
+.progress-chip .progress-bar { width: 22px; height: 3px; }

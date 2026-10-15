@@ -28,6 +28,12 @@ pub fn delegation_seen(core: State<CoreState>, agent_id: String) -> Result<(), S
     core.delegation_seen(&agent_id)
 }
 
+/// #2055: workers' task-list progress (`delegation-progress` carries the changes).
+#[tauri::command]
+pub fn delegation_progress(core: State<CoreState>) -> Vec<dex_core::progress::Progress> {
+    core.delegation_progress()
+}
+
 /// DEX-24: worker questions (open, escalated, recently answered).
 #[tauri::command]
 pub fn question_list(core: State<CoreState>) -> Result<Vec<Question>, String> {

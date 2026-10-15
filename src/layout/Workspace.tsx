@@ -17,6 +17,8 @@ import { hostOf } from "../api/hosts";
 import { requestStart } from "../launcher";
 import { killPty } from "../pty";
 import { activeCount, markSeen, useDelegations } from "../delegations";
+import { useProgress, workerProgress } from "../progress";
+import { ProgressChip } from "../ProgressView";
 import { getTeam, useTeams } from "../team/store";
 import { token } from "../theme";
 import { STATUS_LABEL } from "../TerminalPane";
@@ -159,12 +161,15 @@ function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }
   const questions = useQuestions();
   const delegated = agent?.kind === "leader" ? activeCount(delegations, agent.id, "from") : 0;
   const pending = agent?.kind === "leader" ? leaderPending(questions, agent.id) : 0;
+  useProgress();
+  const progress = agent?.kind === "worker" ? workerProgress(agentId, delegations) : null;
   const control = (e: SyntheticEvent) => e.stopPropagation();
   return (
     <div className="dex-tab" title={`${name} · ${agent?.kind === "leader" && status === "waiting" ? "terminalde izin/girdi bekliyor" : STATUS_LABEL[status]}`}>
       <Heartbeat id={agentId} status={status} />
       <span className="dex-tab-name">{name}</span>
       <AgentMarks id={agentId} />
+      {progress && <ProgressChip p={progress} />}
       {delegated > 0 && <span className="pane-deleg" title="Aktif devretmeler">⇢ {delegated}</span>}
       {pending > 0 && <span className="pane-ask" title="Worker soruları cevap bekliyor">? {pending}</span>}
       {status === "offline" ? (

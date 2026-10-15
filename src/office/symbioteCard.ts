@@ -224,6 +224,13 @@ export function labelRect(spot: Spot, block: ReturnType<typeof textBlock>): Rect
   return { x: spot.textL, y: block.top - 10, w: Math.max(0, spot.textR - spot.textL), h: (block.rows === 3 ? 41 : block.rows === 2 ? 26 : 14) + 10 };
 }
 
+/** #2055: a worker's job progress bar just under the label's last row (the rows keep their places). */
+export function progressRect(spot: Spot, block: ReturnType<typeof textBlock>): Rect {
+  const label = labelRect(spot, block);
+  const w = Math.min(44, label.w);
+  return { x: spot.align === "right" ? spot.textR - w : spot.textL, y: label.y + label.h + 2, w, h: 2.5 };
+}
+
 /** #2020 (patron): Echo beside its Core's name — `gap` from the name block, body ≤ `maxD`, `lift` above its middle. */
 export const ECHO_BESIDE = { gap: 8, maxD: 34, lift: 3, labelW: 120 };
 

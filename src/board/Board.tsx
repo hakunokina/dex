@@ -5,6 +5,9 @@ import { getActiveTeamId, useTeams } from "../team/store";
 import { isAssignable } from "../team/rolePolicy";
 import { hostOf } from "../api/hosts";
 import { useDelegations } from "../delegations";
+import { progressOf, useProgress } from "../progress";
+import { ProgressRow } from "../ProgressView";
+import type { Progress } from "../progressModel";
 import { useTeamCost } from "../usage/costStore";
 import { costBreakdown, costText, sumDelegations } from "../usage/costFormat";
 import type { UsageTotal } from "../usage/costTypes";
@@ -71,6 +74,12 @@ export function BoardView({ tools }: { tools?: ReactNode }) {
   useTeamProjects(teamId); // the cards' project chips follow the team's project list
   const cost = useTeamCost(teamId || null);
   const delegations = useDelegations();
+  useProgress();
+  // #2055: kartın işi çalışıyorsa worker'ın görev listesinden ilerlemesi.
+  const progressFor = (live: LiveState): Progress | null => {
+    const d = live.delegationId == null ? undefined : delegations.find((x) => x.host === host && x.id === live.delegationId);
+    return d ? progressOf(d) : null;
+  };
   // Ajan çalıştı/durdu/soru sordu → rozetler tazelenir.
   const [, setStatusTick] = useState(0);
   useEffect(() => subscribeAgentStatus(() => setStatusTick((t) => t + 1)), []);
@@ -206,6 +215,7 @@ export function BoardView({ tools }: { tools?: ReactNode }) {
                       key={t.id}
                       task={t}
                       live={live}
+                      progress={progressFor(live)}
                       cost={taskCost(t)}
                       role={taskRoleName(t, hostOf(teamId), delegations, roles)}
                       editing={editing === t.id}
@@ -266,6 +276,7 @@ function SkeletonCards() {
 interface CardProps extends Pick<React.HTMLAttributes<HTMLDivElement>, "onPointerDown" | "onPointerMove" | "onPointerUp" | "onPointerCancel"> {
   task: Task;
   live: LiveState;
+  progress: Progress | null;
   role: string | null;
   cost: { total: UsageTotal; warnings: string[] } | null;
   editing: boolean;
@@ -274,7 +285,7 @@ interface CardProps extends Pick<React.HTMLAttributes<HTMLDivElement>, "onPointe
   onDelete: () => void;
 }
 
-function Card({ task, live, role, cost, editing, dragging, onPatch, onDelete, ...pointer }: CardProps) {
+function Card({ task, live, progress, role, cost, editing, dragging, onPatch, onDelete, ...pointer }: CardProps) {
   const members = useTeams().agents;
   const assignable = AGENTS.filter(a => {
     const member = members.find(m => m.id === a.id);
@@ -322,6 +333,7 @@ function Card({ task, live, role, cost, editing, dragging, onPatch, onDelete, ..
         />
       )}
       {!editing && preview && <div className="board-card-desc-view">{preview}</div>}
+      {progress && <ProgressRow p={progress} />}
       <div className="board-card-foot">
         <select
           className="board-agent"

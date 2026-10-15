@@ -4,7 +4,7 @@ import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
   beatAt, chaikin, clockAt, coreVeins, dropAt, ECHO_BESIDE, echoBeside, echoDrift, echoLight, facingOf, footprint, glScale, GL_MAX_PIXELS, GL_MAX_SCALE,
-  keyAzimuth, labelRect, LASER, laserAngle, lasing, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook,
+  keyAzimuth, labelRect, LASER, progressRect, laserAngle, lasing, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook,
   smoothRoute, spotOf, strandTone, textBlock, workerLight,
 } from "./symbioteCard.ts";
 
@@ -211,6 +211,17 @@ describe("gövde ve etiket", () => {
     const block = textBlock(s, 48, true);
     const r = labelRect(s, block);
     assert.ok(r.y <= block.top - 10 + 1e-9 && r.w === s.textR - s.textL && r.y + r.h >= block.costY + 6.5);
+  });
+  it("#2055 ilerleme çubuğu etiketin son satırının altında, etiket tarafına yaslı", () => {
+    for (const facing of [1, -1] as const) {
+      const s = spotOf(slot, facing, false);
+      for (const block of [textBlock(s, 20, false), textBlock(s, 48, true)]) {
+        const label = labelRect(s, block);
+        const bar = progressRect(s, block);
+        assert.ok(bar.y >= label.y + label.h && bar.w <= 44 && bar.w <= label.w);
+        if (facing === 1) near(bar.x + bar.w, s.textR); else near(bar.x, s.textL);
+      }
+    }
   });
   it("#2020 Echo: gövde Core ad bloğunun hemen solunda, bloğun ortasının biraz üstünde; etiket gövdenin altında ortalı", () => {
     const core = { x: 300, nameY: 200, roleY: 215 };

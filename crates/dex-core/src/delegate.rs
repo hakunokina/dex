@@ -611,6 +611,13 @@ pub fn running_effort(conn: &Connection, agent: &str) -> Result<Option<crate::ef
     .map_err(e)
 }
 
+/// #2055: the worker's running job, if any.
+pub fn running_id(conn: &Connection, agent: &str) -> Result<Option<i64>, String> {
+    conn.query_row("SELECT id FROM delegations WHERE to_agent = ?1 AND status = 'running' ORDER BY id DESC LIMIT 1", [agent], |r| r.get(0))
+        .optional()
+        .map_err(e)
+}
+
 /// #671: the job went into the patron's own session (no respawn, no `/effort`).
 pub fn effort_skipped(conn: &Connection, id: i64) -> Result<(), String> {
     conn.execute("UPDATE delegations SET effort_skipped = 1 WHERE id = ?1 AND effort IS NOT NULL", [id])
@@ -1723,8 +1730,19 @@ fn tell_leader(conn: &Connection, agent: &str, text: impl FnOnce(&str, i64) -> S
 }
 
 impl crate::Core {
+    /// #2055: one note per silence — every client runs its own watchdog; only a hook in between
+    /// (the worker moved) lets the next one through.
     pub fn delegation_stalled(&self, agent_id: &str, minutes: u32) -> Result<Option<String>, String> {
-        with(&self.db, |c| stalled(c, agent_id, minutes))
+        let heard = self.agent_states.hook_at(agent_id);
+        let mut noted = self.stall_noted.lock().unwrap();
+        if noted.get(agent_id) == Some(&heard) {
+            return Ok(None);
+        }
+        let lead = with(&self.db, |c| stalled(c, agent_id, minutes))?;
+        if lead.is_some() {
+            noted.insert(agent_id.into(), heard);
+        }
+        Ok(lead)
     }
 }
 
@@ -2380,6 +2398,28 @@ mod tests {
         let n = crate::plan::take_notes(&c, "timur").unwrap().unwrap();
         assert!(n.contains(&format!("#{}", a.id)) && n.contains("10 dk"), "{n}");
         assert!(crate::plan::take_notes(&c, "timur").unwrap().is_none());
+    }
+
+    /// #2055: several clients' watchdogs → one note per silence; a hook in between opens the next.
+    #[test]
+    fn stall_note_goes_once_per_silence() {
+        use crate::{events, Core, Events, Paths};
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp")
+            .join(format!("stall-{}-{}", std::process::id(), crate::agents::next_seq()));
+        let c = Core::start(Paths { data_dir: root.join("data"), config_dir: root.join("config") }, Events::new(events::NullSink)).unwrap();
+        with(&c.db, |db| {
+            let l = caller(db, "timur")?;
+            let d = insert(db, NewDelegation { from: &l, to_agent: "kaan".into(), team_id: "default".into(), service_team_id: None, prompt: "x".into(), task_id: None, patron_words: None, effort: None })?;
+            set_status(db, d.id, "running")
+        }).unwrap();
+        c.agent_states.hook("kaan", Some(crate::agents::Status::Working), None);
+        assert_eq!(c.delegation_stalled("kaan", 20).unwrap().as_deref(), Some("timur"));
+        assert_eq!(c.delegation_stalled("kaan", 20).unwrap(), None, "a second client: same silence");
+        assert!(with(&c.db, |db| crate::plan::take_notes(db, "timur")).unwrap().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.agent_states.hook("kaan", Some(crate::agents::Status::Working), None);
+        assert_eq!(c.delegation_stalled("kaan", 20).unwrap().as_deref(), Some("timur"), "it moved, then went quiet again");
+        c.shutdown();
     }
 
     /// FIX-3: a worker's late first reply reaches its leader the same way.

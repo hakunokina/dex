@@ -38,6 +38,7 @@ pub mod desktop_storage;
 pub mod permit;
 pub mod plan;
 pub mod proc;
+pub mod progress;
 pub mod prompts;
 pub mod proposals;
 pub mod push;
@@ -149,6 +150,11 @@ pub struct Core {
     sleeping_leaders: Mutex<HashSet<String>>,
     /// Leader prompts awaiting UserPromptSubmit; DB delivery stamps remain pending.
     leader_pastes: Mutex<HashMap<String, plan::LeaderPaste>>,
+    /// #2055: workers' Claude task lists → their running job's progress.
+    progress: progress::Tracker,
+    /// #2055: agent → its last hook time (`States::hook_at`) when its leader got the stall note;
+    /// the same silence is told once, whichever client's watchdog asks.
+    stall_noted: Mutex<HashMap<String, u64>>,
     claude_turns: claude_turn::Turns,
     worker_note_receipts: worker_notes::Receipts,
     /// #161: jobs wait in the queue (restart.rs); the host restarts once nothing runs.
@@ -253,6 +259,8 @@ impl Core {
             team_idle: Mutex::default(),
             sleeping_leaders: Mutex::default(),
             leader_pastes: Mutex::default(),
+            progress: progress::Tracker::default(),
+            stall_noted: Mutex::default(),
             claude_turns: claude_turn::Turns::default(),
             worker_note_receipts: worker_notes::Receipts::default(),
             draining: Default::default(),
@@ -449,6 +457,7 @@ impl Core {
     }
 
     pub(crate) fn delegation_hook_prepared(&self, agent: &str, event: &str, body: &Value, preserve_failure: bool, stop: Option<&claude_turn::Stop>) -> Option<String> {
+        if event == "PostToolUse" { self.progress_on_hook(agent, body); }
         if matches!(event, "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "Stop") {
             self.worker_notes_reconcile(agent);
             if event == "UserPromptSubmit" { self.worker_notes_prompt_received(agent, body); }
