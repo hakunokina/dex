@@ -1027,12 +1027,19 @@ pub fn advance_with_ptys(db: &Db, ev: &Events, ptys: &crate::pty::Ptys) -> Resul
 /// flight go back to `waiting`, so [`advance`] delegates them again (attempts > 0 → the prompt says so).
 /// #161 `keep_queued`: a clean restart keeps queued jobs — their items keep them (no second job).
 pub fn requeue_interrupted(conn: &Connection, keep_queued: bool) -> Result<usize, String> {
+    requeue_interrupted_keeping(conn, keep_queued, &[])
+}
+
+/// [`requeue_interrupted`], #1875: a `kept` job goes on in its resumed session — its item keeps it.
+pub fn requeue_interrupted_keeping(conn: &Connection, keep_queued: bool, kept: &[i64]) -> Result<usize, String> {
+    let kept = serde_json::to_string(kept).map_err(|e| e.to_string())?;
     conn.execute(
         "UPDATE plan_items SET status = 'waiting', delegation_id = NULL
          WHERE status = 'running'
            AND plan_id IN (SELECT id FROM plans WHERE status = 'active')
-           AND delegation_id IN (SELECT id FROM delegations WHERE status = 'running' OR (?1 = 0 AND status = 'queued' AND to_agent<>'' AND model_approval IS NOT 'pending'))",
-        [keep_queued],
+           AND delegation_id IN (SELECT id FROM delegations WHERE status = 'running' OR (?1 = 0 AND status = 'queued' AND to_agent<>'' AND model_approval IS NOT 'pending'))
+           AND delegation_id NOT IN (SELECT value FROM json_each(?2))",
+        rusqlite::params![keep_queued, kept],
     )
     .map_err(e)
 }
