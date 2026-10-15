@@ -30,6 +30,7 @@ import { fitConvertedModels, normalizeCloneTemplate } from "./cloneTemplate";
 import { TestLevelToggle } from "./TestLevelToggle";
 import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
 import { ConfirmDialog } from "../settings/kit/ConfirmDialog";
+import { askConfirm } from "../confirm";
 
 /** DEX-25: swap the local provider's (empty) static catalog for the live server list. */
 function withLocalModels(providers: ProviderInfo[], st: LocalStatus | null): ProviderInfo[] {
@@ -742,7 +743,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
               lines.push(`Açık: ${info.openDelegations} devretme, ${info.activePlans} plan — devretmeler raporsuz kapanır, planlar iptal olur.`);
             }
             if (leads.length) lines.push(`DİKKAT: konuştuğun lider (${leads.join(", ")}) bu takımda; oturumu da kapanacak.`);
-            if (!confirm(lines.join("\n\n"))) return;
+            if (!(await askConfirm(lines.join("\n\n")))) return;
             if (info) return removeTeam(team.id, info.running.length > 0);
             // An old server cannot stop agents: the plain delete, refused while any is running.
             await removeTeam(team.id).catch((err) => {
@@ -852,8 +853,8 @@ function WorkersBulk({ teamId, providers }: {
         </button>
         {waiting.length > 0 && (
           <button disabled={busy} title="Bekleyen değişikliği şimdi uygula: çalışanları durdurup yeniden başlatır"
-            onClick={() => {
-              if (!confirm(RESTART_CONFIRM(waiting.length))) return;
+            onClick={async () => {
+              if (!(await askConfirm(RESTART_CONFIRM(waiting.length)))) return;
               void act(async () => {
                 const unstarted = await restartPending(teamId);
                 const names = unstarted.map((id) => workers.find((a) => a.id === id)?.name ?? id);

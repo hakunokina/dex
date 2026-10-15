@@ -14,6 +14,7 @@ import { getTeam, membersOf, useTeams } from "../team/store";
 import { agentPanelId, boundApi, openPanel } from "../layout/panels";
 import { getStatus, type Agent } from "../agents";
 import { playCircuit } from "./circuitFx";
+import { onceLog, revive } from "./frameLoop";
 import { EmptyState } from "../EmptyState";
 import "./office.css";
 
@@ -76,6 +77,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
     let stopped = false;
     let raf = 0;
     let timer = 0;
+    const logOnce = onceLog();
 
     // #247/#252: another team's stage is visibility:hidden, which the observer counts as visible.
     const drawable = () => activeRef.current && inView && !document.hidden && cssW > 0 && cssH > 0 && canvas.checkVisibility({ visibilityProperty: true });
@@ -101,12 +103,24 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       frame(performance.now());
     };
 
+    // #2051: a throwing frame is logged once and the loop goes on (it used to end the chain: a frozen board).
     const frame = (now: number) => {
       raf = 0;
+      let next = 500;
+      try {
+        next = paint(now);
+      } catch (error) {
+        logOnce("kare çizilemedi; döngü sürüyor", error);
+      }
+      schedule(next);
+    };
+
+    /** One frame; returns the delay before the next one. */
+    const paint = (now: number) => {
       if (stopped || !drawable()) {
         card.hide();
         setOfficeShown(shownToken, null);
-        return schedule(800);
+        return 800;
       }
       advance(teamId, now);
       world.teamName = getTeam(teamId)?.name ?? "";
@@ -149,7 +163,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
           cssH,
         );
       } else card.hide();
-      schedule(world.needsAnimation() ? 0 : 500);
+      return world.needsAnimation() ? 0 : 500;
     };
 
     function schedule(delay = 0) {
@@ -172,12 +186,24 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
 
     const ro = new ResizeObserver(resize);
     ro.observe(canvas);
-    const io = new IntersectionObserver(([entry]) => {
-      inView = entry.isIntersecting;
+    // #2051: entries queued between two deliveries arrive together, oldest first — the last one is now.
+    const io = new IntersectionObserver((entries) => {
+      inView = entries[entries.length - 1].isIntersecting;
       if (!inView) card.hide();
       schedule();
     });
     io.observe(canvas);
+    // #2051: an idle loop on a shown board is a stuck one — re-ask the observer, or restart a dead chain.
+    const health = window.setInterval(() => {
+      const fix = revive({ stopped, pending: !!(raf || timer), active: activeRef.current, hidden: document.hidden, inView });
+      if (fix === "observe") {
+        io.unobserve(canvas);
+        io.observe(canvas);
+      } else if (fix === "schedule") {
+        logOnce("döngü durmuştu; yeniden başladı");
+        schedule();
+      }
+    }, 1000);
     const onVisibility = () => schedule();
     document.addEventListener("visibilitychange", onVisibility);
     // #252 spec §4: the cursor left the window → the eyes start home at once (no 1.5 s hold).
@@ -191,6 +217,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       stopped = true;
       cancelAnimationFrame(raf);
       clearTimeout(timer);
+      clearInterval(health);
       ro.disconnect();
       io.disconnect();
       document.removeEventListener("visibilitychange", onVisibility);
