@@ -34,14 +34,17 @@ export interface ProviderMeta {
   /** Logo URL'i (maske olarak boyanır); yoksa `glyph`. */
   icon?: string;
   glyph: string;
+  /** #2019: a second account of the same provider (same logo) — a small mark on its ring. */
+  badge?: string;
 }
 
-const P = (label: string, brand: string, icon?: string): Omit<ProviderMeta, "color"> & { brand: string } =>
-  ({ label, brand, icon, glyph: label.slice(0, 1).toUpperCase() });
+const P = (label: string, brand: string, icon?: string, badge?: string): Omit<ProviderMeta, "color"> & { brand: string } =>
+  ({ label, brand, icon, glyph: label.slice(0, 1).toUpperCase(), badge });
 
 const PROVIDERS: Record<string, ReturnType<typeof P>> = {
   claude: P("Claude", "#cc7c5e", claude),
   anthropic: P("Claude", "#cc7c5e", claude),
+  "anthropic-2": P("Claude 2", "#cc7c5e", claude, "2"),
   openai: P("OpenAI", "#49a3b0", openai),
   opencode: P("OpenCode", "#000000", opencode),
   cursor: P("Cursor", "#000000", cursor),
@@ -88,7 +91,7 @@ export function readableColor(hex: string): string {
 
 export function providerMeta(id: string): ProviderMeta {
   const known = PROVIDERS[id];
-  if (known) return { label: known.label, icon: known.icon, glyph: known.glyph, color: readableColor(known.brand) };
+  if (known) return { label: known.label, icon: known.icon, glyph: known.glyph, badge: known.badge, color: readableColor(known.brand) };
   let h = 0;
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) % 360;
   return { label: id, glyph: id.slice(0, 1).toUpperCase(), color: `hsl(${h} 45% 60%)` };

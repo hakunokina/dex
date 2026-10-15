@@ -434,7 +434,11 @@ fn tool_results_root(transcript: &Path, session: &str, projects: &Path) -> Optio
         return None;
     }
     let project = transcript.parent()?;
-    (project.is_absolute() && key(project.parent()?) == key(projects)).then(|| project.join(session).join("tool-results"))
+    let parent = project.parent()?;
+    // #2019: an extra Claude account's `projects` is a link to the main one — the same folder.
+    let same = key(parent) == key(projects)
+        || std::fs::canonicalize(parent).ok().zip(std::fs::canonicalize(projects).ok()).is_some_and(|(a, b)| a == b);
+    (project.is_absolute() && same).then(|| project.join(session).join("tool-results"))
 }
 
 /// #402: the user's own codex/claude skills (`~/.codex/skills`, `~/.claude/skills`) — a reviewer
@@ -2546,6 +2550,22 @@ mod tests {
         assert_eq!(capability, results);
         for (path, session) in [(root.join("project/s2.jsonl"), "s1"), (root.join("project/../project/s1.jsonl"), "s1"), (transcript.clone(), "../s1"), (root.join("elsewhere/project/s1.jsonl"), "s1")] {
             assert!(tool_results_root(&path, session, &root).is_none());
+        }
+        // #2019: a Claude 2 session's transcript path runs through its account's link to `projects`.
+        let alias = root.with_file_name("permit-744-alias");
+        let _ = std::fs::remove_dir(&alias);
+        if crate::worktree::link_dir(&root, &alias) {
+            let via = tool_results_root(&alias.join("project/s1.jsonl"), "s1", &root).unwrap();
+            assert_eq!(via, alias.join("project/s1/tool-results"));
+            let r = Ctx { read_only: true, tool_results: Some(via), ..ctx() };
+            assert_eq!(decide("Read", &json!({"file_path": alias.join("project/s1/tool-results/x.txt")}), &r), Verdict::Allow);
+            assert!(tool_results_root(&alias.join("project/s1.jsonl"), "s1", &root.join("project")).is_none());
+            #[cfg(windows)]
+            std::fs::remove_dir(&alias).unwrap();
+            #[cfg(unix)]
+            std::fs::remove_file(&alias).unwrap();
+        } else {
+            eprintln!("projects link test unavailable on this host");
         }
         let reviewer = Ctx { tool_results: Some(capability), ..reviewer };
         assert_eq!(decide("Read", &json!({"file_path": file}), &reviewer), Verdict::Allow);

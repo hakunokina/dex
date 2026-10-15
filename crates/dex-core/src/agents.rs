@@ -1072,10 +1072,14 @@ impl crate::Core {
     // ── DEX-17: motor zinciri ──
 
     /// Sağlayıcıda kullanılabilir jeton var mı (zincir atlama kuralı). `anthropic` yerleşik,
-    /// jeton istemez; `local` adres + jeton ister.
+    /// jeton istemez; `local` adres + jeton ister. #2019: ek Claude hesabı CLI girişi (kimlik
+    /// dosyası) ister.
     pub(crate) fn chain_has_token(&self, id: &str) -> bool {
         if id == "anthropic" {
             return true;
+        }
+        if let Some(dir) = crate::claude_accounts::config_dir(&self.paths.data_dir, id) {
+            return crate::claude_accounts::connected(&dir);
         }
         let secret = |acct: &str| crate::secrets::get(crate::providers::KEYRING_SERVICE, acct).ok().flatten();
         if id == "local" {
@@ -1083,6 +1087,13 @@ impl crate::Core {
                 && secret("local").is_some_and(|v| !v.is_empty());
         }
         secret(id).is_some_and(|v| !v.is_empty())
+    }
+
+    /// Zincir seçimi: jetonu var ve #2019 ek Claude hesabıysa taze ölçümü eşikte değil (worker
+    /// oraya taşınıp hemen geri itilmesin).
+    pub(crate) fn chain_usable(&self, id: &str) -> bool {
+        self.chain_has_token(id)
+            && !(id != "anthropic" && crate::claude_accounts::is_claude(id) && self.quota_breached(id))
     }
 
     /// StopFailure'ta zincir kararı (hook thread'inde koşar, spawn YOK). `Some` = zincir bu ajan
@@ -1124,7 +1135,7 @@ impl crate::Core {
         };
         // `next: None` da bir plan (zincir bitti → bekleme).
         self.chain_measure();
-        let next = crate::db::with(&self.db, |c| crate::chain::pick_next(c, &current, &|p| self.chain_has_token(p))).ok()?;
+        let next = crate::db::with(&self.db, |c| crate::chain::pick_next(c, &current, &|p| self.chain_usable(p))).ok()?;
         Some(ChainPlan {
             current,
             next,
@@ -1259,14 +1270,14 @@ impl crate::Core {
         let mut candidate = first;
         let mut skipped = Vec::new();
         while let Some(next) = candidate {
-            if next == "anthropic" || self.chain_has_token(&next) {
+            if next == "anthropic" || self.chain_usable(&next) {
                 let model = crate::chain::map_model(&next, source_model);
                 return (Some((next, model)), skipped);
             } else {
                 skipped.push(format!("{} jetonu yok", chain_target_label(&next)));
             }
             candidate = crate::db::with(&self.db, |c| {
-                crate::chain::pick_next(c, &next, &|p| self.chain_has_token(p))
+                crate::chain::pick_next(c, &next, &|p| self.chain_usable(p))
             })
             .ok()
             .flatten();
@@ -1463,10 +1474,14 @@ impl crate::Core {
     /// (Claude: OAuth ölçümü) — atlama, bildirim ve sıfırlanınca geri
     /// dönüş StopFailure kaydıyla aynı yoldan. Ölçüm yok/bayat/okunamıyor = dokunulmaz (aday kalır).
     /// Poll yok: yalnız seçim anında okunur. GLM/Muse/local'de ölçüm yok, yalnız StopFailure kaydı.
+    /// #2019: her Claude hesabı kendi ölçümüyle ayrı kaydedilir.
     pub(crate) fn chain_measure(&self) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-        let claude = self.quota.lock().unwrap().exhausted_until(now);
-        for (provider, reset) in [("anthropic", claude)] {
+        let measured: Vec<(&str, Option<i64>)> = crate::claude_accounts::ACCOUNTS
+            .iter()
+            .map(|&p| (p, self.quota.of(p).and_then(|q| q.lock().unwrap().exhausted_until(now))))
+            .collect();
+        for (provider, reset) in measured {
             let Some(reset) = reset else { continue };
             let marked = crate::db::with(&self.db, |c| {
                 if crate::chain::exhausted(c)?.iter().any(|e| e.provider == provider && e.reset_at >= reset) {
@@ -1485,9 +1500,11 @@ impl crate::Core {
     }
 
     /// #1027: zincirde geçilecek motor yokken nedeni ([`crate::chain::none_reason`]); `home` = ajanın
-    /// asıl sağlayıcısı (dönüş adayı).
+    /// asıl sağlayıcısı (dönüş adayı). #2019: ek Claude hesabı isteğe bağlı — bağlı değilse de
+    /// "erişim yok" sayılmaz (çoğu kurulumda yok); tükenmişse kota nedenine girer.
     fn chain_none_reason(&self, current: &str, home: &str, skipped: &[String]) -> &'static str {
-        crate::db::with(&self.db, |c| Ok(crate::chain::none_reason(c, current, home, !skipped.is_empty(), &|p| self.chain_has_token(p))))
+        let reachable = |p: &str| self.chain_has_token(p) || crate::claude_accounts::config_dir(&self.paths.data_dir, p).is_some();
+        crate::db::with(&self.db, |c| Ok(crate::chain::none_reason(c, current, home, !skipped.is_empty(), &reachable)))
             .unwrap_or("zincirde kullanılabilir hedef yok")
     }
 
@@ -1502,11 +1519,11 @@ impl crate::Core {
 }
 
 impl crate::Core {
-    // ── Görev #250: proaktif Claude kota eşiği ──
+    // ── Görev #250: proaktif Claude kota eşiği (#2019: Claude hesabı başına) ──
 
-    /// Eşik geçince hemen taşınacak worker'lar: Claude'da (asıl ve etkin sağlayıcı anthropic),
+    /// Eşik geçince hemen taşınacak worker'lar: `provider` hesabında koşan ([`quota_bound`]),
     /// zinciri açık, oturumu canlı ve elinde süren bir devretme olan. Liderler hiç girmez.
-    pub(crate) fn quota_targets(&self) -> Vec<String> {
+    pub(crate) fn quota_targets(&self, provider: &str) -> Vec<String> {
         let guard = self.chain_guard.lock().unwrap().clone();
         crate::db::with(&self.db, |c| {
             let mut st = c
@@ -1519,7 +1536,7 @@ impl crate::Core {
                 .map_err(|e| e.to_string())?;
             Ok(crate::teams::list_agents(c)?
                 .into_iter()
-                .filter(|a| quota_bound(a) && busy.contains(&a.id))
+                .filter(|a| quota_bound(a, provider) && busy.contains(&a.id))
                 .map(|a| a.id)
                 .collect::<Vec<_>>())
         })
@@ -1529,29 +1546,31 @@ impl crate::Core {
         .collect()
     }
 
-    /// Eşik aşıldı: hedef worker'ları mevcut zincir devriyle (resume + `[Dex]` devam turu)
-    /// sıradaki sağlayıcıya geçir. Hedef yoksa worker Claude'da kalır, bir kez uyarı loglanır.
-    pub(crate) fn quota_switch(&self, breach: &crate::quota::Breach) {
-        self.quota_switch_by(breach, &|model| self.quota_pick(model));
+    /// `provider` hesabı eşiği aştı: hedef worker'ları mevcut zincir devriyle (resume + `[Dex]`
+    /// devam turu) sıradaki sağlayıcıya geçir. Hedef yoksa worker hesapta kalır, bir kez uyarı loglanır.
+    pub(crate) fn quota_switch(&self, provider: &str, breach: &crate::quota::Breach) {
+        self.quota_switch_by(provider, breach, &|from, model| self.quota_pick(from, model));
     }
 
-    /// [`Self::quota_switch`]; `pick` = zincir seçimi (testler jeton kasasız verir). #1033: seçim
-    /// gerçekten kullanılabilir hedefe bakar — atlananlar (jeton yok) nottaki nedene girer.
+    /// [`Self::quota_switch`]; `pick` = (çıkılan hesap, model) → zincir seçimi (testler jeton kasasız
+    /// verir). #1033: seçim gerçekten kullanılabilir hedefe bakar — atlananlar (jeton yok) nottaki
+    /// nedene girer.
     #[allow(clippy::type_complexity)]
     fn quota_switch_by(
         &self,
+        provider: &str,
         breach: &crate::quota::Breach,
-        pick: &dyn Fn(&str) -> (Option<(String, String)>, Vec<String>),
+        pick: &dyn Fn(&str, &str) -> (Option<(String, String)>, Vec<String>),
     ) {
-        let targets = self.quota_targets();
+        let targets = self.quota_targets(provider);
         if targets.is_empty() {
             return;
         }
         self.chain_measure();
         let model = crate::db::with(&self.db, |c| crate::teams::get_agent(c, &targets[0])).map(|a| a.model).unwrap_or_default();
-        let (picked, skipped) = pick(&model);
+        let (picked, skipped) = pick(provider, &model);
         let Some((next, ..)) = picked else {
-            self.quota_no_target(breach, &targets, &skipped);
+            self.quota_no_target(provider, breach, &targets, &skipped);
             return;
         };
         let next = Some(next);
@@ -1569,28 +1588,30 @@ impl crate::Core {
             .flatten();
             let (session, transcript) = saved.map_or((None, None), |(s, t)| (Some(s), t));
             self.chain_execute(&id, ChainPlan {
-                current: "anthropic".into(),
+                current: provider.into(),
                 next: next.clone(),
                 reset: None,
                 reason: "esik".into(),
                 session,
                 transcript,
-                threshold: Some(breach.label()),
+                threshold: Some(breach.label_for(&chain_target_label(provider))),
                 threshold_reset: breach.resets_at.clone(),
             });
         }
     }
 
-    /// #1018: eşik aşıldı ama zincirde geçilecek motor yok → worker'lar Claude'da kalır. Eşik
+    /// #1018: eşik aşıldı ama zincirde geçilecek motor yok → worker'lar hesapta kalır. Eşik
     /// bölümü başına TEK bildirim: log + ilgili liderlere birer not (sonraki ölçüm/başlatma susar).
-    fn quota_no_target(&self, breach: &crate::quota::Breach, agents: &[String], skipped: &[String]) {
-        if !self.quota.lock().unwrap().warn_once(breach) {
+    fn quota_no_target(&self, provider: &str, breach: &crate::quota::Breach, agents: &[String], skipped: &[String]) {
+        if !self.quota.of(provider).is_some_and(|q| q.lock().unwrap().warn_once(breach)) {
             return;
         }
         let earliest = crate::db::with(&self.db, crate::chain::earliest_reset).ok().flatten();
-        let none = self.chain_none_reason("anthropic", "anthropic", skipped);
+        let none = self.chain_none_reason(provider, "anthropic", skipped);
         let suffix = if skipped.is_empty() { String::new() } else { format!(" ({})", skipped.join("; ")) };
-        let text = format!("{} ama {none}{suffix}{} — Claude'da sürüyor.", breach.label(), reset_clause(earliest));
+        let stays = if provider == "anthropic-2" { "Claude 2'de" } else { "Claude'da" };
+        let label = breach.label_for(&chain_target_label(provider));
+        let text = format!("{label} ama {none}{suffix}{} — {stays} sürüyor.", reset_clause(earliest));
         eprintln!("dex: {text}");
         for a in agents {
             self.chain_note_lead(a, &format!("{a}: {text}"));
@@ -1602,77 +1623,59 @@ impl crate::Core {
     /// taşınmış worker Claude'a döner (Claude tükenmiş kayıtlıysa dönmez). Süren/resume edilen
     /// oturum geri taşınmaz. Zincir geçişinin kendi başlatması (chain_guard) dokunulmaz.
     fn quota_route(&self, id: &str, options: &mut StartOptions) {
-        self.quota_route_by(id, options, &|model| self.quota_pick(model));
+        self.quota_route_by(id, options, &|from, model| self.quota_pick(from, model));
     }
 
-    /// Claude'dan sonraki gerçekten kullanılabilir hedef ([`Self::chain_pick`]) ve atlananlar.
-    fn quota_pick(&self, model: &str) -> (Option<(String, String)>, Vec<String>) {
-        let first = crate::db::with(&self.db, |c| crate::chain::pick_next(c, "anthropic", &|p| self.chain_has_token(p)))
+    /// `from`'dan sonraki gerçekten kullanılabilir hedef ([`Self::chain_pick`]) ve atlananlar.
+    fn quota_pick(&self, from: &str, model: &str) -> (Option<(String, String)>, Vec<String>) {
+        let first = crate::db::with(&self.db, |c| crate::chain::pick_next(c, from, &|p| self.chain_usable(p)))
             .ok()
             .flatten();
         self.chain_pick(first, model)
     }
 
-    /// [`Self::quota_route`]; `pick` = zincir seçimi (testler jeton kasasız verir).
+    /// [`Self::quota_route`]; `pick` = zincir seçimi (testler jeton kasasız verir). #2019: asıl
+    /// sağlayıcısı bir Claude hesabı olan worker; Claude'dan Claude 2'ye taşınmışsa Claude 2'nin
+    /// eşiği de onu sıradakine taşır.
     #[allow(clippy::type_complexity)]
     fn quota_route_by(
         &self,
         id: &str,
         options: &mut StartOptions,
-        pick: &dyn Fn(&str) -> (Option<(String, String)>, Vec<String>),
+        pick: &dyn Fn(&str, &str) -> (Option<(String, String)>, Vec<String>),
     ) {
         if self.chain_guard.lock().unwrap().contains(id) {
             return;
         }
         let Ok(a) = crate::db::with(&self.db, |c| crate::teams::get_agent(c, id)) else { return };
-        if a.kind != "worker" || a.engine != "claude" || a.chain_off || a.provider != "anthropic" {
+        if a.kind != "worker" || a.engine != "claude" || a.chain_off || !crate::claude_accounts::is_claude(&a.provider) {
             return;
         }
+        let home = a.provider.as_str();
+        let current = current_motor(&a);
         let displaced = a.active_provider.is_some() || a.active_engine.is_some();
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
         // #1027: 5 sa eşiğinin yanında ölçülmüş gerçek %100 tükenme (haftalık dahil) de yönlendirir —
         // bilinen-bitmiş Claude'da boşa tur yok. Haftalık pencere ölçülür, geçiş eşiği değildir.
-        let breach = {
-            let q = self.quota.lock().unwrap();
-            q.exhausted_window(now_ms).map(|(b, _)| b).or_else(|| q.breach_at(now_ms))
+        let breach_of = |p: &str| {
+            self.quota.of(p).and_then(|q| {
+                let q = q.lock().unwrap();
+                q.exhausted_window(now_ms).map(|(b, _)| b).or_else(|| q.breach_at(now_ms))
+            })
         };
+        let breach = breach_of(home);
+        let here = (displaced && a.active_engine.is_none() && current != home && crate::claude_accounts::is_claude(current))
+            .then(|| breach_of(current))
+            .flatten();
         // Ölçüm yalnız seçim ya da dönüş kararı olacaksa.
         if breach.is_some() || displaced {
             self.chain_measure();
         }
-        match breach {
-            Some(b) if !displaced => {
-                let (picked, skipped) = pick(&a.model);
-                let Some((to, model)) = picked else {
-                    self.quota_no_target(&b, &[id.to_string()], &skipped);
-                    return;
-                };
-                if crate::db::with(&self.db, |c| {
-                    c.execute(
-                        "UPDATE agents SET active_engine = NULL, active_provider = ?2, active_model = ?3 WHERE id = ?1",
-                        params![id, to, model],
-                    )
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
-                })
-                .is_err()
-                {
-                    return;
-                }
-                options.model_route_reason = Some(b.label());
-                let text = format!("{} → {} ile açıldı.", b.label(), chain_target_label(&to));
-                let _ = self.events.emit("dex-chain", &serde_json::json!({
-                    "agentId": id, "from": "anthropic", "to": to,
-                    "activeEngine": "claude",
-                    "activeProvider": to,
-                    "resetAt": b.resets_at, "text": text,
-                }));
-                eprintln!("dex: {id}: {} — {} ile açılıyor", b.label(), chain_target_label(&to));
-                self.changed("teams-changed");
-            }
-            None if displaced && options.fresh => {
+        match (breach, here) {
+            (Some(b), _) if !displaced => self.quota_route_to(id, home, &b, &a.model, options, pick),
+            (None, _) if displaced && options.fresh => {
                 let back = crate::db::with(&self.db, |c| {
-                    if crate::chain::exhausted(c)?.iter().any(|e| e.provider == "anthropic") {
+                    if crate::chain::exhausted(c)?.iter().any(|e| e.provider == home) {
                         return Ok(false);
                     }
                     c.execute(
@@ -1684,12 +1687,54 @@ impl crate::Core {
                 })
                 .unwrap_or(false);
                 if back {
-                    eprintln!("dex: {id}: Claude kullanımı eşiğin altında — yeni oturum Claude'da");
+                    eprintln!("dex: {id}: {} kullanımı eşiğin altında — yeni oturum {}", chain_target_label(home), chain_target_label(home));
                     self.changed("teams-changed");
                 }
             }
+            (Some(_), Some(b)) => self.quota_route_to(id, current, &b, &a.model, options, pick),
             _ => {}
         }
+    }
+
+    /// Eşik/tükenme `from` hesabında: worker zincirde sıradakinde açılır; hedef yoksa hesapta kalır.
+    #[allow(clippy::type_complexity)]
+    fn quota_route_to(
+        &self,
+        id: &str,
+        from: &str,
+        b: &crate::quota::Breach,
+        model: &str,
+        options: &mut StartOptions,
+        pick: &dyn Fn(&str, &str) -> (Option<(String, String)>, Vec<String>),
+    ) {
+        let (picked, skipped) = pick(from, model);
+        let Some((to, model)) = picked else {
+            self.quota_no_target(from, b, &[id.to_string()], &skipped);
+            return;
+        };
+        if crate::db::with(&self.db, |c| {
+            c.execute(
+                "UPDATE agents SET active_engine = NULL, active_provider = ?2, active_model = ?3 WHERE id = ?1",
+                params![id, to, model],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .is_err()
+        {
+            return;
+        }
+        let label = b.label_for(&chain_target_label(from));
+        options.model_route_reason = Some(label.clone());
+        let text = format!("{label} → {} ile açıldı.", chain_target_label(&to));
+        let _ = self.events.emit("dex-chain", &serde_json::json!({
+            "agentId": id, "from": from, "to": to,
+            "activeEngine": "claude",
+            "activeProvider": to,
+            "resetAt": b.resets_at, "text": text,
+        }));
+        eprintln!("dex: {id}: {label} — {} ile açılıyor", chain_target_label(&to));
+        self.changed("teams-changed");
     }
 }
 
@@ -1698,14 +1743,16 @@ fn current_motor(a: &crate::teams::Agent) -> &str {
     a.active_provider.as_deref().unwrap_or(&a.provider)
 }
 
-/// Görev #250: eşiğe tabi ajan — Claude'da (asıl ve etkin) duran, zinciri açık worker.
-fn quota_bound(a: &crate::teams::Agent) -> bool {
+/// Görev #250: `provider` hesabının eşiğine tabi ajan — o Claude hesabında koşan, zinciri açık
+/// worker. Asıl Claude'da (`anthropic`) yalnız asıl sağlayıcısı orası olan, taşınmamış worker
+/// (eski kural); #2019 ek hesapta oraya taşınmış ya da asıl sağlayıcısı orası olan worker.
+fn quota_bound(a: &crate::teams::Agent, provider: &str) -> bool {
     a.kind == "worker"
         && a.engine == "claude"
         && !a.chain_off
-        && a.provider == "anthropic"
-        && a.active_provider.is_none()
         && a.active_engine.is_none()
+        && current_motor(a) == provider
+        && (provider != "anthropic" || a.active_provider.is_none())
 }
 
 /// [`Core::chain_plan`] kararı.
@@ -3189,7 +3236,7 @@ mod quota_tests {
         crate::db::with(&core.db, |c| crate::teams::get_agent(c, id)).unwrap()
     }
 
-    fn muse(_: &str) -> Pick {
+    fn muse(_: &str, _: &str) -> Pick {
         (Some(("muse".into(), "muse-spark-1.3".into())), Vec::new())
     }
 
@@ -3238,9 +3285,9 @@ mod quota_tests {
     fn only_busy_claude_workers_are_targets_never_the_leader() {
         let (core, root, _) = core("targets");
         busy_team(&core);
-        assert_eq!(core.quota_targets(), vec!["kaan".to_string()]);
+        assert_eq!(core.quota_targets("anthropic"), vec!["kaan".to_string()]);
         crate::db::with(&core.db, |c| c.execute("UPDATE agents SET chain_off = 1 WHERE id = 'kaan'", []).map_err(|e| e.to_string())).unwrap();
-        assert!(core.quota_targets().is_empty(), "zinciri kapalı worker hariç");
+        assert!(core.quota_targets("anthropic").is_empty(), "zinciri kapalı worker hariç");
         finish(core, root);
     }
 
@@ -3252,12 +3299,12 @@ mod quota_tests {
         assert!(core.quota_tick());
         assert!(core.ptys.is_running("kaan"));
         assert!(agent(&core, "kaan").active_provider.is_none());
-        assert!(!core.quota.lock().unwrap().warned);
+        assert!(!core.quota.of("anthropic").unwrap().lock().unwrap().warned);
         // Haftalık pencere artık eşik değil: %99'da da kimse taşınmaz.
         set(&src, 10.0, 99.0);
         assert!(core.quota_tick());
         assert!(agent(&core, "kaan").active_provider.is_none(), "haftalık doluluk worker'ı taşımaz");
-        assert!(!core.quota.lock().unwrap().warned);
+        assert!(!core.quota.of("anthropic").unwrap().lock().unwrap().warned);
         // Eşik üstü (5 sa 85) ama zincirde Claude dışında açık hedef yok: iş durmaz.
         crate::db::with(&core.db, |c| {
             crate::chain::set_disabled(c, &["muse".into(), "glm".into(), "local".into()]).map(|_| ())
@@ -3268,11 +3315,11 @@ mod quota_tests {
         let kaan = agent(&core, "kaan");
         assert!(kaan.active_provider.is_none() && kaan.active_engine.is_none(), "Claude'da kalır");
         assert!(core.ptys.is_running("kaan"), "oturum öldürülmez");
-        assert!(core.quota.lock().unwrap().warned, "uyarı bir kez");
+        assert!(core.quota.of("anthropic").unwrap().lock().unwrap().warned, "uyarı bir kez");
         assert!(crate::db::with(&core.db, crate::chain::exhausted).unwrap().is_empty(), "eşik Claude'u tükenmiş saymaz");
         set(&src, 10.0, 10.0);
         core.quota_tick();
-        assert!(!core.quota.lock().unwrap().warned, "eşik altında uyarı bayrağı sıfırlanır");
+        assert!(!core.quota.of("anthropic").unwrap().lock().unwrap().warned, "eşik altında uyarı bayrağı sıfırlanır");
         finish(core, root);
     }
 
@@ -3422,7 +3469,7 @@ mod quota_tests {
         let (core, root, src) = core("stale");
         set(&src, 99.0, 99.0);
         core.quota_tick();
-        core.quota.lock().unwrap().last.as_mut().unwrap().0 -= crate::quota::STALE_MS + 1;
+        core.quota.of("anthropic").unwrap().lock().unwrap().last.as_mut().unwrap().0 -= crate::quota::STALE_MS + 1;
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &muse);
         assert!(agent(&core, "kaan").active_provider.is_none(), "bayat ölçüm = bilinmiyor");
         finish(core, root);
@@ -3438,7 +3485,7 @@ mod quota_tests {
         *src.0.lock().unwrap() = Usage { five_hour: 10.0, seven_day: 100.0, seven_day_resets_at: Some(week), ..Default::default() };
         assert!(core.quota_tick());
         // Hedef yok (jeton yok): Claude'da açılır, nedeni erişim — tek not.
-        let none = |_: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
+        let none = |_: &str, _: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         assert!(agent(&core, "kaan").active_provider.is_none());
         let got = notes(&core, "timur");
@@ -3521,7 +3568,7 @@ mod quota_tests {
         let week = ms_to_iso(now() + 86_400_000);
         *src.0.lock().unwrap() = Usage { five_hour: 10.0, seven_day: 100.0, seven_day_resets_at: Some(week), ..Default::default() };
         assert!(core.quota_tick());
-        let none = |_: &str| -> Pick { (None, Vec::new()) };
+        let none = |_: &str, _: &str| -> Pick { (None, Vec::new()) };
         core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &none);
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 2, "{got:?}");
@@ -3537,10 +3584,10 @@ mod quota_tests {
         let (core, root, src) = core("switch-skip");
         busy_team(&core);
         drop(src);
-        core.quota.lock().unwrap().last = Some((now(), Usage { five_hour: 90.0, seven_day: 10.0, ..Default::default() }));
-        let breach = core.quota.lock().unwrap().breach_at(now()).unwrap();
-        let none = |_: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
-        core.quota_switch_by(&breach, &none);
+        core.quota.of("anthropic").unwrap().lock().unwrap().last = Some((now(), Usage { five_hour: 90.0, seven_day: 10.0, ..Default::default() }));
+        let breach = core.quota.of("anthropic").unwrap().lock().unwrap().breach_at(now()).unwrap();
+        let none = |_: &str, _: &str| -> Pick { (None, vec!["Muse jetonu yok".into()]) };
+        core.quota_switch_by("anthropic", &breach, &none);
         let got = notes(&core, "timur");
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(
@@ -3549,6 +3596,105 @@ mod quota_tests {
             got[0]
         );
         assert!(agent(&core, "kaan").active_engine.is_none() && core.ptys.is_running("kaan"), "Claude'da sürer");
+        finish(core, root);
+    }
+
+    // ── #2019: ikinci Claude hesabı ──
+
+    fn connect_claude_2(core: &crate::Core) -> std::path::PathBuf {
+        let dir = crate::claude_accounts::config_dir(&core.paths.data_dir, "anthropic-2").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".credentials.json"), r#"{"claudeAiOauth":{"accessToken":"synthetic-access","refreshToken":"synthetic-refresh"}}"#).unwrap();
+        dir
+    }
+
+    fn usage_of(core: &crate::Core, provider: &str, usage: Usage) {
+        core.quota.of(provider).unwrap().lock().unwrap().last = Some((now(), usage));
+    }
+
+    /// Claude eşiği → worker Claude 2'de sürer (lider yerinde); Claude 2'nin eşiği ayrı ölçülür,
+    /// onu sıradakine taşır; tükenme kaydı hesap başına; bağlantı kalkınca Claude 2 atlanır.
+    #[test]
+    fn claude_full_moves_workers_to_claude_2_then_claude_2_full_moves_on() {
+        let (core, root, src) = core("claude2");
+        busy_team(&core);
+        assert!(!core.chain_has_token("anthropic-2"), "bağlı değilken atlanır");
+        let dir = connect_claude_2(&core);
+        assert!(core.chain_has_token("anthropic-2"));
+        let src2 = Arc::new(Fixed(Mutex::new(Usage::default())));
+        core.quota_set_source_for("anthropic-2", src2.clone());
+        set(&src2, 40.0, 10.0);
+        assert!(core.quota_tick_for("anthropic-2"));
+        assert!(core.quota_targets("anthropic-2").is_empty(), "henüz kimse Claude 2'de değil");
+
+        // Claude %90 → kaan aynı devirle Claude 2'de; lider ve GLM'deki ayla yerinde.
+        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        set(&src, 90.0, 10.0);
+        assert!(core.quota_tick());
+        let starts = CAPTURE.with(|c| c.borrow_mut().take().unwrap());
+        assert_eq!(starts.len(), 1, "yalnız kaan yeniden açıldı");
+        assert_eq!((starts[0].0.id.as_str(), starts[0].0.provider.as_deref()), ("kaan", Some("anthropic-2")));
+        let kaan = agent(&core, "kaan");
+        assert_eq!(kaan.active_provider.as_deref(), Some("anthropic-2"));
+        assert_eq!(kaan.active_model.as_deref(), Some(kaan.model.as_str()), "Claude modeli aynen kalır");
+        assert!(agent(&core, "timur").active_provider.is_none(), "lider eşikten etkilenmez");
+        assert_eq!(agent(&core, "ayla").active_provider, None);
+        assert_eq!(core.quota_targets("anthropic-2"), vec!["kaan".to_string()]);
+        assert!(core.quota_targets("anthropic").is_empty());
+
+        // Claude 2 %90: seçimde atlanır; kendi eşiği kaan'ı Claude 2'den taşır (hedef yoksa not).
+        usage_of(&core, "anthropic-2", Usage { five_hour: 90.0, seven_day: 10.0, ..Default::default() });
+        assert!(core.chain_has_token("anthropic-2") && !core.chain_usable("anthropic-2"), "eşikteki Claude 2'ye kimse taşınmaz");
+        let b = core.quota.of("anthropic-2").unwrap().lock().unwrap().breach_at(now()).unwrap();
+        let seen = Mutex::new(Vec::<String>::new());
+        let nothing = |f: &str, _: &str| -> Pick {
+            seen.lock().unwrap().push(f.into());
+            (None, vec!["Muse jetonu yok".into()])
+        };
+        core.quota_switch_by("anthropic-2", &b, &nothing);
+        assert_eq!(*seen.lock().unwrap(), ["anthropic-2"], "seçim Claude 2'den sonrası");
+        let got = notes(&core, "timur");
+        assert!(got.iter().any(|n| n.contains("kaan: Claude %90 (5 sa) → Claude 2 ile sürüyor")), "{got:?}");
+        let last = got.last().unwrap();
+        assert!(last.contains("kaan: Claude 2 %90 (5 sa) ama ") && last.ends_with("Claude 2'de sürüyor."), "{last}");
+        // Yeni açılış: iki hesap da eşikte → Claude 2'den sonrakine.
+        seen.lock().unwrap().clear();
+        let to_muse = |f: &str, m: &str| -> Pick {
+            seen.lock().unwrap().push(f.into());
+            muse(f, m)
+        };
+        core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &to_muse);
+        assert_eq!(*seen.lock().unwrap(), ["anthropic-2"]);
+        assert_eq!(agent(&core, "kaan").active_provider.as_deref(), Some("muse"));
+        // Claude eşiğin altına inince yeni oturum asıl hesapta.
+        set(&src, 10.0, 10.0);
+        assert!(core.quota_tick());
+        core.quota_route_by("kaan", &mut job_start("iş".into(), vec![]), &to_muse);
+        assert!(agent(&core, "kaan").active_provider.is_none(), "Claude'a döner");
+
+        // %100 ölçülen Claude 2 kendi adıyla tükenmiş kaydına girer; Claude'unki ayrı.
+        let reset = ms_to_iso(now() + 3_600_000);
+        usage_of(&core, "anthropic-2", Usage { five_hour: 100.0, five_hour_resets_at: Some(reset), ..Default::default() });
+        core.chain_measure();
+        let gone: Vec<String> = crate::db::with(&core.db, crate::chain::exhausted).unwrap().into_iter().map(|e| e.provider).collect();
+        assert_eq!(gone, ["anthropic-2"]);
+
+        // StopFailure (kota) Claude'da: sıradaki Claude 2 (tükenmemiş, eşik altı).
+        crate::db::with(&core.db, |c| crate::chain::clear_exhausted(c, "anthropic-2")).unwrap();
+        usage_of(&core, "anthropic-2", Usage { five_hour: 10.0, ..Default::default() });
+        let body = serde_json::json!({
+            "hook_event_name": "StopFailure", "error": "rate_limit",
+            "last_assistant_message": "429 quota exhausted, limit reset soon", "session_id": "s1",
+        });
+        let plan = core.chain_plan("kaan", &body).expect("kota → plan");
+        assert_eq!((plan.current.as_str(), plan.next.as_deref()), ("anthropic", Some("anthropic-2")));
+
+        // Bağlantı kaldırılınca: kimlik silinir, ölçüm unutulur, zincir atlar.
+        core.claude_account_remove("anthropic-2").unwrap();
+        assert!(!dir.join(".credentials.json").exists());
+        assert!(!core.chain_has_token("anthropic-2"));
+        assert!(core.quota.of("anthropic-2").unwrap().lock().unwrap().last.is_none());
+        assert!(!core.usage_get().providers.iter().any(|p| p.id == "anthropic-2"), "şeritte halkası yok");
         finish(core, root);
     }
 }

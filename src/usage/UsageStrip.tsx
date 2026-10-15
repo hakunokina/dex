@@ -67,6 +67,7 @@ function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id
         {m.icon
           ? <span className="usage-mark" data-icon={p.id} style={{ maskImage: `url("${m.icon}")`, WebkitMaskImage: `url("${m.icon}")` }} />
           : <span className="usage-glyph" data-icon="">{m.glyph}</span>}
+        {m.badge && <span className="usage-badge" aria-hidden="true">{m.badge}</span>}
       </div>
       <span className="usage-pct" data-window="fiveHour">{pctText(p.fiveHour?.remainingPercent)}</span>
       <span className="usage-pct usage-pct-week" data-window="weekly">{pctText(p.weekly?.remainingPercent)}</span>

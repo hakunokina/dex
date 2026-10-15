@@ -3,9 +3,11 @@
 // aynı sunucudaki her takım aynı anahtarları paylaşır, takıma özel anahtar yok.
 import { useEffect, useRef, useState } from "react";
 import { Trash2 } from "lucide-react";
-import { callHost, LOCAL, onEvent } from "../api/hosts";
+import { callHost, LOCAL, onEvent, qid } from "../api/hosts";
+import { killPty } from "../pty";
+import { ShellPane } from "../ShellPane";
 import {
-  importProviders, listProviders, localAdd, localDelete, localStatus, setLocalBaseUrl,
+  importProviders, listProviders, localAdd, localDelete, localStatus, removeClaudeAccount, setLocalBaseUrl,
   setProviderToken, type LocalStatus, type ProviderImportRow, type ProviderInfo,
 } from "../team/api";
 import { FirstReplyField } from "./FirstReply";
@@ -68,7 +70,9 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
   }
 
   const anthropic = providers?.find((p) => p.id === "anthropic");
-  const rest = (providers ?? []).filter((p) => p.id !== "anthropic" && p.id !== "local");
+  // #2019: extra Claude accounts (own CLI login) get their own card.
+  const accounts = (providers ?? []).filter((p) => p.account);
+  const rest = (providers ?? []).filter((p) => p.id !== "anthropic" && p.id !== "local" && !p.account);
   const localProvider = providers?.find((p) => p.id === "local");
 
   return (
@@ -96,6 +100,7 @@ export function ProvidersSection({ host, hostLabel }: { host: string; hostLabel:
       {error && <Pad><ErrorBand text={`Sağlayıcılar okunamadı: ${error}`} onRetry={() => void reload()} /></Pad>}
       {!providers && !error && <LoadingRows />}
       {anthropic && <ProviderCard key={providerScopeKey(host, "anthropic")} host={host} p={anthropic} builtIn initialSecs={firstReply?.anthropic} onSaved={() => void reload()} />}
+      {accounts.map((p) => <ClaudeAccountCard key={providerScopeKey(host, p.id)} host={host} p={p} initialSecs={firstReply?.[p.id]} onChanged={() => void reload()} />)}
       {rest.map((p) => <ProviderCard key={providerScopeKey(host, p.id)} host={host} p={p} initialSecs={firstReply?.[p.id]} onSaved={() => void reload()} />)}
       {localProvider && (
         <LocalCard
@@ -144,6 +149,95 @@ function ProviderCard({ host, p, builtIn, initialSecs, onSaved }: {
         )}
         feedback={msg && <FieldMsg ok={msg.ok} text={msg.text} />}
       />
+      <Row
+        label="Yanıt gecikmesi uyarısı"
+        description="Ajan bu süre sessiz kalırsa 'yanıt gecikiyor' işareti çıkar."
+        control={<FirstReplyField host={host} provider={p.id} label={p.label} initial={initialSecs} />}
+      />
+    </div>
+  );
+}
+
+/** #2019: a second Claude subscription in its own CLI config dir. Sign-in runs the real
+ *  `claude auth login` in a terminal here (dex-core's `claude-login` PTY); the chain moves
+ *  workers to it when Claude's quota runs out. */
+function ClaudeAccountCard({ host, p, initialSecs, onChanged }: {
+  host: string;
+  p: ProviderInfo;
+  initialSecs?: number | null;
+  onChanged: () => void;
+}) {
+  const [login, setLogin] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const account = p.account ?? { connected: false, email: null };
+  const ptyId = qid(host, `claude-login-${p.id}`);
+  // An unfinished sign-in does not outlive the card.
+  useEffect(() => () => { if (login) killPty(ptyId).catch(() => {}); }, [login, ptyId]);
+
+  async function remove() {
+    setBusy(true);
+    try {
+      await removeClaudeAccount(host, p.id);
+      setMsg({ ok: true, text: "Bağlantı kaldırıldı." });
+      onChanged();
+    } catch (e) {
+      setMsg({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusy(false);
+      setConfirm(false);
+    }
+  }
+
+  return (
+    <div data-setting={`provider-${p.id}`}>
+      <Row
+        label={p.label}
+        description={account.connected
+          ? `Bağlı${account.email ? ` · ${account.email}` : ""} — Claude'un kotası dolunca worker'lar bu hesaba geçer.`
+          : "Bağlı değil · ikinci Claude aboneliği; bağlanınca zincirde Claude'un hemen arkasında."}
+        control={
+          <span className="set-field-btns">
+            <button type="button" disabled={login} onClick={() => { setMsg(null); setLogin(true); }}>
+              {account.connected ? "Yeniden bağla" : "Hesabı bağla"}
+            </button>
+            {account.connected && (
+              <button type="button" disabled={busy} onClick={() => setConfirm(true)}>Bağlantıyı kaldır</button>
+            )}
+          </span>
+        }
+        feedback={msg && <FieldMsg ok={msg.ok} text={msg.text} />}
+      />
+      {login && (
+        <Pad>
+          <p className="set-note">
+            Tarayıcıda {p.label} olacak Claude hesabıyla giriş yap; tarayıcı açılmazsa aşağıdaki adresi aç.
+            Giriş bitince işlem kapanır ve kart "Bağlı" olur.
+          </p>
+          <div className="set-login-term">
+            <ShellPane ptyId={ptyId} cwd={null} cmd="claude-login" provider={p.id} focused onExit={onChanged} />
+          </div>
+          <span className="set-field-btns">
+            <button type="button" onClick={() => { killPty(ptyId).catch(() => {}); setLogin(false); onChanged(); }}>Kapat</button>
+          </span>
+        </Pad>
+      )}
+      {confirm && (
+        <Pad>
+          <ConfirmDialog
+            title={`${p.label} bağlantısı kaldırılsın mı?`}
+            lines={[
+              "Bu hesabın Dex'teki girişi silinir; zincir artık bu hesaba geçmez.",
+              "Süren oturumları jetonları bitene dek sürer. Geri almak için yeniden bağla.",
+            ]}
+            confirmLabel="Bağlantıyı kaldır"
+            busy={busy}
+            onCancel={() => setConfirm(false)}
+            onConfirm={() => void remove()}
+          />
+        </Pad>
+      )}
       <Row
         label="Yanıt gecikmesi uyarısı"
         description="Ajan bu süre sessiz kalırsa 'yanıt gecikiyor' işareti çıkar."

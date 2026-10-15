@@ -16,6 +16,11 @@ interface Props {
   cwd: string | null;
   focused?: boolean;
   onFocus?: () => void;
+  /** #2019: another agent-less command dex-core resolves (`claude-login` + its account), not the shell. */
+  cmd?: string;
+  provider?: string;
+  /** The session ended (shown in the terminal too). */
+  onExit?: () => void;
 }
 
 const runningShells = new Set<string>();
@@ -30,8 +35,10 @@ export const isShellRunning = (id: string) => runningShells.has(id);
 export const subscribeShellRunning = (notify: () => void) => (runningSubs.add(notify), () => runningSubs.delete(notify));
 export const restartShell = (id: string) => shellStarters.get(id)?.();
 
-export function ShellPane({ ptyId, cwd, focused = false, onFocus }: Props) {
+export function ShellPane({ ptyId, cwd, focused = false, onFocus, cmd = "shell", provider, onExit }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
   const termRef = useRef<Terminal | null>(null);
   const sinkRef = useRef<PtySink | null>(null);
   const sizeRef = useRef<ReturnType<typeof ptyFit> | null>(null);
@@ -45,7 +52,7 @@ export function ShellPane({ ptyId, cwd, focused = false, onFocus }: Props) {
     term.reset();
     setError(null);
     try {
-      await spawnPty({ id: ptyId, cmd: "shell", cwd: cwd ?? undefined, cols: term.cols, rows: term.rows, onExit: () => {} }, sink);
+      await spawnPty({ id: ptyId, cmd, provider, cwd: cwd ?? undefined, cols: term.cols, rows: term.rows, onExit: () => {} }, sink);
       aliveRef.current = true;
       setShellRunning(ptyId, true);
       sizeRef.current?.claim(true); // #62: started here, sized here
@@ -108,6 +115,7 @@ export function ShellPane({ ptyId, cwd, focused = false, onFocus }: Props) {
           aliveRef.current = false;
           setShellRunning(ptyId, false);
           term!.write("\r\n\x1b[90m— kabuk kapandı —\x1b[0m\r\n");
+          onExitRef.current?.();
         },
       };
       sinkRef.current = sink;

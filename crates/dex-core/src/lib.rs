@@ -5,6 +5,7 @@ pub mod browser;
 pub mod agents;
 pub mod chain;
 pub mod chat;
+pub mod claude_accounts;
 pub mod cost;
 pub mod db;
 pub mod dexmsg;
@@ -106,9 +107,9 @@ pub struct Core {
     /// Sağlayıcı reset zamanlayıcısı nesilleri: aynı sağlayıcı yeniden işaretlenirse eski timer
     /// olay yayınlamaz. Event-driven; polling yok.
     chain_resets: Mutex<HashMap<String, i64>>,
-    /// Görev #250: son Claude kullanım ölçümü ve kaynağı (testte sahtesi; `quota_set_source`).
-    pub(crate) quota: Mutex<quota::State>,
-    quota_source: Mutex<std::sync::Arc<dyn quota::UsageSource>>,
+    /// Görev #250 / #2019: Claude hesabı başına son kullanım ölçümü ve kaynağı (testte sahtesi;
+    /// `quota_set_source`).
+    pub(crate) quota: quota::Accounts,
     /// #1861: kullanım şeridinin sağlayıcı ölçümleri (Claude quota'dan, GLM/Muse kendi uçlarından).
     pub(crate) usage: usage::Meter,
     /// S5-B: live transcript watches (one per agent) + queued chat texts per agent.
@@ -209,6 +210,7 @@ impl Core {
         let browser = browser::start(&paths.config_dir)?;
         let skills = skills::start(&paths.config_dir)?;
         let db = Db::new(conn);
+        let quota = quota::Accounts::new(&paths.data_dir);
         let core = Arc::new_cyclic(|weak| Self {
             paths,
             events,
@@ -227,12 +229,7 @@ impl Core {
             admission_gate: Mutex::default(),
             chain_guard: Mutex::default(),
             chain_resets: Mutex::default(),
-            quota: Mutex::default(),
-            quota_source: Mutex::new(if cfg!(test) {
-                std::sync::Arc::new(quota::NoUsage)
-            } else {
-                std::sync::Arc::new(quota::OAuthUsage)
-            }),
+            quota,
             usage: usage::Meter::default(),
             chat_watches: chat::Watches::default(),
             chat_queues: Mutex::default(),
@@ -1233,7 +1230,30 @@ impl Core {
                 }
             });
         }
-        providers::list()
+        let mut list = providers::list()?;
+        // #2019: ek Claude hesabı — "jeton" CLI'ın kimlik dosyası; durum ve e-posta karta gider.
+        for p in &mut list {
+            if let Some(dir) = claude_accounts::config_dir(&self.paths.data_dir, &p.id) {
+                let account = claude_accounts::account(&dir);
+                p.has_token = account.connected;
+                p.account = Some(account);
+            }
+        }
+        Ok(list)
+    }
+
+    /// #2019: ek Claude hesabının bağlantısını kaldırır (kimlik + hesap durumu silinir). Süren
+    /// oturumlar bellekteki jetonla sürer; zincir artık bu hesaba geçmez.
+    pub fn claude_account_remove(&self, provider: &str) -> Result<(), String> {
+        let dir = claude_accounts::config_dir(&self.paths.data_dir, provider)
+            .ok_or_else(|| format!("bilinmeyen Claude hesabı: {provider}"))?;
+        claude_accounts::remove(&dir)?;
+        if let Some(q) = self.quota.of(provider) {
+            *q.lock().unwrap() = quota::State::default();
+        }
+        self.usage_forget(provider);
+        self.changed("providers-changed");
+        Ok(())
     }
 
     pub fn provider_import_routes(&self) -> Result<Vec<providers::ImportRow>, String> {
@@ -1344,6 +1364,17 @@ impl Core {
     }
 
     pub(crate) fn pty_exited(&self, id: &str) {
+        // #2019: a Claude account's sign-in ended — its card and ring show the new state now.
+        if let Some(provider) = claude_accounts::login_provider(id) {
+            self.changed("providers-changed");
+            let weak = self.weak_self.clone();
+            std::thread::spawn(move || {
+                if let Some(core) = weak.upgrade() {
+                    core.quota_tick_for(provider);
+                }
+            });
+            return;
+        }
         self.reported_workers.lock().unwrap().remove(id);
         if let Err(error) = with(&self.db, |c| cost::end_agent(c,id)) {
             log::error!("usage session end: {error}");

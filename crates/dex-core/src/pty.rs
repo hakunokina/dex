@@ -179,6 +179,8 @@ pub(crate) struct AgentLaunch {
 thread_local! {
     /// Capture the fully wired argv at the process boundary, without running either CLI.
     static CAPTURE: std::cell::RefCell<Option<Vec<Vec<String>>>> = const { std::cell::RefCell::new(None) };
+    /// #2019: each captured command's `CLAUDE_CONFIG_DIR` (`None` = inherited).
+    static CAPTURE_CONFIG_DIR: std::cell::RefCell<Vec<Option<String>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// `sink` is subscribed before the child starts, so it sees every byte.
@@ -193,7 +195,16 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     validate_size(cols, rows)?;
     // DEX-29: the patron's shell — none of the agent wiring below applies (no job, hooks, memory).
     let is_shell = cmd == crate::shell::SHELL_CMD;
-    let (cmd, args) = if is_shell { crate::shell::resolve() } else { (cmd, args) };
+    // #2019: a Claude account's sign-in — the real CLI in that account's config dir, but no agent
+    // (no hooks, MCP, provider env or CPU job), like the shell.
+    let login = (cmd == crate::claude_accounts::LOGIN_CMD)
+        .then(|| crate::claude_accounts::login_command(&core.paths.data_dir, provider.as_deref()))
+        .transpose()?;
+    let (cmd, args) = match &login {
+        _ if is_shell => crate::shell::resolve(),
+        Some((login_cmd, login_args, _)) => (login_cmd.clone(), login_args.clone()),
+        None => (cmd, args),
+    };
     // #1710: the Codex engine is gone; an old client asking for it gets a plain error.
     if std::path::Path::new(&cmd).file_stem().is_some_and(|s| s.eq_ignore_ascii_case("codex")) {
         return Err("Codex motoru kaldırıldı — ajanlar yalnız Claude Code ile açılır".into());
@@ -205,9 +216,10 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // DEX-13: PATH'teki `claude` bir claude-route SHİM'ine çözülüyor olabilir; Dex gerçek
     // ikiliyi çağırır — env'i Dex basarken shim üzerinden ikinci bir yönlendirme doğar.
     let cmd = providers::resolve_claude(&cmd);
-    let is_claude = std::path::Path::new(&cmd)
-        .file_stem()
-        .is_some_and(|s| s.eq_ignore_ascii_case("claude"));
+    let is_claude = login.is_none()
+        && std::path::Path::new(&cmd)
+            .file_stem()
+            .is_some_and(|s| s.eq_ignore_ascii_case("claude"));
     // DEX-17: motor DB'den gelir; zincir geçişinde geçici motor kalıcı ayarı ezmez.
     let engine: Option<String> = {
         let conn = core.db.0.lock().map_err(|_| "db kilidi zehirli")?;
@@ -326,7 +338,7 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     // Dex launched from inside a Claude session inherits its markers; the child claude then
     // thinks it is nested (transcript off → --resume breaks). Only strip when that happened,
     // so a user's own CLAUDE_CODE_* config survives a normal launch.
-    if (is_claude || is_shell) && std::env::var_os("CLAUDECODE").is_some() {
+    if (is_claude || is_shell || login.is_some()) && std::env::var_os("CLAUDECODE").is_some() {
         for (k, _) in std::env::vars_os() {
             let inherited = |k: &str| {
                 matches!(k, "CLAUDECODE" | "CLAUDE_EFFORT" | "CLAUDE_PID") || k.starts_with("CLAUDE_CODE_")
@@ -338,12 +350,29 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
     }
     // DEX-13: glm/muse sağlayıcısı gerçek uç env'ini basar (jeton kaseden); anthropic/None
     // env'e dokunmaz. Jeton yoksa burada başarısız olur → pane kullanıcıya ne yapacağını yazar.
-    let provider = provider.filter(|_| !is_shell);
+    let provider = provider.filter(|_| !is_shell && login.is_none());
     if let Some(env) = providers::spawn_env(provider.as_deref(), providers::model_flag(&args).as_deref())? {
         for (k, v) in env {
             builder.env(k, v);
         }
         builder.env_remove("ANTHROPIC_API_KEY"); // CLI API_KEY'i tercih edebilir; tek jeton kaynağı kalır
+    }
+    // #2019: an extra Claude account runs in its own `CLAUDE_CONFIG_DIR` (credentials + account
+    // state there; transcripts, user settings and trust shared — claude_accounts::prepare). Dex's
+    // own wiring (--settings, --mcp-config, --plugin-dir) is flags, independent of the dir.
+    let account = match &login {
+        Some((_, _, dir)) => Some(dir.clone()),
+        None => provider
+            .as_deref()
+            .filter(|_| is_claude)
+            .and_then(|p| crate::claude_accounts::config_dir(&core.paths.data_dir, p)),
+    };
+    if let Some(dir) = account {
+        if login.is_none() {
+            crate::claude_accounts::prepare(&dir)?;
+        }
+        builder.env("CLAUDE_CONFIG_DIR", &dir);
+        builder.env_remove("ANTHROPIC_API_KEY");
     }
     builder.args(args);
     if let Some(dir) = cwd.or_else(|| std::env::var("USERPROFILE").ok()) {
@@ -360,6 +389,8 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
         let mut capture = c.borrow_mut();
         let Some(commands) = capture.as_mut() else { return false };
         commands.push(builder.get_argv().iter().map(|a| a.to_string_lossy().into_owned()).collect());
+        let dir = builder.get_env("CLAUDE_CONFIG_DIR").map(|d| d.to_string_lossy().into_owned());
+        CAPTURE_CONFIG_DIR.with(|c| c.borrow_mut().push(dir));
         true
     }) {
         return Ok(());
@@ -406,7 +437,7 @@ pub(crate) fn spawn_bound(core: &Core, req: Spawn, launch: Option<AgentLaunch>, 
         stream: stream.clone(),
         reader_done: Some(reader_done_rx),
         replay: !is_shell && engine.is_some(),
-        kind: if is_shell { "shell" } else { "agent" }.into(),
+        kind: if is_shell || login.is_some() { "shell" } else { "agent" }.into(),
         cols,
         rows,
         started_at: std::time::SystemTime::now()
@@ -1489,6 +1520,56 @@ mod tests {
         assert!(!core.ptys.is_running("timur"));
         core.shutdown();
         drop(core);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #2019: Claude 2 runs the real CLI with Dex's wiring in its own `CLAUDE_CONFIG_DIR` (prepared:
+    /// transcripts linked, trust carried over); its sign-in is the bare `claude auth login`.
+    #[test]
+    fn claude_2_runs_in_its_account_dir_and_its_login_is_no_agent() {
+        struct Sink;
+        impl PtySink for Sink {
+            fn data(&mut self, _: &[u8]) -> bool { true }
+            fn exit(&mut self) {}
+        }
+        let root = std::env::temp_dir().join(format!("dex-pty-claude2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let main = root.join("main");
+        std::fs::create_dir_all(main.join("projects")).unwrap();
+        std::fs::write(root.join("main.json"), r#"{"hasCompletedOnboarding":true,"projects":{"C:/w":{"hasTrustDialogAccepted":true}}}"#).unwrap();
+        crate::claude_accounts::TEST_MAIN.with(|m| *m.borrow_mut() = Some((main.clone(), root.join("main.json"))));
+        let core = Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
+            crate::Events::new(crate::events::NullSink)).unwrap();
+        let dir = crate::claude_accounts::config_dir(&core.paths.data_dir, "anthropic-2").unwrap();
+        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        CAPTURE_CONFIG_DIR.with(|c| c.borrow_mut().clear());
+        for (id, provider) in [("kaan", "anthropic-2"), ("timur", "anthropic")] {
+            let req = Spawn { id: id.into(), cmd: "claude".into(), provider: Some(provider.into()), cols: 80, rows: 24, ..Default::default() };
+            spawn(&core, req, Sink).unwrap();
+        }
+        let login = Spawn { id: crate::claude_accounts::login_pty_id("anthropic-2"), cmd: crate::claude_accounts::LOGIN_CMD.into(),
+            provider: Some("anthropic-2".into()), cols: 80, rows: 24, ..Default::default() };
+        spawn(&core, login, Sink).unwrap();
+        let bad = Spawn { id: "claude-login-anthropic".into(), cmd: crate::claude_accounts::LOGIN_CMD.into(),
+            provider: Some("anthropic".into()), cols: 80, rows: 24, ..Default::default() };
+        assert!(spawn(&core, bad, Sink).is_err(), "asıl hesabın girişi Dex'ten değil");
+        let argv = CAPTURE.with(|c| c.borrow_mut().take().unwrap());
+        let dirs = CAPTURE_CONFIG_DIR.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        let own = Some(dir.to_string_lossy().into_owned());
+        assert_eq!(dirs, [own.clone(), None, own], "yalnız Claude 2 ve girişi kendi dizininde");
+        assert!(argv[0].iter().any(|a| a == "--settings") && argv[0].iter().any(|a| a == "--mcp-config"), "Dex bağlantısı bayrakla");
+        assert!(argv[2].ends_with(&["auth".to_string(), "login".to_string(), "--claudeai".to_string()]), "{:?}", argv[2]);
+        assert!(!argv[2].iter().any(|a| a == "--settings" || a == "--mcp-config"), "giriş ajan değil");
+        assert!(crate::worktree::is_link(&dir.join("projects")), "transcript'ler paylaşılır");
+        let state: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!((&state["hasCompletedOnboarding"], &state["projects"]["C:/w"]["hasTrustDialogAccepted"]), (&serde_json::json!(true), &serde_json::json!(true)));
+        crate::claude_accounts::TEST_MAIN.with(|m| *m.borrow_mut() = None);
+        core.shutdown();
+        drop(core);
+        #[cfg(windows)]
+        let _ = std::fs::remove_dir(dir.join("projects"));
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(dir.join("projects"));
         let _ = std::fs::remove_dir_all(root);
     }
 

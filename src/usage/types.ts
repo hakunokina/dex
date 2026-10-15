@@ -9,7 +9,7 @@ export interface UsageWindow {
 }
 
 export interface ProviderUsage {
-  /** Dex sağlayıcı kimliği: anthropic, glm, muse. */
+  /** Dex sağlayıcı kimliği: anthropic, anthropic-2 (#2019, bağlıysa), glm, muse. */
   id: string;
   /** null = taze ölçüm yok ("--"); nedeni `note`. */
   fiveHour: UsageWindow | null;

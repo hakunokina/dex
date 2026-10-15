@@ -780,6 +780,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
 function tokenWarning(providers: ProviderInfo[], provider: string): string | null {
   if (provider === "anthropic") return null;
   const p = providers.find((x) => x.id === provider);
+  if (p?.account) return p.hasToken ? null : `${p.label} hesabı bağlı değil — Ayarlar › Sağlayıcılar'dan bağla`;
   return p && !p.hasToken ? `${p.label} anahtarı yok — Ayarlar › Sağlayıcılar'dan içe aktar ya da gir` : null;
 }
 
