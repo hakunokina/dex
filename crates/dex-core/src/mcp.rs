@@ -1739,7 +1739,7 @@ fn tools() -> Value {
         { "name": "map_refresh", "description": "YALNIZ LİDER. Projenin `.dex/map.md` repo haritası iskeletini tazeler (Scout-2'nin Genel bakış bölümü korunur). Birleştirme sonrası otomatik tazelenir; bu araç elle tetikleme içindir.",
           "annotations": { "readOnlyHint": false },
           "inputSchema": { "type": "object", "additionalProperties": false, "properties": { "project": project_schema() } } },
-        { "name": "motivation_set", "description": "YALNIZ LİDER. Patronun bugünkü 3 motivasyon cümlesini kaydeder (sabah 05–12, öğle 12–19, akşam 19–05); telefon dexd'den çeker. Her biri boş değil, tek satır, en çok 200 karakter; biri uymazsa hiçbiri kaydedilmez. Aynı gün tekrar çağrı üzerine yazar.",
+        { "name": "motivation_set", "description": "YALNIZ LİDER. Patronun bugünkü 3 motivasyon cümlesini kaydeder (sabah 05–12, öğle 12–19, akşam 19–05); telefon dexd'den çeker. Her biri boş değil, tek satır, en çok 250 karakter; biri uymazsa hiçbiri kaydedilmez. Aynı gün tekrar çağrı üzerine yazar.",
           "annotations": { "readOnlyHint": false },
           "inputSchema": { "type": "object", "additionalProperties": false, "required": ["morning", "noon", "evening"], "properties": {
               "morning": { "type": "string", "minLength": 1, "maxLength": crate::motivation::MAX_CHARS },

@@ -24,7 +24,7 @@ pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS motivations (
 );";
 
 pub const LEADER: &str = "timur";
-pub const MAX_CHARS: usize = 200;
+pub const MAX_CHARS: usize = 250;
 pub const MAX_ERROR_CHARS: usize = 500;
 /// Local time from which the day's turn is due.
 pub fn due_at() -> NaiveTime {
@@ -202,9 +202,9 @@ mod tests {
             assert!(err.contains("hiçbiri kaydedilmedi"), "{err}");
         }
         let err = validate([("morning", ""), ("noon", "a\nb"), ("evening", &long)]).unwrap_err();
-        assert!(err.contains("morning boş") && err.contains("noon tek satır") && err.contains("evening en çok 200"), "{err}");
+        assert!(err.contains("morning boş") && err.contains("noon tek satır") && err.contains(&format!("evening en çok {MAX_CHARS}")), "{err}");
         assert_eq!(get(&c, "2026-10-15").unwrap(), None);
-        // Exactly 200 (multi-byte) is fine.
+        // Exactly MAX_CHARS (multi-byte) is fine.
         set(&c, "2026-10-15", &"ç".repeat(MAX_CHARS), "öğle", "akşam", 1).unwrap();
         assert!(get(&c, "2026-10-15").unwrap().is_some());
     }
