@@ -164,7 +164,7 @@ function GpuCell() {
   return (
     <div className={`usage-cell usage-gpu ${c.tone}`} title={c.title} aria-label={c.title} tabIndex={0} data-gpu-owner={c.owner}>
       <span className="usage-cap">gpu</span>
-      <span className="usage-big">{c.owner}</span>
+      {c.owner !== "boş" && <span className="usage-big">{c.owner}</span>}
       <span className="usage-sub usage-gpu-daily">{c.daily}</span>
       {c.queued ? <span className="usage-sub">{c.queued} sırada</span> : null}
     </div>
