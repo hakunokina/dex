@@ -14,9 +14,8 @@ export interface CoreNameSpec {
 export type DrawPill = (text: string, minX: number, maxX: number, cy: number) => void;
 
 /** The plate first, then the name, role and pill over it — the text never sits under the plate. */
-export function drawCoreName(ctx: CanvasRenderingContext2D, s: CoreNameSpec, pill: DrawPill) {
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
+/** The name and role line's texts and widths (#2020: Echo sits beside the widest of them). */
+export function measureCoreName(ctx: CanvasRenderingContext2D, s: Pick<CoreNameSpec, "name" | "role" | "cost" | "maxW" | "font" | "mono">) {
   ctx.font = `600 14px ${s.font}`;
   const name = ellipsis(ctx, s.name, s.maxW);
   const nameW = ctx.measureText(name).width;
@@ -26,6 +25,13 @@ export function drawCoreName(ctx: CanvasRenderingContext2D, s: CoreNameSpec, pil
   ctx.font = `600 10px ${s.mono}`;
   const pillW = s.cost ? Math.min(s.maxW * 0.5, ctx.measureText(s.cost).width + 10) : 0;
   const gap = roleText && s.cost ? 6 : 0;
+  return { name, nameW, roleText, roleW, pillW, gap, width: Math.max(nameW, roleW + gap + pillW) };
+}
+
+export function drawCoreName(ctx: CanvasRenderingContext2D, s: CoreNameSpec, pill: DrawPill) {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const { name, nameW, roleText, roleW, pillW, gap } = measureCoreName(ctx, s);
   const left = s.x - (roleW + gap + pillW) / 2;
   if (s.plate) {
     // #401 handoff: no text on the texture without a solid backing.

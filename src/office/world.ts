@@ -9,10 +9,10 @@ import { areaInset, fitUnit, isEcho, layout, ownershipKey, latestOwners, pickMod
 import { ECHO_FOOT, WORKER_FOOT } from "./assets";
 import { chipNameStyle, coreLabel, OFFLINE_NAME_ALPHA, teamSignature } from "./label";
 import { DelegationTouches, TOUCH_MS, reachAt, tentacleContour, fragmentPaths, type FragmentBox } from "./symbiote";
-import { drawCoreName, ellipsis, roundRect } from "./coreName";
+import { drawCoreName, ellipsis, measureCoreName, roundRect } from "./coreName";
 import {
-  LOOK, clockAt, coreEyeK, dropAt, echoDrift, echoLight, facingOf, labelRect, linear, markAlpha, markAt, pathLength, pointAt,
-  routeToBody, scale, smoothRoute, spotOf, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot, type Tone,
+  LOOK, clockAt, coreEyeK, dropAt, echoBeside, echoDrift, echoLight, facingOf, labelRect, lifeOf, linear, markAlpha, markAt, pathLength, pointAt,
+  routeToBody, sacLook, scale, smoothRoute, spotOf, textBlock, workerLight, type Light, type Rect, type Rgb, type Spot, type Tone,
 } from "./symbioteCard";
 import type { BodyDraw, Flow, LitScene, PointLight, Shadow } from "./litLayer";
 import type { OfficeTheme } from "./theme";
@@ -62,7 +62,17 @@ interface Chip {
 interface Trace { leaderId: string; workerId: string; points: Point[]; route: Point[]; length: number }
 
 /** One body on the membrane this frame: a worker's sac, Echo, or a leader too small for Core XL. */
-interface View { chip: Chip; spot: Spot; echo: boolean; light: Light; status: AgentStatus; hot: boolean }
+interface View {
+  chip: Chip; spot: Spot; echo: boolean; light: Light; status: AgentStatus; hot: boolean;
+  /** #2020: 0 dormant .. 1 live (working, an active job, a question, an unread result). */
+  life: number;
+}
+
+/** #2020: Echo beside its Core's name: body spot, its Core-style label rows and the box it takes (hit, calm). */
+type EchoPlace = ReturnType<typeof echoBeside> & { box: Rect };
+
+/** #2020: a strand this frame: its life, colour and the returning drop (`along`). */
+interface StrandState { trace: Trace; job: boolean; life: number; tone: Tone | "team"; along: number | null }
 
 const MOVE_SPEED = 8;
 const BOOT_SECONDS = 0.7;
@@ -80,6 +90,8 @@ export class World {
   private traceKey = "";
   /** #1958: which way each body looks (columns: towards its Core). */
   private facing = new Map<string, 1 | -1 | 0>();
+  /** #2020: Echo beside the first Core's name (none: the Core is too small, Echo keeps its slot). */
+  private echoes = new Map<string, EchoPlace>();
   private ownership = "";
   private readonly delegationTouches = new DelegationTouches();
   private touches: { leader: string; worker: string; at: number }[] = [];
@@ -95,7 +107,7 @@ export class World {
   /** #411: the team's name (Office keeps it current) — the leaders' "Ana Core" label and the board's signature. */
   teamName = "";
   /** #1958: the last draw's lit scene (CSS px) for Office's light layer. */
-  scene: LitScene = { time: 0, reduced: false, core: null, lights: [], shadows: [], flows: [], bodies: [], strands: { key: "", routes: [], cores: [], calm: [] } };
+  scene: LitScene = { time: 0, reduced: false, core: null, lights: [], shadows: [], flows: [], bodies: [], strands: { key: "", routes: [], cores: [], calm: [] }, flowColor: [0, 0, 0] };
 
   constructor(agents: Agent[], private data: WorldData) {
     this.sync(agents);
@@ -237,6 +249,10 @@ export class World {
   }
 
   hit(x: number, y: number): Agent | null {
+    for (const chip of this.chips) {
+      const box = this.echoes.get(chip.agent.id)?.box;
+      if (box && x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h) return chip.agent;
+    }
     const chip = [...this.chips].reverse().find((item) =>
       x >= item.x - item.w / 2 && x <= item.x + item.w / 2 && y >= item.y - item.h / 2 && y <= item.y + item.h / 2,
     );
@@ -270,36 +286,91 @@ export class World {
     const delegations = this.data.delegations();
     this.refreshLayout(delegations);
     this.rebuildTraces(delegations);
+    this.placeEchoes(ctx, palette);
     const time = this.reduced ? 0 : this.time;
-    const views = this.chips.filter((chip) => !this.bodyOf(chip)).map((chip) => this.viewOf(chip, time, chip.agent.id === focusedId));
-    if (fallback) this.drawFallback(ctx, palette, views, delegations, time);
+    const views = this.chips.filter((chip) => !this.bodyOf(chip)).map((chip) => this.viewOf(chip, delegations, time, chip.agent.id === focusedId));
+    const strands = this.strandStates(views, delegations, time);
+    if (fallback) this.drawFallback(ctx, palette, views, strands, time);
     this.drawContacts(ctx, palette);
     this.drawFragments(ctx, palette, core);
     const anchors = this.chips.map((chip) => {
       const body = this.bodyOf(chip);
       if (body) this.drawCore(ctx, chip, body, palette, core);
+      const echo = this.echoes.get(chip.agent.id)?.spot;
+      if (echo) return { agent: chip.agent, x: echo.bx, y: echo.by, top: echo.D / 2 + 8, body };
       return { agent: chip.agent, x: chip.x, y: chip.y, top: chip.h / 2, body };
     });
     for (const view of views) this.drawLabel(ctx, view, palette, time);
     this.drawDropMarks(ctx, palette, time);
     this.drawSignature(ctx, palette);
-    this.scene = this.litScene(views, delegations, palette, time);
+    this.scene = this.litScene(views, strands, palette, time);
     return anchors;
   }
 
-  /** The body's spot in the chip's slot at its current position. */
+  /** The body's spot in the chip's slot at its current position (Echo: beside its Core's name). */
   private spotOf(chip: Chip) {
-    return spotOf(chip, this.facing.get(chip.agent.id) ?? 0, isEcho(chip.agent));
+    return this.echoes.get(chip.agent.id)?.spot ?? spotOf(chip, this.facing.get(chip.agent.id) ?? 0, isEcho(chip.agent));
   }
 
-  private viewOf(chip: Chip, time: number, focused: boolean): View {
+  /**
+   * #2020 (patron): Echo is labelled like Core — its body just left of the first Core's name block, its name
+   * and role (+ cost) centred under it. The layout keeps Echo's slot under Core (routes unchanged).
+   */
+  private placeEchoes(ctx: CanvasRenderingContext2D, p: OfficeTheme) {
+    this.echoes.clear();
+    const leader = this.chips.find((chip) => chip.agent.kind === "leader");
+    const body = leader && this.bodyOf(leader);
+    if (!leader || !body) return;
+    const nameY = body.y + body.s / 2 + XL_PIN + 10;
+    ctx.save();
+    const block = measureCoreName(ctx, { ...this.coreText(leader), maxW: Math.max(40, leader.w + 40), font: p.font, mono: p.mono });
+    for (const chip of this.chips.filter((item) => isEcho(item.agent))) {
+      const place = echoBeside({ x: leader.x, nameY, roleY: nameY + 15 }, block.width, spotOf(chip, 0, true).D);
+      const label = measureCoreName(ctx, { ...this.echoText(chip), maxW: place.maxW, font: p.font, mono: p.mono });
+      const { bx, by, D } = place.spot;
+      const half = Math.max(D, label.width) / 2;
+      this.echoes.set(chip.agent.id, { ...place, box: { x: bx - half, y: by - D / 2 - 8, w: 2 * half, h: place.roleY + 8 - (by - D / 2 - 8) } });
+    }
+    ctx.restore();
+  }
+
+  /** Core's label texts (as drawCore draws them). */
+  private coreText(chip: Chip) {
+    return { name: this.nameOf(chip), role: (chip.agent.roleName || chip.agent.title || "").toLocaleUpperCase("tr-TR"), cost: this.data.cost(chip.agent.id) };
+  }
+
+  private echoText(chip: Chip) {
+    return { name: chip.agent.name, role: (chip.agent.roleName || chip.agent.title || "").toLocaleUpperCase("tr-TR"), cost: this.data.cost(chip.agent.id) };
+  }
+
+  private viewOf(chip: Chip, delegations: Delegation[], time: number, focused: boolean): View {
     const id = chip.agent.id;
     const status = this.data.status(id);
     const echo = isEcho(chip.agent);
-    let light = workerLight(status, echo ? null : this.data.result(id), this.data.question(id), time, this.reduced);
+    const job = !echo && delegations.some((d) => d.toAgent === id && this.data.active(d));
+    // #2020: an idle worker with a running job is still at work: its sac beats like a working one.
+    let light = workerLight(job && status === "idle" ? "working" : status, echo ? null : this.data.result(id), this.data.question(id), time, this.reduced);
     // An offline click wakes the body: its light comes up in the team's red.
     if (chip.boot > 0) light = { ...light, tone: "red", k: 1 - chip.boot / BOOT_SECONDS, pulse: 1, offline: false, mark: null, error: false };
-    return { chip, spot: this.spotOf(chip), echo, light, status, hot: focused || this.hoverId === id };
+    return { chip, spot: this.spotOf(chip), echo, light, status, hot: focused || this.hoverId === id, life: echo ? 0 : lifeOf(light, job) };
+  }
+
+  /** #2020: each strand's life and drop; live strands last (their flow ids win where strands overlap at Core). */
+  private strandStates(views: View[], delegations: Delegation[], time: number): StrandState[] {
+    const byId = new Map(views.map((view) => [view.chip.agent.id, view]));
+    const states = this.traces.map((trace): StrandState => {
+      const job = delegations.some((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d));
+      const view = byId.get(trace.workerId);
+      const question = this.data.question(trace.workerId);
+      const result = this.data.result(trace.workerId);
+      const along = dropAt(question, result, time, this.reduced);
+      // The drop's colour wins (it travels on the strand); else the worker's tone, plain work in the team's.
+      const tone: Tone | "team" = along !== null
+        ? (question ? "amber" : result?.status === "done" ? "green" : result?.status === "failed" ? "redHi" : "amber")
+        : !view || view.light.tone === "muted" || view.light.tone === "red" ? "team" : view.light.tone;
+      return { trace, job, life: Math.max(view?.life ?? 0, job ? 1 : 0), tone, along };
+    });
+    return [...states.filter((s) => s.life <= 0), ...states.filter((s) => s.life > 0)];
   }
 
   /** All fragments precede all chips and text; protected plates also constrain their paths. */
@@ -309,7 +380,10 @@ export class World {
     for (const chip of this.chips) {
       const body = this.bodyOf(chip), core = this.cores.get(chip.agent.id);
       if (!body || !core) continue;
-      const blocks: FragmentBox[] = this.chips.filter(c => c !== chip).map(c => ({ x: c.x - c.w / 2 - 6, y: c.y - c.h / 2 - 12, w: c.w + 12, h: c.h + 18 }));
+      const blocks: FragmentBox[] = this.chips.filter(c => c !== chip).map(c => {
+        const echo = this.echoes.get(c.agent.id)?.box;
+        return echo ? { x: echo.x - 6, y: echo.y - 6, w: echo.w + 12, h: echo.h + 12 } : { x: c.x - c.w / 2 - 6, y: c.y - c.h / 2 - 12, w: c.w + 12, h: c.h + 18 };
+      });
       // The provider badge is not a block: upper traces leave through it, and pieces drawn first slip under it.
       blocks.push({ x: body.x - (chip.w + 40) / 2, y: body.y + body.s / 2 + XL_PIN, w: chip.w + 40, h: 40 });
       const paths = fragmentPaths(body, this.traces.filter(t => t.leaderId === chip.agent.id).map(t => t.points), blocks, board);
@@ -454,9 +528,7 @@ export class World {
     // #411: "Ana Core" in the team colour; #1958: the calm zone under it keeps the membrane quiet.
     drawCoreName(ctx, {
       x: chip.x, nameY, roleY, maxW,
-      name: this.nameOf(chip),
-      role: (chip.agent.roleName || chip.agent.title || "").toLocaleUpperCase("tr-TR"),
-      cost: this.data.cost(chip.agent.id),
+      ...this.coreText(chip),
       plate: null,
       nameColor: p.teamHi, roleColor: p.muted, font: p.font, mono: p.mono,
     }, (text, minX, maxX, cy) => drawTokenPill(ctx, text, minX, maxX, cy, p));
@@ -483,7 +555,22 @@ export class World {
     const block = textBlock(spot, chip.h, !!this.data.cost(chip.agent.id));
     const right = spot.align === "right";
     const maxW = spot.textR - spot.textL;
-    if (maxW >= 12) {
+    const echo = this.echoes.get(chip.agent.id);
+    if (echo) this.drawEchoName(ctx, chip, echo, light, p);
+    else if (maxW >= 12 && view.life > 0 && !light.offline) {
+      // #2020: a live worker's label sits in a faint glow of its colour (the text keeps its dark halo).
+      const r = labelRect(spot, block);
+      const glow = ctx.createRadialGradient(0, 0, 0, 0, 0, 32);
+      glow.addColorStop(0, p[light.tone]); glow.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.save();
+      ctx.translate(r.x + r.w / 2, r.y + r.h / 2 + 3);
+      ctx.scale((r.w * 0.62) / 32, (r.h * 0.8) / 32);
+      ctx.globalAlpha = 0.2 * view.life * (0.7 + 0.3 * light.pulse);
+      ctx.fillStyle = glow;
+      ctx.beginPath(); ctx.arc(0, 0, 32, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    if (!echo && maxW >= 12) {
       ctx.save();
       ctx.textBaseline = "middle";
       if (light.offline) ctx.globalAlpha = 0.62;
@@ -563,8 +650,30 @@ export class World {
     }
   }
 
+  /** #2020: Echo's provider badge on its body's top edge, its name and role (+ cost) under it (Core's look). */
+  private drawEchoName(ctx: CanvasRenderingContext2D, chip: Chip, place: EchoPlace, light: Light, p: OfficeTheme) {
+    const { bx, by, D } = place.spot;
+    ctx.save();
+    if (light.offline) ctx.globalAlpha *= OFFLINE_NAME_ALPHA;
+    const provider = providerOf(chip.agent, p);
+    ctx.font = `700 8px ${p.mono}`;
+    const pt = ellipsis(ctx, provider.label, place.maxW - 8);
+    const pw = ctx.measureText(pt).width + 8;
+    roundRect(ctx, bx - pw / 2, by - D / 2 - 8, pw, 10, 3);
+    ctx.fillStyle = provider.fill ?? p.surface; ctx.fill();
+    ctx.strokeStyle = provider.fill ? p.edge : provider.color; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = provider.color; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(pt, bx, by - D / 2 - 2.5);
+    ctx.shadowColor = LABEL_SHADOW; ctx.shadowBlur = 3;
+    drawCoreName(ctx, {
+      x: bx, nameY: place.nameY, roleY: place.roleY, maxW: place.maxW, ...this.echoText(chip), plate: null,
+      nameColor: light.offline ? p.muted : LOOK.echo.color, roleColor: p.muted, font: p.font, mono: p.mono,
+    }, (text, minX, maxX, cy) => drawTokenPill(ctx, text, minX, maxX, cy, p));
+    ctx.restore();
+  }
+
   /** §4–§9 in CSS px: lights, shadows, strand flows and body quads for the lit layer. */
-  private litScene(views: View[], delegations: Delegation[], p: OfficeTheme, time: number): LitScene {
+  private litScene(views: View[], strandStates: StrandState[], p: OfficeTheme, time: number): LitScene {
     const u = this.unit;
     const c = colorsOf(p);
     const lights: PointLight[] = [];
@@ -590,7 +699,7 @@ export class World {
       const maxW = Math.max(40, chip.w + 40);
       calm.push({ x: at.x - maxW / 2, y: at.y + at.s / 2 + XL_PIN, w: maxW, h: 34 });
     }
-    for (const { chip, spot, echo, light, status, hot } of views) {
+    for (const { chip, spot, echo, light, status, hot, life } of views) {
       const { bx, by, D, fh } = spot;
       const grow = hot ? 1.05 : 1;
       if (echo) {
@@ -600,7 +709,7 @@ export class World {
         const size = (D / foot.w) * grow;
         bodies.push({
           kind: "echo", x: (bx - foot.cx * size) * u, y: (by - foot.cy * size + drift.dy) * u, size: size * u, rot: drift.rot,
-          state: c.echo, intensity, translucency: 1, alpha: LOOK.echo.alpha, desat: light.offline ? 0.75 : 0, pulse, height: D * 0.6 * u,
+          state: c.echo, intensity, translucency: 1, alpha: LOOK.echo.alpha, desat: light.offline ? 0.75 : 0, dim: 0, pulse, height: D * 0.6 * u,
         });
         shadows.push({ x: bx * u, y: by * u, rx: D * 0.5 * u, ry: fh * 0.5 * u, lift: D * 0.55 * u, k: 0.55 });
         lights.push({
@@ -609,43 +718,44 @@ export class World {
         });
       } else {
         const foot = WORKER_FOOT;
-        const size = (D / foot.w) * grow * (light.offline ? LOOK.worker.sink : 1);
+        const sac = sacLook(light, life);
+        const size = (D / foot.w) * grow * sac.size;
         bodies.push({
           kind: "worker", x: (bx - foot.cx * size) * u, y: (by - foot.cy * size) * u, size: size * u, rot: 0,
-          state: c[light.tone], intensity: light.offline ? 0 : light.k * LOOK.worker.light, translucency: LOOK.worker.translucency,
-          alpha: light.offline ? 0.72 : 1, desat: light.offline ? 0.75 : 0, pulse: light.pulse, height: D * LOOK.worker.heightK * u,
+          state: c[light.tone], intensity: sac.intensity, translucency: LOOK.worker.translucency,
+          alpha: sac.alpha, desat: sac.desat, dim: sac.dim, pulse: light.pulse, height: D * LOOK.worker.heightK * u,
         });
         shadows.push({ x: bx * u, y: by * u, rx: D * 0.5 * u, ry: fh * 0.5 * u, lift: D * LOOK.worker.heightK * 0.35 * u, k: LOOK.worker.shadow });
         if (light.k > 0.3 && !light.offline) {
-          lights.push({ x: bx * u, y: by * u, z: D * 0.45 * u, r: D * 0.9 * u, color: scale(c[light.tone], 0.9 * light.k * (0.35 + 0.65 * light.pulse)), spec: 0.3 });
+          lights.push({
+            x: bx * u, y: by * u, z: D * 0.45 * u, r: D * (0.9 + (LOOK.worker.halo - 0.9) * life) * u,
+            color: scale(c[light.tone], 0.9 * light.k * (0.35 + 0.65 * light.pulse)), spec: 0.3, halo: 0.35 * sac.halo,
+          });
         }
       }
-      // calm zone under the label, at the layout target
+      // calm zone under the label, at the layout target (Echo beside Core: under its body)
+      const place = this.echoes.get(chip.agent.id);
       const target = spotOf({ x: chip.tx, y: chip.ty, w: chip.w, h: chip.h }, spot.facing, echo);
-      calm.push(labelRect(target, textBlock(target, chip.h, !!this.data.cost(chip.agent.id))));
+      if (place) calm.push({ x: place.box.x, y: place.nameY - 10, w: place.box.w, h: place.roleY - place.nameY + 18 });
+      else calm.push(labelRect(target, textBlock(target, chip.h, !!this.data.cost(chip.agent.id))));
     }
-    // Strands: active work flows Core → worker; unread results / questions travel back as a lit drop.
-    for (const trace of this.traces) {
-      const job = delegations.some((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d));
-      const question = this.data.question(trace.workerId);
-      const result = this.data.result(trace.workerId);
-      const along = dropAt(question, result, time, this.reduced);
-      const packetColor = question ? c.amber : result?.status === "done" ? c.green : result?.status === "failed" ? c.redHi : c.amber;
+    // Strands: active work flows Core → worker; unread results / questions travel back as a lit drop. #2020:
+    // only live strands keep the red (in their tone); the rest dry out.
+    for (const { trace, job, life, tone, along } of strandStates) {
       if (along !== null) {
         const at = pointAt(trace.route, along);
-        lights.push({ x: at.x * u, y: at.y * u, z: 8 * u, r: 26 * u, color: scale(packetColor, 1.1), spec: 0.5 });
+        lights.push({ x: at.x * u, y: at.y * u, z: 8 * u, r: 26 * u, color: scale(c[tone], 1.1), spec: 0.5 });
       }
-      flows.push({
-        flow: job && !this.reduced ? 1 : 0, packet: along ?? -1, length: trace.length * u, packetK: 3,
-        flowColor: scale(c.team, 1.1), packetColor,
-      });
+      flows.push({ flow: job && !this.reduced ? 1 : 0, packet: along ?? -1, length: trace.length * u, packetK: 3, life, color: c[tone] });
     }
-    const strands = { key: `${this.traceKey}|${calm.map((r) => r.h).join(",")}`, routes: this.traces.map((t) => t.route), cores, calm };
-    return { time, reduced: this.reduced, core: origin, lights, shadows, flows, bodies, strands };
+    // The flow ids follow this order: a strand turning live re-draws the id layer.
+    const order = strandStates.map((s) => `${this.traces.indexOf(s.trace)}${s.life > 0 ? "+" : ""}`).join(",");
+    const strands = { key: `${this.traceKey}|${calm.map((r) => r.h).join(",")}|${order}`, routes: strandStates.map((s) => s.trace.route), cores, calm };
+    return { time, reduced: this.reduced, core: origin, lights, shadows, flows, bodies, strands, flowColor: scale(c.team, 1.1) };
   }
 
   /** The flat stand-in for the lit layer: membrane, Core glow, strands, drops and radial bodies. */
-  private drawFallback(ctx: CanvasRenderingContext2D, p: OfficeTheme, views: View[], delegations: Delegation[], time: number) {
+  private drawFallback(ctx: CanvasRenderingContext2D, p: OfficeTheme, views: View[], strands: StrandState[], time: number) {
     ctx.fillStyle = LOOK.fallback.ground;
     ctx.fillRect(0, 0, this.w, this.h);
     for (const chip of this.chips) {
@@ -658,26 +768,40 @@ export class World {
     }
     ctx.save();
     ctx.lineCap = "round"; ctx.lineJoin = "round";
-    for (const trace of this.traces) {
+    for (const { trace, life, tone, along } of strands) {
       makePath(ctx, trace.route);
-      ctx.strokeStyle = LOOK.fallback.strand; ctx.lineWidth = LOOK.strand.width * 0.7; ctx.stroke();
-      if (delegations.some((d) => d.fromAgent === trace.leaderId && d.toAgent === trace.workerId && this.data.active(d))) {
-        ctx.strokeStyle = p.team; ctx.globalAlpha = 0.55; ctx.lineWidth = 1.5; ctx.stroke(); ctx.globalAlpha = 1;
+      // #2020: a dormant strand is a thin dry thread; a live one a full vein lit in its colour.
+      ctx.strokeStyle = life > 0 ? LOOK.fallback.strand : LOOK.fallback.dry;
+      ctx.lineWidth = LOOK.strand.width * (life > 0 ? 0.7 : 0.35); ctx.stroke();
+      if (life > 0) {
+        ctx.save();
+        ctx.strokeStyle = p[tone]; ctx.globalAlpha = 0.75 * life; ctx.lineWidth = 2.2;
+        ctx.shadowColor = p[tone]; ctx.shadowBlur = 6;
+        ctx.stroke();
+        ctx.restore();
       }
-      const question = this.data.question(trace.workerId);
-      const result = this.data.result(trace.workerId);
-      const along = dropAt(question, result, time, this.reduced);
       if (along === null) continue;
       const at = pointAt(trace.route, along);
       ctx.beginPath(); ctx.arc(at.x, at.y, 3.4, 0, Math.PI * 2);
-      ctx.fillStyle = question ? p.amber : result?.status === "done" ? p.green : result?.status === "failed" ? p.redHi : p.amber;
+      ctx.fillStyle = p[tone];
       ctx.fill();
     }
     ctx.restore();
-    for (const { spot, echo, light, status, hot } of views) {
-      const k = (hot ? 1.05 : 1) * (light.offline ? LOOK.worker.sink : 1);
+    for (const { spot, echo, light, status, hot, life } of views) {
+      const sac = echo ? null : sacLook(light, life);
+      const k = (hot ? 1.05 : 1) * (sac ? sac.size : 1);
       const rx = (spot.D / 2) * k, ry = (spot.fh / 2) * k;
       const x = spot.bx, y = spot.by + (echo ? echoDrift(time, this.reduced).dy : 0);
+      if (sac && sac.halo > 0) {
+        // #2020: a live sac's light on the membrane around it.
+        const r = spot.D * LOOK.worker.halo;
+        const halo = ctx.createRadialGradient(x, y, 0, x, y, r);
+        halo.addColorStop(0, p[light.tone]); halo.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.save();
+        ctx.globalAlpha = 0.45 * sac.halo;
+        ctx.fillStyle = halo; ctx.fillRect(x - r, y - r, 2 * r, 2 * r);
+        ctx.restore();
+      }
       // The core's light reaches further out the stronger (and the brighter in its rhythm) it is.
       const strength = echo ? echoLight(status, time, this.reduced).intensity / 1.25 : light.offline ? 0 : Math.min(1, light.k) * (0.55 + 0.45 * light.pulse);
       const fill = ctx.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
@@ -685,7 +809,7 @@ export class World {
       fill.addColorStop(0.2 + 0.45 * strength, LOOK.fallback.strand);
       fill.addColorStop(1, LOOK.fallback.ground);
       ctx.save();
-      ctx.globalAlpha = echo ? LOOK.echo.alpha : light.offline ? 0.72 : 1;
+      ctx.globalAlpha = echo ? LOOK.echo.alpha : sac!.alpha;
       ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
       ctx.fillStyle = fill; ctx.fill();
       ctx.lineWidth = 1; ctx.strokeStyle = p.edge; ctx.stroke();

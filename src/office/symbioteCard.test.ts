@@ -3,9 +3,9 @@
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
 import {
-  beatAt, chaikin, clockAt, coreVeins, dropAt, echoDrift, echoLight, facingOf, footprint, glScale, GL_MAX_PIXELS, GL_MAX_SCALE,
-  keyAzimuth, labelRect, linear, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, smoothRoute, spotOf, textBlock,
-  workerLight,
+  beatAt, chaikin, clockAt, coreVeins, dropAt, ECHO_BESIDE, echoBeside, echoDrift, echoLight, facingOf, footprint, glScale, GL_MAX_PIXELS, GL_MAX_SCALE,
+  keyAzimuth, labelRect, lifeOf, linear, LOOK, markAlpha, markAt, pathLength, pointAt, resample, routeToBody, sacLook, smoothRoute,
+  spotOf, textBlock, workerLight,
 } from "./symbioteCard.ts";
 
 const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} ≉ ${b}`);
@@ -81,6 +81,46 @@ describe("workerLight (chipLook önceliği)", () => {
   });
 });
 
+describe("canlılık (#2020: yalnız çalışan yol kırmızı)", () => {
+  const done = { status: "done" }, failed = { status: "failed" };
+  const life = (status: string, result: { status: string } | null, question: unknown, job = false) =>
+    lifeOf(workerLight(status, result, question, 0, true), job);
+  it("çalışan, soru, bekleyen, okunmamış sonuç ve süren iş canlı; boşta ve kapalı kuru", () => {
+    for (const l of [life("working", null, null), life("waiting", null, null), life("idle", null, { id: 1 }),
+      life("idle", done, null), life("idle", failed, null), life("idle", { status: "done_no_report" }, null), life("idle", null, null, true)]) {
+      assert.equal(l, 1);
+    }
+    assert.equal(life("idle", null, null), 0);
+    assert.equal(life("offline", null, null), 0);
+    // Kapalı gövde karanlık ama okunmamış sonucu damarda okunur.
+    assert.equal(life("offline", done, null), 1);
+  });
+  it("canlı kese şişer, parlar, zemine hale verir; kuru kese küçük, sönük, gri, halesiz", () => {
+    const live = sacLook(workerLight("working", null, null, 0, true), 1);
+    const idleLight = workerLight("idle", null, null, 0, true);
+    const dry = sacLook(idleLight, lifeOf(idleLight, false));
+    assert.ok(live.size > 1 && dry.size < 1);
+    assert.ok(live.intensity / dry.intensity >= 6, `${live.intensity} / ${dry.intensity}`);
+    assert.ok(live.halo > 0 && dry.halo === 0);
+    assert.ok(dry.desat > 0.5 && live.desat === 0 && dry.dim > 0 && live.dim === 0);
+    // Soru / teslim / hata çalışanla aynı ölçekte belirgin.
+    for (const [r, q] of [[done, null], [failed, null], [null, { id: 1 }]] as const) {
+      const l = workerLight("idle", r, q, 0, true);
+      assert.ok(sacLook(l, lifeOf(l, false)).intensity >= live.intensity * 0.9);
+    }
+  });
+  it("kapalı kese ışıksız ve batık; azaltılmış harekette çalışan kese şişkin ve sabit", () => {
+    const off = sacLook(workerLight("offline", null, null, 0, false), 0);
+    assert.deepEqual([off.intensity, off.halo, off.size, off.alpha], [0, 0, LOOK.worker.sink, 0.72]);
+    const still = [0, 0.4, 2.2].map((t) => sacLook(workerLight("working", null, null, t, true), 1));
+    for (const s of still) assert.deepEqual(s, still[0]);
+    assert.ok(still[0].size >= 1 + LOOK.worker.swell - 1e-9);
+  });
+  it("çalışan kesenin atışı ≤ 3 Hz", () => {
+    assert.ok(peaksPerSecond((t) => sacLook(workerLight("working", null, null, t, false), 1).size) <= 3);
+  });
+});
+
 describe("echo", () => {
   it("konuşuyor > bekliyor > boşta > kapalı (şiddet)", () => {
     const k = (s: string) => echoLight(s, 0, true).intensity;
@@ -131,6 +171,18 @@ describe("gövde ve etiket", () => {
     const block = textBlock(s, 48, true);
     const r = labelRect(s, block);
     assert.ok(r.y <= block.top - 10 + 1e-9 && r.w === s.textR - s.textL && r.y + r.h >= block.costY + 6.5);
+  });
+  it("#2020 Echo: gövde Core ad bloğunun hemen solunda, bloğun ortasının biraz üstünde; etiket gövdenin altında ortalı", () => {
+    const core = { x: 300, nameY: 200, roleY: 215 };
+    const e = echoBeside(core, 60, 41);
+    const s = e.spot;
+    near(s.bx + s.D / 2, core.x - 30 - ECHO_BESIDE.gap);
+    assert.ok(s.D <= ECHO_BESIDE.maxD && s.fh === s.D && s.facing === 0);
+    assert.ok(s.by < (core.nameY + core.roleY) / 2 && s.by > core.nameY - 10);
+    assert.ok(e.nameY > s.by + s.D / 2 && e.roleY > e.nameY);
+    near((s.textL + s.textR) / 2, s.bx);
+    // Küçük gövde küçük kalır.
+    assert.equal(echoBeside(core, 60, 20).spot.D, 20);
   });
   it("işaret dış üst köşede, saat iç üst köşede", () => {
     const left = spotOf(slot, 1, false), right = spotOf(slot, -1, false);

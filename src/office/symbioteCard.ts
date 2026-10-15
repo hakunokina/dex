@@ -16,12 +16,17 @@ export const LOOK = {
   spec: 0.55,
   /** Ground emissive: the vein pulse. */
   emit: "#ff4a3a",
-  strand: { width: 11, height: 1.8, blur: 1, wobble: 4, albedo: "#5a1626", rough: 0.2, glow: "#ff3b30", glowK: 0.16 },
+  /** #2020: `dry` = a dormant strand's albedo (dark, low saturation); `dryRough` = no wet sheen on it. */
+  strand: { width: 11, height: 1.8, blur: 1, wobble: 4, albedo: "#5a1626", rough: 0.2, glow: "#ff3b30", glowK: 0.16, dry: "#24181a", dryRough: 0.6 },
   core: { light: 2.6, radius: 120 },
-  worker: { aspect: 0.82, light: 1.6, translucency: 1, heightK: 0.5, sink: 0.9, shadow: 0.85 },
+  /**
+   * #2020: `live` = a live sac's extra light (× `light`), `swell` = its heartbeat growth, `dry` = a dormant
+   * sac's size and albedo darkening, `halo` = a live sac's light on the ground (radius × D).
+   */
+  worker: { aspect: 0.82, light: 1.6, translucency: 1, heightK: 0.5, sink: 0.9, shadow: 0.85, live: 1.8, swell: 0.1, dry: 0.92, dim: 0.55, halo: 1.3 },
   echo: { color: "#8fe6ea", light: 1.3, glow: 0.8, radius: 70, float: 3, bob: 2.2, alpha: 0.92, sway: 0.07 },
   /** The 2D fallback (no WebGL2, context lost, maps loading): a flat membrane and radial bodies. */
-  fallback: { ground: "#0d0709", glow: "#3a0d12", strand: "#3c111b" },
+  fallback: { ground: "#0d0709", glow: "#3a0d12", strand: "#3c111b", dry: "#1c1012" },
 } as const;
 
 /** GL resolution: ≤ 1.5× and ≤ this many pixels (a weak GPU still holds a big panel). */
@@ -100,6 +105,32 @@ function lookOf(status: string, result: { status: string } | null, question: unk
   return { ...base, tone: "muted", k: 0.22, pulse: 1 };
 }
 
+/**
+ * #2020: how alive a worker's strand reads, 0 (dormant: idle, offline) .. 1 (live: working, an active job,
+ * a question, an unread result). Only live strands keep the red; the rest dry out.
+ */
+export function lifeOf(light: Light, job: boolean): number {
+  if (light.tone === "muted") return job ? 1 : 0;
+  // A mark lights the strand fully (an offline body too); an offline click's wake-up ramps in.
+  return light.offline || light.mark ? 1 : Math.max(0, Math.min(1, light.k));
+}
+
+/** #2020: a worker sac by its light and life: dormant ones shrink, dim and grey; live ones swell and glow. */
+export function sacLook(light: Light, life: number) {
+  const w = LOOK.worker;
+  const live = light.offline ? 0 : life;
+  return {
+    intensity: light.offline ? 0 : light.k * w.light * (1 + (w.live - 1) * live),
+    /** Size factor: a dormant sac w.dry, a live one beats up to 1 + swell (held at the top under reduced motion). */
+    size: (light.offline ? w.sink : w.dry + (1 - w.dry) * live) + w.swell * live * light.pulse,
+    desat: light.offline ? 0.75 : 0.7 * (1 - live),
+    dim: light.offline ? 0 : w.dim * (1 - live),
+    alpha: light.offline ? 0.72 : 1 - 0.12 * (1 - live),
+    /** The ground halo's strength (0: none). */
+    halo: live * (0.4 + 0.6 * light.pulse),
+  };
+}
+
 /** §9: Echo keeps its own colour; talking (≈1.2 + 1.8 Hz beat) / waiting / idle read in its strength and rhythm. */
 export function echoLight(status: string, time: number, reduced: boolean) {
   const talk = status === "working", wait = status === "waiting";
@@ -167,6 +198,23 @@ export type Rect = { x: number; y: number; w: number; h: number };
 /** The label's box (provider badge to the last row): the strand layer's calm zone under it. */
 export function labelRect(spot: Spot, block: ReturnType<typeof textBlock>): Rect {
   return { x: spot.textL, y: block.top - 10, w: Math.max(0, spot.textR - spot.textL), h: (block.rows === 3 ? 41 : block.rows === 2 ? 26 : 14) + 10 };
+}
+
+/** #2020 (patron): Echo beside its Core's name — `gap` from the name block, body ≤ `maxD`, `lift` above its middle. */
+export const ECHO_BESIDE = { gap: 8, maxD: 34, lift: 3, labelW: 120 };
+
+/**
+ * #2020: Echo's body just left of its Core's name block (`blockW` wide, centred on `core.x`), a little above
+ * the block's middle; its Core-style label (name, then role + cost) centred under the body.
+ */
+export function echoBeside(core: { x: number; nameY: number; roleY: number }, blockW: number, D: number) {
+  const d = Math.max(1, Math.min(D, ECHO_BESIDE.maxD));
+  const bx = core.x - blockW / 2 - ECHO_BESIDE.gap - d / 2;
+  const by = (core.nameY + core.roleY) / 2 - ECHO_BESIDE.lift;
+  const half = ECHO_BESIDE.labelW / 2;
+  const spot: Spot = { bx, by, D: d, fh: d, facing: 0, textL: bx - half, textR: bx + half, align: "left" };
+  const nameY = by + d / 2 + 10;
+  return { spot, nameY, roleY: nameY + 15, maxW: ECHO_BESIDE.labelW };
 }
 
 /** The status mark's centre: the body's outer top corner. */
