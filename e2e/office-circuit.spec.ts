@@ -77,7 +77,7 @@ test("Simbiyot: dar Kart klavye ile worker açar; Core çizim bütçesi", async 
   const contacts = await app.evaluate(async (teamId) => {
     const { World } = await import("/src/office/world.ts");
     const { membersOf } = await import("/src/team/store.ts");
-    const { readPcbTheme } = await import("/src/office/pcbTheme.ts");
+    const { readOfficeTheme } = await import("/src/office/theme.ts");
     const { readPalette } = await import("/src/office/companion/coreEngine.ts");
     const agents = [...membersOf(teamId)];
     const leader = agents.find(a => a.kind === "leader")!;
@@ -109,7 +109,7 @@ test("Simbiyot: dar Kart klavye ile worker açar; Core çizim bütçesi", async 
     const draw = () => {
       ribbons = 0;
       pieces = [];
-      world.draw(ctx, null, readPcbTheme(document.documentElement), readPalette());
+      world.draw(ctx, null, readOfficeTheme(document.documentElement), readPalette());
       return ribbons;
     };
     const idle = draw();
@@ -129,7 +129,7 @@ test("Simbiyot: dar Kart klavye ile worker açar; Core çizim bütçesi", async 
     const historical = new World(agents, data);
     historical.update(0.3);
     ribbons = 0;
-    historical.draw(ctx, null, readPcbTheme(document.documentElement), readPalette());
+    historical.draw(ctx, null, readOfficeTheme(document.documentElement), readPalette());
     return { contacts: { idle, clicked, retracted, delegated, reduced, historical: ribbons }, idlePieces, movedPieces, reducedPieces };
   }, team.id);
   expect(contacts.contacts).toEqual({ idle: 0, clicked: 1, retracted: 0, delegated: 1, reduced: 0, historical: 0 });

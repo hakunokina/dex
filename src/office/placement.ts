@@ -3,38 +3,32 @@
 // unit is, and the world is the panel in those units. Wide boards keep the left/right columns; square
 // and tall ones stack the workers in rows above and below Core.
 // #277: the unit is the largest at which no chip or Core is squeezed below its full size — chips, Core
-// and fonts grow with the panel (both sides count, no upper bound) until the content fills it. The board
-// edge, holes and corner labels are a thin strip of fixed CSS px around the chips.
+// and fonts grow with the panel (both sides count, no upper bound) until the content fills it. The edge
+// is a thin strip of fixed CSS px around the chips.
+// #1958: Echo (the assistant) is no worker column member: its own slot right under its Core's labels.
 import type { Agent } from "../agents";
 import type { Delegation } from "../delegations";
+import { isAssignable } from "../team/rolePolicy.ts";
 import { coreBody, corePort, XL_LABEL, XL_MIN, XL_PIN, XL_TARGET_H, type Body } from "./companion/coreXL.ts";
 
 export type Point = { x: number; y: number };
 export type Mode = "columns" | "stack";
 export type Target = { x: number; y: number; w: number; h: number; mode?: Mode };
 
-// ---- board geometry (#277: CSS px, so it stays thin at any scale) ----
+// ---- edge (#277: CSS px, so it stays thin at any scale) ----
 
-/** Panel edge → board edge. */
+/** Panel edge → the strip around the chip area (the team signature lives in it). */
 export const BOARD_PAD_PX = 4;
-/** Board edge → chip area: the strip the mounting holes and the corner labels live in. */
 export const EDGE_PX = 14;
-/** Mounting hole (outer radius) and its centre from the board corner. */
-export const HOLE_R_PX = 5;
-export const HOLE_AT_PX = 8;
-/** Corner labels' size (= the readable minimum) and the narrowest board that still shows them. */
-export const LABEL_PX = 9;
-export const LABELS_FROM_PX = 320;
-/** World units a chip's pins and provider badge reach past its box: each cell's padding (edge and neighbours). */
+/** World units a chip's provider badge reaches past its box: each cell's padding (edge and neighbours). */
 export const PIN_CLEAR = 6;
 
-/** Board inset and chip area inset in world units at `u` CSS px per unit. */
-export const boardInset = (u: number) => BOARD_PAD_PX / u;
+/** Chip area inset in world units at `u` CSS px per unit. */
 export const areaInset = (u: number) => (BOARD_PAD_PX + EDGE_PX) / u;
-export const boardRect = (w: number, h: number, u: number) => {
-  const m = boardInset(u);
-  return { x: m, y: m, w: w - 2 * m, h: h - 2 * m };
-};
+
+/** #1958: the assistant floats beside its Core — never in a worker column, never on a trace. */
+export const isEcho = (agent: Agent) =>
+  agent.kind !== "leader" && !isAssignable({ roleSlug: (agent as { roleSlug?: string | null }).roleSlug ?? null });
 
 // ---- scale ----
 
@@ -73,6 +67,7 @@ function fullSize(agents: Agent[], targets: Map<string, Target>) {
     const t = targets.get(agent.id);
     if (!t) return true;
     if (t.mode) return t.w >= LEADER_W - e && t.h >= (agent.kind === "leader" ? XL_TARGET_H : LEADER_H) - e;
+    if (isEcho(agent)) return t.w >= LEADER_W - e && t.h >= ECHO_H - e;
     return t.w >= WORKER_W - e && t.h >= workerH - e;
   });
 }
@@ -98,10 +93,16 @@ export function latestOwners(delegations: Delegation[]) {
   return owners;
 }
 
-export function ownershipKey(agents: Agent[], delegations: Delegation[]) {
+/** The leaders (the first agent when there is none), the column / row workers and the Echo slot's agents. */
+export function crew(agents: Agent[]) {
   const leaders = agents.filter((agent) => agent.kind === "leader");
   const effectiveLeaders = leaders.length ? leaders : agents.slice(0, 1);
-  const workers = agents.filter((agent) => !effectiveLeaders.some((leader) => leader.id === agent.id));
+  const rest = agents.filter((agent) => !effectiveLeaders.some((leader) => leader.id === agent.id));
+  return { effectiveLeaders, workers: rest.filter((agent) => !isEcho(agent)), echoes: rest.filter(isEcho) };
+}
+
+export function ownershipKey(agents: Agent[], delegations: Delegation[]) {
+  const { effectiveLeaders, workers } = crew(agents);
   const owners = latestOwners(delegations);
   return `${effectiveLeaders.map((leader) => leader.id).join(",")}|${workers.map((worker, index) => {
     const owner = effectiveLeaders.find((leader) => leader.id === owners.get(worker.id)) ?? effectiveLeaders[index % effectiveLeaders.length];
@@ -129,11 +130,18 @@ const ROUTE_MIN = 22;
 const ROUTE_FLOOR = 36;
 /** A small board keeps Core XL (body ≥ 48) before it gives the rows room. */
 const CORE_MIN_H = 2 * XL_PIN + XL_LABEL + XL_MIN + 8;
+/**
+ * #1958: Echo's slot under its Core's labels (as wide as the Core column): its height at full size, the
+ * least it shrinks to, and the gap from the Core target (Echo's provider badge sits above its slot).
+ */
+export const ECHO_H = 44;
+/** A short Kart: Echo gives way to a two-row label first; below that only once Core is at its minimum. */
+const ECHO_SOFT_H = 28;
+const ECHO_MIN_H = 12;
+export const ECHO_GAP = 16;
 
 export function layout(agents: Agent[], delegations: Delegation[], w: number, h: number, mode: Mode, u = MIN_U) {
-  const leaders = agents.filter((agent) => agent.kind === "leader");
-  const effectiveLeaders = leaders.length ? leaders : agents.slice(0, 1);
-  const workers = agents.filter((agent) => !effectiveLeaders.some((leader) => leader.id === agent.id));
+  const { effectiveLeaders, workers, echoes } = crew(agents);
   const owners = latestOwners(delegations);
   const groups = new Map(effectiveLeaders.map((leader) => [leader.id, [] as Agent[]]));
   workers.forEach((worker, index) => {
@@ -149,7 +157,7 @@ export function layout(agents: Agent[], delegations: Delegation[], w: number, h:
     ? Math.ceil(Math.sqrt(effectiveLeaders.length))
     : effectiveLeaders.length <= 12 ? 3 : Math.ceil(Math.sqrt(effectiveLeaders.length));
   const placements: Array<{
-    leader: Agent; left: Agent[]; right: Agent[]; row: number; column: number; span: number;
+    leader: Agent; left: Agent[]; right: Agent[]; echo: Agent[]; row: number; column: number; span: number;
   }> = [];
   let row = 0;
   let column = 0;
@@ -159,7 +167,8 @@ export function layout(agents: Agent[], delegations: Delegation[], w: number, h:
     if (column + span > columns) { row++; column = 0; }
     const cut = sideCut(group);
     // Stack: `left` = the rows above Core, `right` = below (same role-boundary cut).
-    placements.push({ leader, left: group.slice(0, cut), right: group.slice(cut), row, column, span });
+    // Echo stays with the first Core (one assistant per team).
+    placements.push({ leader, left: group.slice(0, cut), right: group.slice(cut), echo: placements.length ? [] : echoes, row, column, span });
     column += span;
     if (column === columns) { row++; column = 0; }
   }
@@ -167,9 +176,10 @@ export function layout(agents: Agent[], delegations: Delegation[], w: number, h:
   const minRowH = Math.min(48, area.h / rows);
   const rowNeeds = Array.from({ length: rows }, () => minRowH);
   for (const placement of placements) {
+    const echo = placement.echo.length ? ECHO_GAP + ECHO_H : 0;
     const need = mode === "columns"
-      ? 24 + Math.max(placement.left.length, placement.right.length) * 34
-      : 80 + (placement.left.length + placement.right.length) * 30;
+      ? Math.max(24 + Math.max(placement.left.length, placement.right.length) * 34, echo && 80 + echo)
+      : 80 + echo + (placement.left.length + placement.right.length) * 30;
     rowNeeds[placement.row] = Math.max(rowNeeds[placement.row], need);
   }
   const extraBudget = Math.max(0, area.h - minRowH * rows);
@@ -188,15 +198,37 @@ export function layout(agents: Agent[], delegations: Delegation[], w: number, h:
       w: unitW * placement.span,
       h: rowHeights[placement.row],
     };
-    if (mode === "stack") placeStack(targets, cell, placement.leader, placement.left, placement.right);
-    else placeColumns(targets, cell, placement.leader, placement.left, placement.right);
+    if (mode === "stack") placeStack(targets, cell, placement.leader, placement.left, placement.right, placement.echo);
+    else placeColumns(targets, cell, placement.leader, placement.left, placement.right, placement.echo);
   }
   return targets;
 }
 
 type Cell = { x: number; y: number; w: number; h: number };
 
-function placeColumns(targets: Map<string, Target>, full: Cell, leader: Agent, left: Agent[], right: Agent[]) {
+/**
+ * #1958: Echo's slot height in `room` (the leader's share of the cell, Core wanting `want`): Echo gives
+ * way first (to a two-row label), then Core (to `coreMin`), then Echo again.
+ */
+function echoHeight(echo: Agent[], room: number, want: number, coreMin: number) {
+  if (!echo.length) return 0;
+  const left = room - ECHO_GAP;
+  if (left - want >= ECHO_SOFT_H) return Math.min(ECHO_H, left - want);
+  return Math.max(ECHO_MIN_H, Math.min(ECHO_SOFT_H, left - coreMin));
+}
+
+/** The gap over Echo: its full size unless Core at `leaderH` leaves less (a tiny Kart keeps Core XL). */
+const echoGap = (echo: Agent[], room: number, leaderH: number, echoH: number) =>
+  echo.length ? Math.max(2, Math.min(ECHO_GAP, room - leaderH - echoH)) : 0;
+
+/** Echo's slot(s) `gap` under the leader target `core`, sharing the Core column's width. */
+function placeEcho(targets: Map<string, Target>, echo: Agent[], core: Target, h: number, gap: number) {
+  const w = core.w / Math.max(1, echo.length);
+  const y = core.y + core.h / 2 + gap + h / 2;
+  echo.forEach((agent, i) => targets.set(agent.id, { x: core.x - core.w / 2 + w * (i + 0.5), y, w, h }));
+}
+
+function placeColumns(targets: Map<string, Target>, full: Cell, leader: Agent, left: Agent[], right: Agent[], echo: Agent[] = []) {
   const fitW = Math.min(full.w, COLUMNS_MAX_W);
   const cell = { ...full, x: full.x + (full.w - fitW) / 2, w: fitW };
   const padX = PIN_CLEAR;
@@ -204,11 +236,15 @@ function placeColumns(targets: Map<string, Target>, full: Cell, leader: Agent, l
   const bothSides = left.length > 0 && right.length > 0;
   // #252: a leader is the big Core (pins + 120 body + labels, spec §5.1); its traces leave the body.
   const xl = leader.kind === "leader";
-  const leaderH = xl
-    ? Math.max(16, Math.min(XL_TARGET_H, Math.max(cell.h * CORE_SHARE, CORE_MIN_H), cell.h - padY * 2 - 6))
-    : Math.max(16, Math.min(LEADER_H, cell.h * 0.4, cell.h - padY * 2 - 6));
+  const room = cell.h - padY * 2 - 6;
+  const want = xl ? Math.min(XL_TARGET_H, Math.max(cell.h * CORE_SHARE, CORE_MIN_H), room) : Math.min(LEADER_H, cell.h * 0.4, room);
+  const echoH = echoHeight(echo, room, want, xl ? CORE_MIN_H : 16);
+  const leaderH = Math.max(16, Math.min(want, xl ? CORE_MIN_H : 16), Math.min(want, room - (echo.length ? ECHO_GAP + echoH : 0)));
+  const gap = echoGap(echo, room, leaderH, echoH);
+  const echoRoom = echo.length ? gap + echoH : 0;
   const body = xl ? coreBody({ x: 0, y: 0, w: LEADER_W, h: leaderH }) : null;
-  const span = body ? { h: body.s, y: body.y } : { h: leaderH, y: 0 };
+  // The Core + Echo block is centred: Core sits `echoRoom / 2` above the cell's middle.
+  const span = body ? { h: body.s, y: body.y - echoRoom / 2 } : { h: leaderH, y: -echoRoom / 2 };
   const sideCount = Number(left.length > 0) + Number(right.length > 0);
   const desiredRouteGap = Math.max(sideRouteGap(left.length, cell.h, padY, span.h, span.y), sideRouteGap(right.length, cell.h, padY, span.h, span.y));
   // #270: a narrow cell keeps its workers ≥ the detailed chip's width before it widens the bends.
@@ -229,8 +265,10 @@ function placeColumns(targets: Map<string, Target>, full: Cell, leader: Agent, l
   let leaderX = cell.x + cell.w / 2;
   if (left.length && !right.length) leaderX = cell.x + cell.w - padX - leaderW / 2;
   else if (right.length && !left.length) leaderX = cell.x + padX + leaderW / 2;
-  const cy = cell.y + cell.h / 2;
-  targets.set(leader.id, { x: leaderX, y: cy, w: leaderW, h: leaderH, mode: "columns" });
+  const cy = cell.y + cell.h / 2 - echoRoom / 2;
+  const core: Target = { x: leaderX, y: cy, w: leaderW, h: leaderH, mode: "columns" };
+  targets.set(leader.id, core);
+  placeEcho(targets, echo, core, echoH, gap);
 
   const placeSide = (list: Agent[], side: "left" | "right") => list.forEach((agent, index) => {
     const slotH = (cell.h - padY * 2) / list.length;
@@ -250,12 +288,17 @@ const ROW_MIN_H = 22;
 const ROW_TIGHT_W = 40;
 
 /** #270: square / tall cell — workers in rows above (`top`) and below (`bottom`) a centred Core. */
-function placeStack(targets: Map<string, Target>, cell: Cell, leader: Agent, top: Agent[], bottom: Agent[]) {
+function placeStack(targets: Map<string, Target>, cell: Cell, leader: Agent, top: Agent[], bottom: Agent[], echo: Agent[] = []) {
   const padX = PIN_CLEAR;
   const padY = PIN_CLEAR;
   const innerW = Math.max(1, cell.w - padX * 2);
-  const innerH = Math.max(1, cell.h - padY * 2);
+  const cellH = Math.max(1, cell.h - padY * 2);
   const xl = leader.kind === "leader";
+  // #1958: Echo's slot is taken off the top: Core and the rows share what is left.
+  const echoH = echoHeight(echo, cellH - 6, xl ? XL_TARGET_H : LEADER_H, xl ? CORE_MIN_H : 16);
+  const gap = echoGap(echo, cellH - 6, xl ? CORE_MIN_H : 16, echoH);
+  const echoRoom = echo.length ? gap + echoH : 0;
+  const innerH = Math.max(1, cellH - echoRoom);
   const leaderW = Math.max(28, Math.min(LEADER_W, innerW));
   // Rows as wide as the cell packs them; too low for the height → more, narrower chips per row.
   const fit = (perRow: number) => {
@@ -280,10 +323,10 @@ function placeStack(targets: Map<string, Target>, cell: Cell, leader: Agent, top
     plan = fit(plan.perRow + 1);
   }
   const { perRow, topRows, rowCount, leaderH, gaps, free, rowH } = plan;
-  if (rowCount && rowH < ROW_MIN_H) return placeColumns(targets, cell, leader, top, bottom);
+  if (rowCount && rowH < ROW_MIN_H) return placeColumns(targets, cell, leader, top, bottom, echo);
   // What the capped rows leave widens the bend room (#277: all of it — the rows reach the board edges).
   const route = gaps ? ROUTE_MIN + Math.max(0, free - rowH * rowCount) / gaps : 0;
-  const blockH = rowH * rowCount + leaderH + route * gaps;
+  const blockH = rowH * rowCount + leaderH + echoRoom + route * gaps;
   let y = cell.y + (cell.h - blockH) / 2;
   const cx = cell.x + cell.w / 2;
   const workerH = Math.max(2, Math.min(WORKER_H, rowH * CHIP_SHARE));
@@ -300,8 +343,10 @@ function placeStack(targets: Map<string, Target>, cell: Cell, leader: Agent, top
   };
   placeRows(top);
   y += rowH * topRows + (topRows ? route : 0);
-  targets.set(leader.id, { x: cx, y: y + leaderH / 2, w: leaderW, h: leaderH, mode: "stack" });
-  y += leaderH + (rowCount > topRows ? route : 0);
+  const core: Target = { x: cx, y: y + leaderH / 2, w: leaderW, h: leaderH, mode: "stack" };
+  targets.set(leader.id, core);
+  placeEcho(targets, echo, core, echoH, gap);
+  y += leaderH + echoRoom + (rowCount > topRows ? route : 0);
   placeRows(bottom);
 }
 

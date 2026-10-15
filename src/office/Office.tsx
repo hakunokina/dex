@@ -2,8 +2,11 @@ import { useEffect, useRef } from "react";
 import { HoverCard } from "./hovercard";
 import { World } from "./world";
 import { advance, worldFor } from "./worlds";
-import { readPcbTheme } from "./pcbTheme";
+import { readOfficeTheme } from "./theme";
 import { readPalette } from "./companion/coreEngine";
+import { LitLayer } from "./litLayer";
+import { cardMaps } from "./assets";
+import { glScale } from "./symbioteCard";
 import { CoreBalloon, useDecisions } from "./companion/CoreBalloon";
 import { setDeferred, setOfficeShown, useOfficeLeaders } from "./companion/coreShown";
 import { useReducedMotion } from "./companion/CoreStrip";
@@ -24,6 +27,7 @@ interface Props {
 
 export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const glRef = useRef<HTMLCanvasElement>(null);
   const focusedRef = useRef(focusedId);
   focusedRef.current = focusedId;
   const view = useRef({ scale: 1, ox: 0, oy: 0, dpr: 1 });
@@ -44,12 +48,26 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
 
   useEffect(() => {
     const canvas = canvasRef.current!;
+    const glCanvas = glRef.current!;
     const ctx = canvas.getContext("2d")!;
     const world = worldFor(teamId);
     worldRef.current = world;
     const card = new HoverCard(canvas.parentElement!);
-    const theme = readPcbTheme(canvas);
+    const theme = readOfficeTheme(canvas);
     const corePalette = readPalette(canvas);
+    // #1958: the lit membrane under the ink, made once the maps are decoded and the board is first shown.
+    // No WebGL2 (or a lost context): the world draws its flat fallback into the ink canvas instead.
+    let lit: LitLayer | null = null;
+    let litFailed = false;
+    const litLayer = () => {
+      if (!lit && !litFailed) {
+        const maps = cardMaps();
+        if (maps) {
+          try { lit = new LitLayer(glCanvas, maps); } catch { litFailed = true; }
+        }
+      }
+      return lit?.ready ? lit : null;
+    };
     // #252: this office's big Cores on screen carry their leaders' balloons (the strip's stays shut).
     const shownToken = {};
     let cssW = 0;
@@ -71,6 +89,9 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       cssH = height;
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
+      const k = glScale(dpr, width, height);
+      glCanvas.width = Math.max(1, Math.round(width * k));
+      glCanvas.height = Math.max(1, Math.round(height * k));
       if (width <= 0 || height <= 0) return schedule();
       world.resize(width, height);
       view.current = { scale: world.unit * dpr, dpr, ox: 0, oy: 0 };
@@ -92,12 +113,14 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       // #277: a team / ownership change refits the unit.
       view.current.scale = world.unit * view.current.dpr;
       const { scale, ox, oy, dpr } = view.current;
+      const layer = litLayer();
+      glCanvas.style.visibility = layer ? "" : "hidden";
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.fillStyle = theme.outside;
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(scale, 0, 0, scale, ox, oy);
-      const anchors = world.draw(ctx, keyboardId.current ?? focusedRef.current, theme, corePalette);
+      const anchors = world.draw(ctx, keyboardId.current ?? focusedRef.current, theme, corePalette, !layer);
       ctx.setTransform(1, 0, 0, 1, 0, 0);
+      layer?.draw(world.scene, cssW, cssH, world.unit);
       setOfficeShown(shownToken, anchors.filter((anchor) => anchor.body).map((anchor) => anchor.agent.id));
       for (const anchor of anchors) {
         const el = anchor.body && balloons.current.get(anchor.agent.id);
@@ -174,6 +197,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       document.removeEventListener("mouseout", onWindowOut);
       setOfficeShown(shownToken, null);
       card.destroy();
+      lit?.destroy();
       requestFrameRef.current = () => {};
     };
   }, [teamId]);
@@ -280,6 +304,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
 
   return (
     <div className="office-box">
+      <canvas ref={glRef} className="office-lit" aria-hidden="true" />
       <canvas
         ref={canvasRef}
         className="office"

@@ -40,22 +40,14 @@
   --idle: #3a3e44;
   --ring: 0 0 0 2px rgba(170, 180, 195, 0.28);
 
-  /* PCB scene (DEX-39): canvas resolves these once per mount through src/theme.ts. */
-  --pcb-outside: var(--bg);
+  /* Core's drawing (coreEngine readPalette, unchanged since the PCB Kart, DEX-39) and the provider tint.
+     The Kart's membrane is lit from maps (#1958, src/office/symbioteCard.ts). */
   --pcb-board: #15191a;
-  --pcb-board-edge: rgba(184, 194, 194, 0.18);
-  --pcb-grid: rgba(184, 194, 194, 0.025);
-  --pcb-trace: rgba(150, 160, 160, 0.28);
-  --pcb-trace-hot: var(--team-line);
   --pcb-chip: #1d2124;
-  --pcb-chip-off: #131618;
   --pcb-chip-edge: rgba(205, 211, 214, 0.2);
   --pcb-pin: #71777b;
   --pcb-via: rgba(173, 182, 183, 0.22);
   --pcb-provider: #94a7bd;
-  --pcb-shadow: rgba(0, 0, 0, 0.45);
-  --pcb-radius: 12px;
-  --pcb-chip-radius: 6px;
 
   /* Radii */
   --r-xs: 4px;
@@ -208,7 +200,6 @@
   --tab-accent: var(--team);
   --drop-overlay: var(--team-soft);
   --drop-outline: var(--team-line);
-  --pcb-trace-hot: var(--team-line);
 }
 
 /* #33: compact density (Settings → Görünüm; src/density.ts sets the attribute, default compact).
