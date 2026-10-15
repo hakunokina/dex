@@ -27,14 +27,8 @@ use crate::Core;
 pub const DEFAULT_PRIMARY: &str = "";
 pub const DEFAULT_FALLBACK: &str = "";
 pub const DEFAULT_BUDGET: i64 = 24;
-/// Broker'ın günlük sınırı henüz okunmadıysa görsel izin için geri dönüş.
+/// Broker'ın günlük sınırı henüz okunmadıysa tek izin için geri dönüş (src/gpu/view.ts GPU_BUDGET_MAX ile aynı).
 const MAX_BUDGET: i64 = 240;
-/// Metin birimli türler (`embedding`, `rerank`) için tek tavan (metin/belge sayısı).
-pub const MAX_TEXT_BUDGET: i64 = 50_000;
-/// Bütçesi metin/belge sayılan türler; diğerleri görsel adedi.
-const TEXT_TYPES: [&str; 2] = ["embedding", "rerank"];
-/// İstek başına en çok metin/belge (broker sözleşmesi).
-const MAX_TEXTS_PER_REQUEST: usize = 256;
 /// Takım başına patron onayında bekleyen istek.
 const MAX_PENDING: i64 = 5;
 const CACHE: Duration = Duration::from_secs(30);
@@ -281,46 +275,6 @@ impl Broker<'_> {
         self.scrub_str(&text)
     }
 
-    /// Senkron metin çağrısı (`/v1/embeddings`, `/v1/rerank`): ilk istekte 60 sn zaman aşımı.
-    /// 503 (GPU patronun LLM oturumunda) `Retry-After` kadar beklenip yeniden denenir; toplam
-    /// 10 dakikayı aşarsa açık hata. Başka kodlar ilk yanıtta biter (yedek adrese geçilmez:
-    /// 503 yapışkan yanıttır, aynı adres yeniden denenir). `alive`: sleep'ten uyanınca yoklanır —
-    /// izin bu arada başka işe geçti/biterse POST atılmadan vazgeçilir (ayrılanı çağıran iade eder).
-    fn post_sync(&self, path: &str, task: Option<&str>, body: &Value, alive: &dyn Fn() -> bool) -> Result<Value, String> {
-        let deadline = Instant::now() + Duration::from_secs(600);
-        loop {
-            let (_, r) = self.send("POST", path, task, Some(body), Duration::from_secs(60))?;
-            let code = r.status();
-            if code == 503 {
-                let wait = r
-                    .header("Retry-After")
-                    .and_then(|h| h.trim().parse::<u64>().ok())
-                    .map(|s| s.clamp(1, 600))
-                    .unwrap_or(5);
-                if Instant::now() + Duration::from_secs(wait) > deadline {
-                    return Err("GPU 10 dakikadır patronun LLM oturumunda; daha sonra yeniden dene".into());
-                }
-                std::thread::sleep(Duration::from_secs(wait));
-                if !alive() {
-                    return Err("GPU izni beklerken başka işe geçti ya da iş bitti; broker'a gönderilmedi".into());
-                }
-                if Instant::now() >= deadline {
-                    return Err("GPU 10 dakikadır patronun LLM oturumunda; daha sonra yeniden dene".into());
-                }
-                continue;
-            }
-            let broker = Broker { addrs: self.addrs, token: self.token, last: self.last };
-            let text = r.into_string().map_err(|e| e.to_string());
-            if (200..300).contains(&code) {
-                return text
-                    .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
-                    .map_err(|e| broker.scrub_str(&format!("GPU broker yanıtı okunamadı (HTTP {code}): {e}")));
-            }
-            let v: Value = text.ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null);
-            return Err(broker.error(code, &v));
-        }
-    }
-
     fn secrets(&self) -> Vec<String> {
         let mut out = Vec::new();
         for a in [&self.addrs.primary, &self.addrs.fallback] {
@@ -564,33 +518,12 @@ pub fn pending_requests(conn: &Connection) -> Result<Vec<Request>, String> {
     rows.collect::<Result<_, _>>().map_err(e)
 }
 
-/// İzin türlerinde metin birimli tür varsa bütçe "metin", yoksa "görsel".
-pub fn budget_unit(types: &[String]) -> &'static str {
-    if types.iter().any(|t| TEXT_TYPES.contains(&t.as_str())) { "metin" } else { "görsel" }
-}
-
-/// Metin ve görsel türleri aynı izinde karışamaz: sayaç tek, birim tür başına — karışık
-/// kümede "50.000 metin" diye onaylanan izinle görsel üretilebilirdi. Ayrı izin gerekir.
-fn check_mixed(types: &[String]) -> Result<(), String> {
-    let text = types.iter().any(|t| TEXT_TYPES.contains(&t.as_str()));
-    let visual = types.iter().any(|t| !TEXT_TYPES.contains(&t.as_str()));
-    if text && visual {
-        return Err("metin ve görsel türleri ayrı izin ister (tek istekte karışmaz)".into());
-    }
-    Ok(())
-}
-
-fn check_budget(conn: &Connection, b: i64, types: &[String]) -> Result<i64, String> {
-    let unit = budget_unit(types);
-    let max = if unit == "metin" {
-        MAX_TEXT_BUDGET
-    } else {
-        setting::<Limits>(conn, LIMITS).and_then(|l| l.daily_image_limit).filter(|n| *n > 0).unwrap_or(MAX_BUDGET)
-    };
+fn check_budget(conn: &Connection, b: i64) -> Result<i64, String> {
+    let max = setting::<Limits>(conn, LIMITS).and_then(|l| l.daily_image_limit).filter(|n| *n > 0).unwrap_or(MAX_BUDGET);
     if (1..=max).contains(&b) {
         Ok(b)
     } else {
-        Err(format!("bütçe 1–{max} {unit} olmalı"))
+        Err(format!("bütçe 1–{max} görsel olmalı"))
     }
 }
 
@@ -613,7 +546,6 @@ pub fn request(conn: &Connection, lead: &Caller, args: &Value, available: &[Stri
     if let Some(t) = types.iter().find(|t| !available.contains(t)) {
         return Err(format!("tür ajan erişimine açık değil: {t}. Açık türler: {}", available.join(", ")));
     }
-    check_mixed(&types)?;
     let key = args.get("workerId").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).ok_or("workerId gerekli")?;
     let worker: String = conn
         .query_row(
@@ -625,7 +557,7 @@ pub fn request(conn: &Connection, lead: &Caller, args: &Value, available: &[Stri
         .map_err(e)?
         .ok_or_else(|| format!("takımında böyle bir worker yok: {key}"))?;
     let reason = args.get("reason").and_then(Value::as_str).map(str::trim).filter(|r| !r.is_empty()).ok_or("reason gerekli (patron bunu görecek)")?;
-    let budget = check_budget(conn, args.get("budget").and_then(Value::as_i64).unwrap_or(DEFAULT_BUDGET), &types)?;
+    let budget = check_budget(conn, args.get("budget").and_then(Value::as_i64).unwrap_or(DEFAULT_BUDGET))?;
     let pending: i64 = conn
         .query_row("SELECT COUNT(*) FROM gpu_requests WHERE team_id = ?1 AND status = 'pending'", [&lead.team_id], |r| r.get(0))
         .map_err(e)?;
@@ -646,14 +578,10 @@ pub fn decide(conn: &Connection, id: i64, approve: bool, budget: Option<i64>) ->
     if r.status != "pending" {
         return Err(format!("GPU isteği #{id} zaten karara bağlandı ({})", r.status));
     }
-    if approve {
-        check_mixed(&r.types)?;
-    }
     let tx = conn.unchecked_transaction().map_err(e)?;
     let ts = now();
     let text = if approve {
-        let budget = check_budget(conn, budget.unwrap_or(r.budget), &r.types)?;
-        let unit = budget_unit(&r.types);
+        let budget = check_budget(conn, budget.unwrap_or(r.budget))?;
         tx.execute("UPDATE gpu_requests SET status = 'approved', budget = ?2, decided_at = ?3 WHERE id = ?1", params![id, budget, ts]).map_err(e)?;
         // İzin isteğin projesinde doğar (#899); açılış backfill'inden sonra hâlâ NULL eski istek NULL kalır.
         tx.execute(
@@ -663,7 +591,7 @@ pub fn decide(conn: &Connection, id: i64, approve: bool, budget: Option<i64>) ->
         )
         .map_err(e)?;
         format!(
-            "GPU isteğin #{id} ONAYLANDI: izin #{} ({} için, türler {}, bütçe {budget} {unit}). İşi `delegate` ile bu worker'a verirken `gpuGrant: {}` ekle; izin o işe bağlanır, iş bitince kapanır.",
+            "GPU isteğin #{id} ONAYLANDI: izin #{} ({} için, türler {}, bütçe {budget} görsel). İşi `delegate` ile bu worker'a verirken `gpuGrant: {}` ekle; izin o işe bağlanır, iş bitince kapanır.",
             tx.last_insert_rowid(), r.worker_name, r.types.join(", "), tx.last_insert_rowid()
         )
     } else {
@@ -809,197 +737,14 @@ fn reserve(conn: &Connection, g: &Grant, n: i64) -> Result<(), String> {
 }
 
 fn budget_err(conn: &Connection, g: &Grant, n: i64) -> String {
-    match conn.query_row("SELECT budget, used, types FROM gpu_grants WHERE id = ?1", [g.id], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
-    }) {
-        Ok((budget, used, types)) => {
-            let types: Vec<String> = serde_json::from_str(&types).unwrap_or_default();
-            let unit = budget_unit(&types);
-            format!("GPU bütçesi bitti ({used}/{budget} {unit}, bu istek {n}); devam için lidere sor (ask_leader)")
-        }
+    match conn.query_row("SELECT budget, used FROM gpu_grants WHERE id = ?1", [g.id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+        Ok((budget, used)) => format!("GPU bütçesi bitti ({used}/{budget} görsel, bu istek {n}); devam için lidere sor (ask_leader)"),
         Err(err) => err.to_string(),
     }
 }
 
 fn refund(conn: &Connection, g: &Grant, n: i64) {
     let _ = conn.execute("UPDATE gpu_grants SET used = MAX(0, used - ?2) WHERE id = ?1", params![g.id, n]);
-}
-
-/// Senkron metin çağrısı için bütçeden ayır (görsel önbellek yolu yok: her çağrı düşer).
-fn reserve_text(conn: &Connection, g: &Grant, delegation: i64, n: i64) -> Result<(), String> {
-    if !still_bound(conn, g, delegation)? {
-        return Err(format!("GPU izni artık #{delegation} işinin değil (iş bitti ya da izin başka işe geçti); broker'a gönderilmedi"));
-    }
-    reserve(conn, g, n)
-}
-
-/// Boş olmayan metin listesi (içerik hataya/log'a yazılmaz, yalnız sayısı).
-fn nonempty_texts(v: Option<&Value>, key: &str) -> Result<Vec<String>, String> {
-    let a = v.and_then(Value::as_array).ok_or_else(|| format!("{key} gerekli (1–256 metin)"))?;
-    if a.is_empty() || a.len() > MAX_TEXTS_PER_REQUEST {
-        return Err(format!("{key} 1–256 metin olmalı"));
-    }
-    let mut out = Vec::with_capacity(a.len());
-    for t in a {
-        let t = t.as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or_else(|| format!("{key} yalnız boş olmayan metin alır"))?;
-        out.push(t.to_string());
-    }
-    Ok(out)
-}
-
-/// Metin girdisi: satır içi liste ya da çalışma klasöründeki JSONL dosyası (yol çağıranda çözülür).
-enum TextInput {
-    Inline(Vec<String>),
-    File(String),
-}
-
-fn present<'a>(args: &'a Value, key: &str) -> Option<&'a Value> {
-    args.get(key).filter(|v| !v.is_null())
-}
-
-/// `key` ile `path_key` birbirini dışlar; ikisi birlikte doğrulama hatasıdır (bütçe/POST yok).
-fn text_input(args: &Value, key: &str, path_key: &str) -> Result<TextInput, String> {
-    match (present(args, key), present(args, path_key)) {
-        (Some(_), Some(_)) => Err(format!("{key} ile {path_key} birlikte verilmez; birini seç")),
-        (None, Some(p)) => {
-            let p = p.as_str().map(str::trim).filter(|p| !p.is_empty()).ok_or_else(|| format!("{path_key} boş olmayan bir yol olmalı"))?;
-            Ok(TextInput::File(p.to_string()))
-        }
-        (v, None) => nonempty_texts(v, key).map(TextInput::Inline).map_err(|err| format!("{err} ya da {path_key} (JSONL)")),
-    }
-}
-
-fn out_path(args: &Value) -> Result<Option<String>, String> {
-    match present(args, "outPath") {
-        None => Ok(None),
-        Some(v) => v.as_str().map(str::trim).filter(|p| !p.is_empty()).map(|p| Some(p.to_string())).ok_or_else(|| "outPath boş olmayan bir yol olmalı".into()),
-    }
-}
-
-/// JSONL metin dosyası: her dolu satır bir JSON string (boş satırlar sayılmaz). Hata yalnız satır
-/// numarasını verir, içeriği değil. En çok `MAX_TEXT_BUDGET` metin ve `MAX_OUTPUT` bayt.
-fn read_texts(path: &Path, key: &str) -> Result<Vec<String>, String> {
-    let mut bytes = Vec::new();
-    let f = std::fs::File::open(path).map_err(|err| format!("{key} okunamadı: {err}"))?;
-    std::io::Read::read_to_end(&mut std::io::Read::take(f, MAX_OUTPUT + 1), &mut bytes).map_err(|err| format!("{key} okunamadı: {err}"))?;
-    if bytes.len() as u64 > MAX_OUTPUT {
-        return Err(format!("{key} en çok {} MiB olabilir", MAX_OUTPUT >> 20));
-    }
-    let s = String::from_utf8(bytes).map_err(|_| format!("{key} UTF-8 değil"))?;
-    let mut out = Vec::new();
-    for (i, line) in s.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let t = match serde_json::from_str::<Value>(line) {
-            Ok(Value::String(t)) => t,
-            _ => return Err(format!("{key} satır {}: JSON metin (\"...\") değil", i + 1)),
-        };
-        let t = t.trim();
-        if t.is_empty() {
-            return Err(format!("{key} satır {}: boş metin", i + 1));
-        }
-        if out.len() as i64 >= MAX_TEXT_BUDGET {
-            return Err(format!("{key} en çok {MAX_TEXT_BUDGET} metin olabilir"));
-        }
-        out.push(t.to_string());
-    }
-    if out.is_empty() {
-        return Err(format!("{key} en az bir metin içermeli"));
-    }
-    Ok(out)
-}
-
-fn embed_args(args: &Value) -> Result<(TextInput, Option<String>, Option<String>, Option<i64>), String> {
-    let texts = text_input(args, "texts", "textsPath")?;
-    let input_type = match args.get("input_type") {
-        None | Some(Value::Null) => None,
-        Some(v) => match v.as_str() {
-            Some("query") => Some("query".to_string()),
-            Some("document") => Some("document".to_string()),
-            _ => return Err("input_type \"query\" ya da \"document\" olmalı".into()),
-        },
-    };
-    let instruction =
-        args.get("instruction").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    let dimensions = match args.get("dimensions") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_i64().filter(|d| (32..=4096).contains(d)).ok_or("dimensions 32–4096 arasında tam sayı olmalı")?),
-    };
-    Ok((texts, input_type, instruction, dimensions))
-}
-
-/// `top_n` belge sayısına karşı çağıranda denetlenir (dosya girdisinde sayı okunduktan sonra).
-fn rerank_args(args: &Value) -> Result<(String, TextInput, Option<i64>), String> {
-    let query = args
-        .get("query")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|q| !q.is_empty())
-        .ok_or("query gerekli")?
-        .to_string();
-    let documents = text_input(args, "documents", "documentsPath")?;
-    let top_n = match args.get("top_n") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(v.as_i64().filter(|n| *n >= 1).ok_or("top_n pozitif tam sayı olmalı")?),
-    };
-    Ok((query, documents, top_n))
-}
-
-/// `data:[{index, embedding}]` → `index` sırasına dizilmiş vektörler. Çağıran gönderdiği
-/// metin sayısını (`n`) verir: `data` tam `n` eleman, index'ler tekrarsız `0..n` olmalı —
-/// eksik/tekrar/aralık dışı yanıtta vektörler yanlış metne eşlenirdi. Hata + iade (çağıranda).
-fn parse_embeddings(v: &Value, n: usize) -> Result<Vec<Vec<f64>>, String> {
-    let data = v.get("data").and_then(Value::as_array).ok_or("GPU broker yanıtı okunamadı (data yok)")?;
-    if data.len() != n {
-        return Err(format!("GPU broker yanıtı okunamadı (data {}/{}: protokol hatası)", data.len(), n));
-    }
-    let mut out: Vec<(u64, Vec<f64>)> = Vec::with_capacity(data.len());
-    for item in data {
-        let index = item.get("index").and_then(Value::as_u64).ok_or("GPU broker yanıtı okunamadı (index yok)")?;
-        let raw = item.get("embedding").and_then(Value::as_array).ok_or("GPU broker yanıtı okunamadı (embedding yok)")?;
-        if raw.is_empty() {
-            return Err("GPU broker yanıtı okunamadı (embedding boş)".into());
-        }
-        let vec: Vec<f64> =
-            raw.iter().map(|x| x.as_f64()).collect::<Option<_>>().ok_or("GPU broker yanıtı okunamadı (embedding sayı değil)")?;
-        out.push((index, vec));
-    }
-    out.sort_by_key(|(i, _)| *i);
-    for (i, (index, _)) in out.iter().enumerate() {
-        if *index != i as u64 {
-            return Err("GPU broker yanıtı okunamadı (index eksik/tekrar/aralık dışı: protokol hatası)".into());
-        }
-    }
-    Ok(out.into_iter().map(|(_, v)| v).collect())
-}
-
-/// `results:[{index, relevance_score|score}]` → broker sırasını korur. Boş sonuç, belge
-/// dışı index ya da tekrar protokol hatasıdır (hata + iade çağıranda).
-fn parse_rerank(v: &Value, n_docs: usize) -> Result<Vec<(u64, f64)>, String> {
-    let results = v.get("results").and_then(Value::as_array).ok_or("GPU broker yanıtı okunamadı (results yok)")?;
-    if results.is_empty() {
-        return Err("GPU broker yanıtı okunamadı (results boş: protokol hatası)".into());
-    }
-    let mut seen = vec![false; n_docs];
-    let mut out = Vec::with_capacity(results.len());
-    for r in results {
-        let index = r.get("index").and_then(Value::as_u64).ok_or("GPU broker yanıtı okunamadı (index yok)")?;
-        if index as usize >= n_docs {
-            return Err("GPU broker yanıtı okunamadı (index belge dışında)".into());
-        }
-        if seen[index as usize] {
-            return Err("GPU broker yanıtı okunamadı (index tekrar: protokol hatası)".into());
-        }
-        seen[index as usize] = true;
-        let score = r
-            .get("relevance_score")
-            .or_else(|| r.get("score"))
-            .and_then(Value::as_f64)
-            .ok_or("GPU broker yanıtı okunamadı (skor yok: protokol hatası)")?;
-        out.push((index, score));
-    }
-    Ok(out)
 }
 
 /// Erişim (job_id, izin) ilişkisinden: broker önbelleği aynı job_id'yi başka izne de döndürebilir.
@@ -1083,19 +828,6 @@ const LINK: &str = "path bir bağlantıdan (symlink/junction) geçemez";
 /// Çıktı yolu. Metin kontrolü yetmez: ara klasörler kökten tek tek açılır, hiçbiri bağlantı
 /// olamaz; ebeveynin gerçek yolu kökün gerçek yolu içinde kalmalı; hedef varsa bağlantı olamaz.
 fn target(root: &Path, p: &str) -> Result<PathBuf, String> {
-    resolve(root, p, true)
-}
-
-/// Girdi yolu: `target` ile aynı sınır, ama klasör açmaz; hedef var olan düz dosya olmalı.
-fn source(root: &Path, p: &str) -> Result<PathBuf, String> {
-    let path = resolve(root, p, false)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => Ok(path),
-        _ => Err("dosya bulunamadı (çalışma klasörüne göre yol ver)".into()),
-    }
-}
-
-fn resolve(root: &Path, p: &str, create: bool) -> Result<PathBuf, String> {
     use std::path::Component;
     let p = p.trim();
     if p.is_empty() {
@@ -1118,8 +850,7 @@ fn resolve(root: &Path, p: &str, create: bool) -> Result<PathBuf, String> {
             Ok(m) if is_link(&m) => return Err(LINK.into()),
             Ok(m) if m.is_dir() => {}
             Ok(_) => return Err(outside()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound && create => std::fs::create_dir(&dir).map_err(|err| format!("klasör açılamadı: {err}"))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err("dosya bulunamadı (çalışma klasörüne göre yol ver)".into()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&dir).map_err(|err| format!("klasör açılamadı: {err}"))?,
             Err(err) => return Err(format!("klasör okunamadı: {err}")),
         }
     }
@@ -1138,35 +869,19 @@ fn resolve(root: &Path, p: &str, create: bool) -> Result<PathBuf, String> {
 /// sonra yerine taşıma. Hata olursa yalnız kendi geçici dosyası silinir.
 fn write_output(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let (tmp, mut f) = open_part(path)?;
-    let res = f.write_all(bytes).and_then(|_| f.sync_all());
-    drop(f);
-    match res {
-        Ok(()) => commit_part(&tmp, path),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(format!("yazılamadı: {err}"))
-        }
-    }
-}
-
-fn open_part(path: &Path) -> Result<(PathBuf, std::fs::File), String> {
     static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = path.parent().ok_or("path bir dosya olmalı")?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.{}-{}-{}.dex-part", std::process::id(), now(), SEQ.fetch_add(1, Ordering::Relaxed)));
-    let f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|err| format!("yazılamadı: {err}"))?;
-    Ok((tmp, f))
-}
-
-/// Geçici dosyayı hedefe taşır; hedef bağlantıysa ya da taşıma düşerse geçici dosya silinir.
-fn commit_part(tmp: &Path, path: &Path) -> Result<(), String> {
-    let res = match std::fs::symlink_metadata(path) {
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(|err| format!("yazılamadı: {err}"))?;
+    let res = f.write_all(bytes).and_then(|_| f.sync_all());
+    drop(f);
+    let res = res.map_err(|err| format!("yazılamadı: {err}")).and_then(|_| match std::fs::symlink_metadata(path) {
         Ok(m) if is_link(&m) => Err(LINK.to_string()),
-        _ => std::fs::rename(tmp, path).map_err(|err| format!("yazılamadı: {err}")),
-    };
+        _ => std::fs::rename(&tmp, path).map_err(|err| format!("yazılamadı: {err}")),
+    });
     if res.is_err() {
-        let _ = std::fs::remove_file(tmp);
+        let _ = std::fs::remove_file(&tmp);
     }
     res
 }
@@ -1183,12 +898,12 @@ fn lead_tools() -> Vec<Value> {
         json!({ "name": "gpu_status", "description": "YALNIZ LİDER. Dex'e bağlı GPU kaynağı: modeller üç grupta (ajana açık / servis edilen / yalnız diskte) tam sayı ve en çok 8 örnek adla, kuyruk ve günlük kullanım. detail: true tam model listesini verir. Doğrudan kullanım yasak; iş gerekiyorsa gpu_request.",
           "inputSchema": { "type": "object", "additionalProperties": false, "properties": {
               "detail": { "type": "boolean", "description": "Tam model listesi (ad, tür, motor, yol, tarifler, bayraklar)" } } } }),
-        json!({ "name": "gpu_request", "description": "YALNIZ LİDER. Bir worker'ın işi için patrondan GPU izni iste (tür kümesi + bütçe; birim tür başına: görsel türlerde adet, embedding/rerank'te metin/belge sayısı; varsayılan 24). Karar bağlamına not olarak gelir; onaylanırsa izin id'sini delegate'e gpuGrant olarak ekle.",
+        json!({ "name": "gpu_request", "description": "YALNIZ LİDER. Bir worker'ın işi için patrondan GPU izni iste (tür kümesi + bütçe = üretilecek görsel adedi, varsayılan 24). Karar bağlamına not olarak gelir; onaylanırsa izin id'sini delegate'e gpuGrant olarak ekle.",
           "inputSchema": { "type": "object", "additionalProperties": false, "required": ["types", "workerId", "reason"], "properties": {
-              "types": { "type": "array", "items": { "type": "string" }, "description": "gpu_status'taki ajan türleri, ör. [\"t2i\",\"bg-removal\"] ya da [\"embedding\",\"rerank\"]" },
+              "types": { "type": "array", "items": { "type": "string" }, "description": "gpu_status'taki ajan türleri, ör. [\"t2i\",\"bg-removal\"]" },
               "workerId": { "type": "string", "description": "İşi yapacak worker (id ya da ad)" },
               "reason": { "type": "string", "description": "Patronun göreceği kısa gerekçe" },
-              "budget": { "type": "integer", "description": "Tür biriminde kullanım (görselde adet, metinde sayı; en çok broker günlük limiti ya da 50000)" } } } }),
+              "budget": { "type": "integer", "description": "Görsel adedi (en çok broker günlük limiti)" } } } }),
     ]
 }
 
@@ -1205,21 +920,6 @@ fn worker_tools() -> Vec<Value> {
           "inputSchema": { "type": "object", "additionalProperties": false, "required": ["jobId", "index", "path"], "properties": {
               "jobId": { "type": "string" }, "index": { "type": "integer" },
               "path": { "type": "string", "description": "Çalışma klasörüne göre dosya yolu, ör. assets/icon.png" } } } }),
-        json!({ "name": "gpu_embed", "description": "Metinleri vektöre çevirir (senkron). Girdi: texts (en çok 256) ya da textsPath (JSONL, her satır bir JSON string; büyük girdi 256'lık parçalarla gönderilir) — ikisi birlikte verilmez. outPath verilirse vektörler dosyaya yazılır (JSONL, girdi sırasıyla her satır {\"i\":n,\"v\":[...]}) ve yanıt yalnız özettir (sayı, boyut, yol, harcanan bütçe); büyük girdide outPath kullan. Yollar çalışma klasörüne göredir. Bütçe metin sayısıdır, toplamı yetmezse hiç gönderilmez; bir parça düşerse o ana kadar yazılan ve harcanan hata metninde. 503'te broker Retry-After kadar beklenip yeniden denenir.",
-          "inputSchema": { "type": "object", "additionalProperties": false, "properties": {
-              "texts": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 256 },
-              "textsPath": { "type": "string", "description": "texts yerine: çalışma klasörüne göre JSONL dosyası, ör. .dex/tmp/texts.jsonl" },
-              "outPath": { "type": "string", "description": "Vektörlerin yazılacağı JSONL dosyası (çalışma klasörüne göre); verilirse yanıt yalnız özet" },
-              "input_type": { "type": "string", "enum": ["query", "document"], "description": "Yoksa belge" },
-              "instruction": { "type": "string" },
-              "dimensions": { "type": "integer", "minimum": 32, "maximum": 4096 } } } }),
-        json!({ "name": "gpu_rerank", "description": "Belgeleri soruya göre yeniden sıralar (senkron). Girdi: documents (en çok 256) ya da documentsPath (JSONL, her satır bir JSON string; 256'lık parçalarla gönderilir, birden çok parçada sonuç skora göre azalan) — ikisi birlikte verilmez. outPath verilirse sonuçlar dosyaya yazılır (JSONL, her satır {\"i\":belge sırası,\"score\":x}) ve yanıt yalnız özettir. Yollar çalışma klasörüne göredir. Bütçe belge sayısıdır, toplamı yetmezse hiç gönderilmez; bir parça düşerse harcanan ve yazılan hata metninde. 503'te broker Retry-After kadar beklenip yeniden denenir.",
-          "inputSchema": { "type": "object", "additionalProperties": false, "required": ["query"], "properties": {
-              "query": { "type": "string" },
-              "documents": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 256 },
-              "documentsPath": { "type": "string", "description": "documents yerine: çalışma klasörüne göre JSONL dosyası" },
-              "outPath": { "type": "string", "description": "Sonuçların yazılacağı JSONL dosyası (çalışma klasörüne göre); verilirse yanıt yalnız özet" },
-              "top_n": { "type": "integer", "minimum": 1 } } } }),
     ]
 }
 
@@ -1379,20 +1079,6 @@ impl Core {
         Ok(v)
     }
 
-    /// Metin türünün servis edilen ajan modeli (ad sabit yazılmaz; broker listesinden).
-    fn gpu_text_model(&self, kind: &str) -> Result<String, String> {
-        let o = self.gpu_overview(false)?;
-        if !o.authorized {
-            return Err("GPU kaynağı şu an bağlı değil; lidere sor (ask_leader)".into());
-        }
-        o.models
-            .iter()
-            .find(|m| m.kind == kind && m.agent)
-            .or_else(|| o.models.iter().find(|m| m.kind == kind))
-            .map(|m| m.name.clone())
-            .ok_or_else(|| format!("'{kind}' türü şu an servis edilmiyor; patrona açılmasını öner (ask_leader)"))
-    }
-
     /// `gpu_request` için ajan erişimi açık türler. Broker'a ağ çağrısı olabilir: çağıran ne başlatma
     /// kapısını ne DB kilidini tutar (#882).
     pub(crate) fn gpu_agent_types(&self) -> Result<Vec<String>, String> {
@@ -1434,7 +1120,7 @@ impl Core {
                 }
                 Ok(b.scrub(v))
             }
-            "gpu_recipes" | "gpu_submit" | "gpu_job" | "gpu_fetch" | "gpu_embed" | "gpu_rerank" => {
+            "gpu_recipes" | "gpu_submit" | "gpu_job" | "gpu_fetch" => {
                 let (delegation, g) = with(&self.db, |conn| active_grant(conn, &c.id, job))?
                     .ok_or_else(|| format!("bilinmeyen araç: {name}"))?;
                 let out = self.gpu_worker(&b, c, delegation, &g, name, args);
@@ -1577,259 +1263,9 @@ impl Core {
                 write_output(&path, &bytes)?;
                 Ok(json!({ "path": path.to_string_lossy(), "bytes": bytes.len(), "sha256": got, "width": out.get("width"), "height": out.get("height"), "mode": out.get("mode") }))
             }
-            "gpu_embed" => {
-                if !g.types.iter().any(|t| t == "embedding") {
-                    return Err(format!("'embedding' türü bu işin GPU izninde değil (izinli türler: {})", g.types.join(", ")));
-                }
-                let (input, input_type, instruction, dimensions) = embed_args(args)?;
-                let out = out_path(args)?;
-                let (texts, out) = self.gpu_text_io(c, delegation, input, "textsPath", out)?;
-                let model = self.gpu_text_model("embedding")?;
-                let n = texts.len();
-                with(&self.db, |conn| can_spend(conn, g, delegation, n as i64))?;
-                let mut body = json!({ "model": model });
-                if let Some(t) = input_type {
-                    body["input_type"] = json!(t);
-                }
-                if let Some(i) = instruction {
-                    body["instruction"] = json!(i);
-                }
-                if let Some(d) = dimensions {
-                    body["dimensions"] = json!(d);
-                }
-                let mut sink = match &out {
-                    Some(o) => {
-                        let (tmp, f) = open_part(&o.path).map_err(|err| format!("outPath: {err}"))?;
-                        Some((tmp, std::io::BufWriter::new(f)))
-                    }
-                    None => None,
-                };
-                let chunks = n.div_ceil(MAX_TEXTS_PER_REQUEST);
-                let (mut vecs, mut dims, mut spent, mut written) = (Vec::new(), 0, 0, 0);
-                let mut failed = None;
-                for (k, chunk) in texts.chunks(MAX_TEXTS_PER_REQUEST).enumerate() {
-                    body["input"] = json!(chunk);
-                    let part = match self.gpu_text_call(b, c, delegation, g, "/v1/embeddings", &body, chunk.len(), |v| parse_embeddings(v, chunk.len())) {
-                        Ok(part) => part,
-                        Err(err) => {
-                            failed = Some((k, err));
-                            break;
-                        }
-                    };
-                    spent += chunk.len();
-                    if dims == 0 {
-                        dims = part.first().map(Vec::len).unwrap_or(0);
-                    }
-                    let Some((_, w)) = &mut sink else {
-                        vecs.extend(part);
-                        continue;
-                    };
-                    let wrote = part.iter().enumerate().try_for_each(|(j, v)| {
-                        use std::io::Write;
-                        writeln!(w, "{}", json!({ "i": written + j, "v": v }))
-                    });
-                    if let Err(err) = wrote {
-                        // Yarım satır kalmış olabilir: dosya bırakılmaz.
-                        failed = Some((k, format!("outPath yazılamadı: {err}")));
-                        written = 0;
-                        break;
-                    }
-                    written += chunk.len();
-                }
-                // Parça kalıcı düştüyse o ana kadarki satırlar dosyada kalır; harcanan ve yazılan açıkça söylenir.
-                let finished = match (sink, &out) {
-                    (Some((tmp, w)), Some(o)) => Some(finish_part(o, tmp, w, written > 0)),
-                    _ => None,
-                };
-                let unit = "metin";
-                if let Some((k, err)) = failed {
-                    if spent == 0 {
-                        return Err(err);
-                    }
-                    let used = with(&self.db, |conn| used_now(conn, g))?;
-                    return Err(partial_err(&err, unit, (k, chunks), spent, (used, g.budget), out.as_ref().map(|o| (o, written, finished))));
-                }
-                let used = with(&self.db, |conn| used_now(conn, g))?;
-                if let (Some(Err(err)), Some(o)) = (finished, &out) {
-                    return Err(partial_err(&err, unit, (chunks - 1, chunks), spent, (used, g.budget), Some((o, 0, None))));
-                }
-                Ok(match out {
-                    Some(o) => json!({ "path": o.path.to_string_lossy(), "count": n, "dimensions": dims, "model": model, "chunks": chunks, "spent": spent, "budget": budget(used) }),
-                    None => json!({ "embeddings": vecs, "model": model, "dimensions": dims, "count": n, "budget": budget(used) }),
-                })
-            }
-            "gpu_rerank" => {
-                if !g.types.iter().any(|t| t == "rerank") {
-                    return Err(format!("'rerank' türü bu işin GPU izninde değil (izinli türler: {})", g.types.join(", ")));
-                }
-                let (query, input, top_n) = rerank_args(args)?;
-                let out = out_path(args)?;
-                let (documents, out) = self.gpu_text_io(c, delegation, input, "documentsPath", out)?;
-                let n = documents.len();
-                if top_n.is_some_and(|t| t > n as i64) {
-                    return Err("top_n belge sayısını aşamaz".into());
-                }
-                let model = self.gpu_text_model("rerank")?;
-                with(&self.db, |conn| can_spend(conn, g, delegation, n as i64))?;
-                let mut body = json!({ "model": model, "query": query });
-                let chunks = n.div_ceil(MAX_TEXTS_PER_REQUEST);
-                let (mut scored, mut spent) = (Vec::new(), 0);
-                let mut failed = None;
-                for (k, chunk) in documents.chunks(MAX_TEXTS_PER_REQUEST).enumerate() {
-                    body["documents"] = json!(chunk);
-                    // Genel ilk n, parçaların ilk n'lerinin birleşimindedir.
-                    if let Some(t) = top_n {
-                        body["top_n"] = json!(t.min(chunk.len() as i64));
-                    }
-                    match self.gpu_text_call(b, c, delegation, g, "/v1/rerank", &body, chunk.len(), |v| parse_rerank(v, chunk.len())) {
-                        Ok(part) => {
-                            scored.extend(part.into_iter().map(|(i, s)| (i + spent as u64, s)));
-                            spent += chunk.len();
-                        }
-                        Err(err) => {
-                            failed = Some((k, err));
-                            break;
-                        }
-                    }
-                }
-                // Tek parçada broker sırası korunur; birden çok parçada skora göre azalan, sonra top_n.
-                if chunks > 1 {
-                    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    if let Some(t) = top_n {
-                        scored.truncate(t as usize);
-                    }
-                }
-                // Sonuç küçük (belge başına bir satır): bellekte toplanır, sonda tek yazımla taşınır.
-                let save = |o: &OutFile| {
-                    let lines: String = scored.iter().map(|(i, s)| format!("{}\n", json!({ "i": i, "score": s }))).collect();
-                    target(&o.root, &o.rel).and_then(|path| write_output(&path, lines.as_bytes()))
-                };
-                let unit = "belge";
-                if let Some((k, err)) = failed {
-                    if spent == 0 {
-                        return Err(err);
-                    }
-                    let finished = out.as_ref().map(save);
-                    let used = with(&self.db, |conn| used_now(conn, g))?;
-                    return Err(partial_err(&err, unit, (k, chunks), spent, (used, g.budget), out.as_ref().map(|o| (o, scored.len(), finished))));
-                }
-                let used = with(&self.db, |conn| used_now(conn, g))?;
-                if let Some(o) = &out {
-                    if let Err(err) = save(o) {
-                        return Err(partial_err(&err, unit, (chunks - 1, chunks), spent, (used, g.budget), Some((o, 0, None))));
-                    }
-                }
-                Ok(match out {
-                    Some(o) => json!({ "path": o.path.to_string_lossy(), "count": n, "results": scored.len(), "model": model, "chunks": chunks, "spent": spent, "budget": budget(used) }),
-                    None => {
-                        let results: Vec<Value> = scored.into_iter().map(|(index, score)| json!({ "index": index, "score": score })).collect();
-                        json!({ "results": results, "model": model, "count": n, "budget": budget(used) })
-                    }
-                })
-            }
             _ => Err(format!("bilinmeyen araç: {name}")),
         }
     }
-
-    /// Bir parçanın senkron metin çağrısı: izin + bütçe ayrımı, 503/Retry-After (`post_sync`),
-    /// hata ya da bozuk yanıtta iade. Başarıda ayrılan düşmüş kalır.
-    #[allow(clippy::too_many_arguments)]
-    fn gpu_text_call<T>(
-        &self, b: &Broker, c: &Caller, delegation: i64, g: &Grant, path: &str, body: &Value, n: usize,
-        parse: impl FnOnce(&Value) -> Result<T, String>,
-    ) -> Result<T, String> {
-        let n = n as i64;
-        with(&self.db, |conn| reserve_text(conn, g, delegation, n))?;
-        let task = format!("{}/{delegation}", c.id);
-        let alive = || with(&self.db, |conn| still_bound(conn, g, delegation)).unwrap_or(false);
-        let res = b.post_sync(path, Some(&task), body, &alive).and_then(|v| parse(&v));
-        if res.is_err() {
-            with(&self.db, |conn| {
-                refund(conn, g, n);
-                Ok(())
-            })?;
-        }
-        res
-    }
-
-    /// Dosya girdisi ve çıktı yolu işin çalışma kökünde (`work_root`) çözülür; ikisi de yoksa kök
-    /// aranmaz (klasörsüz işte satır içi çağrı çalışır). Ağdan önce: yol hatası bütçe harcamaz.
-    fn gpu_text_io(&self, c: &Caller, delegation: i64, input: TextInput, path_key: &str, out: Option<String>) -> Result<(Vec<String>, Option<OutFile>), String> {
-        let (input, out) = match (input, out) {
-            (TextInput::Inline(texts), None) => return Ok((texts, None)),
-            x => x,
-        };
-        let root = with(&self.db, |conn| work_root(conn, &self.paths.data_dir, c, delegation))?;
-        let texts = match input {
-            TextInput::Inline(texts) => texts,
-            TextInput::File(p) => read_texts(&source(&root, &p).map_err(|err| format!("{path_key}: {err}"))?, path_key)?,
-        };
-        let out = match out {
-            Some(rel) => {
-                let path = target(&root, &rel).map_err(|err| format!("outPath: {err}"))?;
-                Some(OutFile { root, rel, path })
-            }
-            None => None,
-        };
-        Ok((texts, out))
-    }
-}
-
-/// Çalışma kökü altında doğrulanmış çıktı dosyası (yazmadan önce yeniden doğrulanır).
-struct OutFile {
-    root: PathBuf,
-    rel: String,
-    path: PathBuf,
-}
-
-/// Akışlı çıktıyı kapatır. `keep` yoksa geçici dosya silinir; varsa yol yeniden doğrulanır
-/// (uzun ağ beklemesinde klasör bağlantıyla değişmiş olabilir, #300) ve yerine taşınır.
-fn finish_part(o: &OutFile, tmp: PathBuf, w: std::io::BufWriter<std::fs::File>, keep: bool) -> Result<(), String> {
-    let synced = w.into_inner().map_err(|err| err.to_string()).and_then(|f| f.sync_all().map_err(|err| err.to_string()));
-    if !keep || synced.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        return synced.map_err(|err| format!("yazılamadı: {err}"));
-    }
-    match target(&o.root, &o.rel) {
-        Ok(path) => commit_part(&tmp, &path),
-        Err(err) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(err)
-        }
-    }
-}
-
-/// Bütçe yetiyor mu (ayırmadan): parçalı çağrı hiç POST atmadan reddedilsin.
-fn can_spend(conn: &Connection, g: &Grant, delegation: i64, n: i64) -> Result<(), String> {
-    if !still_bound(conn, g, delegation)? {
-        return Err(format!("GPU izni artık #{delegation} işinin değil (iş bitti ya da izin başka işe geçti); broker'a gönderilmedi"));
-    }
-    let left: i64 = conn.query_row("SELECT budget - used FROM gpu_grants WHERE id = ?1", [g.id], |r| r.get(0)).map_err(e)?;
-    if left < n {
-        return Err(budget_err(conn, g, n));
-    }
-    Ok(())
-}
-
-fn used_now(conn: &Connection, g: &Grant) -> Result<i64, String> {
-    conn.query_row("SELECT used FROM gpu_grants WHERE id = ?1", [g.id], |r| r.get::<_, i64>(0)).map_err(e)
-}
-
-/// Çıktı dosyasının kapanış sonucu (`None`: hiç denenmedi).
-type Saved = Option<Result<(), String>>;
-
-/// Yarıda kalan parçalı çağrı: hata + nerede durdu + harcanan + dosyaya yazılan.
-fn partial_err(
-    err: &str, unit: &str, (k, chunks): (usize, usize), spent: usize, (used, total): (i64, i64),
-    out: Option<(&OutFile, usize, Saved)>,
-) -> String {
-    let file = match out {
-        None => "sonuçlar döndürülmedi (outPath ver)".to_string(),
-        Some((o, written, Some(Ok(())))) if written > 0 => format!("{written} satır {} dosyasına yazıldı", o.path.to_string_lossy()),
-        Some((_, _, Some(Err(werr)))) => format!("çıktı dosyası yazılamadı ({werr})"),
-        Some(_) => "çıktı dosyası yazılmadı".to_string(),
-    };
-    format!("{err} — parça {}/{chunks}'de durdu; bu çağrıda {spent} {unit} işlendi ve bütçeden düştü (kullanım {used}/{total}); {file}", k + 1)
 }
 
 #[cfg(test)]
@@ -1862,17 +1298,6 @@ mod tests {
         on_models: Mutex<Option<Box<dyn Fn() + Send>>>,
         /// Bu yollar (yetkiyle bile) 500 döner.
         broken: Mutex<Vec<String>>,
-        /// Ek ajan modelleri (embedding/rerank testleri; varsayılan boş → mevcut testler etkilenmez).
-        extra_models: Mutex<Vec<Value>>,
-        /// POST /v1/embeddings başında bu kadar 503 (`Retry-After: 1`), sonra başarı.
-        embed_503: std::sync::atomic::AtomicUsize,
-        /// Embedding yanıt biçimi: "" (normal) | "dup" (index tekrar) | "short" (eksik eleman).
-        embed_style: Mutex<String>,
-        /// Son embedding isteği (model/input_type/instruction/dimensions denetimi).
-        last_embed: Mutex<Option<Value>>,
-        /// Rerank sonuç biçimi: "relevance" | "score" | "empty" (skorsuz) | "noresults" (boş) |
-        /// "dup" (index tekrar) | "oob" (index belge dışında) — hepsi protokol hatası.
-        rerank_style: Mutex<String>,
         /// Bu yol (yetkiyle) 200 + verilen gövdeyi döner; başlıktaki uzunluk gövdeden büyükse yarım kalır.
         mangled: Mutex<Option<(String, Vec<u8>, usize)>>,
         /// İşler patronun LLM'i yüzünden bekler (`waiting_owner`).
@@ -1965,16 +1390,11 @@ mod tests {
             ("GET", "/health") => (200, "application/json", br#"{"status":"ok"}"#.to_vec()),
             ("GET", p) if f.broken.lock().unwrap().iter().any(|b| b == p) => (500, "application/json", br#"{"error":"internal","message":"vllm yanit vermedi"}"#.to_vec()),
             _ if !authed => (401, "application/json", br#"{"detail":"gecersiz ya da eksik token"}"#.to_vec()),
-            ("GET", "/v1/models") => {
-                let mut models = vec![
-                    json!({ "name": "FLUX.2-dev", "type": "t2i", "engine": "comfyui", "path": "image/flux2-dev", "recipes": ["flux_draft", "flux_final"], "agent": true, "serve": true, "disk": true }),
-                    json!({ "name": "RMBG-2.0", "type": "bg-removal", "engine": "comfyui", "path": "image/rmbg-2", "recipes": ["rmbg"], "agent": true, "serve": true, "disk": true }),
-                    json!({ "name": "qwen3-coder-next", "type": "llm", "engine": "vllm", "path": "llm/Qwen3-Coder-Next", "recipes": [], "agent": false, "serve": true, "disk": true }),
-                    json!({ "name": "Qwen-Image", "type": "image", "engine": null, "path": "image/Qwen-Image", "recipes": [], "agent": false, "serve": false, "disk": true }),
-                ];
-                models.extend(f.extra_models.lock().unwrap().clone());
-                (200, "application/json", json!({ "models": models }).to_string().into_bytes())
-            }
+            ("GET", "/v1/models") => (200, "application/json", json!({ "models": [
+                { "name": "FLUX.2-dev", "type": "t2i", "engine": "comfyui", "path": "image/flux2-dev", "recipes": ["flux_draft", "flux_final"], "agent": true, "serve": true, "disk": true },
+                { "name": "RMBG-2.0", "type": "bg-removal", "engine": "comfyui", "path": "image/rmbg-2", "recipes": ["rmbg"], "agent": true, "serve": true, "disk": true },
+                { "name": "qwen3-coder-next", "type": "llm", "engine": "vllm", "path": "llm/Qwen3-Coder-Next", "recipes": [], "agent": false, "serve": true, "disk": true },
+                { "name": "Qwen-Image", "type": "image", "engine": null, "path": "image/Qwen-Image", "recipes": [], "agent": false, "serve": false, "disk": true } ] }).to_string().into_bytes()),
             ("GET", "/v1/status") => {
                 let limits = f.limits.lock().unwrap().clone();
                 (200, "application/json", json!({ "gpu": { "owner": "llm", "llm_model": "qwen3-coder-next" },
@@ -2010,70 +1430,6 @@ mod tests {
                         "message": format!("Sirada 1. ({base} uzerinden)") }).to_string().into_bytes())
                 }
             }
-            ("POST", "/v1/embeddings") => {
-                if f.embed_503.load(Ordering::SeqCst) > 0 {
-                    f.embed_503.fetch_sub(1, Ordering::SeqCst);
-                    let out = br#"{"error":"busy","message":"GPU patronun LLM oturumunda"}"#;
-                    let _ = write!(s, "HTTP/1.1 503 X\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", out.len());
-                    let _ = s.write_all(out);
-                    return;
-                }
-                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                *f.last_embed.lock().unwrap() = Some(v.clone());
-                let inputs = v.get("input").and_then(Value::as_array).cloned().unwrap_or_default();
-                if inputs.iter().any(|t| t.as_str() == Some("bozuk")) {
-                    (400, "application/json", br#"{"error":"invalid","message":"metin cok uzun"}"#.to_vec())
-                } else {
-                    // Sıra karışık verilir; Dex `index`'e göre dizer.
-                    let mut data: Vec<Value> = inputs
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        // "n:<k>" metni k değerini taşır (parçalar arası sıra denetimi).
-                        .map(|(i, t)| json!({ "index": i, "embedding": [tagged(t).unwrap_or(0.1 * i as f64), 0.2] }))
-                        .collect();
-                    match f.embed_style.lock().unwrap().as_str() {
-                        // 2 metne [0, 0, 2]: 1. vektör iki kez, 2.'ninki kayıp.
-                        "dup" => data.insert(1, json!({ "index": 0, "embedding": [0.0, 0.2] })),
-                        "short" => {
-                            data.pop();
-                        }
-                        _ => {}
-                    }
-                    (200, "application/json", json!({ "object": "list", "model": v.get("model"), "data": data }).to_string().into_bytes())
-                }
-            }
-            ("POST", "/v1/rerank") => {
-                let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let docs = v.get("documents").and_then(Value::as_array).cloned().unwrap_or_default();
-                let style = f.rerank_style.lock().unwrap().clone();
-                if v.get("query").and_then(Value::as_str) == Some("bozuk") || docs.iter().any(|d| d.as_str() == Some("bozuk")) {
-                    (400, "application/json", br#"{"error":"invalid","message":"sorgu bos"}"#.to_vec())
-                } else if style == "empty" {
-                    (200, "application/json", br#"{"results":[{"index":0}]}"#.to_vec())
-                } else if style == "noresults" {
-                    (200, "application/json", br#"{"results":[]}"#.to_vec())
-                } else if style == "dup" {
-                    (200, "application/json", br#"{"results":[{"index":0,"relevance_score":0.9},{"index":0,"relevance_score":0.8}]}"#.to_vec())
-                } else if style == "oob" {
-                    (200, "application/json", br#"{"results":[{"index":99,"relevance_score":0.9}]}"#.to_vec())
-                } else {
-                    let key = if style == "score" { "score" } else { "relevance_score" };
-                    // Broker sırası (tersten); Dex aynen korur.
-                    let results: Vec<Value> = docs
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .map(|(i, _)| {
-                            let mut m = serde_json::Map::new();
-                            m.insert("index".into(), json!(i));
-                            m.insert(key.into(), json!(tagged(&docs[i]).map(|k| k / 1000.0).unwrap_or(0.9 - 0.1 * i as f64)));
-                            Value::Object(m)
-                        })
-                        .collect();
-                    (200, "application/json", json!({ "model": v.get("model"), "results": results }).to_string().into_bytes())
-                }
-            }
             ("DELETE", p) if p.starts_with("/v1/jobs/") => (200, "application/json", json!({ "job_id": &p["/v1/jobs/".len()..], "status": "canceled" }).to_string().into_bytes()),
             ("GET", p) if p.starts_with("/v1/jobs/") && p.ends_with("/outputs/0") => {
                 if let Some(hook) = f.on_output.lock().unwrap().as_ref() {
@@ -2091,10 +1447,6 @@ mod tests {
             _ => (404, "application/json", br#"{"error":"not_found","message":"yok"}"#.to_vec()),
         };
         reply(&mut s, code, ctype, &out);
-    }
-
-    fn tagged(t: &Value) -> Option<f64> {
-        t.as_str()?.strip_prefix("n:")?.parse().ok()
     }
 
     fn reply(s: &mut std::net::TcpStream, code: u16, ctype: &str, out: &[u8]) {
@@ -2175,19 +1527,7 @@ mod tests {
     }
 
     fn approved_job_for(core: &Core, worker: &str, budget: Option<i64>) -> (i64, i64) {
-        approved_text_job(core, worker, &["t2i"], budget)
-    }
-
-    /// Metin türlerinde sahte broker modelleri (ad sabit yazılmaz; listeden çözülür).
-    fn text_models() -> Vec<Value> {
-        vec![
-            json!({ "name": "Qwen3-Embedding-8B", "type": "embedding", "engine": "vllm", "path": "embed/Qwen3-Embedding-8B", "recipes": [], "agent": true, "serve": true, "disk": true }),
-            json!({ "name": "Qwen3-Reranker-8B", "type": "rerank", "engine": "vllm", "path": "rerank/Qwen3-Reranker-8B", "recipes": [], "agent": true, "serve": true, "disk": true }),
-        ]
-    }
-
-    fn approved_text_job(core: &Core, worker: &str, types: &[&str], budget: Option<i64>) -> (i64, i64) {
-        let r = mcp(core, "timur", "gpu_request", json!({ "types": types, "workerId": worker, "reason": "vektör" }));
+        let r = mcp(core, "timur", "gpu_request", json!({ "types": ["t2i"], "workerId": worker, "reason": "ikon taslakları" }));
         assert!(r.get("isError").is_none(), "{r}");
         let id = r["structuredContent"]["requestId"].as_i64().unwrap();
         let g = core.gpu_request_decide(id, true, budget).unwrap().grant_id.unwrap();
@@ -2795,482 +2135,6 @@ mod tests {
             assert_eq!(decide(c, r.id, true, Some(300))?.budget, 300);
             Ok(())
         }).unwrap();
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    fn used_of(core: &Core, g: i64) -> i64 {
-        with(&core.db, |c| c.query_row("SELECT used FROM gpu_grants WHERE id = ?1", [g], |r| r.get(0)).map_err(e)).unwrap()
-    }
-
-    #[test]
-    fn text_budget_caps_high_and_labels_the_unit() {
-        let (core, root) = core("text-cap");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        // Metin tavanı yüksek; görsel broker limitinde kalır.
-        let r = mcp(&core, "timur", "gpu_request", json!({ "types": ["embedding"], "workerId": "ayla", "reason": "x", "budget": 50000 }));
-        assert!(r.get("isError").is_none(), "{r}");
-        let bad = mcp(&core, "timur", "gpu_request", json!({ "types": ["embedding"], "workerId": "ayla", "reason": "x", "budget": 50001 }));
-        assert!(text(&bad).contains("metin"), "{bad}");
-        let bad = mcp(&core, "timur", "gpu_request", json!({ "types": ["t2i"], "workerId": "ayla", "reason": "x", "budget": 121 }));
-        assert!(text(&bad).contains("görsel"), "{bad}");
-        // Onay notu birimi doğru gösterir.
-        let id = r["structuredContent"]["requestId"].as_i64().unwrap();
-        core.gpu_request_decide(id, true, None).unwrap();
-        let note = with(&core.db, |c| crate::plan::take_notes(c, "timur")).unwrap().unwrap();
-        assert!(note.contains("50000 metin"), "{note}");
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn mixed_text_and_image_types_need_separate_grants() {
-        let (core, root) = core("mixed");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        // Karışık küme istekte reddedilir.
-        let v = mcp(&core, "timur", "gpu_request", json!({ "types": ["t2i", "embedding"], "workerId": "ayla", "reason": "x" }));
-        assert!(text(&v).contains("ayrı izin"), "{v}");
-        // Onay aşaması da savunur (istek API'sini atlayıp yazılmış eski satır).
-        let id = with(&core.db, |c| {
-            c.execute(
-                "INSERT INTO gpu_requests (team_id, leader, worker, types, reason, budget, created_at) VALUES ('default', 'timur', 'ayla', '[\"t2i\",\"embedding\"]', 'eski', 8, 1)",
-                [],
-            )
-            .map_err(e)?;
-            Ok(c.last_insert_rowid())
-        })
-        .unwrap();
-        assert!(core.gpu_request_decide(id, true, None).unwrap_err().contains("ayrı izin"));
-        // Aynı birimden kümeler bugünkü gibi: metin+metin, görsel+görsel.
-        for types in [json!(["embedding", "rerank"]), json!(["t2i", "bg-removal"])] {
-            let v = mcp(&core, "timur", "gpu_request", json!({ "types": types, "workerId": "ayla", "reason": "x" }));
-            assert!(v.get("isError").is_none(), "{types}: {v}");
-        }
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn image_budget_falls_back_to_240_without_a_broker_limit() {
-        let (core, root) = core("img-fallback");
-        // `gpu_limits` ayarı yok: broker limiti okunmadı → geri dönüş 240 (UI ile aynı).
-        let (ok, over): (bool, bool) = with(&core.db, |c| {
-            let lead = crate::delegate::caller(c, "timur")?;
-            let ok = request(c, &lead, &json!({"workerId":"ayla", "types":["t2i"], "reason":"test", "budget":240}), &["t2i".into()], None).is_ok();
-            let over = request(c, &lead, &json!({"workerId":"ayla", "types":["t2i"], "reason":"test", "budget":241}), &["t2i".into()], None)
-                .unwrap_err()
-                .contains("240 görsel");
-            Ok((ok, over))
-        })
-        .unwrap();
-        assert!(ok && over, "{ok} {over}");
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_roundtrip_sorts_by_index_and_spends_texts() {
-        let (core, root) = core("embed");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(5));
-        assert!(listed(&core, "ayla").contains(&"gpu_embed".to_string()));
-        let r = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["vektor-alfa-zz", "vektor-beta-zz"], "input_type": "query", "instruction": "temsil", "dimensions": 64 }));
-        assert!(r.get("isError").is_none(), "{r}");
-        let sc = &r["structuredContent"];
-        // Sahte broker ters sırada döner; Dex `index`'e göre dizer.
-        assert_eq!(sc["embeddings"][0], json!([0.0, 0.2]), "{r}");
-        assert!((sc["embeddings"][1][0].as_f64().unwrap() - 0.1).abs() < 1e-12, "{r}");
-        assert_eq!((sc["model"].as_str(), sc["dimensions"].as_u64(), sc["count"].as_i64()), (Some("Qwen3-Embedding-8B"), Some(2), Some(2)));
-        assert_eq!(sc["budget"]["used"], json!(2));
-        assert_eq!(used_of(&core, g), 2);
-        // Broker'a giden gövde: model listeden çözülür.
-        let sent = f.last_embed.lock().unwrap().clone().unwrap();
-        assert_eq!(sent["model"], json!("Qwen3-Embedding-8B"));
-        assert_eq!(
-            (sent["input_type"].as_str(), sent["instruction"].as_str(), sent["dimensions"].as_i64()),
-            (Some("query"), Some("temsil"), Some(64))
-        );
-        assert_eq!(sent["input"].as_array().map(Vec::len), Some(2));
-        let s = r.to_string();
-        assert!(!s.contains("vektor-alfa-zz") && !s.contains("vektor-beta-zz") && !s.contains(&base) && !s.contains(TOKEN), "sızıntı: {s}");
-        // input_type verilmezse alan düşer (broker varsayılanı belge).
-        let r = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["ucuncu-zz"] }));
-        assert!(r.get("isError").is_none(), "{r}");
-        assert!(f.last_embed.lock().unwrap().as_ref().unwrap().get("input_type").is_none());
-        assert_eq!(used_of(&core, g), 3);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_validation_and_broker_errors_spend_nothing() {
-        let (core, root) = core("embed-err");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(4));
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
-        let many: Vec<Value> = (0..257).map(|i| json!(format!("m{i}"))).collect();
-        for args in [
-            json!({}),
-            json!({ "texts": [] }),
-            json!({ "texts": many }),
-            json!({ "texts": ["  "] }),
-            json!({ "texts": ["a"], "input_type": "soru" }),
-            json!({ "texts": ["a"], "dimensions": 16 }),
-            json!({ "texts": ["a"], "dimensions": 8192 }),
-            json!({ "texts": ["a"], "dimensions": "x" }),
-        ] {
-            let v = mcp(&core, "ayla", "gpu_embed", args);
-            assert!(v.get("isError").is_some(), "{v}");
-        }
-        assert_eq!(posts(), 0, "geçersiz girdi broker'a gitmez");
-        assert_eq!(used_of(&core, g), 0);
-        // Broker 400'ü aynen gelir, ayrılan geri verilir.
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["bozuk"] }));
-        assert!(text(&v).contains("metin cok uzun"), "{v}");
-        assert_eq!(posts(), 1);
-        assert_eq!(used_of(&core, g), 0);
-        // Bütçe yetmezse POST yok.
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["a", "b", "c", "d", "e"] }));
-        assert!(text(&v).contains("bütçesi bitti") && text(&v).contains("metin"), "{v}");
-        assert_eq!(posts(), 1);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_protocol_errors_refund_and_spend_nothing() {
-        let (core, root) = core("embed-proto");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(6));
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
-        // 2 metne [0, 0] (tekrar; 2. vektör kayıp) ve [1] (eksik): ikisi de protokol hatası.
-        for style in ["dup", "short"] {
-            *f.embed_style.lock().unwrap() = style.into();
-            let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["bir-zz", "iki-zz"] }));
-            assert!(text(&v).contains("protokol hatası"), "{style}: {v}");
-        }
-        assert_eq!(posts(), 2);
-        assert_eq!(used_of(&core, g), 0, "bozuk yanıtın bütçesi iade edilir");
-        // Sağlam yanıt yine çalışır.
-        *f.embed_style.lock().unwrap() = String::new();
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["bir-zz", "iki-zz"] }));
-        assert!(v.get("isError").is_none(), "{v}");
-        assert_eq!(used_of(&core, g), 2);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_503_waits_retry_after_and_retries() {
-        let (core, root) = core("embed-retry");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        f.embed_503.store(2, Ordering::SeqCst);
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(4));
-        let r = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["tekrar-zz"] }));
-        assert!(r.get("isError").is_none(), "{r}");
-        assert_eq!(f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count(), 3);
-        assert_eq!(used_of(&core, g), 1);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_gives_up_after_sleep_if_the_grant_moved_on() {
-        let (core, root) = core("embed-cancel");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        f.embed_503.store(1, Ordering::SeqCst);
-        let (g, d) = approved_text_job(&core, "ayla", &["embedding"], Some(4));
-        with(&core.db, |c| crate::delegate::set_status(c, d, "running")).unwrap();
-        // İlk POST 503 → 1 sn uyku; uyku sırasında iş biterse uyanınca POST atılmaz.
-        let r = std::thread::scope(|s| {
-            let h = s.spawn(|| mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["yari-zz"] })));
-            while f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count() < 1 {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            with(&core.db, |c| crate::delegate::set_status(c, d, "done")).unwrap();
-            h.join().unwrap()
-        });
-        assert!(text(&r).contains("başka işe geçti ya da iş bitti"), "{r}");
-        assert_eq!(f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count(), 1, "uyanışta POST yok");
-        assert_eq!(used_of(&core, g), 0, "ayrılan iade edilir");
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rerank_maps_scores_and_spends_documents() {
-        let (core, root) = core("rerank");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "kaan", &["rerank"], Some(6));
-        let r = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "sorgu-zz", "documents": ["belge-alfa-zz", "belge-beta-zz", "belge-gama-zz"], "top_n": 2 }));
-        assert!(r.get("isError").is_none(), "{r}");
-        let sc = &r["structuredContent"];
-        // Broker sırası korunur (tersten geldi).
-        assert_eq!(sc["results"][0]["index"], json!(2), "{r}");
-        assert!((sc["results"][0]["score"].as_f64().unwrap() - 0.7).abs() < 1e-12, "{r}");
-        assert_eq!(sc["model"], json!("Qwen3-Reranker-8B"));
-        assert_eq!(used_of(&core, g), 3);
-        let s = r.to_string();
-        assert!(!s.contains("belge-alfa-zz") && !s.contains("sorgu-zz") && !s.contains(&base) && !s.contains(TOKEN), "sızıntı: {s}");
-        // `score` biçimi de okunur.
-        *f.rerank_style.lock().unwrap() = "score".into();
-        let r = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d1"] }));
-        assert!(r.get("isError").is_none(), "{r}");
-        assert!((r["structuredContent"]["results"][0]["score"].as_f64().unwrap() - 0.9).abs() < 1e-12, "{r}");
-        assert_eq!(used_of(&core, g), 4);
-        // Skorsuz yanıt protokol hatasıdır; ayrılan geri verilir.
-        *f.rerank_style.lock().unwrap() = "empty".into();
-        let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d1"] }));
-        assert!(text(&v).contains("protokol hatası"), "{v}");
-        assert_eq!(used_of(&core, g), 4);
-        // Boş sonuç, tekrar index ve belge dışı index de öyle.
-        for style in ["noresults", "dup", "oob"] {
-            *f.rerank_style.lock().unwrap() = style.into();
-            let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d1"] }));
-            assert!(text(&v).contains("protokol hatası") || text(&v).contains("belge dışında"), "{style}: {v}");
-        }
-        assert_eq!(used_of(&core, g), 4);
-        // Yerel doğrulama broker'a gitmez.
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/rerank")).count();
-        let before = posts();
-        for args in [json!({}), json!({ "query": "q", "documents": [] }), json!({ "query": "q", "documents": ["d1"], "top_n": 2 })] {
-            let v = mcp(&core, "kaan", "gpu_rerank", args);
-            assert!(v.get("isError").is_some(), "{v}");
-        }
-        assert_eq!(posts(), before);
-        // Broker 400'ü aynen gelir, ayrılan geri verilir.
-        let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "bozuk", "documents": ["d1"] }));
-        assert!(text(&v).contains("sorgu bos"), "{v}");
-        assert_eq!(used_of(&core, g), 4);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    /// JSONL metin dosyası (her satır bir JSON string).
-    fn jsonl(path: &Path, texts: &[String]) {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let body: String = texts.iter().map(|t| format!("{}\n", json!(t))).collect();
-        std::fs::write(path, body).unwrap();
-    }
-
-    fn lines_of(path: &Path) -> Vec<Value> {
-        std::fs::read_to_string(path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
-    }
-
-    fn tags(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("n:{i}")).collect()
-    }
-
-    #[test]
-    fn embed_file_in_file_out_keeps_order_across_parts_and_returns_only_a_summary() {
-        let (core, root) = core("embed-file");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(1000));
-        let proj = root.join("proj");
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
-        // 600 metin = 256 + 256 + 88; CRLF ve boş satır sayılmaz.
-        let mut body: String = tags(600).iter().map(|t| format!("{}\r\n", json!(t))).collect();
-        body.push_str("\r\n\r\n");
-        std::fs::create_dir_all(proj.join("data")).unwrap();
-        std::fs::write(proj.join("data/in.jsonl"), body).unwrap();
-        let r = mcp(&core, "ayla", "gpu_embed", json!({ "textsPath": "data/in.jsonl", "outPath": "out/vec.jsonl", "dimensions": 64 }));
-        assert!(r.get("isError").is_none(), "{r}");
-        let sc = &r["structuredContent"];
-        assert_eq!((sc["count"].as_u64(), sc["dimensions"].as_u64(), sc["chunks"].as_u64(), sc["spent"].as_u64()), (Some(600), Some(2), Some(3), Some(600)), "{r}");
-        assert_eq!(sc["budget"]["used"], json!(600));
-        assert!(sc.get("embeddings").is_none(), "özet dışında vektör yok: {r}");
-        let s = r.to_string();
-        assert!(s.len() < 2000 && !s.contains("n:5") && !s.contains(&base) && !s.contains(TOKEN), "yalnız özet: {s}");
-        assert_eq!(posts(), 3, "parça başına bir POST");
-        let sent = f.last_embed.lock().unwrap().clone().unwrap();
-        assert_eq!((sent["input"].as_array().map(Vec::len), sent["dimensions"].as_i64()), (Some(88), Some(64)), "son parça ve seçenekler");
-        let got = lines_of(&proj.join("out/vec.jsonl"));
-        assert_eq!(got.len(), 600);
-        for (i, l) in got.iter().enumerate() {
-            assert_eq!(l, &json!({ "i": i, "v": [i as f64, 0.2] }), "satır {i}");
-        }
-        let left: Vec<_> = std::fs::read_dir(proj.join("out")).unwrap().flatten().map(|d| d.file_name().to_string_lossy().into_owned()).collect();
-        assert_eq!(left, vec!["vec.jsonl".to_string()], "geçici dosya kalmaz");
-        assert_eq!(used_of(&core, g), 600);
-        // Satır içi girdi de dosyaya yazılabilir.
-        let r = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["n:7", "n:3"], "outPath": "out/small.jsonl" }));
-        assert!(r.get("isError").is_none(), "{r}");
-        assert_eq!(lines_of(&proj.join("out/small.jsonl")), vec![json!({ "i": 0, "v": [7.0, 0.2] }), json!({ "i": 1, "v": [3.0, 0.2] })]);
-        assert_eq!(used_of(&core, g), 602);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn embed_part_failure_keeps_written_lines_and_reports_the_spend() {
-        let (core, root) = core("embed-part");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(600));
-        let proj = root.join("proj");
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
-        // 2. parçadaki metin broker'da 400: 1. parça dosyada ve bütçede kalır, 2. parça iade edilir.
-        let mut texts = tags(300);
-        texts[260] = "bozuk".into();
-        jsonl(&proj.join("data/in.jsonl"), &texts);
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "textsPath": "data/in.jsonl", "outPath": "out/vec.jsonl" }));
-        let t = text(&v);
-        assert!(v.get("isError").is_some(), "{v}");
-        assert!(t.contains("metin cok uzun") && t.contains("parça 2/2") && t.contains("256 metin işlendi") && t.contains("256/600") && t.contains("256 satır"), "{t}");
-        assert!(!t.contains("n:1") && !t.contains(&base) && !t.contains(TOKEN), "içerik/adres sızmaz: {t}");
-        assert_eq!(posts(), 2);
-        assert_eq!(used_of(&core, g), 256);
-        let got = lines_of(&proj.join("out/vec.jsonl"));
-        assert_eq!(got.len(), 256);
-        assert_eq!(got[255], json!({ "i": 255, "v": [255.0, 0.2] }));
-        // Toplam bütçe yetmezse hiç POST yok (kalan 344 < 600).
-        jsonl(&proj.join("data/big.jsonl"), &tags(600));
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "textsPath": "data/big.jsonl", "outPath": "out/big.jsonl" }));
-        assert!(text(&v).contains("bütçesi bitti"), "{v}");
-        assert_eq!(posts(), 2);
-        assert_eq!(used_of(&core, g), 256);
-        assert!(!proj.join("out/big.jsonl").exists());
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn text_paths_stay_in_the_work_root_and_double_inputs_spend_nothing() {
-        let (core, root) = core("embed-paths");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(100));
-        let proj = root.join("proj");
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/embeddings")).count();
-        jsonl(&proj.join("data/in.jsonl"), &tags(3));
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["a"], "textsPath": "data/in.jsonl" }));
-        assert!(text(&v).contains("birlikte verilmez"), "{v}");
-        // Kök dışı: `..`, mutlak dış yol, kök dışına giden klasör bağlantısı; yok olan dosya.
-        let out = root.join("out");
-        jsonl(&out.join("in.jsonl"), &tags(3));
-        #[cfg(windows)]
-        let made = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(proj.join("linked")).arg(&out).output().unwrap().status.success();
-        #[cfg(unix)]
-        let made = std::os::unix::fs::symlink(&out, proj.join("linked")).is_ok();
-        assert!(made, "klasör bağlantısı kurulamadı");
-        let abs = out.join("in.jsonl").to_string_lossy().into_owned();
-        for (args, want) in [
-            (json!({ "textsPath": "../out/in.jsonl" }), "çalışma klasörünün içinde"),
-            (json!({ "textsPath": abs }), "çalışma klasörünün içinde"),
-            (json!({ "textsPath": "linked/in.jsonl" }), "bağlantı"),
-            (json!({ "textsPath": "data/yok.jsonl" }), "bulunamadı"),
-            (json!({ "textsPath": "data/in.jsonl", "outPath": "../out/v.jsonl" }), "çalışma klasörünün içinde"),
-            (json!({ "textsPath": "data/in.jsonl", "outPath": out.join("v.jsonl").to_string_lossy() }), "çalışma klasörünün içinde"),
-            (json!({ "textsPath": "data/in.jsonl", "outPath": "linked/v.jsonl" }), "bağlantı"),
-            (json!({ "texts": ["a"], "outPath": "linked/alt/v.jsonl" }), "bağlantı"),
-        ] {
-            let v = mcp(&core, "ayla", "gpu_embed", args.clone());
-            assert!(text(&v).contains(want), "{args}: {v}");
-        }
-        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1, "kök dışına yazılmadı");
-        // Bozuk JSONL içeriği hataya yazılmaz, yalnız satır numarası.
-        std::fs::write(proj.join("data/bad.jsonl"), "\"tamam\"\ngizli-metin-zz\n").unwrap();
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "textsPath": "data/bad.jsonl" }));
-        assert!(text(&v).contains("satır 2") && !text(&v).contains("gizli-metin-zz"), "{v}");
-        assert_eq!(posts(), 0, "hiçbiri broker'a gitmez");
-        assert_eq!(used_of(&core, g), 0, "bütçe harcanmaz");
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn rerank_file_parts_merge_by_score_and_cut_to_top_n() {
-        let (core, root) = core("rerank-file");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "kaan", &["rerank"], Some(1000));
-        let proj = root.join("proj");
-        let posts = || f.hits.lock().unwrap().iter().filter(|h| h.starts_with("POST /v1/rerank")).count();
-        // Skor = k/1000: en iyiler 2. parçada (299, 298, 297).
-        jsonl(&proj.join("data/docs.jsonl"), &tags(300));
-        let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documents": ["d"], "documentsPath": "data/docs.jsonl" }));
-        assert!(text(&v).contains("birlikte verilmez"), "{v}");
-        let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documentsPath": "data/docs.jsonl", "top_n": 301 }));
-        assert!(text(&v).contains("top_n"), "{v}");
-        assert_eq!((posts(), used_of(&core, g)), (0, 0));
-        let r = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documentsPath": "data/docs.jsonl", "outPath": "out/rank.jsonl", "top_n": 3 }));
-        assert!(r.get("isError").is_none(), "{r}");
-        let sc = &r["structuredContent"];
-        assert_eq!((sc["count"].as_u64(), sc["results"].as_u64(), sc["chunks"].as_u64(), sc["spent"].as_u64()), (Some(300), Some(3), Some(2), Some(300)), "{r}");
-        assert_eq!(posts(), 2);
-        assert_eq!(used_of(&core, g), 300);
-        let got = lines_of(&proj.join("out/rank.jsonl"));
-        let idx: Vec<_> = got.iter().map(|l| l["i"].as_u64().unwrap()).collect();
-        assert_eq!(idx, vec![299, 298, 297], "{got:?}");
-        assert!((got[0]["score"].as_f64().unwrap() - 0.299).abs() < 1e-12);
-        // 2. parça düşerse 1. parçanın sonuçları dosyada, harcanan hata metninde.
-        let mut docs = tags(300);
-        docs[280] = "bozuk".into();
-        jsonl(&proj.join("data/bad.jsonl"), &docs);
-        let v = mcp(&core, "kaan", "gpu_rerank", json!({ "query": "q", "documentsPath": "data/bad.jsonl", "outPath": "out/part.jsonl" }));
-        let t = text(&v);
-        assert!(t.contains("sorgu bos") && t.contains("parça 2/2") && t.contains("256 belge") && t.contains("256 satır"), "{t}");
-        assert_eq!(lines_of(&proj.join("out/part.jsonl")).len(), 256);
-        assert_eq!(used_of(&core, g), 556);
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn text_tools_need_their_grant_type() {
-        let (core, root) = core("text-type");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        approved_text_job(&core, "ayla", &["embedding"], Some(4));
-        approved_text_job(&core, "kaan", &["rerank"], Some(4));
-        approved_job_for(&core, "bora", Some(4));
-        assert!(text(&mcp(&core, "ayla", "gpu_rerank", json!({ "query": "q", "documents": ["d"] }))).contains("izinli türler"));
-        assert!(text(&mcp(&core, "kaan", "gpu_embed", json!({ "texts": ["t"] }))).contains("izinli türler"));
-        assert!(text(&mcp(&core, "bora", "gpu_embed", json!({ "texts": ["t"] }))).contains("GPU izninde değil"));
-        // İzinsiz worker'da araç listede yok.
-        assert!(listed(&core, "timur").contains(&"gpu_request".to_string()));
-        let names = listed(&core, "bora");
-        assert!(names.contains(&"gpu_embed".to_string()), "izinli iş sürerken araç listede: {names:?}");
-        core.shutdown();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn text_model_missing_without_broker_types() {
-        let (core, root) = core("text-nomodel");
-        let (base, f) = fake();
-        configure(&core, &base, &dead());
-        f.extra_models.lock().unwrap().extend(text_models());
-        let (g, _) = approved_text_job(&core, "ayla", &["embedding"], Some(4));
-        // Broker modelleri geri çeker: ad listeden çözülemez.
-        f.extra_models.lock().unwrap().clear();
-        core.gpu_overview(true).unwrap();
-        let v = mcp(&core, "ayla", "gpu_embed", json!({ "texts": ["t"] }));
-        assert!(text(&v).contains("servis edilmiyor"), "{v}");
-        assert_eq!(used_of(&core, g), 0);
-        assert!(!f.hits.lock().unwrap().iter().any(|h| h.starts_with("POST /v1/embeddings")));
         core.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

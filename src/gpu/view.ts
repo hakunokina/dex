@@ -101,22 +101,14 @@ export function limitsPatch(form: GpuLimitsForm, saved: GpuLimits = {}): Partial
   return limits;
 }
 
-/** Broker'dan okunamayan günlük limit için geri dönüş (görsel; dex-core gpu.rs MAX_BUDGET ile aynı). */
+/** Broker'dan okunamayan günlük limit için geri dönüş (dex-core gpu.rs MAX_BUDGET ile aynı). */
 export const GPU_BUDGET_MAX = 240;
-/** Metin birimli türler (dex-core gpu.rs TEXT_TYPES ile aynı küme) ve tek tavan. */
-export const GPU_TEXT_TYPES = ["embedding", "rerank"];
-export const GPU_TEXT_BUDGET_MAX = 50000;
-/** İzin türlerine göre bütçe birimi: metin/belge ya da görsel adedi. */
-export function budgetUnit(types: string[]): "metin" | "görsel" {
-  return types.some((t) => GPU_TEXT_TYPES.includes(t)) ? "metin" : "görsel";
-}
-export function budgetMax(limit?: number | null, types: string[] = []): number {
-  if (budgetUnit(types) === "metin") return GPU_TEXT_BUDGET_MAX;
+export function budgetMax(limit?: number | null): number {
   return limit != null && Number.isSafeInteger(limit) && limit > 0 ? limit : GPU_BUDGET_MAX;
 }
-export function parseBudget(raw: string, fallback: number, limit?: number | null, types: string[] = []): number {
+export function parseBudget(raw: string, fallback: number, limit?: number | null): number {
   const n = Math.round(Number(raw));
-  return Math.max(1, Math.min(budgetMax(limit, types), !raw.trim() || !Number.isFinite(n) ? fallback : n));
+  return Math.max(1, Math.min(budgetMax(limit), !raw.trim() || !Number.isFinite(n) ? fallback : n));
 }
 
 /** Only the fields the patron changed; an untouched token field keeps the stored one. */
