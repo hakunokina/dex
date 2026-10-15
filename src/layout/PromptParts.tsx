@@ -5,6 +5,7 @@ import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { Lock, X } from "lucide-react";
 import { callHost, onEvent } from "../api/hosts";
+import { askConfirm } from "../confirm";
 import { audienceLabel, channelLabel, replacePart, type PromptPart, type PromptParts } from "./notePrompts";
 
 type Load = { phase: "loading" } | { phase: "error"; text: string } | { phase: "ready"; data: PromptParts };
@@ -40,8 +41,8 @@ export function PromptPartsDialog({ host, onClose }: { host: string; onClose: ()
   useEffect(() => box.current?.focus(), []);
 
   const dirtyCount = Object.keys(drafts).length;
-  const close = () => {
-    if (dirtyCount && !confirm(`${dirtyCount} parçada kaydedilmemiş değişiklik var. Yine de kapatılsın mı?`)) return;
+  const close = async () => {
+    if (dirtyCount && !(await askConfirm(`${dirtyCount} parçada kaydedilmemiş değişiklik var. Yine de kapatılsın mı?`))) return;
     onClose();
   };
   const dropDraft = (id: string) => setDrafts(({ [id]: _, ...rest }) => rest);
@@ -71,7 +72,7 @@ export function PromptPartsDialog({ host, onClose }: { host: string; onClose: ()
 
   // Esc closes (from anywhere: a click may have left focus on the page), backing out of a confirm first.
   const onEsc = useRef<() => void>(() => {});
-  onEsc.current = () => (confirmReset ? endConfirm() : close());
+  onEsc.current = () => (confirmReset ? endConfirm() : void close());
   useEffect(() => {
     const key = (e: globalThis.KeyboardEvent) => {
       if (e.key !== "Escape") return;
@@ -104,11 +105,11 @@ export function PromptPartsDialog({ host, onClose }: { host: string; onClose: ()
 
   // Portal: a floating dock group is transformed, which would trap a fixed overlay inside it.
   return createPortal(
-    <div className="pp-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) close(); }}>
+    <div className="pp-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) void close(); }}>
       <div className="pp" ref={box} role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1} onKeyDown={onKey}>
         <header className="pp-head">
           <h2 id={titleId}>Dex istemleri</h2>
-          <button className="icon-btn" onClick={close} aria-label="Kapat" title="Kapat (Esc)"><X /></button>
+          <button className="icon-btn" onClick={() => void close()} aria-label="Kapat" title="Kapat (Esc)"><X /></button>
         </header>
         {load.phase === "ready" && <p className="pp-policy">{load.data.policyNote}</p>}
         {load.phase === "loading" && <p className="pp-state" role="status">Yükleniyor…</p>}

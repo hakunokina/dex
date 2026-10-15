@@ -25,6 +25,13 @@ test("eski sunucu: bilgi yerine not, çalışan ajan varken anlaşılır hata, y
   await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Takım ayarları", exact: true }).click();
   const del = app.getByRole("button", { name: "Takımı sil", exact: true });
   const err = app.locator(".team-err");
+  // #2051: İptal → takım silinmez, istek gitmez.
+  let asked = false;
+  app.once("dialog", (d) => { asked = true; void d.dismiss(); });
+  await del.click();
+  await expect.poll(() => asked).toBe(true);
+  await app.waitForTimeout(300);
+  expect((await calls(app)).filter((c) => c.cmd === "team_delete")).toHaveLength(0);
   let message = "";
   app.once("dialog", (d) => {
     message = d.message();

@@ -46,6 +46,14 @@ test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar
   expect((await calls(app)).filter(c => c.cmd === "leader_reset" && c.args.action !== "get")).toHaveLength(0);
   await picker.selectOption(original.id);
   await expect(picker).toHaveValue(original.id);
+  // #2051: İptal → arşivlenmez, istek gitmez.
+  let asked = false;
+  app.once("dialog", d => { asked = true; void d.dismiss(); });
+  await site.getByRole("button", { name: "Arşivle" }).click();
+  await expect.poll(() => asked).toBe(true);
+  await app.waitForTimeout(300);
+  expect((await calls(app)).filter(c => c.cmd === "project_archive")).toHaveLength(0);
+  await expect(site).toHaveCount(1);
   app.on("dialog", d => d.accept());
   await site.getByRole("button", { name: "Arşivle" }).click();
   await expect(site).toHaveCount(0);

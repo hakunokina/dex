@@ -6,6 +6,7 @@ import { callHost, hostInfo } from "../api/hosts";
 import { patchTeam, useTeams } from "../team/store";
 import { categoryFolder, projectContext } from "./api";
 import { FolderButton } from "./FolderButton";
+import { askConfirm } from "../confirm";
 import { activeProjects, folderName, projectErrorText, projectState, STATE_TEXT, type Project } from "./model";
 import {
   archiveProject, createProject, leaderNote, reloadProjects, reopenProject, selectedProject, setDefaultProject, updateProject, useChecks,
@@ -104,8 +105,8 @@ export function ProjectsSection({ teamId }: { teamId: string }) {
               await setDefaultProject(teamId, p.id);
               leaderNote(teamId, p.name);
             })}
-            onArchive={() => {
-              if (!confirm(`"${p.name}" arşivlensin mi?\n\nKlasör, git, worktree, rapor ve hafıza silinmez; yeniden açılabilir.`)) return;
+            onArchive={async () => {
+              if (!(await askConfirm(`"${p.name}" arşivlensin mi?\n\nKlasör, git, worktree, rapor ve hafıza silinmez; yeniden açılabilir.`))) return;
               void run(() => archiveProject(p));
             }}
             onReopen={() => void run(() => reopenProject(p))} />

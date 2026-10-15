@@ -5,6 +5,7 @@ import { hostName, hostSupports, rawId, useHosts } from "../api/hosts";
 import { useTeams } from "../team/store";
 import { killAgentProcess, listAgentProcesses } from "./api";
 import { agentRows, cpuText, keepOrder, KIND_LABEL, killQuestion, memText, REFRESH_MS, totals, type AgentRow } from "./view";
+import { askConfirm } from "../confirm";
 import "./procs.css";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -83,7 +84,7 @@ function ProcsView({ host, active, onClose }: { host: string; active: boolean; o
     });
   const kill = async (row: AgentRow, pid: number) => {
     const p = row.procs.find((x) => x.pid === pid);
-    if (killing !== null || !p || !confirm(killQuestion(label(row.agent).name, p))) return;
+    if (killing !== null || !p || !(await askConfirm(killQuestion(label(row.agent).name, p)))) return;
     setKilling(pid);
     setKillError(null);
     try {
