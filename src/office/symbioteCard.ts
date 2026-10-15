@@ -125,18 +125,48 @@ export function strandTone(workerTone: Tone | null, question: unknown, result: {
 }
 
 /**
- * #2036 (patron): the short red laser orbiting a working sac — on the focus ring's ellipse (`orbit` × D / fh),
- * one calm turn per `period` s, its tail `tail` rad behind the head; `width` = the line's half width (units).
+ * #2068 (patron): the short red laser circling a working worker's label box (#2036 put it on the sac) — on a
+ * rounded rect `pad` outside the box (corner `radius`), one calm lap per `period` s, its tail `tail` of the lap
+ * behind the head; `width` = the line's half width (units).
  */
-export const LASER = { orbit: 0.62, period: 1.75, tail: 1.1, width: 1.1 };
+export const LASER = { pad: 4, radius: 6, period: 1.75, tail: 0.18, width: 1.1 };
 
 /** Only plain work carries the laser (a question / result / idle / offline / waking sac does not). */
 export const lasing = (light: Light, life: number) => light.tone === "red" && light.k >= 1 && !light.offline && life > 0;
 
-/** The laser head's angle (rad, clockwise on screen) from its seed's phase; held there under reduced motion. */
-export function laserAngle(time: number, reduced: boolean, seed: number) {
-  const phase = ((seed * 0.618034) % 1) * Math.PI * 2;
-  return reduced ? phase : (phase + (time / LASER.period) * Math.PI * 2) % (Math.PI * 2);
+/** The laser head's place on its lap (0–1, clockwise on screen) from its seed's phase; held there under reduced motion. */
+export function laserHead(time: number, reduced: boolean, seed: number) {
+  const phase = (seed * 0.618034) % 1;
+  return reduced ? phase : (phase + time / LASER.period) % 1;
+}
+
+/** The laser's track around a label box: the box `pad` out, its corner radius (≤ half the shorter side). */
+export function laserTrack(box: Rect): Rect & { r: number } {
+  const x = box.x - LASER.pad, y = box.y - LASER.pad, w = box.w + 2 * LASER.pad, h = box.h + 2 * LASER.pad;
+  return { x, y, w, h, r: Math.max(0, Math.min(LASER.radius, w / 2, h / 2)) };
+}
+
+/** The track's length. */
+export const trackLength = (t: Rect & { r: number }) => 2 * (t.w - 2 * t.r) + 2 * (t.h - 2 * t.r) + 2 * Math.PI * t.r;
+
+/**
+ * The point `at` (0–1) along the track by arc length, clockwise on screen from the top edge's left end
+ * (top, top-right corner, right, …) — the lit layer's shader maps a pixel back the same way.
+ */
+export function trackPoint(t: Rect & { r: number }, at: number): Point {
+  const { r } = t;
+  const sw = t.w - 2 * r, sh = t.h - 2 * r, q = (Math.PI * r) / 2;
+  let s = (((at % 1) + 1) % 1) * trackLength(t);
+  const l = t.x + r, rt = t.x + t.w - r, tp = t.y + r, bt = t.y + t.h - r;
+  const arc = (cx: number, cy: number, a0: number) => ({ x: cx + r * Math.cos(a0 + s / r), y: cy + r * Math.sin(a0 + s / r) });
+  if (s <= sw) return { x: l + s, y: t.y };
+  s -= sw; if (s <= q) return arc(rt, tp, -Math.PI / 2);
+  s -= q; if (s <= sh) return { x: t.x + t.w, y: tp + s };
+  s -= sh; if (s <= q) return arc(rt, bt, 0);
+  s -= q; if (s <= sw) return { x: rt - s, y: t.y + t.h };
+  s -= sw; if (s <= q) return arc(l, bt, Math.PI / 2);
+  s -= q; if (s <= sh) return { x: t.x, y: bt - s };
+  s -= sh; return arc(l, tp, Math.PI);
 }
 
 /** #2020: a worker sac by its light and life: dormant ones shrink, dim and grey; live ones swell and glow. */
