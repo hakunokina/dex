@@ -60,7 +60,7 @@ test("çekirdek başka derleme: 'Çekirdek güncel değil' bandı, Gizle ile kal
   await app.reload();
   await openTeam(app, team.name);
   const band = app.locator(".team-stage:not(.hidden) .host-banner");
-  await expect(band).toContainText("Çekirdek güncel değil: çalışan çekirdek bu arayüzden eski");
+  await expect(band).toContainText("Çekirdek güncel değil: çalışan çekirdek bu arayüzden eski bir sürüm");
   await expect(band).toContainText("0ld0000000");
   // A warning, not a dead host: the stage stays usable.
   await expect(app.locator(".team-stage:not(.hidden)")).toHaveClass(/host-warn/);

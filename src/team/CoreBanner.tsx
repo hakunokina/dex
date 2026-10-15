@@ -50,9 +50,9 @@ export function LocalCoreBanner({ status }: { status: HostView["status"] }) {
 }
 
 const DRIFT_TEXT: Record<Drift, string> = {
-  older: "çalışan çekirdek bu arayüzden eski",
-  newer: "çalışan çekirdek bu arayüzden yeni",
-  other: "çalışan çekirdek bu arayüzle aynı derlemeden değil",
+  older: "Çekirdek güncel değil: çalışan çekirdek bu arayüzden eski bir sürüm",
+  newer: "Arayüz güncel değil: çalışan çekirdek bu arayüzden yeni bir sürüm, uygulamayı güncelle",
+  other: "Çekirdek ve arayüz farklı derlemelerden",
 };
 
 /** The connected local core's build vs this UI's; null when they match (or can't tell). */
@@ -81,9 +81,9 @@ export function CoreDriftBanner({ drift, commit, onDismiss }: { drift: Drift; co
   // A newer core than this UI: restarting would bring this (older) build back.
   const update = drift !== "newer";
   return (
-    <div className="host-banner" role="status" title="Yeni özellikler eksik ya da hatalı çalışabilir; çekirdek yeniden başlayınca bu sürüm açılır. Kuyruktaki işler korunur, liderler kaldıkları oturumla geri gelir.">
+    <div className="host-banner" role="status" title={update ? "Yeni özellikler eksik ya da hatalı çalışabilir; çekirdek yeniden başlayınca bu sürüm açılır. Kuyruktaki işler korunur, liderler kaldıkları oturumla geri gelir." : "Çekirdeği yeniden başlatmak bu arayüzün eski sürümünü geri getirir; bunun yerine uygulamayı güncelle."}>
       <span>
-        Çekirdek güncel değil: {DRIFT_TEXT[drift]} (<code>{commit}</code> · arayüz <code>{UI_BUILD.commit}</code>)
+        {DRIFT_TEXT[drift]} (çekirdek <code>{commit}</code> · arayüz <code>{UI_BUILD.commit}</code>)
         {draining && " — boşalınca yeniden başlayacak; yeni işler kuyrukta bekliyor"}
       </span>
       <span className="core-drift-actions">
