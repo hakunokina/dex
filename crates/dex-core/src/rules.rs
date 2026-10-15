@@ -22,6 +22,11 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 - [Worker] İş metninde patronun sözü liderin açıklamasından üstündür; çelişki ya da arada kalma varsa varsayım yapma, `ask_leader` ile sor.
 - [Lider] Onayı patrondan al. Worker sorusunu `answer` ile cevapla; karar patronunsa `escalate`. Soruyu cevapsız bırakma.
 - [Lider] Durum mesajlarında grupları şu başlıklarla yaz: `Senden beklenen:` (patron kararı/eylemi), `Süren:`, `Biten:` — her biri satır başında, altında madde listesi.
+- [Lider] İş boyutu: her istekte önce tek satırla söyle (`Boyut: küçük/orta/büyük — neden`).
+- [Lider] İş boyutu küçük (mevcut ayar/eşik/metin, tek dosya, ~30 satır): önce mevcut ayar/sabit var mı ara; işi kendin yap, devretme; inceleme ve QA yok.
+- [Lider] İş boyutu orta (tek alan, birkaç dosya): tek worker, tek inceleme turu; incelemenin küçük notları iş açmaz; inceleme 2. kez `düzelt` derse patrona sor.
+- [Lider] İş boyutu büyük (yeni mekanizma, veri modeli, izin politikası): önce patrona kısa karar notu (1-3-1: sorun, 3 seçenek, 1 öneri), sonra plan.
+- [Lider] İş boyutu küçük/orta ise yalnız kritik kapsam (veri kaybı, güvenlik, gerileme) ekle; \"iyi olur\" eki yok.
 
 ## Araçlar (dex MCP)
 - Pano: `task_list`, `task_create`, `task_update`. Devredilen işin görevini sen güncelle.
@@ -44,7 +49,7 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 - Tam test paketi — hangi araçla olursa olsun (tarayıcı/uçtan uca, oyun motoru, mobil emülatör, …) — yalnız QA'nın işi (plan sonunda ya da patron isteyince); diğer roller yalnız ilgili tek dosya/test.
 - Uygulayıcı örnekleri: Playwright'ta tarayıcı/uçtan uca test yalnız UI akışını değiştiren işte ve yalnız ilgili tek test; Godot GUT'ta ilgili tek dosya/test. Kayıtlı uygulayıcılar tam paketi QA dışına reddeder.
 - [QA] QA: bilinmeyen/plansız bir tam-paket çalıştırıcı görürsen `ask_leader` ile \"kural planı öner\" yükseltmesi yap.
-- [Lider] Lider tarayıcı/e2e testi koşmaz (politika reddeder); kendi küçük işinde yalnız tip kontrolü.
+- [Lider] Lider tarayıcı/e2e testi koşmaz (politika reddeder); kendi küçük işinde yalnız tip kontrolü + dokunduğu modülün birim testleri. Tam e2e (QA) yalnız büyük işin planı sonunda.
 - [Lider] Test bütçesi planı eksikse patrona öner. Patron onayıyla zamanı geldiğinde plan yazdır. Otomatik kural ekleme yok.
 - Kırmızıyı testi gevşeterek yeşile çevirme.
 
@@ -262,7 +267,7 @@ fn education_rules(rules: &str) -> String {
         if in_test_budget { continue; }
         if [
             "- Yazmadan önce", "- En küçük doğru", "- Durum mesajlarında",
-            "- Worker işi kendi git", "- İnceleme `düzelt`", "- Rapor/kanıt/ekran",
+            "- Worker işi kendi git", "- İnceleme `düzelt`", "- İş boyutu", "- Rapor/kanıt/ekran",
             "- Ayrı kod incelemesi", "- Koşmadığın komutu",
         ].iter().any(|prefix| line.starts_with(prefix)) { continue; }
         out.push(if line.starts_with("- Çıktı sözleşmesi:") {
@@ -370,6 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn work_size_rule_reaches_dev_leaders_only_and_lead_role_follows_seed_unless_overridden() {
+        let c = db();
+        let (s, o) = mem();
+        // An existing install still carrying the old lead text: the seed upsert refreshes it.
+        c.execute("UPDATE roles SET system_prompt=replace(system_prompt, 'Küçük işi kendin yap; orta ve büyük işi ekibe devret.', 'İşi ekibe devret; detayı kendin yapma.') WHERE slug='lead'", []).unwrap();
+        crate::roles::seed(&c).unwrap();
+        let lead = system_prompt(&c, "timur", Some((&s, &o)));
+        for kept in ["Küçük işi kendin yap; orta ve büyük işi ekibe devret.", "- İş boyutu: her istekte önce", "- İş boyutu küçük", "- İş boyutu orta", "- İş boyutu büyük", "yalnız tip kontrolü + dokunduğu modülün birim testleri"] {
+            assert!(lead.contains(kept), "{kept}: {lead}");
+        }
+        assert!(!lead.contains("detayı kendin yapma"), "{lead}");
+        assert!(!system_prompt(&c, "ayla", Some((&s, &o))).contains("İş boyutu"));
+        c.execute("INSERT INTO prompt_overrides (part_id, body, updated_at) VALUES ('role:lead', 'PATRON LEAD', 1)", []).unwrap();
+        assert!(system_prompt(&c, "timur", Some((&s, &o))).starts_with("PATRON LEAD\n\n"));
+        c.execute("UPDATE teams SET profile='edu' WHERE id='default'", []).unwrap();
+        assert!(!system_prompt(&c, "timur", Some((&s, &o))).contains("İş boyutu"));
+    }
+
+    #[test]
     fn education_prompts_keep_roles_memory_and_mechanics_without_dev_rules() {
         let c = db();
         c.execute("UPDATE teams SET profile='edu' WHERE id='default'", []).unwrap();
@@ -401,7 +425,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let c = db();
         let (s, o) = mem();
-        for (agent, expected) in [("timur", "5e39c1ff89c7ffafffc6adc85ebd072c369ab16bfe62ce01ee22f247c5581a75"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
+        for (agent, expected) in [("timur", "251e76a106c9bffa005b7526f21b65fbe692d80eadddb6165b97302b9f6a0f11"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
             let t = system_prompt(&c, agent, Some((&s, &o)));
             assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
         }
