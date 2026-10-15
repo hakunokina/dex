@@ -1,6 +1,6 @@
 [package]
 name = "dex-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dex çekirdeği: PTY, hook/MCP alıcısı, SQLite, hafıza, sağlayıcılar — arayüzden bağımsız"
 authors = ["hakunokina"]
 edition = "2021"

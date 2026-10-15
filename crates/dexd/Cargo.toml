@@ -1,6 +1,6 @@
 [package]
 name = "dexd"
-version = "0.1.0"
+version = "0.2.0"
 description = "Dex sunucusu: dex-core'u arayüzsüz barındırır, istemcilere tek WebSocket ucundan sunar"
 authors = ["hakunokina"]
 edition = "2021"
