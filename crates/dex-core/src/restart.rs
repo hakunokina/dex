@@ -37,7 +37,9 @@ use std::sync::atomic::Ordering;
 const TEAM_IDLE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 pub(crate) struct TeamIdle {
-    seen: std::time::Instant,
+    /// Idle deadline, kept forward (`now + TEAM_IDLE`): Windows `Instant` starts at boot, so
+    /// backdating one (`now - TEAM_IDLE`) overflows on a freshly booted machine.
+    due: std::time::Instant,
     viewers: std::collections::HashSet<String>,
     reset: std::sync::mpsc::Sender<Option<std::time::Instant>>,
 }
@@ -72,14 +74,14 @@ impl Core {
                 let changed = if viewed { timer.viewers.insert(client.into()) } else { timer.viewers.remove(client) };
                 if !changed { return; }
             }
-            timer.seen = now;
+            timer.due = now + TEAM_IDLE;
             let _ = timer.reset.send(timer.viewers.is_empty().then_some(now + TEAM_IDLE));
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let viewers = view.filter(|(_, v)| *v).map(|(client, _)| std::collections::HashSet::from([client.into()])).unwrap_or_default();
         let initial = viewers.is_empty().then_some(now + TEAM_IDLE);
-        timers.insert(team.into(), TeamIdle { seen: now, viewers, reset: tx });
+        timers.insert(team.into(), TeamIdle { due: now + TEAM_IDLE, viewers, reset: tx });
         let (weak, team) = (self.weak_self.clone(), team.to_string());
         std::thread::spawn(move || {
             let mut deadline = initial;
@@ -122,7 +124,7 @@ impl Core {
         // Keep the deadline lock through the close, so a concurrent view event wins or resets
         // after it; it cannot be lost between the check and kill.
         let timers = self.team_idle.lock().unwrap();
-        if !timers.get(team).is_some_and(|t| t.viewers.is_empty() && t.seen.elapsed() >= TEAM_IDLE) { return false; }
+        if !timers.get(team).is_some_and(|t| t.viewers.is_empty() && std::time::Instant::now() >= t.due) { return false; }
         let leader = with(&self.db, |c| {
             let busy: bool = c.query_row(
                 "SELECT EXISTS(SELECT 1 FROM delegations
@@ -275,7 +277,7 @@ mod lifecycle_tests {
     }
     fn expire(c: &Core) {
         c.team_viewed("default", false).unwrap();
-        c.team_idle.lock().unwrap().get_mut("default").unwrap().seen = std::time::Instant::now() - TEAM_IDLE;
+        c.team_idle.lock().unwrap().get_mut("default").unwrap().due = std::time::Instant::now();
     }
     #[test]
     fn unseen_leader_waits_for_its_turn_and_workers_then_closes() {
@@ -313,7 +315,7 @@ mod lifecycle_tests {
         assert!(starts[0].0.args.windows(2).any(|a| a == ["--resume", "leader-saved"]));
         assert!(starts[0].0.args.last().unwrap().starts_with("[Dex-Sistem] Bekleyen"));
         assert!(!c.sleeping_leaders.lock().unwrap().contains("timur"));
-        assert!(c.team_idle.lock().unwrap()["default"].seen.elapsed() < TEAM_IDLE);
+        assert!(c.team_idle.lock().unwrap()["default"].due > std::time::Instant::now());
         assert!(delegate::on_session_start(&c.db, &c.events, "timur").unwrap().contains(&format!("#{}", d.id)));
         c.agent_stop("timur");
         c.leader_notes_wake("timur");
@@ -325,17 +327,17 @@ mod lifecycle_tests {
         let c = core(); open(&c, "timur");
         c.team_viewed_for("default", "one", true).unwrap();
         c.team_viewed_for("default", "two", true).unwrap();
-        c.team_idle.lock().unwrap().get_mut("default").unwrap().seen = std::time::Instant::now() - TEAM_IDLE;
+        c.team_idle.lock().unwrap().get_mut("default").unwrap().due = std::time::Instant::now();
         assert!(!c.leader_close_unseen("default"), "continuous viewing holds the leader");
         c.team_view_release("one");
         assert_eq!(c.team_idle.lock().unwrap()["default"].viewers.len(), 1);
         assert!(!c.leader_close_unseen("default"));
         c.team_view_release("two");
-        let seen = c.team_idle.lock().unwrap()["default"].seen;
-        assert!(seen.elapsed() < TEAM_IDLE);
+        let due = c.team_idle.lock().unwrap()["default"].due;
+        assert!(due > std::time::Instant::now());
         assert!(c.team_idle.lock().unwrap()["default"].viewers.is_empty());
         c.team_viewed_for("default", "two", false).unwrap();
-        assert_eq!(c.team_idle.lock().unwrap()["default"].seen, seen, "repeated hidden is idempotent");
+        assert_eq!(c.team_idle.lock().unwrap()["default"].due, due, "repeated hidden is idempotent");
         expire(&c);
         assert!(c.leader_close_unseen("default"));
         assert!(c.team_viewed_for("missing", "one", true).is_err());

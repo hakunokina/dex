@@ -1948,8 +1948,11 @@ mod permit_tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let root = std::env::temp_dir().join(format!("dex-permit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        // #2083: the team folder as Dex stores it (canonical long name). CI's temp dir is an 8.3
+        // alias (`RUNNER~1`), and the leader push policy deliberately rejects `~` (#1599).
+        let root = std::path::PathBuf::from(teams::normalize_dir(&root.to_string_lossy()).unwrap());
         let proj = root.join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
         let core = Core::start(
             Paths { data_dir: root.join("data"), config_dir: root.join("config") },
             Events::new(events::NullSink),
