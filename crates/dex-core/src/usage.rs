@@ -7,12 +7,12 @@
 //! - GLM: `GET api.z.ai/api/monitor/usage/quota/limit`, Dex'in GLM jetonuyla (`dex-provider/glm`).
 //!   Token pencereleri (`TOKENS_LIMIT`/`CREDIT_LIMIT`) süreye göre sıralanır: en kısası 5 sa, en
 //!   uzunu haftalık; tek pencere ≤6 sa ise 5 sa sayılır. Aylık MCP (`TIME_LIMIT`) şeride girmez.
-//! - Muse: kullanım ucu yok; Muse CLI açılışta OAuth girişiyle (`~/.config/muse/auth.json`)
-//!   `POST api.meta.ai/muse-code/key` ile anahtar basar ve yanıtın `subs_usage`'ı 5 sa/haftalık
-//!   penceredir. Aynı çağrı yapılır; basılan anahtar okunmaz/saklanmaz, eldekini geçersiz kılmaz.
-//!   2026-10-15: etkin abonelikte yanıtta `subs_usage` yok (Muse CLI 1.4.7 kotayı model akışındaki
-//!   `response.subscription_usage` olayından alıyor; Claude CLI bunu transcript'e yazmıyor) → "--".
-//!   Uç alanı yeniden verirse şerit kendiliğinden dolar.
+//! - Muse: okunabilir kaynak yok → hep "--" ve [`MUSE_NOTE`]; Dex Muse için ağa çıkmaz (#1871).
+//!   Muse CLI'ın `POST api.meta.ai/muse-code/key` anahtar basma yanıtı eskiden `subs_usage` taşırdı;
+//!   2026-10-15'te etkin abonelikte de yok (CLI 1.4.7 kotayı model akışındaki
+//!   `response.subscription_usage` olayından alıyor, Claude CLI bunu transcript'e yazmıyor). Her
+//!   ölçümde hesapta yeni API anahtarı basan bu çağrı karşılıksız olduğu için kaldırıldı;
+//!   [`parse_muse`] uç alanı geri verirse diye duruyor.
 //! Ölçüm aralığı quota.rs'nin kademesi ([`crate::quota::next_delay`]); bayatlık sınırı da onun
 //! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir. Jeton, anahtar ve yanıt gövdesi
 //! loglanmaz; hata yalnız durum kodu ya da kısa neden.
@@ -30,8 +30,8 @@ use std::sync::{Arc, Mutex};
 pub const PROVIDERS: [&str; 3] = ["anthropic", "glm", "muse"];
 
 const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-const MUSE_MINT_URL: &str = "https://api.meta.ai/muse-code/key";
-const MUSE_AUTH_MAX_BYTES: u64 = 256 * 1024;
+/// #1871: Muse'un sabit "--" nedeni (ölçüm kaynağı yok, ağ çağrısı yok).
+pub const MUSE_NOTE: &str = "Muse anahtar ucu kullanım bildirmiyor";
 /// İlk ölçüm açılıştan biraz sonra (kısa ömürlü çekirdekler uca istek atmasın).
 const FIRST_POLL_MS: u64 = 5_000;
 
@@ -109,7 +109,7 @@ pub trait LimitSource: Send + Sync {
 
 type Sources = Vec<(&'static str, Arc<dyn LimitSource>)>;
 
-/// Core'daki durum: sağlayıcı başına son ölçüm, son yayınlanan görüntü, GLM/Muse kaynakları.
+/// Core'daki durum: sağlayıcı başına son ölçüm, son yayınlanan görüntü, ağ kaynakları (yalnız GLM).
 pub struct Meter {
     readings: Mutex<HashMap<&'static str, Reading>>,
     last: Mutex<Option<UsageSnapshot>>,
@@ -121,10 +121,17 @@ impl Default for Meter {
         let sources: Sources = if cfg!(test) {
             Vec::new() // testler ağa çıkmaz
         } else {
-            vec![("glm", Arc::new(ZaiLimits)), ("muse", Arc::new(MuseLimits))]
+            real_sources()
         };
-        Self { readings: Mutex::default(), last: Mutex::default(), sources: Mutex::new(sources) }
+        // Muse ölçülmez: notu baştan yazılı, şeritte "--".
+        let readings = HashMap::from([("muse", Reading { ok: None, error: Some(MUSE_NOTE.into()) })]);
+        Self { readings: Mutex::new(readings), last: Mutex::default(), sources: Mutex::new(sources) }
     }
+}
+
+/// Ağa çıkan ölçüm kaynakları. #1871: Muse yok (anahtar basma çağrısı karşılıksızdı).
+fn real_sources() -> Sources {
+    vec![("glm", Arc::new(ZaiLimits))]
 }
 
 /// Görüntü: taze ölçüm pencereleri gösterir; yoksa "--" ve nedeni.
@@ -255,7 +262,7 @@ pub fn parse_muse(v: &Value) -> Result<Limits, String> {
     }
     // 2026-10-15 gözlemi: etkin abonelikte de alan gelmiyor (CLI kotayı model akışından alıyor).
     if !usage.is_object() {
-        return Err("Muse anahtar ucu kullanım bildirmiyor".into());
+        return Err(MUSE_NOTE.into());
     }
     let win = |w: &Value| {
         let used = num(first(w, &["used_percent", "usedPercent"]))?;
@@ -307,53 +314,10 @@ impl LimitSource for ZaiLimits {
     }
 }
 
-/// Muse CLI'ının kimlik dosyası: `$MUSE_AUTH_PATH`, `$XDG_CONFIG_HOME/muse`, `~/.config/muse`.
-fn muse_auth_path() -> Option<std::path::PathBuf> {
-    let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
-    if let Some(p) = env("MUSE_AUTH_PATH") {
-        return Some(p);
-    }
-    let config = env("XDG_CONFIG_HOME").or_else(|| Some(env("USERPROFILE").or_else(|| env("HOME"))?.join(".config")))?;
-    Some(config.join("muse").join("auth.json"))
-}
-
-/// OAuth girişinin erişim jetonu; düz API anahtarıyla (kullandıkça öde) ölçülecek abonelik yok.
-pub fn muse_token(auth: &Value) -> Option<String> {
-    let meta = &auth["providers"]["meta"];
-    let oauth = meta["mechanism"].as_str().is_some_and(|m| m.trim().eq_ignore_ascii_case("oauth"));
-    let token = meta["access_token"].as_str().map(str::trim).filter(|t| !t.is_empty())?;
-    oauth.then(|| token.to_string())
-}
-
-/// Muse: CLI'ın açılıştaki anahtar basma çağrısı; yanıttaki abonelik kullanımı.
-pub struct MuseLimits;
-
-impl LimitSource for MuseLimits {
-    fn read(&self) -> Result<Limits, String> {
-        let path = muse_auth_path().ok_or("Muse girişi yok (muse login)")?;
-        let small = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MUSE_AUTH_MAX_BYTES);
-        let auth = small
-            .then(|| std::fs::read_to_string(&path).ok())
-            .flatten()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
-        let token = auth.as_ref().and_then(muse_token).ok_or("Muse girişi yok (muse login)")?;
-        let resp = agent()
-            .post(MUSE_MINT_URL)
-            .set("Authorization", &format!("Bearer {token}"))
-            .set("Content-Type", "application/json")
-            .set("Accept", "application/json")
-            // CLI'ın istemci başlığı; sunucu ürün kontrolünü buna göre yapar.
-            .set("x-client-id", "tbh:tui")
-            .send_string("{}");
-        // Gövdede yeni anahtar da var: yalnız `subs_usage` okunur, gövde burada düşer.
-        parse_muse(&json(resp, "Muse anahtar ucu")?)
-    }
-}
-
 // ── Core ─────────────────────────────────────────────────────────────────────
 
 impl crate::Core {
-    /// GLM/Muse arka plan ölçümü: kaynak başına bir iş parçacığı, aralık quota.rs'nin kademesi.
+    /// GLM arka plan ölçümü: kaynak başına bir iş parçacığı, aralık quota.rs'nin kademesi.
     pub(crate) fn usage_watch(&self) {
         for (id, source) in self.usage.sources.lock().unwrap().clone() {
             let weak = self.weak_self.clone();
@@ -483,13 +447,15 @@ mod tests {
         assert!(parse_muse(&json!({"subs_usage": {"window": {}}})).is_err());
     }
 
+    /// #1871: Muse için ağ kaynağı yok (anahtar basılmaz); şerit sabit notla "--" gösterir.
     #[test]
-    fn muse_token_only_from_oauth_login() {
-        let auth = |mech: &str, token: &str| json!({"providers": {"meta": {"mechanism": mech, "access_token": token, "api_key": "k"}}});
-        assert_eq!(muse_token(&auth("OAuth", " t1 ")), Some("t1".into()));
-        assert_eq!(muse_token(&auth("api_key", "t1")), None, "kullandıkça öde: ölçülecek abonelik yok");
-        assert_eq!(muse_token(&auth("oauth", "")), None);
-        assert_eq!(muse_token(&json!({})), None);
+    fn muse_never_calls_the_network() {
+        let ids: Vec<_> = real_sources().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, ["glm"], "Muse ölçüm kaynağı olmamalı");
+        let meter = Meter::default();
+        let s = build(&meter.readings.lock().unwrap(), None, 1_000);
+        let muse = s.providers.iter().find(|p| p.id == "muse").unwrap();
+        assert_eq!((&muse.limits, muse.note.as_deref(), muse.measured_at), (&Limits::default(), Some(MUSE_NOTE), None));
     }
 
     #[test]
@@ -576,29 +542,26 @@ mod tests {
         core.usage_set_sources(vec![("glm", Arc::new(Fixed(Ok(glm.clone()))))]);
         let source = core.usage.sources.lock().unwrap()[0].1.clone();
         core.usage_record("glm", source.read());
-        core.usage_record("muse", Err("Muse girişi yok (muse login)".into()));
         let got = core.usage_get();
         assert_eq!(got.providers[0].limits.five_hour, Some(w(70.0, None)));
         assert_eq!(got.providers[0].limits.weekly, Some(w(45.0, None)));
         assert_eq!(got.providers[1].limits, glm);
-        assert_eq!(got.providers[2].note.as_deref(), Some("Muse girişi yok (muse login)"));
+        assert_eq!((&got.providers[2].limits, got.providers[2].note.as_deref()), (&Limits::default(), Some(MUSE_NOTE)));
         assert_eq!(got.today_tokens, Some(0));
         let events = sink.0.lock().unwrap().clone();
-        assert_eq!(events.len(), 3, "her ölçüm görüntüyü değiştirdi");
-        assert_eq!(events[2]["providers"][1]["fiveHour"]["remainingPercent"], 10.0);
+        assert_eq!(events.len(), 2, "her ölçüm görüntüyü değiştirdi");
+        assert_eq!(events[1]["providers"][1]["fiveHour"]["remainingPercent"], 10.0);
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Canlı salt okuma: GLM/Muse uçları gerçek kimlikle. Yalnız ayrıştırılmış yüzdeler basılır.
+    /// Canlı salt okuma: GLM ucu gerçek jetonla. Yalnız ayrıştırılmış yüzdeler basılır.
     #[test]
-    #[ignore = "ağ + gerçek GLM jetonu / Muse girişi ister"]
+    #[ignore = "ağ + gerçek GLM jetonu ister"]
     fn live_limits() {
-        for (id, source) in [("glm", &ZaiLimits as &dyn LimitSource), ("muse", &MuseLimits)] {
-            match source.read() {
-                Ok(l) => println!("{id}: 5sa={:?} hafta={:?}", l.five_hour, l.weekly),
-                Err(e) => println!("{id}: hata {e}"),
-            }
+        match ZaiLimits.read() {
+            Ok(l) => println!("glm: 5sa={:?} hafta={:?}", l.five_hour, l.weekly),
+            Err(e) => println!("glm: hata {e}"),
         }
     }
 }
