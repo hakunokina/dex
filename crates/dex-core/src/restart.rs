@@ -6,10 +6,11 @@
 //!   `ask_leader`. The host restarts once that list is empty (or at once, if told so).
 //! - **Marker** (`<data_dir>/dex.restart.json`, [`write`] just before such an exit): the next
 //!   `Core::start` ([`take`]) keeps the queue (`reconcile_on_start` closes only `running` rows) and
-//!   starts the leaders that ran, with `--resume` (their saved session). Workers are not reopened —
-//!   every job starts in a fresh session anyway (#20); the kept queue starts them.
-//! - Without a marker (the patron closed the core, its 120 s no-window rule, a crash) a start is
-//!   as before: the queue fails and leaders stay closed. A marker older than [`FRESH_MS`] is
+//!   starts the leaders that ran, with `--resume` (their saved session). An idle worker is not
+//!   reopened — every job starts in a fresh session anyway (#20); the kept queue starts them (one
+//!   cut mid-turn: #1875 below).
+//! - Without a marker or a fresh live snapshot (the patron closed the core, its 120 s no-window
+//!   rule) a start is as before: the queue fails and leaders stay closed. A marker older than [`FRESH_MS`] is
 //!   ignored: a restart whose new core never came up must not reopen anything days later.
 //! - #447 **Admission** ([`Core::admit`]): every path that starts an agent's turn — a dispatch, a
 //!   paste (`paste_prompt`: chat, leader notes, a leader reset), a start with a prompt
