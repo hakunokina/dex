@@ -1237,8 +1237,10 @@ mod tests {
         struct Replies { original: Box<dyn Write + Send>, tx: mpsc::Sender<Vec<u8>> }
         impl Write for Replies {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.original.write_all(bytes)?;
+                // Record the reply routed to this generation before delivery: the child is
+                // already killed, and a Unix PTY master rejects writes once the slave is gone (EIO).
                 self.tx.send(bytes.to_vec()).unwrap();
+                self.original.write_all(bytes)?;
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> { self.original.flush() }
