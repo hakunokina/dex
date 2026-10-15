@@ -58,7 +58,7 @@ export function buildCommands(bridge: Bridge): Command[] {
       restoreFocus: true,
     },
     { id: "office.panel", title: "Ajan kartını aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "kart pcb office panel", run: () => void openPanel(activeId, "office"), restoreFocus: true },
-    // #46: the notes pages are free panels; a closed one comes back here (onto the other page if open).
+    // #46/#2086: the notes are one free panel; closed, it comes back here.
     { id: "notes.open", title: "Notları aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "not notlar notes ortak takım", run: () => void openNotes(activeId) },
     // #47: the Kart's Ayarlar button, for when the Kart is closed.
     { id: "settings.open", title: "Ayarlar", hint: "Ayarlar", keywords: "settings tercihler görünüm genel", run: () => void openPanel(activeId, "settings") },

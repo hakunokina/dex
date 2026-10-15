@@ -22,12 +22,20 @@
 .notes-tab-name { color: var(--text); }
 .notes-tab-name.filled { color: var(--red-hi); }
 
-/* #2040: the team page — band, the note, the leader appends under it. */
-.team-notes { display: flex; flex-direction: column; height: 100%; min-height: 0; background: var(--surface-1); }
-.team-notes > .notes { flex: 1 1 auto; height: auto; min-height: 96px; }
+/* #2040/#2086: the one notes panel — band, the shared note, the team note, the leader appends under it.
+   Short panel: each note keeps a usable height and the whole page scrolls. */
+.notes-page { display: flex; flex-direction: column; height: 100%; min-height: 0; overflow-y: auto; background: var(--surface-1); }
+.notes-sec { flex: 1 1 0; min-height: 132px; display: flex; flex-direction: column; }
+.notes-sec + .notes-sec { border-top: 1px solid var(--line); }
+.notes-sec > .notes { flex: 1 1 auto; height: auto; min-height: 96px; }
+.notes-sec-head {
+  flex: none; margin: 0; padding: var(--sp-1) var(--sp-3) 0;
+  font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-2);
+}
+.notes-sec-head span { margin-left: var(--sp-1); font-weight: var(--fw-regular); font-size: var(--fs-xs); }
 .notes-band { flex: none; }
 .notes-appends {
-  flex: none; max-height: 55%; overflow-y: auto; display: flex; flex-direction: column; gap: var(--sp-2);
+  flex: none; display: flex; flex-direction: column; gap: var(--sp-2);
   padding: var(--sp-2) var(--sp-3) var(--sp-3); border-top: 1px solid var(--line); background: var(--surface-2);
 }
 .notes-appends-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2); flex-wrap: wrap; }

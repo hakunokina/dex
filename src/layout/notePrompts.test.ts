@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { audienceLabel, channelLabel, hasText, noteFilled, replacePart, type PromptPart } from "./notePrompts.ts";
+import { appendLabel, audienceLabel, channelLabel, hasText, noteFilled, replacePart, type PromptPart } from "./notePrompts.ts";
 
 test("hasText: boşluk ve satır sonu boş sayılır", () => {
   assert.equal(hasText(""), false);
@@ -43,4 +43,11 @@ test("replacePart: yalnız aynı id'yi değiştirir, sırayı korur", () => {
   const out = replacePart(list, { ...part("b", "3"), overridden: true });
   assert.deepEqual(out.map(p => [p.id, p.text, p.overridden]), [["a", "1", false], ["b", "3", true]]);
   assert.deepEqual(replacePart(list, part("z", "9")), list);
+});
+
+test("appendLabel: tek satır, parantez içinde, uzunsa kısaltılır", () => {
+  assert.equal(appendLabel("test", 20), "(ek: test)");
+  assert.equal(appendLabel("  Kısa\n  tut.\n", 20), "(ek: Kısa tut.)");
+  assert.equal(appendLabel("Türkçe cevap ver ve kısa tut", 10), "(ek: Türkçe ce…)");
+  assert.equal(appendLabel("12345", 5), "(ek: 12345)");
 });

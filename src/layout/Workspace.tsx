@@ -12,14 +12,14 @@ import {
   type GetTabContextMenuItemsParams, type resolveMessages,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
-import { Boxes, Brain, CircuitBoard, Cpu, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, StickyNote, Users, X } from "lucide-react";
+import { Boxes, Brain, CircuitBoard, Cpu, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, Users, X } from "lucide-react";
 import { hostOf } from "../api/hosts";
 import { requestStart } from "../launcher";
 import { killPty } from "../pty";
 import { activeCount, markSeen, useDelegations } from "../delegations";
 import { useProgress, workerProgress } from "../progress";
 import { ProgressChip } from "../ProgressView";
-import { getTeam, useTeams } from "../team/store";
+import { useTeams } from "../team/store";
 import { token } from "../theme";
 import { STATUS_LABEL } from "../TerminalPane";
 import { isShellRunning, restartShell, subscribeShellRunning } from "../ShellPane";
@@ -33,8 +33,8 @@ import { noteFilled } from "./notePrompts";
 import { OfficeBar } from "../office/OfficeBar";
 import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
 import {
-  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isNotes, load, NOTES, openPanel, openShell, reconcile,
-  resetLayout, shellPanelId, unbindApi, type NotesPage,
+  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isNotes, load, openPanel, openShell, reconcile,
+  resetLayout, shellPanelId, unbindApi,
 } from "./panels";
 import "./workspace.css";
 
@@ -42,8 +42,7 @@ const Office = lazy(() => import("../office/Office").then(m => ({ default: m.Off
 const BoardView = lazy(() => import("../board/Board").then(m => ({ default: m.BoardView })));
 const SettingsView = lazy(() => import("../settings/Settings").then(m => ({ default: m.SettingsView })));
 const TeamPanel = lazy(() => import("../team/TeamBar").then(m => ({ default: m.TeamPanel })));
-const NotesEditor = lazy(() => import("./Notes").then(m => ({ default: m.NotesEditor })));
-const TeamNotes = lazy(() => import("./TeamNotes").then(m => ({ default: m.TeamNotes })));
+const NotesPage = lazy(() => import("./NotesPage").then(m => ({ default: m.NotesPage })));
 const Procs = lazy(() => import("../procs/Procs").then(m => ({ default: m.Procs })));
 const MemoryView = lazy(() => import("../memory/MemoryMap").then(m => ({ default: m.MemoryMap })));
 
@@ -99,11 +98,9 @@ function ShellPanel({ api, params }: IDockviewPanelProps<{ shellId: string }>) {
   return <SlotPanel slot={shellPanelId(params.shellId)} api={api} />;
 }
 
-function NotesPanel({ params }: IDockviewPanelProps<{ page: NotesPage }>) {
+function NotesPanel() {
   const { teamId } = useContext(WorkspaceCtx);
-  return lazyPanel(params.page === "team"
-    ? <TeamNotes teamId={teamId} placeholder={`${getTeam(teamId)?.name ?? "Bu takım"} notları — yalnız sen görürsün`} />
-    : <NotesEditor scope="shared" placeholder="Ortak notlar — tüm takımlarda aynı, yalnız sen görürsün" />);
+  return lazyPanel(<NotesPage teamId={teamId} />);
 }
 
 /** S4: limits and first-reply thresholds are the team's host's (a remote team → its server). */
@@ -235,17 +232,16 @@ function TabClose({ api, title }: { api: IDockviewPanelHeaderProps["api"]; title
 }
 
 /** #46: a free panel like the others; closed, the palette's "Notları aç" brings it back.
- *  #2040: the name is red while the page holds something (the team page: its appends too). */
+ *  #2040/#2086: the name is red while either note or one of the team's appends holds something. */
 function NotesTab({ api }: IDockviewPanelHeaderProps) {
   const { teamId } = useContext(WorkspaceCtx);
-  const shared = api.id === NOTES.shared.id;
-  const Icon = shared ? NotebookPen : StickyNote;
-  const body = useNoteBody(shared ? "shared" : teamId);
+  const shared = useNoteBody("shared");
+  const body = useNoteBody(teamId);
   const lp = useLeaderPrompt(teamId);
-  const filled = noteFilled(body, shared ? null : lp);
+  const filled = noteFilled(shared) || noteFilled(body, lp);
   return (
-    <div className="dex-tab" title={`Notlar · ${api.title}${filled ? " · dolu" : " · boş"}`}>
-      <Icon className="dex-tab-icon" />
+    <div className="dex-tab" title={`${api.title}${filled ? " · dolu" : " · boş"}`}>
+      <NotebookPen className="dex-tab-icon" />
       <span className={`dex-tab-name notes-tab-name${filled ? " filled" : ""}`}>{api.title}</span>
       <TabClose api={api} title={`${api.title} sekmesini kapat`} />
     </div>

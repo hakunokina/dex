@@ -54,3 +54,9 @@ export const channelLabel = (c: PromptPart["channel"]) => (c === "system" ? "sis
 
 /** Replaces one part in the list (a save, a reset or `prompt-parts-changed`); unknown ids are ignored. */
 export const replacePart = (parts: PromptPart[], next: PromptPart) => parts.map(p => (p.id === next.id ? next : p));
+
+/** #2086: the per-message append as the patron sees it beside the leader — "(ek: …)", one line, `max` chars of text. */
+export function appendLabel(text: string, max: number): string {
+  const flat = [...text.trim().replace(/\s+/g, " ")];
+  return `(ek: ${flat.length > max ? `${flat.slice(0, max - 1).join("").trimEnd()}…` : flat.join("")})`;
+}

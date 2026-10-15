@@ -366,6 +366,13 @@ svg.lucide { width: var(--icon); height: var(--icon); stroke-width: var(--icon-s
   white-space: nowrap;
 }
 .pane-view-toggle .ctx-meter + .pane-reset, .pane-view-toggle .ctx-meter + .pane-write { margin-left: 0; }
+/* #2086: the leader's per-message append — faint, after the context meter; shrinks first on a narrow pane. */
+.pane-view-toggle .pane-append {
+  display: block; align-self: center; min-width: 0; flex: 0 1 auto; padding: 0 4px; border-radius: var(--r-sm);
+  color: var(--muted); font-size: calc(var(--fs-xs) - .5px); font-style: italic; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; position: relative; top: 1px; cursor: default;
+}
+.pane-view-toggle .pane-append:focus-visible { outline: 2px solid var(--text-2); outline-offset: 1px; }
 .ctx-meter .ctx-text { overflow: hidden; text-overflow: ellipsis; }
 .ctx-meter .ctx-bar { flex: none; width: 48px; height: 4px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
 .ctx-meter .ctx-bar > span { display: block; height: 100%; background: var(--muted); }

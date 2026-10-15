@@ -1,6 +1,7 @@
 // #2040: the team note page — the leader's two appends (saved to the core), the amber band while the
 // running leader hasn't picked the system append up, the "Dex istemleri" overlay (read, edit, back to
-// default, read-only parts) and the notes tabs' colour (red with content, white when empty).
+// default, read-only parts) and the notes tab's colour (red with content, white when empty).
+// #2086: one "Notlar" panel (shared + team note); the message append shows faint in the leader's header.
 import type { Page } from "@playwright/test";
 import { isolatedTest as test, expect, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
@@ -14,7 +15,7 @@ test.afterEach(async ({ dexd }) => {
   for (const p of await dexd.call<{ id: string }[]>("pty.list").catch(() => [])) await dexd.call("pty_kill", { id: p.id });
 });
 
-test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overlay'i, dolu sekme kırmızı", async ({ app, dexd }) => {
+test("Takım notu: ekleme alanları kaydeder, sarı kuşak, lider başlığında mesaj eki, Dex istemleri overlay'i, dolu sekme kırmızı", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Notlar ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   await app.reload();
@@ -23,9 +24,10 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overla
   // The leader is up (autostart): its applied fingerprint is recorded, so a system append is pending.
   await expect(pane.locator(".xterm-rows")).toContainText("fake-claude hazir");
 
-  await expect(tabName(app, "Ortak not")).not.toHaveClass(/filled/);
-  await expect(tabName(app, "Takım notu")).not.toHaveClass(/filled/);
-  await app.locator(".team-stage:not(.hidden) .dv-tab", { hasText: "Takım notu" }).click();
+  const chip = pane.locator(".pane-append");
+  await expect(tabName(app, "Notlar")).not.toHaveClass(/filled/);
+  await expect(chip).toHaveCount(0);
+  await app.locator(".team-stage:not(.hidden) .dv-tab", { hasText: "Notlar" }).click();
 
   const stage = app.locator(".team-stage:not(.hidden)");
   const sys = stage.getByLabel("Lider sistem istemine ekle");
@@ -44,8 +46,10 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overla
     .toMatchObject({ systemAppend: "Kısa yaz.", messageAppend: "Türkçe cevap ver.", pendingRestart: true });
   await expect(stage.getByText("Lider oturumu yeniden başlamadan değişiklikler uygulanmaz.")).toBeVisible();
   await expect(stage.getByRole("button", { name: "Lider paneline git" })).toBeVisible();
-  await expect(tabName(app, "Takım notu")).toHaveClass(/filled/);
-  await expect(tabName(app, "Ortak not")).not.toHaveClass(/filled/);
+  await expect(tabName(app, "Notlar")).toHaveClass(/filled/);
+  // The leader's header shows the message append (not the system one), full text on hover/focus.
+  await expect(chip).toHaveText("(ek: Türkçe cevap ver.)");
+  await expect(chip).toHaveAttribute("title", "Türkçe cevap ver.");
 
   // Back to what the leader runs: the band goes, the tab is white again.
   await sys.fill("");
@@ -54,18 +58,21 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overla
   await expect.poll(() => dexd.call<LeaderPrompt>("leader_prompt_get", { teamId: team.id }))
     .toMatchObject({ systemAppend: "", messageAppend: "", pendingRestart: false });
   await expect(stage.getByText("Lider oturumu yeniden başlamadan değişiklikler uygulanmaz.")).toHaveCount(0);
-  await expect(tabName(app, "Takım notu")).not.toHaveClass(/filled/);
+  await expect(tabName(app, "Notlar")).not.toHaveClass(/filled/);
+  await expect(chip).toHaveCount(0);
 
   // A remote write (another client / the core) reaches the field and the tab.
   await dexd.call("leader_prompt_set", { teamId: team.id, messageAppend: "uzaktan" });
   await expect(msg).toHaveValue("uzaktan");
-  await expect(tabName(app, "Takım notu")).toHaveClass(/filled/);
+  await expect(tabName(app, "Notlar")).toHaveClass(/filled/);
+  await expect(chip).toHaveText("(ek: uzaktan)");
   await dexd.call("leader_prompt_set", { teamId: team.id, messageAppend: "" });
-  await expect(tabName(app, "Takım notu")).not.toHaveClass(/filled/);
+  await expect(tabName(app, "Notlar")).not.toHaveClass(/filled/);
 
-  // The shared note: content → red.
+  // The shared note, in the same panel: content → red.
+  await expect(stage.getByRole("heading", { name: /Ortak not/ })).toBeVisible();
   await dexd.call("note_set", { scope: "shared", body: "ortak" });
-  await expect(tabName(app, "Ortak not")).toHaveClass(/filled/);
+  await expect(tabName(app, "Notlar")).toHaveClass(/filled/);
 
   // Overlay: open by keyboard, focus inside, Esc closes and returns focus.
   const open = stage.getByRole("button", { name: "Dex istemleri" });
@@ -124,4 +131,8 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, Dex istemleri overla
   expect(box.x + box.width).toBeLessThanOrEqual(480);
   await dialog.getByRole("button", { name: "Kapat" }).click();
   await expect(dialog).toHaveCount(0);
+  // #2086: the one notes panel scrolls down, never sideways, on the narrow window.
+  const notes = stage.locator(".notes-page");
+  await expect(notes).toBeVisible();
+  expect(await notes.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
 });
