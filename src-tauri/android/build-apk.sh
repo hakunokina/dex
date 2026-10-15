@@ -72,6 +72,11 @@ cmp -s "$ICON_SRC/mipmap-xxxhdpi/ic_launcher.png" "$ICON_DST/mipmap-xxxhdpi/ic_l
   || { echo 'Dex simgeleri gen/ res/ altına kopyalanamadı'; exit 1; }
 # #1719 Echo cevapları: bildirim köprüsü (jeton / bildirimden açılış / tarayıcı) + FCM servisi.
 for k in PushPlugin DexMessagingService; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
+# #1859 Günlük motivasyon: WorkManager işi (host'tan çek → JezLauncher ContentProvider) + saf plan
+# mantığı ve JVM birim testi (gen/ app/src/test; `./gradlew :app:testDebugUnitTest`).
+for k in MotivationPlan MotivationWorker; do cp "src-tauri/android/$k.kt" "$(dirname "$DST")/$k.kt"; done
+TDST=src-tauri/gen/android/app/src/test/java/com/hakunokina/dex/hosttokens
+mkdir -p "$TDST" && cp src-tauri/android/MotivationPlanTest.kt "$TDST/"
 M=src-tauri/gen/android/app/src/main/AndroidManifest.xml
 awk -v f=src-tauri/android/share-aliases.xml '
   /Paylaş hedefi \(ShareTargetPlugin.kt\): metin/ { skip = 2; next }
@@ -102,12 +107,31 @@ awk -v f=src-tauri/android/push-service.xml '
   !done && /<\/application>/ { while ((getline l < f) > 0) print l; done = 1 }
   { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
 [ "$(grep -c 'android:name="com.hakunokina.dex.hosttokens.DexMessagingService"' "$M")" = 1 ] || { echo "manifest'e FCM servisi eklenemedi"; exit 1; }
+# #1859 JezLauncher izni + queries: işaretli blok her derlemede silinip <application önüne yeniden
+# eklenir. Sabitler MotivationWorker.kt'deki JezLauncher nesnesiyle aynı olmalı (aşağıda denetlenir).
+MOT=src-tauri/android/motivation.xml
+awk -v f="$MOT" '
+  /dex-motivation:begin/, /dex-motivation:end/ { next }
+  !done && /^[[:space:]]*<application([[:space:]>]|$)/ { while ((getline l < f) > 0) print l; done = 1 }
+  { print }' "$M" > "$M.tmp" && mv "$M.tmp" "$M"
+for k in AUTHORITY PERMISSION; do
+  v="$(grep -oE "const val $k = \"[^\"]+\"" src-tauri/android/MotivationWorker.kt | cut -d'"' -f2)"
+  [ -n "$v" ] && grep -q "\"$v\"" "$MOT" || { echo "motivation.xml ile MotivationWorker.kt JezLauncher.$k uyuşmuyor"; exit 1; }
+  [ "$(grep -c "\"$v\"" "$M")" = 1 ] || { echo "manifest'e JezLauncher $k eklenemedi"; exit 1; }
+done
 grep -q security-crypto "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("androidx.security:security-crypto:1.1.0-alpha06")|' "$G"
 # #1719 FCM: kütüphane her zaman (Kotlin servisi derlensin); google-services eklentisi yalnız
 # google-services.json varken. Dosya yoksa FirebaseApp kurulmaz: uygulama çalışır, jeton/bildirim yok.
 # Dosya repoya girmez; gen/ içine her derlemede kopyalanır (yoksa oradan da silinir).
 grep -q firebase-messaging "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("com.google.firebase:firebase-messaging:24.1.0")|' "$G"
 grep -q firebase-messaging "$G" || { echo "firebase-messaging bağımlılığı eklenemedi"; exit 1; }
+# #1859: WorkManager (sabah işi) + OkHttp (native WebSocket) + JUnit (yalnız birim testi). Kotlin 1.9
+# şablonuyla uyumlu sürümler.
+grep -q androidx.work:work-runtime "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("androidx.work:work-runtime:2.9.1")|' "$G"
+grep -q com.squareup.okhttp3:okhttp "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    implementation("com.squareup.okhttp3:okhttp:4.12.0")|' "$G"
+grep -q 'testImplementation("junit:junit' "$G" || sed -i 's|implementation("androidx.webkit:webkit:1.14.0")|implementation("androidx.webkit:webkit:1.14.0")\n    testImplementation("junit:junit:4.13.2")|' "$G"
+grep -q androidx.work:work-runtime "$G" && grep -q com.squareup.okhttp3:okhttp "$G" && grep -q 'testImplementation("junit:junit' "$G" \
+  || { echo "WorkManager/OkHttp/JUnit bağımlılığı eklenemedi"; exit 1; }
 FCM_JSON="${DEX_FCM_JSON:-$HOME/.config/dex/google-services.json}"
 R=src-tauri/gen/android/build.gradle.kts
 if [ -f "$FCM_JSON" ]; then

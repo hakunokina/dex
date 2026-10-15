@@ -1,0 +1,9 @@
+    <!-- dex-motivation:begin — build-apk.sh bu bloğu her derlemede silip <application önüne yeniden ekler. -->
+    <!-- #1859 Günlük motivasyon: JezLauncher'ın ContentProvider'ına yazma izni (knownSigner; yalnız
+         tanıtılmış imzalı release APK alır) + Android 11+ paket görünürlüğü. Sabitler: MotivationWorker.kt
+         (JezLauncher nesnesi); değişirse ikisi birlikte değişir. -->
+    <uses-permission android:name="dev.jez.launcher.permission.SET_MOTIVATION" />
+    <queries>
+        <provider android:authorities="dev.jez.launcher.motivation" />
+    </queries>
+    <!-- dex-motivation:end -->
