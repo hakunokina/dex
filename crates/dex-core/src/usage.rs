@@ -7,21 +7,25 @@
 //! - GLM: `GET api.z.ai/api/monitor/usage/quota/limit`, Dex'in GLM jetonuyla (`dex-provider/glm`).
 //!   Token pencereleri (`TOKENS_LIMIT`/`CREDIT_LIMIT`) süreye göre sıralanır: en kısası 5 sa, en
 //!   uzunu haftalık; tek pencere ≤6 sa ise 5 sa sayılır. Aylık MCP (`TIME_LIMIT`) şeride girmez.
-//! - Muse: okunabilir kaynak yok → hep "--" ve [`MUSE_NOTE`]; Dex Muse için ağa çıkmaz (#1871).
-//!   Muse CLI'ın `POST api.meta.ai/muse-code/key` anahtar basma yanıtı eskiden `subs_usage` taşırdı;
-//!   2026-10-15'te etkin abonelikte de yok (CLI 1.4.7 kotayı model akışındaki
-//!   `response.subscription_usage` olayından alıyor, Claude CLI bunu transcript'e yazmıyor). Her
-//!   ölçümde hesapta yeni API anahtarı basan bu çağrı karşılıksız olduğu için kaldırıldı;
-//!   [`parse_muse`] uç alanı geri verirse diye duruyor.
+//! - Muse: `POST api.meta.ai/muse-code/key` (Muse CLI'ın kendi anahtar basma ucu, #1987;
+//!   fork'taki yoklamayla aynı uç). Kimlik `~/.config/muse/auth.json` OAuth `access_token`
+//!   (`mechanism: oauth`), başlık `x-client-id: tbh:tui`, gövde `{}`, yönlendirme yok. Her ölçüm
+//!   hesapta yeni bir API anahtarı basar (patron kabulü). Yanıtın `key` alanı hiçbir yere
+//!   yazılmaz/loglanmaz ([`parse_muse`] onu okumaz bile). Son başarılı okuma `settings`
+//!   satırında saklanır; `subs_usage` gelmezse ya da hata olursa son değer `measured_at` ile
+//!   gösterilir. Süresi geçmiş pencere (`resets_at` < şimdi) geçersizdir: "--" ve
+//!   [`MUSE_STALE_NOTE`]. Hiç değer yoksa "--" ve ölçüm notu.
 //! Ölçüm aralığı quota.rs'nin kademesi ([`crate::quota::next_delay`]); bayatlık sınırı da onun
-//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir. Jeton, anahtar ve yanıt gövdesi
-//! loglanmaz; hata yalnız durum kodu ya da kısa neden.
+//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir — yalnız Muse'ta saklanan son
+//! değer pencereleri geçerliyse `measured_at` ile gösterilmeye devam eder. Jeton, anahtar ve
+//! yanıt gövdesi loglanmaz; hata yalnız durum kodu ya da kısa neden.
 //!
 //! Bugünün token'ı: Dex ajanlarının transcript kullanımı (`cost.rs`, sağlayıcı-farkında), bu
 //! makinenin yerel gece yarısından beri input + output + cache okuma + cache yazma. Dex dışındaki
 //! CLI kullanımı sayılmaz.
 
-use serde::Serialize;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -30,12 +34,15 @@ use std::sync::{Arc, Mutex};
 pub const PROVIDERS: [&str; 3] = ["anthropic", "glm", "muse"];
 
 const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-/// #1871: Muse'un sabit "--" nedeni (ölçüm kaynağı yok, ağ çağrısı yok).
+const MUSE_MINT_URL: &str = "https://api.meta.ai/muse-code/key";
+/// #1987: son başarılı Muse okuması yokken yoklama `subs_usage` vermezse gösterilen neden.
 pub const MUSE_NOTE: &str = "Muse anahtar ucu kullanım bildirmiyor";
+/// #1987: saklanan Muse değerinin pencereleri süresi geçmişse gösterilen neden.
+pub const MUSE_STALE_NOTE: &str = "pencere sıfırlandı";
 /// İlk ölçüm açılıştan biraz sonra (kısa ömürlü çekirdekler uca istek atmasın).
 const FIRST_POLL_MS: u64 = 5_000;
 
-#[derive(Serialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Window {
     /// Kalan yüzde (0-100).
@@ -48,7 +55,20 @@ fn window(used: f64, resets_at: Option<String>) -> Window {
     Window { remaining_percent: (100.0 - used).clamp(0.0, 100.0), resets_at }
 }
 
-#[derive(Serialize, Debug, Clone, PartialEq, Default)]
+/// Süresi geçmiş Muse pencerelerini düşür (`resets_at` < şimdi): o pencerenin yüzdesi artık
+/// geçersizdir. `resets_at` yoksa ya da okunamazsa pencere korunur (geçerli sayılır).
+fn drop_expired(limits: &Limits, now: i64) -> Limits {
+    let live = |w: &Option<Window>| match w {
+        Some(w) => match w.resets_at.as_deref().and_then(crate::chain::parse_rfc3339) {
+            Some(reset) if reset < now => None,
+            _ => Some(w.clone()),
+        },
+        None => None,
+    };
+    Limits { five_hour: live(&limits.five_hour), weekly: live(&limits.weekly) }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
     pub five_hour: Option<Window>,
@@ -123,15 +143,14 @@ impl Default for Meter {
         } else {
             real_sources()
         };
-        // Muse ölçülmez: notu baştan yazılı, şeritte "--".
-        let readings = HashMap::from([("muse", Reading { ok: None, error: Some(MUSE_NOTE.into()) })]);
-        Self { readings: Mutex::new(readings), last: Mutex::default(), sources: Mutex::new(sources) }
+        Self { readings: Mutex::default(), last: Mutex::default(), sources: Mutex::new(sources) }
     }
 }
 
-/// Ağa çıkan ölçüm kaynakları. #1871: Muse yok (anahtar basma çağrısı karşılıksızdı).
+/// Ağa çıkan ölçüm kaynakları. Muse da GLM ile aynı döngüde yoklanır
+/// ([`crate::Core::usage_watch`]); basılan anahtar saklanmaz, loglanmaz.
 fn real_sources() -> Sources {
-    vec![("glm", Arc::new(ZaiLimits))]
+    vec![("glm", Arc::new(ZaiLimits)), ("muse", Arc::new(MuseLimits))]
 }
 
 /// Görüntü: taze ölçüm pencereleri gösterir; yoksa "--" ve nedeni.
@@ -141,6 +160,26 @@ fn build(readings: &HashMap<&'static str, Reading>, tokens: Option<&BTreeMap<Str
         .map(|&id| {
             let r = readings.get(id);
             let fresh = r.and_then(|r| r.ok.as_ref()).filter(|(at, _)| now - at <= crate::quota::STALE_MS);
+            let today = tokens.map(|t| t.get(id).copied().unwrap_or(0));
+            if id == "muse" {
+                // #1987: bayatlık sınırı Muse'a işlemez — saklanan son değer, pencereleri
+                // geçerliyse `measured_at` ile gösterilmeye devam eder.
+                let shown =
+                    fresh.map(|(at, l)| (*at, l.clone())).or_else(|| r.and_then(|r| r.ok.as_ref()).map(|(at, l)| (*at, l.clone())));
+                if let Some((at, limits)) = shown {
+                    let live = drop_expired(&limits, now);
+                    if live.five_hour.is_some() || live.weekly.is_some() {
+                        return ProviderUsage { id, limits: live, note: None, measured_at: Some(at), today_tokens: today };
+                    }
+                    return ProviderUsage {
+                        id,
+                        limits: Limits::default(),
+                        note: Some(MUSE_STALE_NOTE.into()),
+                        measured_at: None,
+                        today_tokens: today,
+                    };
+                }
+            }
             let note = match (fresh, r) {
                 (Some(_), _) => None,
                 (None, Some(r)) => Some(r.error.clone().unwrap_or_else(|| "ölçüm bayat".into())),
@@ -260,7 +299,7 @@ pub fn parse_muse(v: &Value) -> Result<Limits, String> {
     if v["is_subs_active"] == Value::Bool(false) {
         return Err("Muse aboneliği etkin değil".into());
     }
-    // 2026-10-15 gözlemi: etkin abonelikte de alan gelmiyor (CLI kotayı model akışından alıyor).
+    // Alan yoksa hata (boşta hesap gibi): çağrıcı saklanan son değeri göstermeye devam eder.
     if !usage.is_object() {
         return Err(MUSE_NOTE.into());
     }
@@ -314,6 +353,90 @@ impl LimitSource for ZaiLimits {
     }
 }
 
+/// Muse CLI'ın oturum dosyası: `$MUSE_AUTH_PATH`, yoksa `$XDG_CONFIG_HOME/muse`,
+/// yoksa ev dizinindeki `.config/muse` (fork'taki `museAuthPath` ile aynı sıra).
+fn muse_auth_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("MUSE_AUTH_PATH") {
+        if !p.trim().is_empty() {
+            return Some(p.into());
+        }
+    }
+    let base = std::env::var_os("XDG_CONFIG_HOME").map(std::path::PathBuf::from).or_else(|| {
+        std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(|h| std::path::PathBuf::from(h).join(".config"))
+    })?;
+    Some(base.join("muse").join("auth.json"))
+}
+
+/// OAuth oturumunun `access_token`i (`mechanism: oauth` şart; ham `META_API_KEY` yok).
+/// Yoksa/giriş yoksa `None` — çağrıcı ağa çıkmaz.
+fn muse_access_token() -> Option<String> {
+    let raw = std::fs::read_to_string(muse_auth_path()?).ok()?;
+    if raw.len() > 256 * 1024 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let meta = &v["providers"]["meta"];
+    if meta["mechanism"].as_str()?.trim().to_ascii_lowercase() != "oauth" {
+        return None;
+    }
+    let t = meta["access_token"].as_str()?.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Muse: CLI'ın anahtar basma ucundan `subs_usage`. Basılan `key` yanıttan alınmaz,
+/// saklanmaz, loglanmaz; istek gövdesi `{}` ve yönlendirme kapalı (fork ile aynı).
+pub struct MuseLimits;
+
+impl LimitSource for MuseLimits {
+    fn read(&self) -> Result<Limits, String> {
+        let token = muse_access_token().ok_or("Muse girişi yok (`muse login`)")?;
+        let url = std::env::var("TBH_MINT_BASE_URL")
+            .ok()
+            .filter(|b| !b.trim().is_empty())
+            .map(|b| format!("{}/muse-code/key", b.trim_end_matches('/')))
+            .unwrap_or_else(|| MUSE_MINT_URL.into());
+        let resp = agent()
+            .post(&url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .set("x-client-id", "tbh:tui")
+            .set("Content-Type", "application/json")
+            .set("Accept", "application/json")
+            .send_string("{}");
+        parse_muse(&json(resp, "Muse anahtar ucu")?)
+    }
+}
+
+// ── Son başarılı Muse okumasının kalıcılığı (`settings` satırı; migration yok) ──
+
+/// `settings` anahtarı: JSON `{measuredAt, limits}`; satır yoksa/bozuksa ölçüm yok.
+const MUSE_LAST_KEY: &str = "usage_muse_last";
+
+#[derive(Serialize, Deserialize)]
+struct MuseLast {
+    #[serde(rename = "measuredAt")]
+    measured_at: i64,
+    limits: Limits,
+}
+
+fn save_muse_last(conn: &Connection, at: i64, limits: &Limits) -> Result<(), String> {
+    let v = serde_json::to_string(&MuseLast { measured_at: at, limits: limits.clone() }).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![MUSE_LAST_KEY, v],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn load_muse_last(conn: &Connection) -> Option<(i64, Limits)> {
+    let raw: Option<String> =
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [MUSE_LAST_KEY], |r| r.get(0)).ok()?;
+    let last: MuseLast = serde_json::from_str(raw?.as_str()).ok()?;
+    Some((last.measured_at, last.limits))
+}
+
 // ── Core ─────────────────────────────────────────────────────────────────────
 
 impl crate::Core {
@@ -338,7 +461,8 @@ impl crate::Core {
         }
     }
 
-    /// Bir ölçümü yazar ve görüntüyü yayınlar. Hata son başarılı ölçümü silmez (bayatlayınca "--").
+    /// Bir ölçümü yazar ve görüntüyü yayınlar. Hata son başarılı ölçümü silmez (Muse'ta
+    /// bayatlayınca bile gösterilir; penceresi geçmişse "--").
     pub(crate) fn usage_record(&self, id: &'static str, read: Result<Limits, String>) {
         let now = crate::model_news::now_ms();
         {
@@ -346,8 +470,15 @@ impl crate::Core {
             let r = readings.entry(id).or_default();
             match read {
                 Ok(limits) => {
-                    r.ok = Some((now, limits));
+                    r.ok = Some((now, limits.clone()));
                     r.error = None;
+                    if id == "muse" {
+                        // dexd yeniden başlasa da kalsın; yazılamazsa ölçüm yine de gösterilir.
+                        let saved = crate::db::with(&self.db, |c| save_muse_last(c, now, &limits));
+                        if let Err(err) = saved {
+                            eprintln!("dex: Muse son ölçüm saklanamadı: {err}");
+                        }
+                    }
                 }
                 Err(err) => {
                     // Kalıcı neden (jeton yok) her denemede log'u doldurmasın: yalnız değişince.
@@ -359,6 +490,14 @@ impl crate::Core {
             }
         }
         self.usage_publish();
+    }
+
+    /// Açılışta saklanan son Muse okumasını belleğe alır (yoksa/bozuksa "--" aynen kalır).
+    pub(crate) fn usage_restore_muse(&self) {
+        let loaded = crate::db::with(&self.db, |c| Ok(load_muse_last(c)));
+        if let Ok(Some((at, limits))) = loaded {
+            self.usage.readings.lock().unwrap().insert("muse", Reading { ok: Some((at, limits)), error: None });
+        }
     }
 
     /// Bugünün kuyruğunu okuyup görüntüyü kurar; değiştiyse `usage-snapshot` yayınlar.
@@ -447,15 +586,100 @@ mod tests {
         assert!(parse_muse(&json!({"subs_usage": {"window": {}}})).is_err());
     }
 
-    /// #1871: Muse için ağ kaynağı yok (anahtar basılmaz); şerit sabit notla "--" gösterir.
+    /// #1987: Muse GLM ile aynı döngüde ölçülür; hiç değer yokken şerit "--" gösterir.
     #[test]
-    fn muse_never_calls_the_network() {
+    fn muse_is_measured_like_glm() {
         let ids: Vec<_> = real_sources().into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, ["glm"], "Muse ölçüm kaynağı olmamalı");
+        assert_eq!(ids, ["glm", "muse"], "Muse ölçüm kaynağı olmalı");
         let meter = Meter::default();
         let s = build(&meter.readings.lock().unwrap(), None, 1_000);
         let muse = s.providers.iter().find(|p| p.id == "muse").unwrap();
-        assert_eq!((&muse.limits, muse.note.as_deref(), muse.measured_at), (&Limits::default(), Some(MUSE_NOTE), None));
+        assert_eq!(
+            (&muse.limits, muse.note.as_deref(), muse.measured_at),
+            (&Limits::default(), Some("henüz ölçülmedi"), None)
+        );
+    }
+
+    /// #1987: `subs_usage` gelmezse ya da hata olursa son değer `measured_at` ile durur
+    /// (bayatlık sınırı Muse'a işlemez).
+    #[test]
+    fn muse_holds_last_value_when_subs_usage_missing() {
+        let now = 10_000_000;
+        let limits =
+            Limits { five_hour: Some(w(77.5, Some("2026-10-20T00:00:00Z"))), weekly: Some(w(39.0, None)) };
+        let at = now - crate::quota::STALE_MS - 60_000;
+        let mut readings = HashMap::new();
+        readings.insert("muse", Reading { ok: Some((at, limits.clone())), error: Some(MUSE_NOTE.into()) });
+        let s = build(&readings, None, now);
+        let muse = s.providers.iter().find(|p| p.id == "muse").unwrap();
+        assert_eq!((&muse.limits, muse.note.as_deref(), muse.measured_at), (&limits, None, Some(at)));
+    }
+
+    /// #1987: süresi geçmiş pencere geçersizdir — "--" + sıfırlanma notu; geçerli
+    /// pencere tek başına durur.
+    #[test]
+    fn muse_expired_window_shows_reset() {
+        let now = 10_000_000;
+        let held = |five: Option<Window>, weekly: Option<Window>| {
+            let mut readings = HashMap::new();
+            readings.insert("muse", Reading { ok: Some((now - 1_000, Limits { five_hour: five, weekly })), error: None });
+            build(&readings, None, now).providers.into_iter().find(|p| p.id == "muse").unwrap()
+        };
+        let past = || Some(w(10.0, Some("1970-01-01T00:00:01Z")));
+        let future = || Some(w(20.0, Some("2026-10-20T00:00:00Z")));
+        let muse = held(past(), past());
+        assert_eq!((&muse.limits, muse.note.as_deref(), muse.measured_at), (&Limits::default(), Some(MUSE_STALE_NOTE), None));
+        let muse = held(past(), future());
+        assert_eq!(muse.limits, Limits { five_hour: None, weekly: future() });
+        assert_eq!((muse.note.as_deref(), muse.measured_at), (None, Some(now - 1_000)));
+        // `resets_at` yoksa/okunamazsa pencere geçerli sayılır.
+        let muse = held(Some(w(10.0, None)), None);
+        assert_eq!(muse.limits.five_hour, Some(w(10.0, None)));
+    }
+
+    /// #1987: son Muse okuması `settings` satırında gidip gelir; bozuk satır "--"a düşer.
+    #[test]
+    fn muse_last_round_trips_through_settings() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+        assert_eq!(load_muse_last(&c), None);
+        let limits = Limits { five_hour: Some(w(77.5, Some("2026-10-20T00:00:00Z"))), weekly: None };
+        save_muse_last(&c, 1_792_000_000_000, &limits).unwrap();
+        assert_eq!(load_muse_last(&c), Some((1_792_000_000_000, limits.clone())));
+        save_muse_last(&c, 1_792_000_001_000, &limits).unwrap();
+        assert_eq!(load_muse_last(&c).unwrap().0, 1_792_000_001_000, "upsert idempotent");
+        c.execute("UPDATE settings SET value = 'bozuk' WHERE key = 'usage_muse_last'", []).unwrap();
+        assert_eq!(load_muse_last(&c), None);
+    }
+
+    /// #1987: kimlik yalnız OAuth oturumundan okunur; ham anahtar/girişsizlik ağa çıkarmaz.
+    #[test]
+    fn muse_login_reads_only_oauth_session() {
+        let dir = std::env::temp_dir().join(format!("dex-muse-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let prev = std::env::var_os("MUSE_AUTH_PATH");
+        unsafe { std::env::set_var("MUSE_AUTH_PATH", &path) };
+        let token = |body: &str| {
+            std::fs::write(&path, body).unwrap();
+            muse_access_token()
+        };
+        assert_eq!(muse_auth_path(), Some(path.clone()));
+        assert_eq!(
+            token(r#"{"providers":{"meta":{"mechanism":"oauth","access_token":" tok ","user_email":"a@b.c"}}}"#).as_deref(),
+            Some("tok")
+        );
+        assert_eq!(token(r#"{"providers":{"meta":{"mechanism":"apikey","access_token":"x"}}}"#), None);
+        assert_eq!(token("bozuk"), None);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(muse_access_token(), None);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MUSE_AUTH_PATH", v),
+                None => std::env::remove_var("MUSE_AUTH_PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
@@ -546,11 +770,19 @@ mod tests {
         assert_eq!(got.providers[0].limits.five_hour, Some(w(70.0, None)));
         assert_eq!(got.providers[0].limits.weekly, Some(w(45.0, None)));
         assert_eq!(got.providers[1].limits, glm);
-        assert_eq!((&got.providers[2].limits, got.providers[2].note.as_deref()), (&Limits::default(), Some(MUSE_NOTE)));
+        assert_eq!((&got.providers[2].limits, got.providers[2].note.as_deref()), (&Limits::default(), Some("henüz ölçülmedi")));
         assert_eq!(got.today_tokens, Some(0));
         let events = sink.0.lock().unwrap().clone();
         assert_eq!(events.len(), 2, "her ölçüm görüntüyü değiştirdi");
         assert_eq!(events[1]["providers"][1]["fiveHour"]["remainingPercent"], 10.0);
+        // #1987: Muse hatası son değeri silmez; başarılı okuma `settings`'e yazılır.
+        let muse = Limits { five_hour: Some(w(30.0, Some("2026-10-20T00:00:00Z"))), weekly: None };
+        core.usage_record("muse", Ok(muse.clone()));
+        core.usage_record("muse", Err(MUSE_NOTE.into()));
+        let got = core.usage_get();
+        assert_eq!(&got.providers[2].limits, &muse, "hata son değeri silmez");
+        let at = got.providers[2].measured_at.unwrap();
+        assert_eq!(crate::db::with(&core.db, |c| Ok(load_muse_last(c))).unwrap(), Some((at, muse)));
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -562,6 +794,18 @@ mod tests {
         match ZaiLimits.read() {
             Ok(l) => println!("glm: 5sa={:?} hafta={:?}", l.five_hour, l.weekly),
             Err(e) => println!("glm: hata {e}"),
+        }
+    }
+
+    /// Canlı salt okuma: Muse anahtar ucu gerçek OAuth oturumuyla (#1987). Yalnız
+    /// ayrıştırılmış yüzdeler basılır; anahtar/token basılmaz. Her çağrı hesapta
+    /// yeni bir anahtar basar — seyrek koş.
+    #[test]
+    #[ignore = "ağ + gerçek Muse girişi ister"]
+    fn live_muse() {
+        match MuseLimits.read() {
+            Ok(l) => println!("muse: 5sa={:?} hafta={:?}", l.five_hour, l.weekly),
+            Err(e) => println!("muse: hata {e}"),
         }
     }
 }
