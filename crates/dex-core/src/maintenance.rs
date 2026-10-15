@@ -443,12 +443,9 @@ impl crate::Core {
                     checked = Some(day.clone());
                 }
                 // #1858: same loop, same per-minute wake; the DB claim keeps it once a day.
-                if motivated.as_ref() != Some(&day) && now.time() >= crate::motivation::due_at() {
-                    if core.motivation_tick(now.naive_local()).is_err() {
-                        crate::diagnostics::event("motivation", serde_json::json!({"reason":"db_error"}));
-                    }
-                    motivated = Some(day);
-                }
+                motivation_step(&mut motivated, &day, now.time() >= crate::motivation::due_at(), || {
+                    core.motivation_tick(now.naive_local())
+                });
                 drop(core); // The sleeping watcher does not keep a shutdown Core alive.
                 std::thread::sleep(next_wake(chrono::Local::now()));
             }
@@ -549,6 +546,18 @@ fn claim_day(c: &Connection, day: &str) -> Result<bool, String> {
     .map_err(|e| e.to_string())
 }
 
+/// #1864: the day is marked only after a tick that did not fail; a transient DB error (e.g.
+/// `database is locked`) is retried on the next minute. The DB claim keeps it once a day.
+fn motivation_step(motivated: &mut Option<String>, day: &str, due: bool, tick: impl FnOnce() -> Result<bool, String>) {
+    if !due || motivated.as_deref() == Some(day) {
+        return;
+    }
+    match tick() {
+        Ok(_) => *motivated = Some(day.to_string()),
+        Err(_) => crate::diagnostics::event("motivation", serde_json::json!({"reason":"db_error"})),
+    }
+}
+
 fn next_wake<T: TimeZone>(now: DateTime<T>) -> Duration {
     now.date_naive()
         .succ_opt()
@@ -578,6 +587,36 @@ mod tests {
                 .to_string_lossy()
                 .trim_start_matches(r"\\?\"),
         )
+    }
+
+    #[test]
+    fn motivation_retries_after_a_db_error_and_still_asks_once() {
+        let root = fixture("motivation");
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        let at = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        let day = "2026-10-15";
+        let mut motivated = None;
+        let mut calls = 0;
+        // Not due yet: no tick.
+        motivation_step(&mut motivated, day, false, || { calls += 1; Ok(false) });
+        assert_eq!((calls, motivated.as_deref()), (0, None));
+        // A transient error leaves the day unmarked.
+        motivation_step(&mut motivated, day, true, || { calls += 1; Err("database is locked".into()) });
+        assert_eq!((calls, motivated.as_deref()), (1, None));
+        // The next minute retries and the real tick asks.
+        let mut asked = Vec::new();
+        motivation_step(&mut motivated, day, true, || { let r = core.motivation_tick(at("2026-10-15 04:31")); asked.push(r.clone()); r });
+        assert_eq!(asked, vec![Ok(true)]);
+        assert_eq!(motivated.as_deref(), Some(day));
+        // Marked: no more ticks today; a fresh loop (restart) is held off by the DB claim.
+        motivation_step(&mut motivated, day, true, || { calls += 1; Ok(true) });
+        assert_eq!(calls, 1);
+        let mut fresh = None;
+        motivation_step(&mut fresh, day, true, || { let r = core.motivation_tick(at("2026-10-15 04:32")); asked.push(r.clone()); r });
+        assert_eq!(asked, vec![Ok(true), Ok(false)]);
+        let notes: i64 = with(&core.db, |c| c.query_row("SELECT count(*) FROM leader_notes WHERE agent_id='timur' AND text LIKE '[Dex-Motivasyon]%'", [], |r| r.get(0)).map_err(|e| e.to_string())).unwrap();
+        assert_eq!(notes, 1);
+        core.shutdown();
     }
 
     #[test]

@@ -1788,6 +1788,11 @@ pub(crate) fn tools_list_for_test(core: &Core, agent: &str) -> Vec<Value> {
     tools_for(core, agent, None).as_array().cloned().unwrap_or_default()
 }
 
+/// #1864: the patron's lines come from the main leader only, not any team's leader.
+fn motivation_writer(c: &delegate::Caller) -> bool {
+    c.is_leader() && c.id == crate::motivation::LEADER
+}
+
 /// Görev #289: GPU tools only for whom they are — the leader's request tools, a worker's job tools
 /// only while its granted job runs.
 fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
@@ -1798,7 +1803,8 @@ fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
             return all;
         }
         if let Ok(c) = delegate::caller(&conn, agent) {
-            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note" && t["name"] != "motivation_set"); }
+            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| t["name"] != "note"); }
+            if !motivation_writer(&c) { all.as_array_mut().unwrap().retain(|t| t["name"] != "motivation_set"); }
             all.as_array_mut().unwrap().extend(crate::gpu::tools_for(&conn, &c, job));
         }
     }
@@ -2277,7 +2283,9 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
         }
         // #1858: the patron's daily lines; never logged.
         "motivation_set" => {
-            lead_only("motivation_set")?;
+            if !motivation_writer(&c) {
+                return Err(format!("yetki yok: motivation_set yalnız ana lidere ({}) açık", crate::motivation::LEADER));
+            }
             let fields = args.as_object().ok_or("arguments nesne olmalı")?;
             if let Some(key) = fields.keys().find(|k| !matches!(k.as_str(), "morning" | "noon" | "evening")) {
                 return Err(format!("bilinmeyen alan: {key}"));
@@ -2415,6 +2423,15 @@ mod motivation_tests {
         let lines = json!({"morning": "sabah", "noon": "öğle", "evening": "akşam"});
         let denied = call_with_args_for_test(&core, "kaan", "motivation_set", lines.clone());
         assert_eq!(denied["isError"], true, "{denied}");
+        // #1864: another team's leader neither sees nor calls it.
+        let other = core.team_create(crate::teams::NewTeam { profile: None, name: "Diğer".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let lead = core.agent_list().unwrap().into_iter().find(|a| a.team_id == other.id && a.kind == "leader").unwrap().id;
+        assert_ne!(lead, crate::motivation::LEADER);
+        assert!(tools_list_for_test(&core, &lead).iter().any(|t| t["name"] == "note"), "still a leader");
+        assert!(!tools_list_for_test(&core, &lead).iter().any(|t| t["name"] == "motivation_set"));
+        let foreign = call_with_args_for_test(&core, &lead, "motivation_set", lines.clone());
+        assert_eq!(foreign["isError"], true, "{foreign}");
+        assert!(foreign["content"][0]["text"].as_str().unwrap().contains("ana lidere"), "{foreign}");
         let bad = call_with_args_for_test(&core, "timur", "motivation_set", json!({"morning": "sabah", "noon": "a
 b", "evening": "akşam"}));
         assert_eq!(bad["isError"], true, "{bad}");

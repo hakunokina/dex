@@ -56,7 +56,7 @@ pub fn validate(lines: [(&str, &str); 3]) -> Result<(), String> {
         let n = text.trim().chars().count();
         if n == 0 {
             bad.push(format!("{name} boş"));
-        } else if text.chars().any(char::is_control) {
+        } else if text.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
             bad.push(format!("{name} tek satır olmalı (satır sonu/kontrol karakteri var)"));
         } else if n > MAX_CHARS {
             bad.push(format!("{name} en çok {MAX_CHARS} karakter ({n})"));
@@ -197,7 +197,7 @@ mod tests {
         let path = db_path("rules");
         let c = crate::db::open(&path).unwrap();
         let long = "ç".repeat(MAX_CHARS + 1);
-        for (m, n, ev) in [("", "öğle", "akşam"), ("  ", "öğle", "akşam"), ("sabah", "iki\nsatır", "akşam"), ("sabah", "öğle", "a\rb"), ("sabah", "öğle", long.as_str())] {
+        for (m, n, ev) in [("", "öğle", "akşam"), ("  ", "öğle", "akşam"), ("sabah", "iki\nsatır", "akşam"), ("sabah", "öğle", "a\rb"), ("sabah", "a\u{2028}b", "akşam"), ("a\u{2029}b", "öğle", "akşam"),("sabah", "öğle", long.as_str())] {
             let err = set(&c, "2026-10-15", m, n, ev, 1).unwrap_err();
             assert!(err.contains("hiçbiri kaydedilmedi"), "{err}");
         }
