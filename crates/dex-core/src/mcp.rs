@@ -1759,6 +1759,8 @@ fn tools() -> Value {
     all.as_array_mut().unwrap().extend(crate::questions::tools());
     // Görev #144: delegation_merge.
     all.as_array_mut().unwrap().extend(crate::worktree::tools());
+    // #2048: delegation_cancel, delegation_reassign (patron-approved).
+    all.as_array_mut().unwrap().extend(crate::job_change::tools());
     all
 }
 
@@ -1810,7 +1812,9 @@ fn tools_for(core: &Core, agent: &str, job: Option<i64>) -> Value {
             return all;
         }
         if let Ok(c) = delegate::caller(&conn, agent) {
-            if !c.is_leader() { all.as_array_mut().unwrap().retain(|t| !matches!(t["name"].as_str(), Some("note" | "team_note_get" | "team_note_set"))); }
+            if !c.is_leader() {
+                all.as_array_mut().unwrap().retain(|t| !matches!(t["name"].as_str(), Some("note" | "team_note_get" | "team_note_set")) && !crate::job_change::TOOLS.contains(&t["name"].as_str().unwrap_or("")));
+            }
             if !motivation_writer(&c) { all.as_array_mut().unwrap().retain(|t| t["name"] != "motivation_set"); }
             all.as_array_mut().unwrap().extend(crate::gpu::tools_for(&conn, &c, job));
         }
@@ -2336,6 +2340,7 @@ fn run(core: &Core, agent: &str, job: Option<i64>, name: &str, args: &Value) -> 
         _ => {
             drop(conn);
             crate::plan::mcp_call_with_ptys(&core.db, &core.events, &core.ptys, &c, name, args)
+                .or_else(|| crate::job_change::mcp_call(&core.db, &core.events, &c, name, args))
                 .or_else(|| crate::questions::mcp_call(&core.db, &core.events, &core.permits, &core.answers, &c, name, args))
                 .unwrap_or_else(|| Err(format!("bilinmeyen araç: {name}")))
         }

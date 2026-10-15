@@ -74,7 +74,10 @@ test("Lider pane: Core şeridi yok; sekme durumu, oturum kontrolleri ve worker i
 test("Ofis gizliyken kararlar köşe listesinde; lider pane'inde Core geri gelmez", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Köşe ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
-  await app.addInitScript((f) => { window.__dexFake = f; }, { proposal_list: [proposal(leader, 1)], question_list: [] });
+  // #2048: a leader's reassign of a job not started yet is a card of the same list.
+  const move = { ...proposal(leader, 2), roleSlug: "", roleName: "", model: "", provider: "", change: "reassign",
+    reason: "İş #7: Ödeme sayfası\nŞu an: Pixel-1\nİşlem: aktarma → Pixel-2\nGerekçe: Pixel-1 meşgul" };
+  await app.addInitScript((f) => { window.__dexFake = f; }, { proposal_list: [proposal(leader, 1), move], question_list: [] });
   await app.reload();
   await hideOffice(app);
   await openTeam(app, team.name);
@@ -85,6 +88,12 @@ test("Ofis gizliyken kararlar köşe listesinde; lider pane'inde Core geri gelme
   await expect(corner).toContainText("Checkout akışında regresyon");
   await corner.getByRole("button", { name: /Ekle/ }).click();
   await expect.poll(async () => (await calls(app)).filter((c) => c.cmd === "proposal_decide").map((c) => c.args)).toEqual([{ id: 1, approve: true, name: null }]);
+  const card = corner.getByRole("alertdialog", { name: `${leader.name} iş aktarma onayı istiyor` });
+  await expect(card.getByRole("heading")).toContainText("İş aktarma");
+  await expect(card).toContainText("aktarma → Pixel-2");
+  await expect(card.getByRole("textbox")).toHaveCount(0);
+  await card.getByRole("button", { name: "Onayla", exact: true }).click();
+  await expect.poll(async () => (await calls(app)).filter((c) => c.cmd === "proposal_decide").map((c) => c.args).at(-1)).toEqual({ id: 2, approve: true, name: null });
 });
 
 test("Ofis Core'u: karar kartları, klavye ve dar görünüm; gizlenince köşe listesi devralır", async ({ app, dexd }) => {

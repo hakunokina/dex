@@ -32,10 +32,13 @@ pub struct Proposal {
     pub agent_id: Option<String>,
     pub created_at: i64,
     pub decided_at: Option<i64>,
+    /// #2048: `cancel` | `reassign` — a leader's change to a job not started yet (job_change.rs).
+    pub change: Option<String>,
 }
 
 const COLS: &str = "p.id, p.team_id, IFNULL(t.name, p.team_id), p.leader, IFNULL(a.name, p.leader), p.role_slug,
-    IFNULL(r.name, p.role_slug), p.name, p.model, p.provider, p.reason, p.status, p.agent_id, p.created_at, p.decided_at, (SELECT delegation_id FROM job_models WHERE proposal_id=p.id)";
+    IFNULL(r.name, p.role_slug), p.name, p.model, p.provider, p.reason, p.status, p.agent_id, p.created_at, p.decided_at, (SELECT delegation_id FROM job_models WHERE proposal_id=p.id),
+    (SELECT action FROM job_changes WHERE proposal_id=p.id)";
 const FROM: &str = "member_proposals p LEFT JOIN teams t ON t.id = p.team_id
     LEFT JOIN agents a ON a.id = p.leader LEFT JOIN roles r ON r.slug = p.role_slug";
 
@@ -57,6 +60,7 @@ fn row(r: &Row) -> rusqlite::Result<Proposal> {
         agent_id: r.get(12)?,
         created_at: r.get(13)?,
         decided_at: r.get(14)?,
+        change: r.get(16)?,
     })
 }
 
@@ -122,7 +126,11 @@ pub fn propose(conn: &Connection, lead: &Caller, args: &Value) -> Result<Proposa
     let (provider, model) = provider_model(s("provider"), s("model"))?;
     let name = s("name").map(str::trim).filter(|n| !n.is_empty());
     let pending: i64 = conn
-        .query_row("SELECT COUNT(*) FROM member_proposals WHERE team_id = ?1 AND status = 'pending'", [&lead.team_id], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM member_proposals WHERE team_id = ?1 AND status = 'pending' AND id NOT IN (SELECT proposal_id FROM job_changes)",
+            [&lead.team_id],
+            |r| r.get(0),
+        )
         .map_err(e)?;
     if pending >= MAX_PENDING {
         return Err(format!("takımın {pending} önerisi zaten patron onayında; önce onlar karara bağlansın"));
@@ -139,11 +147,28 @@ pub fn propose(conn: &Connection, lead: &Caller, args: &Value) -> Result<Proposa
 /// The patron's answer. Approve → the worker is created (name: the patron's, else the leader's,
 /// else the role's template name); both ways the leader gets a note.
 pub fn decide(conn: &Connection, data_dir: &std::path::Path, id: i64, approve: bool, name: Option<&str>) -> Result<Proposal, String> {
+    decide_in(conn, data_dir, id, approve, name, &std::collections::HashSet::new())
+}
+
+/// [`decide`]; `starting`: jobs a dispatch is starting right now (a job change leaves them alone).
+pub(crate) fn decide_in(
+    conn: &Connection,
+    data_dir: &std::path::Path,
+    id: i64,
+    approve: bool,
+    name: Option<&str>,
+    starting: &std::collections::HashSet<i64>,
+) -> Result<Proposal, String> {
     let p = get(conn, id)?;
     if p.status != "pending" {
         return Err(format!("öneri #{id} zaten karara bağlandı ({})", p.status));
     }
     let tx = conn.unchecked_transaction().map_err(e)?;
+    if p.change.is_some() {
+        crate::job_change::decision(&tx, &p, approve, starting)?;
+        tx.commit().map_err(e)?;
+        return get(conn, id);
+    }
     if p.delegation_id.is_some() {
         crate::job_model::decision(&tx, &p, approve)?;
         tx.commit().map_err(e)?;
@@ -188,8 +213,13 @@ impl Core {
     }
 
     pub fn proposal_decide(&self, id: i64, approve: bool, name: Option<&str>) -> Result<Proposal, String> {
-        let p = with(&self.db, |c| decide(c, &self.paths.data_dir, id, approve, name))?;
-        if let Some(job) = p.delegation_id {
+        // #2048: held through the decision — a dispatch cannot begin a start of a job it changes.
+        let starting = self.starting.lock()?;
+        let p = with(&self.db, |c| decide_in(c, &self.paths.data_dir, id, approve, name, &starting))?;
+        drop(starting);
+        if p.change.is_some() {
+            self.job_change_decided(&p);
+        } else if let Some(job) = p.delegation_id {
             self.changed("delegations-changed");
             self.changed("tasks-changed");
             if approve { self.delegation_dispatch(with(&self.db, |c| crate::delegate::get(c,job))?)?; }
