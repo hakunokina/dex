@@ -11,17 +11,25 @@ import { LOOK, beatAt, coreVeins, keyAzimuth, lightDir, linear, pathLength, scal
 export interface MapSet { n: ImageBitmap; c: ImageBitmap; x: ImageBitmap }
 export interface CardMaps { bg: MapSet; worker: MapSet; echo: MapSet }
 
-/** CSS px; `z` = height above the ground, `r` = falloff radius, `spec` = its specular share. */
-export interface PointLight { x: number; y: number; z: number; r: number; color: Rgb; spec: number }
+/**
+ * CSS px; `z` = height above the ground, `r` = falloff radius, `spec` = its specular share, `halo` = its
+ * glow on the ground (#2020: a live sac's light around it; 0 / none: only the lighting).
+ */
+export interface PointLight { x: number; y: number; z: number; r: number; color: Rgb; spec: number; halo?: number }
 /** A body's shadow on the ground (CSS px): `lift` shifts it away from the key light, `k` = strength. */
 export interface Shadow { x: number; y: number; rx: number; ry: number; lift: number; k: number }
-/** Per strand (flow id = index + 1): active-work band, the returning drop (`packet` < 0: none). */
-export interface Flow { flow: number; packet: number; length: number; packetK: number; flowColor: Rgb; packetColor: Rgb }
+/**
+ * Per strand (flow id = index + 1): active-work band, the returning drop (`packet` < 0: none), and #2020 its
+ * life (0 dry .. 1 live) and colour (the live glow's and the drop's).
+ */
+export interface Flow { flow: number; packet: number; length: number; packetK: number; life: number; color: Rgb }
 export interface BodyDraw {
   kind: "worker" | "echo";
   /** Quad centre and side (CSS px), rotation (rad). */
   x: number; y: number; size: number; rot: number;
   state: Rgb; intensity: number; translucency: number; alpha: number; desat: number; pulse: number;
+  /** #2020: albedo darkening (a dormant sac), 0..1. */
+  dim: number;
   /** Height range of the body's map (CSS px). */
   height: number;
 }
@@ -32,12 +40,17 @@ export interface LitScene {
   /** The pulse's origin (CSS px): the first Core. */
   core: { x: number; y: number } | null;
   lights: PointLight[]; shadows: Shadow[]; flows: Flow[]; bodies: BodyDraw[];
+  /** The active-work band's colour (the team's). */
+  flowColor: Rgb;
   strands: Strands;
 }
 
-const MAX_LIGHTS = 16;
+const MAX_LIGHTS = 24;
 const MAX_SHADOWS = 16;
-const MAX_FLOWS = 16;
+/** #2020: a wide team (~20 workers) keeps every strand's own life; strands past it read dry. */
+const MAX_FLOWS = 32;
+/** The flow id of strands past MAX_FLOWS. */
+const OVER_FLOW = 255;
 
 const HEADER = `#version 300 es
 precision highp float;
@@ -100,10 +113,11 @@ uniform sampler2D uGN; uniform sampler2D uGC; uniform sampler2D uGX;
 uniform float uTile;
 uniform sampler2D uSH; uniform sampler2D uSF;
 uniform vec2 uSTex; uniform float uSHk;
-uniform vec3 uStrandAlb; uniform float uStrandRough; uniform vec3 uStrandGlow;
+uniform vec3 uStrandAlb; uniform float uStrandRough; uniform vec3 uStrandGlow; uniform vec3 uStrandDry; uniform float uDryRough;
 uniform vec3 uEmit; uniform vec2 uCore; uniform float uBeat; uniform float uVig;
 uniform int uNB; uniform vec4 uBS[${MAX_SHADOWS}]; uniform vec4 uBX[${MAX_SHADOWS}];
-uniform int uNR; uniform vec4 uRoute[${MAX_FLOWS}]; uniform vec3 uFlowCol[${MAX_FLOWS}]; uniform vec3 uPackCol[${MAX_FLOWS}];
+uniform int uNR; uniform vec4 uRoute[${MAX_FLOWS}]; uniform vec4 uLife[${MAX_FLOWS}]; uniform vec3 uFlowCol;
+uniform vec4 uLH[${MAX_LIGHTS / 4}];
 out vec4 outColor;
 
 void main() {
@@ -120,12 +134,17 @@ void main() {
   vec2 suv = css / uView;
   vec4 s = texture(uSH, suv);
   float s0 = s.r;
+  // #2020: the strand's life (Core's own veins and the ground off the strands: 1, as before)
+  vec4 f = texture(uSF, suv);
+  int id = int(f.g * 255.0 + 0.5) - 1;
+  float life = id == ${OVER_FLOW - 1} ? 0.0 : id >= 0 && id < uNR ? uLife[id].a : 1.0;
   float sx = texture(uSH, suv + vec2(uSTex.x, 0.0)).r - texture(uSH, suv - vec2(uSTex.x, 0.0)).r;
   float sy = texture(uSH, suv + vec2(0.0, uSTex.y)).r - texture(uSH, suv - vec2(0.0, uSTex.y)).r;
-  float on = smoothstep(0.02, 0.4, s0);
-  n = normalize(vec3(n.xy * (1.0 - 0.8 * on) - vec2(sx, sy) * uSHk, n.z));
-  alb = mix(alb, uStrandAlb, on * 0.85);
-  rough = mix(rough, uStrandRough, on);
+  // A dry strand is thinner and flatter: only the tube's crest stays on.
+  float on = smoothstep(mix(0.5, 0.02, life), mix(0.85, 0.4, life), s0);
+  n = normalize(vec3(n.xy * (1.0 - 0.8 * on) - vec2(sx, sy) * uSHk * mix(0.5, 1.0, life), n.z));
+  alb = mix(alb, mix(uStrandDry, uStrandAlb, life), on * 0.85);
+  rough = mix(rough, mix(uDryRough, uStrandRough, life), on);
   thick = mix(thick, 0.5, on);
   ao *= 1.0 - 0.35 * smoothstep(0.0, 0.1, s0) * (1.0 - smoothstep(0.1, 0.45, s0));
 
@@ -147,18 +166,23 @@ void main() {
     float ph = fract(uBeat + float(k) * 0.5);
     wave += exp(-pow((dc - ph * 560.0) / 34.0, 2.0)) * (1.0 - ph) * (1.0 - ph);
   }
-  vec3 E = uEmit * emit * (0.035 + 0.7 * wave) * (1.0 - 0.6 * on);
+  vec3 E = uEmit * emit * (0.035 + 0.7 * wave) * (1.0 - mix(0.95, 0.6, life) * on);
 
-  vec4 f = texture(uSF, suv);
-  int id = int(f.g * 255.0 + 0.5) - 1;
   if (id >= 0 && id < uNR && on > 0.01) {
     vec4 R = uRoute[id];
     float along = f.r + f.b / 255.0;
     float band = R.x * pow(0.5 + 0.5 * sin((along * R.z / 46.0 - uTime * 1.5) * 6.2831), 5.0);
     float pk = R.y >= 0.0 ? exp(-pow((along - R.y) * R.z / 10.0, 2.0)) : 0.0;
-    E += (uFlowCol[id] * band * 0.9 + uPackCol[id] * pk * R.w) * on;
+    // #2020: a live strand glows in its colour (still under reduced motion) and carries the band.
+    E += (uLife[id].rgb * uLife[id].a * 0.55 * smoothstep(0.1, 0.7, s0) + uFlowCol * band * 1.6 + uLife[id].rgb * pk * R.w) * on;
   }
-  E += uStrandGlow * on * smoothstep(0.15, 0.8, s0);
+  E += uStrandGlow * on * smoothstep(0.15, 0.8, s0) * life;
+  // #2020: a live sac's light pools on the ground around it.
+  for (int i = 0; i < ${MAX_LIGHTS}; i++) {
+    if (i >= uNL) break;
+    float hk = uLH[i / 4][i % 4];
+    if (hk > 0.0) E += uLC[i].rgb * hk * exp(-pow(length(css - uLP[i].xy) / uLP[i].w, 2.0));
+  }
 
   vec3 P = vec3(css, (hgt * 4.0 + s0 * 3.0) * uUnit);
   lightAll(P, n, rough, 0.45 * thick);
@@ -188,6 +212,7 @@ void main() {
 
 const BODY_FS = HEADER + `
 uniform sampler2D uBN; uniform sampler2D uBC; uniform sampler2D uBX;
+// uMat: translucency, #2020 dim (a dormant sac's albedo darkening), alpha, desaturation
 uniform vec4 uBody; uniform vec4 uState; uniform vec4 uMat; uniform vec4 uAnim;
 in vec2 vUV; in vec2 vCss;
 out vec4 outColor;
@@ -205,7 +230,7 @@ void main() {
   float hgt = (x.a * 255.0 - 1.0) / 254.0;
   vec3 P = vec3(vCss, hgt * uAnim.y);
   lightAll(P, n, x.b, uMat.x * x.g * 0.8);
-  vec3 alb = mix(c.rgb, vec3(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722))), uMat.w);
+  vec3 alb = mix(c.rgb, vec3(dot(c.rgb, vec3(0.2126, 0.7152, 0.0722))), uMat.w) * (1.0 - uMat.y);
   float F = 0.04 + 0.96 * pow(1.0 - clamp(n.z, 0.0, 1.0), 5.0);
   vec3 col = alb * (uAmb * c.a + gDiff) + gSpec * uSpec * (0.35 + F);
   col += alb * gTrans * uMat.x * x.g * 0.5;
@@ -246,6 +271,7 @@ const AMBIENT = scale(linear(LOOK.ambient), LOOK.ambientK);
 const EMIT = linear(LOOK.emit);
 const STRAND_ALB = linear(LOOK.strand.albedo);
 const STRAND_GLOW = scale(linear(LOOK.strand.glow), LOOK.strand.glowK);
+const STRAND_DRY = linear(LOOK.strand.dry);
 
 /** The relief's resolution (× CSS px). */
 const strandRes = (cssW: number) => Math.min(1, Math.max(0.4, 1600 / Math.max(1, cssW)));
@@ -364,8 +390,9 @@ export class LitLayer {
     fg.fillStyle = "#000"; fg.fillRect(0, 0, w, h);
     fg.setTransform(k * unit, 0, 0, k * unit, 0, 0);
     fg.lineCap = "round";
-    fg.lineWidth = LOOK.strand.width * 2.4;
-    s.routes.slice(0, MAX_FLOWS).forEach((route, i) => {
+    fg.lineWidth = LOOK.strand.width * 1.3;
+    s.routes.forEach((route, i) => {
+      const id = i < MAX_FLOWS ? i + 1 : OVER_FLOW;
       const total = pathLength(route) || 1;
       let acc = 0;
       for (let j = 1; j < route.length; j++) {
@@ -374,7 +401,7 @@ export class LitLayer {
         const u = (acc + len / 2) / total;
         acc += len;
         const hi = Math.min(255, Math.floor(u * 255));
-        fg.strokeStyle = `rgb(${hi},${i + 1},${Math.round((u * 255 - hi) * 255)})`;
+        fg.strokeStyle = `rgb(${hi},${id},${Math.round((u * 255 - hi) * 255)})`;
         fg.beginPath(); fg.moveTo(a.x, a.y); fg.lineTo(b.x, b.y); fg.stroke();
       }
     });
@@ -454,6 +481,11 @@ export class LitLayer {
     gl.uniform3fv(g.u("uStrandAlb"), STRAND_ALB);
     gl.uniform1f(g.u("uStrandRough"), LOOK.strand.rough);
     gl.uniform3fv(g.u("uStrandGlow"), STRAND_GLOW);
+    gl.uniform3fv(g.u("uStrandDry"), STRAND_DRY);
+    gl.uniform1f(g.u("uDryRough"), LOOK.strand.dryRough);
+    const halos = new Float32Array(MAX_LIGHTS);
+    scene.lights.slice(0, MAX_LIGHTS).forEach((l, i) => { halos[i] = l.halo ?? 0; });
+    gl.uniform4fv(g.u("uLH"), halos);
     gl.uniform3fv(g.u("uEmit"), EMIT);
     // No Core: the rings start far off and never reach the board.
     gl.uniform2f(g.u("uCore"), scene.core?.x ?? -1e5, scene.core?.y ?? -1e5);
@@ -469,9 +501,9 @@ export class LitLayer {
     gl.uniform1i(g.u("uNR"), flows.length);
     if (flows.length) {
       gl.uniform4fv(g.u("uRoute"), flows.flatMap((r) => [r.flow, r.packet, r.length, r.packetK]));
-      gl.uniform3fv(g.u("uFlowCol"), flows.flatMap((r) => r.flowColor));
-      gl.uniform3fv(g.u("uPackCol"), flows.flatMap((r) => r.packetColor));
+      gl.uniform4fv(g.u("uLife"), flows.flatMap((r) => [...r.color, r.life]));
     }
+    gl.uniform3fv(g.u("uFlowCol"), scene.flowColor);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     const b = this.body;
@@ -485,7 +517,7 @@ export class LitLayer {
       this.bind(b, 2, "uBX", this.tex.get(`${body.kind}.x`)!);
       gl.uniform4f(b.u("uBody"), body.x, body.y, body.size, body.rot);
       gl.uniform4f(b.u("uState"), ...body.state, body.intensity);
-      gl.uniform4f(b.u("uMat"), body.translucency, 0, body.alpha, body.desat);
+      gl.uniform4f(b.u("uMat"), body.translucency, body.dim, body.alpha, body.desat);
       gl.uniform4f(b.u("uAnim"), body.pulse, body.height, 0, 0);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
