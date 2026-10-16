@@ -204,6 +204,7 @@ pub enum ProjectError {
     RootConflict,
     Mismatch,
     BranchMismatch,
+    CategoryUnset,
 }
 impl ProjectError {
     pub fn code(self) -> &'static str {
@@ -215,6 +216,7 @@ impl ProjectError {
             Self::RootConflict => "project_root_conflict",
             Self::Mismatch => "project_mismatch",
             Self::BranchMismatch => "project_branch_mismatch",
+            Self::CategoryUnset => "project_category_unset",
         }
     }
     /// #838 G2: an error string of the project APIs back to its code (RPC `{code,message}`).
@@ -227,6 +229,7 @@ impl ProjectError {
             Self::RootConflict,
             Self::Mismatch,
             Self::BranchMismatch,
+            Self::CategoryUnset,
         ]
         .into_iter()
         .find(|e| e.code() == code)
@@ -907,16 +910,23 @@ impl crate::Core {
         if team.kind != "main" {
             return Err("project_not_found".into());
         }
-        let workspace = team.workspace_root.ok_or("project_unavailable")?;
-        let workspace = PathBuf::from(crate::teams::normalize_dir(&workspace).map_err(|_| "project_unavailable")?);
+        // The recorded category root is a real, patron-chosen folder (the legacy app-data
+        // placeholder never reaches here: `get_team` presents it as unset). It may have been
+        // deleted since it was recorded — recreate it instead of failing; only a missing or
+        // unusable root is `project_category_unset`, never `project_unavailable`.
+        let workspace = team.workspace_root.ok_or("project_category_unset")?;
+        if !Path::new(&workspace).exists() {
+            std::fs::create_dir_all(&workspace).map_err(|_| "project_category_unset")?;
+        }
+        let workspace = PathBuf::from(crate::teams::normalize_dir(&workspace).map_err(|_| "project_category_unset")?);
         let name = crate::teams::folder_name(&input.name)?;
         let root = workspace.join(name);
         match std::fs::create_dir(&root) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err("project_unavailable".into()),
+            Err(e) => return Err(format!("klasör oluşturulamadı: {e}")),
         }
-        let root = crate::teams::normalize_dir(&root.to_string_lossy()).map_err(|_| "project_unavailable")?;
+        let root = crate::teams::normalize_dir(&root.to_string_lossy()).map_err(|_| "project_category_unset")?;
         if !Path::new(&root).starts_with(&workspace) {
             return Err("project_root_conflict".into());
         }
@@ -1482,6 +1492,32 @@ pub(crate) mod tests {
         assert_eq!(p.name,"New App");
         assert_eq!(core.project_create_folder("default",NewProject {name:" /:*?".into(),worktrees:None},None).unwrap_err(),"invalid_folder_name");
         core.shutdown();
+    }
+
+    /// #2137: no recorded category root is `project_category_unset` (never the placeholder, never
+    /// `project_unavailable`); a recorded root deleted since is recreated and the project binds.
+    #[test]
+    fn core_create_folder_needs_a_real_category_root_and_recreates_it() {
+        let f = Fixture::new();
+        let state = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp/project-core-2137").join(std::process::id().to_string());
+        let _ = std::fs::remove_dir_all(&state);
+        let core = crate::Core::start(crate::Paths {data_dir:state.join("data"),config_dir:state.join("config")},crate::Events::new(crate::events::NullSink)).unwrap();
+        let new = |name: &str| NewProject {name:name.into(),worktrees:None};
+        crate::db::with(&core.db, |c| c.execute("UPDATE teams SET workspace_root=NULL WHERE id='default'", []).map_err(|e| e.to_string())).unwrap();
+        assert_eq!(core.project_create_folder("default",new("JezSTT"),None).unwrap_err(),"project_category_unset");
+        assert!(!state.join("data").join("teams/default/workspace/JezSTT").exists(), "no folder under the app-data placeholder");
+
+        let workspace = f.0.join("category");
+        std::fs::create_dir(&workspace).unwrap();
+        let canonical = crate::teams::normalize_dir(workspace.to_str().unwrap()).unwrap();
+        core.team_update("default",crate::teams::TeamPatch {workspace_root:Some(Some(canonical)),..Default::default()}).unwrap();
+        std::fs::write(f.0.join(".git"),"gitdir: missing-fixture-git-dir").unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let p = core.project_create_folder("default",new("JezSTT"),None).unwrap();
+        assert!(workspace.join("JezSTT").is_dir());
+        assert_eq!(p.root_path,Some(crate::teams::normalize_dir(workspace.join("JezSTT").to_str().unwrap()).unwrap()));
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     /// Closes a session without its exit starting queued work (as agents.rs's tests do).

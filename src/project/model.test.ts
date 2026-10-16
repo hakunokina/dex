@@ -55,6 +55,7 @@ describe("proje listesi ve hata", () => {
     assert.equal(isUnknownMethod(new Error("bilinmeyen metot: project_list"), "project_list"), true);
     assert.equal(isUnknownMethod(new Error("bağlantı yok"), "project_list"), false);
     assert.match(projectErrorText("project_busy"), /süren iş/);
+    assert.match(projectErrorText("project_category_unset"), /kategori kökü/);
     assert.equal(projectErrorText(new Error("sunucu kapalı")), "sunucu kapalı");
     assert.equal(folderName("C:\\repo\\site\\"), "site");
   });

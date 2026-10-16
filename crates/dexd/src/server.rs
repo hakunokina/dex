@@ -964,9 +964,9 @@ fn handle(srv: &Server, conn: &Conn, req: &Request) -> Result<Value, Error> {
                 if m == "team_update" {
                     if let Some(raw) = p.pointer("/patch/workspaceRoot").and_then(Value::as_str) {
                         if roots.check(raw).is_err() {
-                            let team = dex_core::db::with(&srv.core.db, |c| dex_core::teams::get_team(c,&srv.core.paths.data_dir,team_id.ok_or("team_not_found")?)).map_err(Error::failed)?;
+                            let adoptable = dex_core::db::with(&srv.core.db, |c| dex_core::teams::remote_adoptable_suggestion(c,&srv.core.paths.data_dir,team_id.ok_or("team_not_found")?)).map_err(Error::failed)?;
                             let normalized = dex_core::teams::normalize_dir(raw).map_err(Error::failed)?;
-                            if team.suggested_workspace_root.as_deref() != Some(normalized.as_str()) {
+                            if adoptable.as_deref() != Some(normalized.as_str()) {
                                 return Err(Error::failed("workspace root izinli klasörlerin dışında"));
                             }
                         }
@@ -1252,6 +1252,30 @@ mod tests {
         assert!(methods::METHODS.contains(&"team_folder_preview"));
         assert!(rpc("team_folder_preview", json!({})).is_err());
         assert_eq!(rpc("team_folder_preview", json!({"name":"   "})).unwrap_err().message, "invalid_folder_name");
+        core.shutdown();
+    }
+
+    /// Lens #2146: the wider #2137 suggestion (a non-`<Name>Main` project's parent) is UI advice —
+    /// a remote client cannot adopt it outside its roots; the local desktop still can.
+    #[test]
+    fn remote_cannot_adopt_wide_suggestion_outside_roots() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp/team-rpc-2147").join(std::process::id().to_string());
+        let core = Core::start_bare(Paths {data_dir:base.join("data"),config_dir:base.join("config")},Events::new(dex_core::events::NullSink)).unwrap();
+        let category = base.join("JezDev");
+        std::fs::create_dir_all(category.join("no-more-clickbait")).unwrap();
+        let t = core.team_create(serde_json::from_value(json!({"name":"Jez Dev","kind":"main","cwd":category.join("no-more-clickbait")})).unwrap()).unwrap();
+        let normalized = dex_core::teams::normalize_dir(&category.to_string_lossy()).unwrap();
+        assert_eq!(t.suggested_workspace_root.as_deref(), Some(normalized.as_str()));
+        let (tx,_rx) = tokio::sync::mpsc::unbounded_channel();
+        let conn = Conn {closed:AtomicBool::new(false),tx,chans:Arc::new(Mutex::new(HashMap::new())),client:"test".into(),view_client:"test-view".into(),view_state:Mutex::new(ViewState::default())};
+        let patch = json!({"id":t.id,"patch":{"workspaceRoot":category}});
+        let remote = Server::from_core(core.clone(),base.join("dexd.db"),Roots::new(&[base.join("global")]).unwrap()).unwrap();
+        let denied = handle(&remote,&conn,&Request {id:json!(1),method:"team_update".into(),params:patch.clone()}).unwrap_err();
+        assert_eq!(denied.message,"workspace root izinli klasörlerin dışında");
+        let local = Server::local(core.clone(),LocalToken::new().unwrap().0).unwrap();
+        let adopted = handle(&local,&conn,&Request {id:json!(1),method:"team_update".into(),params:patch}).unwrap();
+        assert_eq!(adopted["workspaceRoot"],normalized);
+        assert!(adopted["suggestedWorkspaceRoot"].is_null());
         core.shutdown();
     }
 
