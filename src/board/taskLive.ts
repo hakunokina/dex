@@ -46,10 +46,21 @@ export function taskLive(
     if (newest.status === "running" && st === "working") return { kind: "working", delegationId: newest.id };
     return { kind: "queued", delegationId: newest.id };
   }
-  // Devretme bitti ama görev hâlâ açık: dalı birleşmedi.
-  if (finished(newest.status) && task.status !== "done") return { kind: "merge", delegationId: newest.id };
+  // Devretme bitti, kart Sürüyor'da: dalı birleşmedi. (Yapılacak'taki raporsuz kartın dalı beklemez.)
+  if (finished(newest.status) && task.status === "doing") return { kind: "merge", delegationId: newest.id };
   return { kind: null, delegationId: newest.id };
 }
+
+/** #2104: kartın başındaki numara: bağlı işin `#2077`'si, işsiz kartta pano görevinin `T#928`'i. */
+export function cardNumber(task: Pick<Task, "id" | "delegationId">, live: Pick<LiveState, "delegationId">): string {
+  const job = live.delegationId ?? task.delegationId ?? null;
+  return job != null ? `#${job}` : `T#${task.id}`;
+}
+
+export const CLOSED_LABEL: Record<NonNullable<Task["closedReason"]>, string> = {
+  cancelled: "İptal",
+  superseded: "Yerine yenisi açıldı",
+};
 
 const HEADING = /^#{1,6}\s/;
 const LIST_MARK = /^([-*+]|\d+[.)])\s+/;

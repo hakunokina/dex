@@ -21,7 +21,7 @@ import { jobProjectName, useTeamProjects } from "../project/store";
 import "../project/project.css";
 import { PanelsTopLeft, Trash2, X } from "lucide-react";
 import { taskRoleName } from "./taskRole";
-import { LIVE_LABEL, doingRank, plainPreview, taskLive, type LiveState } from "./taskLive";
+import { CLOSED_LABEL, LIVE_LABEL, cardNumber, doingRank, plainPreview, taskLive, type LiveState } from "./taskLive";
 
 const COLUMNS: { status: TaskStatus; label: string }[] = [
   { status: "todo", label: "Yapılacak" },
@@ -295,23 +295,21 @@ function Card({ task, live, progress, role, cost, editing, dragging, onPatch, on
   const project = jobProjectName(task); // #838: only where the team has several projects
   const preview = task.description ? plainPreview(task.description) : "";
   const stopDrag = (e: React.SyntheticEvent) => e.stopPropagation(); // numara seçilir/kopyalanır, kart sürüklenmez
+  const num = cardNumber(task, live);
   return (
     <div className={`board-card${dragging ? " dragging" : ""}${editing ? " editing" : ""}`} {...pointer}>
-      {(live.delegationId != null || live.kind) && (
-        <div className="board-card-top">
-          {live.delegationId != null && (
-            <span className="board-num" title="İş numarası (seçip kopyalayabilirsin)"
-              onPointerDown={stopDrag} onPointerMove={stopDrag} onPointerUp={stopDrag}>
-              #{live.delegationId}
-            </span>
-          )}
-          {live.kind && (
-            <span className={`board-live ${live.kind}`} title={LIVE_LABEL[live.kind]}>
-              <i className="dot" aria-hidden="true" />{LIVE_LABEL[live.kind]}
-            </span>
-          )}
-        </div>
-      )}
+      <div className="board-card-top">
+        <span className="board-num" title={num.startsWith("T#") ? "Görev numarası (bağlı iş yok)" : "İş numarası (seçip kopyalayabilirsin)"}
+          onPointerDown={stopDrag} onPointerMove={stopDrag} onPointerUp={stopDrag}>
+          {num}
+        </span>
+        {live.kind && (
+          <span className={`board-live ${live.kind}`} title={LIVE_LABEL[live.kind]}>
+            <i className="dot" aria-hidden="true" />{LIVE_LABEL[live.kind]}
+          </span>
+        )}
+        {task.closedReason && <span className="board-closed">{CLOSED_LABEL[task.closedReason]}</span>}
+      </div>
       {editing ? (
         <input
           className="board-card-title-input"

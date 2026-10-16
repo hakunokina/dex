@@ -13,6 +13,10 @@ export interface Task {
   teamId: string | null;
   /** #838: the project the task belongs to (qualified); absent from older hosts. */
   projectId?: string | null;
+  /** #2104: the card's newest job (its number), from the host's DB; absent from older hosts. */
+  delegationId?: number | null;
+  /** #2104: a closed card that is not done work: the leader's cancel or a same-titled replacement. */
+  closedReason?: "cancelled" | "superseded" | null;
   createdAt: number;
   updatedAt: number;
 }

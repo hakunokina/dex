@@ -493,7 +493,15 @@ fn cancel(conn: &Connection, job: &Job, reason: &str) -> Result<String, String> 
         delegate::sync_task(conn, d.id)?;
     }
     let Some(it) = &job.item else {
-        return Ok("iş kapandı (failed), başlamadı; pano kartı yapılacaklara döndü.".into());
+        // #2104: a patron-approved cancel closes the card; it is no work waiting in "Yapılacak".
+        if let Some(t) = job.task() {
+            conn.execute(
+                "UPDATE tasks SET status='done', closed_reason='cancelled', updated_at=?2 WHERE id=?1",
+                params![t, now()],
+            )
+            .map_err(e)?;
+        }
+        return Ok("iş kapandı (failed), başlamadı; pano kartı iptal olarak kapandı.".into());
     };
     conn.execute("UPDATE plan_items SET status='failed' WHERE id=?1", [it.id]).map_err(e)?;
     set_task(conn, job, tasks::TaskPatch { status: Some("todo".into()), ..Default::default() })?;
@@ -678,7 +686,8 @@ mod tests {
         let after = delegate::get(&c, d.id).unwrap();
         assert_eq!(after.status, "failed");
         assert!(after.summary.unwrap().contains("gereksiz"));
-        assert_eq!(tasks::get(&c, after.task_id.unwrap()).unwrap().status, "todo");
+        let card = tasks::get(&c, after.task_id.unwrap()).unwrap();
+        assert_eq!((card.status.as_str(), card.closed_reason.as_deref()), ("done", Some("cancelled")), "#2104: closed, not back in todo");
         assert!(delegate::take_unnotified(&c, "timur").unwrap().is_empty(), "heard once, as the note");
         assert!(notes(&c).contains("ONAYLANDI ve uygulandı"));
         assert!(crate::proposals::decide(&c, Path::new("."), p.id, true, None).is_err(), "decided once");

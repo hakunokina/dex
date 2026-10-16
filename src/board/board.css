@@ -69,6 +69,8 @@
 .board-live.working { color: var(--text); border-color: var(--line-strong); }
 .board-live.working .dot { background: var(--green); }
 .board-live.patron .dot { background: var(--amber); }
+/* #2104: iptal / yerine yenisi açılmış kapalı kart (Bitti'de, iş değil). */
+.board-closed { font-size: var(--fs-xs); color: var(--muted); border: 1px dashed var(--line); border-radius: var(--r-sm); padding: 0 5px; white-space: nowrap; }
 .board-doing-count { font-weight: var(--fw-normal); text-transform: none; letter-spacing: normal; }
 .board-doing-count b { color: var(--text-2); font-variant-numeric: tabular-nums; }
 .board-card-title-input { width: 100%; height: var(--ctl-h-sm); padding: 0 5px; font-weight: var(--fw-semibold); }

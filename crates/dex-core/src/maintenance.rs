@@ -58,8 +58,23 @@ fn sweep_root(
                 };
                 if entry.reason == Reason::Removed {
                     with(db, |c| {
+                        let path = entry.path.to_string_lossy();
+                        // #2104: a finished job's card waited for this branch; it has no tree now.
+                        let mut st = c
+                            .prepare("SELECT w.delegation_id FROM delegation_worktrees w JOIN delegations d ON d.id=w.delegation_id
+                                      WHERE w.path=?1 AND w.removed_at IS NULL AND d.status='done'")
+                            .map_err(|e| e.to_string())?;
+                        let rows = st.query_map([&path], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())?;
+                        let mut done = Vec::new();
+                        for id in rows {
+                            done.push(id.map_err(|e| e.to_string())?);
+                        }
                         c.execute("UPDATE delegation_worktrees SET removed_at=?2 WHERE path=?1 AND removed_at IS NULL",
-                        params![entry.path.to_string_lossy(), crate::diagnostics::now_ms() as i64]).map_err(|e| e.to_string())
+                        params![path, crate::diagnostics::now_ms() as i64]).map_err(|e| e.to_string())?;
+                        for id in done {
+                            crate::delegate::sync_task(c, id)?;
+                        }
+                        Ok(())
                     })?;
                 }
             }
@@ -430,11 +445,13 @@ impl crate::Core {
                     break;
                 }
                 if checked.as_ref() != Some(&day) {
-                    if run_due(&core.db, &day, SystemTime::now(), &|| {
+                    let ran = run_due(&core.db, &day, SystemTime::now(), &|| {
                         core.ptys.list().into_iter().map(|p| p.id).collect()
-                    })
-                    .is_err()
-                    {
+                    });
+                    if matches!(ran, Ok(Some(ref s)) if s.deleted > 0) {
+                        core.changed("tasks-changed"); // #2104: a removed tree may have closed a card
+                    }
+                    if ran.is_err() {
                         crate::diagnostics::event(
                             "maintenance",
                             serde_json::json!({"reason":"db_error"}),

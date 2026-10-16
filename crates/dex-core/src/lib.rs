@@ -920,6 +920,7 @@ impl Core {
             eprintln!("dex: {}", l.text);
         }
         self.changed("teams-changed");
+        self.changed("tasks-changed"); // #2104: a stuck card may have closed
     }
 
     /// At startup no worker session survives: open rows are closed so leaders hear about them.

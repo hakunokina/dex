@@ -829,13 +829,30 @@ pub(crate) fn auto_task(
     conn.execute("UPDATE tasks SET project_id=?2 WHERE id=?1", params![task.id, snapshot.project_id])
         .map_err(e)?;
     task.project_id = snapshot.project_id.clone();
+    close_superseded(conn, &task)?;
     Ok(task)
+}
+
+/// #2104: the leader sent a failed/unreported job again without its `taskId`: the older
+/// same-titled card of the team/project whose newest job did not succeed is closed, not left in
+/// "Yapılacak" next to its replacement. Plan cards stay with `plan::step`.
+fn close_superseded(conn: &Connection, new: &crate::db::tasks::Task) -> Result<(), String> {
+    conn.execute(
+        "UPDATE tasks SET status='done', closed_reason='superseded', updated_at=?5
+         WHERE id < ?1 AND status='todo' AND team_id IS ?2 AND project_id IS ?3 AND title = ?4
+           AND (SELECT x.status FROM delegations x WHERE x.task_id = tasks.id ORDER BY x.id DESC LIMIT 1) IN ('failed','done_no_report')
+           AND NOT EXISTS (SELECT 1 FROM plan_items i WHERE i.task_id = tasks.id)",
+        params![new.id, new.team_id, new.project_id, new.title, now()],
+    )
+    .map_err(e)?;
+    Ok(())
 }
 
 /// #1768: sıradan bir devretme (inceleme ya da plan öğesi değil) kapandığında
 /// bağlı pano kartını günceller: `done` + (dalsız ya da birleşmiş) → `done`;
 /// `failed` / `done_no_report` → `todo`. Açık dal varken `done` kartı `doing`
-/// bırakır (birleştirmede `done` olur). Kart yoksa/silinmişse no-op.
+/// bırakır (birleştirmede `done` olur). Kart yoksa/silinmişse ya da kapatılmışsa
+/// (#2104 `closed_reason`) no-op.
 pub(crate) fn sync_task(conn: &Connection, id: i64) -> Result<(), String> {
     let d = get(conn, id)?;
     let Some(task) = d.task_id else { return Ok(()) };
@@ -848,8 +865,10 @@ pub(crate) fn sync_task(conn: &Connection, id: i64) -> Result<(), String> {
     if plan_owned {
         return Ok(()); // plan kartını plan::step yönetir
     }
-    if crate::db::tasks::get(conn, task).is_err() {
-        return Ok(());
+    match crate::db::tasks::get(conn, task) {
+        // #2104: a cancelled/superseded card stays closed; a late event of its job must not reopen it.
+        Ok(t) if t.closed_reason.is_none() => {}
+        _ => return Ok(()),
     }
     let done = match d.status.as_str() {
         "done" => {
@@ -2823,6 +2842,39 @@ mod tests {
             sync_task(&c, d.id).unwrap();
             assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "todo", "{end}");
         }
+    }
+
+    #[test]
+    fn new_same_titled_card_closes_the_failed_one_and_a_closed_card_stays_closed() {
+        let c = mem();
+        let card = |title: &str| auto_task(&c, "kaan", "default", Some(title), "x", None, &snap()).unwrap().id;
+        let (old, unreported, running, other) = (card("gitleaks"), card("gitleaks"), card("gitleaks"), card("başka"));
+        let failed = job_with_task(&c, old);
+        set_status(&c, failed.id, "failed").unwrap();
+        sync_task(&c, failed.id).unwrap();
+        let d = job_with_task(&c, unreported);
+        set_status(&c, d.id, "done_no_report").unwrap();
+        sync_task(&c, d.id).unwrap();
+        job_with_task(&c, running);
+        let o = job_with_task(&c, other);
+        set_status(&c, o.id, "failed").unwrap();
+        sync_task(&c, o.id).unwrap();
+        let get = |t: i64| crate::db::tasks::get(&c, t).unwrap();
+        assert_eq!((get(old).status, get(unreported).status), ("todo".into(), "todo".into()));
+        let new = card("gitleaks");
+        for t in [old, unreported] {
+            assert_eq!((get(t).status.as_str(), get(t).closed_reason.as_deref()), ("done", Some("superseded")), "{t}");
+        }
+        assert_eq!((get(running).status, get(running).closed_reason), ("doing".into(), None), "a live job's card stays");
+        assert_eq!((get(other).status, get(other).closed_reason), ("todo".into(), None), "another title stays");
+        assert_eq!(get(new).status, "doing");
+        // A late event of the replaced job does not reopen its card.
+        sync_task(&c, failed.id).unwrap();
+        assert_eq!(get(old).status, "done");
+        // Moved back by hand: open again, the reason goes (tasks_reopen).
+        crate::db::tasks::update(&c, old, crate::db::tasks::TaskPatch { status: Some("todo".into()), ..Default::default() }).unwrap();
+        assert_eq!((get(old).status, get(old).closed_reason), ("todo".into(), None));
+        assert_eq!(get(old).delegation_id, Some(failed.id), "the card's number is its newest job");
     }
 
     #[test]
