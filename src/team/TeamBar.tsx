@@ -20,7 +20,7 @@ import {
   setAgentChain, useTeams,
 } from "./store";
 import "./team.css";
-import { Server, X } from "lucide-react";
+import { Plus, Server, X } from "lucide-react";
 import { getSnapshot as getLayoutSnapshot, subscribe as subscribeLayout } from "../layout/store";
 import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../layout/panels";
 import { isActive } from "../layout/rackOrder";
@@ -162,6 +162,11 @@ export function TeamTabs({ onOpenTeamSettings }: { onOpenTeamSettings: () => voi
             </Fragment>
           );
         })}
+        {/* #2138: last in DOM = leftmost (row-reverse), right beside the newest team; scrolls with the tabs. */}
+        {teams.length > 0 && <button type="button" className="team-tab team-new" onClick={() => { setPresetHost(null); setSourceId(undefined); setMenu("new"); }}
+          title="Yeni takım" aria-label="Yeni takım">
+          <Plus aria-hidden="true" />
+        </button>}
       </div>
       {context && <div className="team-pop team-context" role="menu" aria-label="Takım işlemleri"
         onKeyDown={e => { if (e.key === "Escape") { e.stopPropagation(); closeContext(); } }}

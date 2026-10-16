@@ -17,6 +17,9 @@
   content: ""; position: absolute; left: var(--sp-2); right: var(--sp-2); bottom: -3px; height: 2px;
   border-radius: var(--r-pill); background: var(--team); box-shadow: 0 0 6px var(--team-glow);
 }
+/* #2138: "+ Yeni takım" — a square tab, same height/hover as the team tabs. */
+.team-new { width: var(--ctl-h); padding: 0; justify-content: center; }
+.team-new svg { width: 14px; height: 14px; }
 .team-kind { font: var(--fw-semibold) var(--fs-2xs) var(--font-mono); color: var(--muted); background: var(--hover); border-radius: var(--r-xs); padding: 0 4px; text-transform: uppercase; }
 /* Modern §7: the team's badge — soft fill + light ink, legible on every accent (white on cyan/green is not). */
 .team-live { font: var(--fw-semibold) 10px/12px var(--font-mono); color: var(--team-hi); background: var(--team-soft); border: 1px solid var(--team-line); border-radius: var(--r-pill); padding: 0 5px; min-width: 14px; text-align: center; }

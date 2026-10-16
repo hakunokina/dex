@@ -89,7 +89,15 @@ test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi
   await expect(kart).toContainText("çalışıyor");
   await expect(kart).toContainText("boşta");
   await expect(kart).not.toContainText("bekliyor");
-  for (const b of ["Görevler", "Yeni takım", "Tüm worker'lar", "Takım ayarları", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  for (const b of ["Görevler", "Tüm worker'lar", "Takım ayarları", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  // #2138: "Yeni takım" left the Kart for the header: a "+" right left of the newest (leftmost) team tab.
+  await expect(kart.getByRole("button", { name: "Yeni takım", exact: true })).toHaveCount(0);
+  const tabsNav = app.getByRole("navigation", { name: "Takımlar" });
+  const plus = tabsNav.getByRole("button", { name: "Yeni takım", exact: true });
+  await expect(plus).toBeVisible();
+  const plusBox = (await plus.boundingBox())!;
+  const teamTabs = await tabsNav.locator(".team-tab:not(.team-new)").evaluateAll((els) => els.map((e) => e.getBoundingClientRect().left));
+  expect(plusBox.x + plusBox.width).toBeLessThanOrEqual(Math.min(...teamTabs));
   // Tüm worker'lar: popover düğmenin yerinde açılır, seçimler içinde, Esc odağı düğmeye döndürür.
   const bulkBtn = kart.getByRole("button", { name: "Tüm worker'lar", exact: true });
   await bulkBtn.click();
@@ -188,7 +196,7 @@ test("eski host (project_list yok): ana takım klasör seçilmeden oluşturulama
   await app.addInitScript(() => { window.__dexOld = { hide: ["project_list"] }; });
   await app.reload();
   await openTeam(app, team.name);
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
+  await app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
   await app.getByRole("textbox", { name: "Ad" }).fill("Klasörsüz olmaz");
   await expect(app.getByText("klasör seçilmedi", { exact: true })).toBeVisible();
   const create = app.getByRole("button", { name: "Oluştur", exact: true });
@@ -211,7 +219,7 @@ test("eski host (profile yok): Eğitim engellenir, geliştirici oluşturma korun
   await app.reload();
   await app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: new RegExp(`^${team.name}`) }).first().click();
   await app.setViewportSize({ width: 390, height: 780 });
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).focus();
+  await app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: "Yeni takım", exact: true }).focus();
   await app.keyboard.press("Enter");
   const form = app.getByRole("dialog", { name: "Yeni takım", exact: true });
   const host = form.getByRole("combobox", { name: "Takımın host'u", exact: true });
