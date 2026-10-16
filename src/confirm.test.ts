@@ -10,13 +10,13 @@ const root = new URL(".", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$
 function sources(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
     const path = join(dir, e.name);
-    if (e.isDirectory()) return e.name === "mobile" ? [] : sources(path); // Android: no plugin override
+    if (e.isDirectory()) return sources(path); // mobile too: the Android WebView would show its native box
     return /\.tsx?$/.test(e.name) && !/\.test\.tsx?$/.test(e.name) && e.name !== "confirm.ts" ? [path] : [];
   });
 }
 
 describe("onay soruları", () => {
-  it("masaüstü kodunda çıplak confirm() yok; askConfirm her yerde await edilir", () => {
+  it("hiçbir yerde (mobil dahil) çıplak confirm() yok; askConfirm her yerde await edilir", () => {
     const raw: string[] = [];
     const unawaited: string[] = [];
     for (const file of sources(root)) {

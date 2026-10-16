@@ -400,6 +400,8 @@ code { color: var(--text-2); }
   font-size: 12px;
 }
 .m-danger { align-self: flex-start; color: var(--red-hi); border-color: var(--red-line); }
+/* askConfirm on the phone: the desktop --ctl-h (26px) is too small a touch target. */
+body .set-dialog-actions button { min-height: 44px; }
 
 /* ---- Paylaş hedefi (ShareScreen): agent screen'in üstünde ---- */
 .m-share { z-index: calc(var(--z-m-screen) + 1); }
