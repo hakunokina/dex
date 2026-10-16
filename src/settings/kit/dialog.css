@@ -1,0 +1,23 @@
+/* Onay penceresi: uygulama içi, Dex koyu teması. Ayarlar tembel yüklenir; bu dosya bileşenle gelir
+   (askConfirm uygulamanın her yerinden açar). Yıkıcı işlemde birincil dolu kırmızı, odak Vazgeç'te. */
+.set-dialog-backdrop { position: fixed; inset: 0; margin: 0; width: 100%; height: 100%; max-width: none; max-height: none; box-sizing: border-box; border: 0; background: var(--scrim); color: var(--text); padding: var(--sp-4); }
+.set-dialog-backdrop[open] { display: flex; align-items: center; justify-content: center; }
+.set-dialog-backdrop::backdrop { background: transparent; }
+.set-dialog { background: var(--surface-pop); border: 1px solid var(--line-strong); border-top: 2px solid var(--red); border-radius: var(--r-md); box-shadow: var(--shadow-pop); max-width: 440px; width: 100%; max-height: calc(100vh - 2 * var(--sp-4)); overflow-y: auto; box-sizing: border-box; padding: var(--sp-4); color: var(--text); }
+.set-dialog h3 { margin: 0 0 var(--sp-2); font-size: var(--fs-md); font-weight: var(--fw-semibold); overflow-wrap: anywhere; }
+.set-dialog ul { margin: 0 0 var(--sp-3); padding-left: var(--sp-4); font-size: var(--fs-sm); color: var(--text-2); display: flex; flex-direction: column; gap: 2px; }
+.set-dialog-body { margin: 0 0 var(--sp-3); display: flex; flex-direction: column; gap: var(--sp-2); font-size: var(--fs-sm); color: var(--text-2); }
+.set-dialog-body p { margin: 0; white-space: pre-line; overflow-wrap: anywhere; }
+.set-dialog-actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--sp-2); }
+.set-dialog-actions button {
+  min-height: var(--ctl-h); min-width: 72px; padding: 0 var(--sp-3); cursor: pointer;
+  font-size: var(--fs-sm); font-weight: var(--fw-medium);
+  background: var(--surface-3); border: 1px solid var(--line); border-radius: var(--r-sm); color: var(--text);
+}
+.set-dialog-actions button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--press); }
+.set-dialog-actions button.primary { background: var(--red-soft); border-color: var(--red-line); }
+.set-dialog-actions button.primary:hover:not(:disabled) { background: var(--red-glow); }
+.set-dialog-actions button.danger { background: var(--red); border-color: transparent; color: var(--on-accent); }
+.set-dialog-actions button.danger:hover:not(:disabled) { background: var(--red-hi); }
+.set-dialog-actions button:disabled { opacity: 0.45; cursor: default; }
+.set-dialog-actions button:focus-visible { outline: 2px solid var(--text-2); outline-offset: 2px; }
