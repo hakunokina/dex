@@ -560,6 +560,11 @@ fn team_row(data_dir: &Path) -> impl Fn(&Row) -> rusqlite::Result<Team> + '_ {
         let agent_memory_root: Option<String> = r.get(10)?;
         let default_root: Option<String> = r.get(11)?;
         let suggested_workspace_root = suggested_workspace(data_dir, &id, &kind, workspace_root.as_deref(), default_root.as_deref());
+        let workspace_root = if is_legacy_workspace(data_dir, &id, &kind, workspace_root.as_deref()) {
+            None
+        } else {
+            workspace_root
+        };
         let (workdir, memory_dir) = if kind == "service" {
             let d = service_dir(data_dir, &id);
             (Some(d.join("workspace")), Some(d.join("memory")))
@@ -579,6 +584,18 @@ fn team_row(data_dir: &Path) -> impl Fn(&Row) -> rusqlite::Result<Team> + '_ {
     }
 }
 
+/// The v28 backfill wrote `<data_dir>/teams/<id>/workspace` as a placeholder category root for
+/// legacy main teams without ever creating it. It is not a real category root: never present it
+/// as one — consumers fall back to the same path where the old spelling is load-bearing — and
+/// instead suggest the folder the team's projects actually live under.
+fn is_legacy_workspace(data_dir: &Path, id: &str, kind: &str, workspace: Option<&str>) -> bool {
+    kind == "main"
+        && workspace.is_some_and(|w| {
+            crate::projects::path_key(w)
+                == crate::projects::path_key(&service_dir(data_dir, id).join("workspace").to_string_lossy())
+        })
+}
+
 fn suggested_workspace(
     data_dir: &Path,
     id: &str,
@@ -586,14 +603,13 @@ fn suggested_workspace(
     workspace: Option<&str>,
     root: Option<&str>,
 ) -> Option<String> {
-    let legacy = service_dir(data_dir, id).join("workspace");
-    if kind != "main" || crate::projects::path_key(workspace?) != crate::projects::path_key(&legacy.to_string_lossy()) {
+    if !is_legacy_workspace(data_dir, id, kind, workspace) {
         return None;
     }
     let root = Path::new(root?);
     let parent = root.parent()?;
-    let name = parent.file_name()?.to_str()?;
-    (root.file_name()?.to_str()? == format!("{name}Main")).then(|| parent.to_string_lossy().into_owned())
+    parent.file_name()?; // A filesystem root is not a category folder.
+    Some(parent.to_string_lossy().into_owned())
 }
 
 fn agent_row(r: &Row) -> rusqlite::Result<Agent> {
@@ -1244,6 +1260,7 @@ mod tests {
         let before = c.total_changes();
         let loaded = get_team(&c,&f.0,&t.id).unwrap();
         assert_eq!(loaded.suggested_workspace_root, Some(normalize_dir(root.parent().unwrap().to_str().unwrap()).unwrap()));
+        assert!(loaded.workspace_root.is_none(), "the backfilled placeholder is not a category root");
         let ctx = crate::project_context::resolve(&c,&f.0,crate::project_context::ResolveRequest {
             team_id:&t.id,agent_id:None,delegation_id:None,project_id:None,mode:crate::project_context::ContextMode::Team,
         }).unwrap();
@@ -1251,6 +1268,21 @@ mod tests {
         assert_eq!(before,c.total_changes());
         let changed = update_team(&c,&f.0,&t.id,TeamPatch {workspace_root:Some(Some(root.parent().unwrap().to_string_lossy().into())),..Default::default()}).unwrap();
         assert!(changed.suggested_workspace_root.is_none());
+    }
+
+    /// #2137: a legacy main team whose default project is not named `<Category>Main` still gets
+    /// its real category suggested (the projects' parent), and the placeholder stays unset.
+    #[test]
+    fn legacy_team_suggests_project_parent_for_non_main_root_name() {
+        let f = crate::projects::tests::Fixture::new();
+        let root = f.0.join("JezDev/no-more-clickbait");
+        std::fs::create_dir_all(&root).unwrap();
+        let c = mem();
+        let input: NewTeam = serde_json::from_value(serde_json::json!({"name":"Jez Dev","kind":"main","cwd":root})).unwrap();
+        let t = create_team(&c,&f.0,input).unwrap();
+        let loaded = get_team(&c,&f.0,&t.id).unwrap();
+        assert!(loaded.workspace_root.is_none());
+        assert_eq!(loaded.suggested_workspace_root, Some(normalize_dir(root.parent().unwrap().to_str().unwrap()).unwrap()));
     }
 
     #[test]
