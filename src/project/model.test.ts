@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { workerProjectId, workerProjectTeam, blockedJob, projectState, showsProjects, projectErrorText, isUnknownMethod, folderName, leaderProjectMismatch, memoryRequest, memoryProjectId, projectCreateParams, type Project } from "./model.ts";
+import { workerProjectId, workerProjectTeam, blockedJob, projectState, showsProjects, projectErrorText, isUnknownMethod, folderName, leaderProjectMismatch, memoryRequest, memoryProjectId, projectCreateParams, folderCategoryReady, pickStep, type Project } from "./model.ts";
 
 const project = (id: string, extra: Partial<Project> = {}): Project => ({
   id, host: "local", teamId: "t", name: id, rootPath: "/repo", rootKey: "/repo", repoKey: "git", defaultBranch: "main",
@@ -91,5 +91,23 @@ it("new project folder is created by the backend without a root argument", () =>
   });
   assert.deepEqual(projectCreateParams({ name: "Repo" }, { root: "C:\\Repo" }, ""), {
     project: { name: "Repo" }, root: "C:\\Repo", branch: null,
+  });
+});
+
+describe("başlık proje seçici (#2141)", () => {
+  it("yeni klasör yalnız kayıtlı kategori kökünde; bekleyen öneri önce kabul edilir", () => {
+    assert.equal(folderCategoryReady("/cat", null), true);
+    assert.equal(folderCategoryReady(null, null), false);
+    assert.equal(folderCategoryReady("/cat", "/öneri"), false);
+    assert.equal(folderCategoryReady(null, "/öneri"), false);
+  });
+  it("ok/Home/End satırlarda gezer, uçlarda durur", () => {
+    assert.equal(pickStep(0, "ArrowDown", 3), 1);
+    assert.equal(pickStep(2, "ArrowDown", 3), 2);
+    assert.equal(pickStep(0, "ArrowUp", 3), 0);
+    assert.equal(pickStep(1, "Home", 3), 0);
+    assert.equal(pickStep(0, "End", 3), 2);
+    assert.equal(pickStep(1, "a", 3), 1);
+    assert.equal(pickStep(-1, "ArrowDown", 3), 0);
   });
 });

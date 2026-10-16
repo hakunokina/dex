@@ -2,14 +2,13 @@
 // existing folder/repo (or make one under the category folder in the picker), rename, re-bind the
 // root/branch, worktrees, select, archive / reopen. Every refusal is the core's (busy, conflict…).
 import { useEffect, useRef, useState } from "react";
-import { callHost, hostInfo } from "../api/hosts";
 import { patchTeam, useTeams } from "../team/store";
 import { categoryFolder, projectContext } from "./api";
 import { FolderButton } from "./FolderButton";
 import { askConfirm } from "../confirm";
-import { activeProjects, folderName, projectErrorText, projectState, STATE_TEXT, type Project } from "./model";
+import { activeProjects, folderCategoryReady, folderName, projectErrorText, projectState, STATE_TEXT, type Project } from "./model";
 import {
-  archiveProject, createProject, leaderNote, reloadProjects, reopenProject, selectedProject, setDefaultProject, updateProject, useChecks,
+  archiveProject, createFolderProject, createProject, leaderNote, reloadProjects, reopenProject, selectedProject, setDefaultProject, updateProject, useChecks,
   useTeamProjects, verifyProject,
 } from "./store";
 import "./project.css";
@@ -212,14 +211,10 @@ function AddProject({ teamId, host, start, categoryRoot, suggestedRoot, run }: {
 
   async function add(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim() || (existing ? !root : !categoryRoot || !!suggestedRoot)) return;
-    const ok = await run(async () => {
-      // project_list alone predates createFolder; require the newer folder API's explicit advertisement.
-      const target = existing ? root! : hostInfo(host)?.methods?.includes("team_folder_preview")
-        ? { createFolder: true as const }
-        : await callHost<string>(host, "fs.mkdir", { parent: categoryRoot!, name: name.trim() });
-      return createProject(teamId, { name: name.trim() }, target, branch.trim() || null);
-    });
+    if (!name.trim() || (existing ? !root : !folderCategoryReady(categoryRoot, suggestedRoot))) return;
+    const ok = await run(() => existing
+      ? createProject(teamId, { name: name.trim() }, root!, branch.trim() || null)
+      : createFolderProject(teamId, host, categoryRoot!, name.trim(), branch.trim() || null));
     if (ok) { setRoot(null); setName(""); setBranch(""); }
   }
 
@@ -256,7 +251,7 @@ function AddProject({ teamId, host, start, categoryRoot, suggestedRoot, run }: {
         <label>Merge dalı<input aria-label="Merge dalı" placeholder="Boş: checkout’taki dal" value={branch} onChange={e => setBranch(e.target.value)} /></label>
       </div>
       <div className="team-actions">
-        <button type="submit" className="primary" disabled={!name.trim() || (existing ? !root : !categoryRoot || !!suggestedRoot)}>{existing ? "Proje ekle" : "Oluştur ve bağla"}</button>
+        <button type="submit" className="primary" disabled={!name.trim() || (existing ? !root : !folderCategoryReady(categoryRoot, suggestedRoot))}>{existing ? "Proje ekle" : "Oluştur ve bağla"}</button>
       </div>
     </form>
   );

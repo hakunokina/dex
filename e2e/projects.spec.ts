@@ -1,7 +1,14 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
+import type { Page } from "@playwright/test";
 import { isolatedTest as test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+
+/** #2141: the top-bar picker is a button + listbox, not a native <select>. */
+const pickProject = async (app: Page, name: string) => {
+  await app.getByRole("combobox", { name: "Aktif proje", exact: true }).click();
+  await app.getByRole("listbox", { name: "Projeler" }).getByRole("option", { name, exact: true }).click();
+};
 
 test.afterEach(async ({ dexd }) => {
   for (const p of await dexd.call<{ id: string }[]>("pty.list")) await dexd.call("pty_kill", { id: p.id });
@@ -9,7 +16,7 @@ test.afterEach(async ({ dexd }) => {
 
 test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar klavye akışı", async ({ app, dexd }) => {
   const team = await newTeam(dexd, "Projeler");
-  const original = (await dexd.call<{ id: string; rootPath: string }[]>("project_list", { teamId: team.id }))[0];
+  const original = (await dexd.call<{ id: string; name: string; rootPath: string }[]>("project_list", { teamId: team.id }))[0];
   execFileSync("git", ["init", "-b", "main", original.rootPath]);
   await dexd.call("project_verify", { teamId: team.id, id: original.id });
   const leader = (await teamAgents(dexd, team.id)).find(a => a.kind === "leader")!;
@@ -37,15 +44,15 @@ test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar
   const site = projects.locator(".project-row", { has: app.getByText("Site", { exact: true }) });
   await expect(site).toBeVisible();
   const picker = app.getByRole("combobox", { name: "Aktif proje", exact: true });
-  await picker.selectOption({ label: "Site" });
-  await expect(picker.locator("option:checked")).toHaveText("Site");
+  await pickProject(app, "Site");
+  await expect(picker).toHaveText("Site");
   const p2 = (await dexd.call<{ id: string; name: string; rootPath: string }[]>("project_list", { teamId: team.id })).find(p => p.name === "Site")!;
   await app.getByRole("button", { name: "Yeni terminal", exact: true }).first().click();
   await expect.poll(async () => (await calls(app)).filter(c => c.cmd === "pty_spawn" && c.args.cwd === p2.rootPath).length).toBe(1);
   // Selection must never reset/start a leader behind the patron's back.
   expect((await calls(app)).filter(c => c.cmd === "leader_reset" && c.args.action !== "get")).toHaveLength(0);
-  await picker.selectOption(original.id);
-  await expect(picker).toHaveValue(original.id);
+  await pickProject(app, original.name);
+  await expect(picker).toHaveText(original.name);
   // #2051: İptal → arşivlenmez, istek gitmez.
   let asked = false;
   app.once("dialog", d => { asked = true; void d.dismiss(); });
@@ -100,7 +107,7 @@ test("proje hafızası: tek grafikte yalnız seçili proje; oturum başlığı k
   const leaderPane = await paneOf(app, leader.name);
   const workerPane = await paneOf(app, worker.name);
   await expect(workerPane.locator(".project-chip")).toHaveText(p1.name);
-  await app.getByRole("combobox", { name: "Aktif proje", exact: true }).selectOption(p2.id);
+  await pickProject(app, p2.name);
   await expect(leaderPane).toContainText(`Lider ${p1.name} oturumunda`);
   await expect(leaderPane.getByRole("button", { name: "Yeni projede temiz oturum" })).toBeVisible();
   await expect(workerPane.locator(".project-chip")).toHaveText(p1.name);
@@ -264,8 +271,8 @@ test("uzak host: aynı ham kimlikler proje seçimi ve hafıza çağrısında nit
   await app.reload();
   await app.locator('.team-tab[title^="Uzak:"]').filter({ hasText: team.name }).click();
   const picker = app.getByRole("combobox", { name: "Aktif proje", exact: true });
-  await picker.selectOption(`remote:${p2.id}`);
-  await expect(picker).toHaveValue(`remote:${p2.id}`);
+  await pickProject(app, "Uzak İkinci");
+  await expect(picker).toHaveText("Uzak İkinci");
   const selection = (await calls(app)).filter(c => c.cmd === "project_set_default").at(-1)!;
   expect(selection.args).toEqual({ teamId: team.id, id: p2.id });
   await app.getByRole("button", { name: "Hafıza haritası", exact: true }).click();
@@ -308,4 +315,58 @@ test("uzak takım: home kategorisinde scoped klasör gezme ve oluşturma", async
   await expect(projects.locator(".project-row").filter({ has: app.getByText("Site", { exact: true }) })).toBeVisible();
   expect((await calls(app)).filter(c => c.cmd === "fs.list").at(-1)?.args.teamId).toBe(team.id);
   expect((await calls(app)).filter(c => c.cmd === "fs.mkdir").at(-1)?.args).toEqual({ teamId: team.id, parent: team.workspaceRoot, name: "Site" });
+});
+
+test("başlık proje listesi: + satırı ad alanına döner, Enter kategori kökünde klasör açıp bağlar; dar klavye akışı", async ({ app, dexd }) => {
+  const team = await newTeam(dexd, "Başlık Proje");
+  const first = (await dexd.call<{ id: string; name: string }[]>("project_list", { teamId: team.id }))[0];
+  const category = join(dexd.projects, "header-category");
+  mkdirSync(join(category, "second"), { recursive: true });
+  await dexd.call("team_update", { id: team.id, patch: { workspaceRoot: category } });
+  await dexd.call("project_create", { teamId: team.id, project: { name: "İkinci" }, root: join(category, "second") });
+  await app.reload();
+  await openTeam(app, team.name);
+  await app.setViewportSize({ width: 390, height: 780 });
+  const picker = app.getByRole("combobox", { name: "Aktif proje", exact: true });
+  await expect(picker).toHaveText(first.name);
+  await picker.focus();
+  await app.keyboard.press("ArrowDown");
+  const list = app.getByRole("listbox", { name: "Projeler" });
+  await expect(list.getByRole("option", { name: first.name, exact: true })).toBeFocused();
+  await expect(list.getByRole("option", { name: first.name, exact: true })).toHaveAttribute("aria-selected", "true");
+  await app.keyboard.press("End");
+  const add = app.getByRole("button", { name: "Yeni klasörde proje", exact: true });
+  await expect(add).toBeFocused();
+  await app.keyboard.press("Enter");
+  const field = app.getByRole("textbox", { name: "Yeni klasör adı", exact: true });
+  await expect(field).toBeFocused();
+  // Esc closes only the field: back to "+".
+  await app.keyboard.press("Escape");
+  await expect(field).toHaveCount(0);
+  await expect(add).toBeFocused();
+  await app.keyboard.press("Enter");
+  await app.keyboard.type("Yeni Site");
+  await app.keyboard.press("Enter");
+  await expect(list.getByRole("option", { name: "Yeni Site", exact: true })).toBeVisible();
+  await expect(field).toHaveCount(0);
+  await expect(add).toBeFocused();
+  const created = (await dexd.call<{ name: string; rootPath: string }[]>("project_list", { teamId: team.id })).find(p => p.name === "Yeni Site")!;
+  expect(dirname(created.rootPath)).toBe(category);
+  expect(existsSync(created.rootPath)).toBe(true);
+  expect((await calls(app)).filter(c => c.cmd === "project_create").at(-1)?.args).toMatchObject({ teamId: team.id, project: { name: "Yeni Site" }, createFolder: true });
+  const box = (await app.locator(".project-pick-pop").boundingBox())!;
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
+  // Same as Takım ayarları: binding does not select it; Esc returns to the picker.
+  await app.keyboard.press("Escape");
+  await expect(list).toHaveCount(0);
+  await expect(picker).toBeFocused();
+  await expect(picker).toHaveText(first.name);
+  // A refused name stays in the field with the core's reason under it.
+  await picker.click();
+  await add.click();
+  await field.fill("Yeni Site");
+  await field.press("Enter");
+  await expect(app.locator(".project-pick-pop").getByRole("alert")).toBeVisible();
+  await expect(field).toHaveValue("Yeni Site");
 });

@@ -2,7 +2,7 @@
 // fresh by its events (`projects-changed`, `teams-changed`, `delegations-changed`, reconnect).
 // A team is loaded when something first asks for it; sync getters serve the office hover card.
 import { useSyncExternalStore } from "react";
-import { hostOf, onHostUp, qid } from "../api/hosts";
+import { callHost, hostInfo, hostOf, onHostUp, qid } from "../api/hosts";
 import { kept, latest, listenKept } from "../hot";
 import { getStatus } from "../agents";
 import { getTeam, getTeamsSnapshot, refreshTeams } from "../team/store";
@@ -136,6 +136,14 @@ async function after<T>(teamId: string, f: Promise<T>): Promise<T> {
 }
 export const createProject = (teamId: string, p: api.NewProject, target: string | ProjectTarget, branch?: string | null) =>
   after(teamId, api.createProject(teamId, p, target, branch));
+/** A new folder named `name` under the team's category root, bound as a project (team panel + top-bar picker). */
+export const createFolderProject = async (teamId: string, host: string, categoryRoot: string, name: string, branch: string | null = null) => {
+  // project_list alone predates createFolder; require the newer folder API's explicit advertisement.
+  const target = hostInfo(host)?.methods?.includes("team_folder_preview")
+    ? { createFolder: true as const }
+    : await callHost<string>(host, "fs.mkdir", { parent: categoryRoot, name });
+  return createProject(teamId, { name }, target, branch);
+};
 export const updateProject = (p: Project, change: Parameters<typeof api.updateProject>[1]) => after(p.teamId, api.updateProject(p, change));
 export const archiveProject = (p: Project) => after(p.teamId, api.archiveProject(p));
 export const reopenProject = (p: Project) => after(p.teamId, api.reopenProject(p));
