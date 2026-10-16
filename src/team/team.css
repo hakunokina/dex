@@ -225,3 +225,13 @@
 .remote-folder-list svg { width: 14px; height: 14px; color: var(--muted); flex: none; }
 .remote-folder-new { display: flex; gap: var(--sp-1); }
 .remote-folder-new input { flex: 1; min-width: 0; }
+
+/* Takım ayarları: hafıza başlıkta, Test düğmesi açıklamasıyla, alt düğmeler ortada. */
+.team-settings h3 .team-head-memory { display: inline-flex; gap: var(--sp-2); align-items: center; min-width: 0; margin-left: var(--sp-3); font-size: var(--fs-xs); font-weight: normal; color: var(--muted); }
+.team-settings h3 .team-head-memory code { font-family: var(--font-mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-test-level button { display: flex; flex-direction: column; align-items: center; gap: 2px; width: 100%; }
+.team-test-level .team-test-hint { font-size: var(--fs-xs); font-weight: normal; color: var(--muted); }
+.team-settings .team-actions { justify-content: center; flex-wrap: wrap; }
+.team-settings .team-bottom-actions { align-items: stretch; }
+.team-settings .team-test-level { display: flex; flex-direction: column; }
+.team-settings .team-test-level button { flex: 1; }
