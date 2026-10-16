@@ -36,6 +36,17 @@ class HostTokensPlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
         // #1859: the morning job is (re)scheduled on every start; a WorkManager failure must not
         // take pairing down with it.
+        ensureMotivation()
+    }
+
+    // #2095: arka planda canlı süreç öne gelince load() koşmaz; bugünün backoff'taki işi burada da
+    // kırılır (bugün yazıldıysa ya da iş koşuyorsa ensure dokunmaz). Soğuk başlatmada load'la çift
+    // çağrı zararsız: ikinci REPLACE henüz koşmayan işi aynısıyla değiştirir.
+    override fun onResume() {
+        ensureMotivation()
+    }
+
+    private fun ensureMotivation() {
         try {
             MotivationWork.ensure(activity.applicationContext)
         } catch (e: Exception) {
@@ -48,11 +59,7 @@ class HostTokensPlugin(private val activity: Activity) : Plugin(activity) {
         if (!validUrl(url) || urls.getString(args.id, null) == url) return
         urls.edit().putString(args.id, url).apply()
         // #1877: açılışta load()'un kurduğu iş adres yazılmadan koşmuş olabilir; yeni adresle yeniden kur.
-        try {
-            MotivationWork.ensure(activity.applicationContext)
-        } catch (e: Exception) {
-            // Sabah işi kurulamadı; jeton köprüsü çalışmaya devam eder.
-        }
+        ensureMotivation()
     }
 
     private fun argsOrReject(invoke: Invoke): TokenArgs? {
