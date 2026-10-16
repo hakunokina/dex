@@ -89,4 +89,7 @@ object MotivationPlan {
     private val DATE = Regex("^\\d{4}-\\d{2}-\\d{2}$")
 
     fun validDate(date: String): Boolean = DATE.matches(date)
+
+    /** #2090 FCM `motivation` mesajının tarihi telefonun bugünü mü (gecikmiş mesaj eski günü koşturmasın). */
+    fun isToday(date: String, now: Long, tz: TimeZone): Boolean = validDate(date) && date == day(now, tz)
 }
