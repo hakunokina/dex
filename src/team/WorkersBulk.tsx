@@ -1,6 +1,7 @@
 // "Tüm worker'lar" — Kart araç çubuğundaki düğmeden, tıklanan yerde açılan küçük popover.
 // Mantık takım ayarlarındaki eski satırla aynı (DEX-30); yalnız yerleşim değişti.
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { UserCog } from "lucide-react";
 import { LOCAL, onEvent } from "../api/hosts";
 import { openSettings } from "../layout/panels";
@@ -11,6 +12,7 @@ import {
 } from "./api";
 import { isRunning, membersOf, restartPending, setWorkersModel, useTeams } from "./store";
 import { providerModels } from "./providerModels";
+import { bulkSpot, type BulkSpot } from "./bulkPlace";
 import { isAssignable } from "./rolePolicy";
 import "./team.css";
 
@@ -29,7 +31,8 @@ export function WorkersBulkButton({ teamId }: { teamId: string }) {
   useEffect(() => {
     if (!open) return;
     const onDown = (e: PointerEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (!wrapRef.current?.contains(t) && !(t instanceof Element && t.closest(".workers-bulk-pop"))) setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.stopPropagation(); close(); }
@@ -56,12 +59,14 @@ export function WorkersBulkButton({ teamId }: { teamId: string }) {
       >
         <UserCog />
       </button>
-      {open && <WorkersBulkPopover teamId={teamId} onClose={close} />}
+      {open && <WorkersBulkPopover teamId={teamId} onClose={close} anchorRef={btnRef} />}
     </span>
   );
 }
 
-function WorkersBulkPopover({ teamId, onClose }: { teamId: string; onClose: () => void }) {
+function WorkersBulkPopover({ teamId, onClose, anchorRef }: {
+  teamId: string; onClose: () => void; anchorRef: React.RefObject<HTMLButtonElement | null>;
+}) {
   const { teams } = useTeams();
   const team = teams.find((t) => t.id === teamId);
   const host = team?.host ?? LOCAL;
@@ -72,6 +77,24 @@ function WorkersBulkPopover({ teamId, onClose }: { teamId: string; onClose: () =
   const [retry, setRetry] = useState(0);
   const request = useRef(0);
   const firstRef = useRef<HTMLSelectElement>(null);
+  // #2134: portal + fixed — dar/alçak Kart paneli (overflow:hidden) popover'ı kırpmasın.
+  const popRef = useRef<HTMLDivElement>(null);
+  const [spot, setSpot] = useState<BulkSpot | null>(null);
+
+  useLayoutEffect(() => {
+    const el = popRef.current, anchor = anchorRef.current;
+    if (!el || !anchor) return;
+    const next = bulkSpot(anchor.getBoundingClientRect(),
+      { w: el.offsetWidth, h: el.scrollHeight }, { w: window.innerWidth, h: window.innerHeight });
+    setSpot((prev) => prev && prev.left === next.left && prev.top === next.top
+      && prev.maxHeight === next.maxHeight && prev.above === next.above ? prev : next);
+  });
+
+  useEffect(() => {
+    const onResize = () => setSpot(null); // ölçüm bir sonraki layout etkisinde tazelenir
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
 
   useEffect(() => { firstRef.current?.focus(); }, []);
 
@@ -103,8 +126,13 @@ function WorkersBulkPopover({ teamId, onClose }: { teamId: string; onClose: () =
 
   const providers = withLocalModels(baseProviders, local);
 
-  return (
-    <div className="workers-bulk-pop" role="dialog" aria-label="Tüm worker'lar">
+  return createPortal(
+    <div ref={popRef} className="workers-bulk-pop" role="dialog" aria-label="Tüm worker'lar"
+      data-above={spot?.above || undefined}
+      style={{
+        left: spot?.left ?? -9999, top: spot?.top ?? -9999, maxHeight: spot?.maxHeight,
+        visibility: spot ? "visible" : "hidden",
+      }}>
       {loading && !providers.length ? (
         <p className="team-note" role="status">Sağlayıcılar yükleniyor…</p>
       ) : providerError && !providers.length ? (
@@ -116,8 +144,7 @@ function WorkersBulkPopover({ teamId, onClose }: { teamId: string; onClose: () =
         <WorkersBulkForm teamId={teamId} providers={providers} firstRef={firstRef} onDone={onClose} />
       )}
       {providerError && providers.length > 0 && <p className="team-err" role="alert">{providerError}</p>}
-    </div>
-  );
+    </div>, document.body);
 }
 
 /** DEX-30: DEX-13's wording — without a token the session fails at start, so say it before. */

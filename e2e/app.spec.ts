@@ -104,6 +104,41 @@ test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi
   await app.keyboard.press("Escape");
   await expect(bulk).toHaveCount(0);
   await expect(bulkBtn).toBeFocused();
+  // #2134: Kart dar (≈260px) ve alçak bir paneldeyken de popover kırpılmaz — tamamen pencere
+  // içinde kalır, Uygula elementFromPoint ile tıklanabilir ve sonucu gösterir.
+  const kartSize = await app.evaluate(async (teamId) => {
+    const { boundApi } = await import("/src/layout/panels.ts");
+    const office = boundApi(teamId)!.getPanel("office")!;
+    office.api.setActive();
+    const size = { width: office.group.api.width, height: office.group.api.height };
+    office.group.api.setSize({ width: 260, height: 160 });
+    return size;
+  }, team!.id);
+  await expect.poll(() => app.evaluate(async (teamId) => {
+    const { boundApi } = await import("/src/layout/panels.ts");
+    return boundApi(teamId)!.getPanel("office")!.group.element.getBoundingClientRect().width;
+  }, team!.id)).toBeLessThanOrEqual(262);
+  await bulkBtn.click();
+  await expect(bulk.getByRole("combobox", { name: "Worker'ların sağlayıcısı" })).toBeFocused();
+  const apply = bulk.getByRole("button", { name: "Uygula", exact: true });
+  await expect(apply).toBeVisible();
+  expect(await bulk.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return r.left >= 0 && r.right <= window.innerWidth && r.top >= 0 && r.bottom <= window.innerHeight;
+  })).toBe(true);
+  expect(await apply.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return hit === el || el.contains(hit);
+  })).toBe(true);
+  await apply.click();
+  await expect(bulk).toContainText(/worker değişti/);
+  await app.keyboard.press("Escape");
+  await expect(bulk).toHaveCount(0);
+  await app.evaluate(async ({ teamId, size }) => {
+    const { boundApi } = await import("/src/layout/panels.ts");
+    boundApi(teamId)!.getPanel("office")!.group.api.setSize(size);
+  }, { teamId: team!.id, size: kartSize });
   // Takım ayarları: Sağlayıcılar bölümü ve Tüm worker'lar yok; Test + Takımı kopyala altta yan yana.
   await kart.getByRole("button", { name: "Takım ayarları", exact: true }).click();
   const settings = app.locator(".team-settings");
