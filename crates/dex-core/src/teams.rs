@@ -612,6 +612,24 @@ fn suggested_workspace(
     Some(parent.to_string_lossy().into_owned())
 }
 
+/// S4: the suggestion a remote client may adopt outside its roots. Only the old
+/// `<Category>/<Category>Main` layout grants that; the wider #2137 suggestion (any default
+/// project's parent, possibly the home folder) is UI advice, never an authorization.
+pub fn remote_adoptable_suggestion(conn: &Connection, data_dir: &Path, id: &str) -> Result<Option<String>, String> {
+    let team = get_team(conn, data_dir, id)?;
+    let Some(suggested) = team.suggested_workspace_root else { return Ok(None) };
+    let root: Option<String> = conn
+        .query_row("SELECT root_path FROM projects WHERE id=?1 AND team_id=?2", params![team.default_project_id, id], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let main_layout = root.as_deref().map(Path::new).is_some_and(|root| {
+        let name = Path::new(&suggested).file_name().and_then(|n| n.to_str());
+        name.is_some_and(|name| root.file_name().and_then(|n| n.to_str()) == Some(format!("{name}Main").as_str()))
+    });
+    Ok(main_layout.then_some(suggested))
+}
+
 fn agent_row(r: &Row) -> rusqlite::Result<Agent> {
     Ok(Agent {
         id: r.get(0)?,
@@ -1266,6 +1284,7 @@ mod tests {
         }).unwrap();
         assert_eq!(serde_json::to_value(ctx).unwrap()["suggestedWorkspaceRoot"], serde_json::json!(loaded.suggested_workspace_root));
         assert_eq!(before,c.total_changes());
+        assert_eq!(remote_adoptable_suggestion(&c,&f.0,&t.id).unwrap(), loaded.suggested_workspace_root, "the old Main layout stays adoptable");
         let changed = update_team(&c,&f.0,&t.id,TeamPatch {workspace_root:Some(Some(root.parent().unwrap().to_string_lossy().into())),..Default::default()}).unwrap();
         assert!(changed.suggested_workspace_root.is_none());
     }
@@ -1283,6 +1302,7 @@ mod tests {
         let loaded = get_team(&c,&f.0,&t.id).unwrap();
         assert!(loaded.workspace_root.is_none());
         assert_eq!(loaded.suggested_workspace_root, Some(normalize_dir(root.parent().unwrap().to_str().unwrap()).unwrap()));
+        assert_eq!(remote_adoptable_suggestion(&c,&f.0,&t.id).unwrap(), None, "UI advice, not a remote grant");
     }
 
     #[test]
