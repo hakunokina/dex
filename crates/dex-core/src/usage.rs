@@ -113,6 +113,8 @@ pub struct UsageSnapshot {
     pub providers: Vec<ProviderUsage>,
     /// Bugün tüm sağlayıcılarda (yerel LLM dahil) Dex ajanlarının token'ı.
     pub today_tokens: Option<u64>,
+    /// Son 7 gün (bugün dahil) aynı tanımla; `None` = okunamadı.
+    pub week_tokens: Option<u64>,
     /// Epoch ms.
     pub updated_at: i64,
 }
@@ -155,7 +157,12 @@ fn real_sources() -> Sources {
 }
 
 /// Görüntü: taze ölçüm pencereleri gösterir; yoksa "--" ve nedeni.
-fn build(readings: &HashMap<&'static str, Reading>, tokens: Option<&BTreeMap<String, u64>>, now: i64) -> UsageSnapshot {
+fn build(
+    readings: &HashMap<&'static str, Reading>,
+    tokens: Option<&BTreeMap<String, u64>>,
+    week: Option<&BTreeMap<String, u64>>,
+    now: i64,
+) -> UsageSnapshot {
     let providers = PROVIDERS
         .iter()
         .map(|&id| {
@@ -195,16 +202,21 @@ fn build(readings: &HashMap<&'static str, Reading>, tokens: Option<&BTreeMap<Str
             }
         })
         .collect();
-    UsageSnapshot { providers, today_tokens: tokens.map(|t| t.values().sum()), updated_at: now }
+    UsageSnapshot {
+        providers,
+        today_tokens: tokens.map(|t| t.values().sum()),
+        week_tokens: week.map(|t| t.values().sum()),
+        updated_at: now,
+    }
 }
 
-/// Bu makinenin yerel gece yarısı (epoch ms).
-fn local_midnight(now: chrono::DateTime<chrono::Local>) -> i64 {
-    now.date_naive()
+/// Bu makinenin `days_ago` gün önceki yerel gece yarısı (epoch ms); 0 = bugün.
+fn local_midnight(now: chrono::DateTime<chrono::Local>, days_ago: u64) -> i64 {
+    (now.date_naive() - chrono::Days::new(days_ago))
         .and_hms_opt(0, 0, 0)
         .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
         .map(|d| d.timestamp_millis())
-        .unwrap_or_else(|| now.timestamp_millis() - 86_400_000)
+        .unwrap_or_else(|| now.timestamp_millis() - (days_ago as i64 + 1) * 86_400_000)
 }
 
 // ── Yanıt ayrıştırma ─────────────────────────────────────────────────────────
@@ -505,7 +517,9 @@ impl crate::Core {
     fn usage_publish(&self) {
         let snap = self.usage_build(true);
         let mut last = self.usage.last.lock().unwrap();
-        let same = last.as_ref().is_some_and(|l| l.providers == snap.providers && l.today_tokens == snap.today_tokens);
+        let same = last.as_ref().is_some_and(|l| {
+            l.providers == snap.providers && l.today_tokens == snap.today_tokens && l.week_tokens == snap.week_tokens
+        });
         if !same {
             *last = Some(snap.clone());
             drop(last);
@@ -514,10 +528,12 @@ impl crate::Core {
     }
 
     fn usage_build(&self, ingest: bool) -> UsageSnapshot {
-        let since = local_midnight(chrono::Local::now());
-        let tokens = self.cost_tokens_since(since, ingest).ok();
+        let now = chrono::Local::now();
+        // Kuyruklar bir kez, haftanın penceresiyle okunur; bugün aynı tablodan toplanır.
+        let week = self.cost_tokens_since(local_midnight(now, 6), ingest).ok();
+        let tokens = self.cost_tokens_since(local_midnight(now, 0), false).ok();
         let readings = self.usage.readings.lock().unwrap();
-        let mut snap = build(&readings, tokens.as_ref(), crate::model_news::now_ms());
+        let mut snap = build(&readings, tokens.as_ref(), week.as_ref(), crate::model_news::now_ms());
         // #2019: bağlı olmayan ek Claude hesabının halkası yok.
         snap.providers.retain(|p| {
             crate::claude_accounts::config_dir(&self.paths.data_dir, p.id).is_none_or(|d| crate::claude_accounts::connected(&d))
@@ -604,7 +620,7 @@ mod tests {
         let ids: Vec<_> = real_sources().into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, ["glm", "muse"], "Muse ölçüm kaynağı olmalı");
         let meter = Meter::default();
-        let s = build(&meter.readings.lock().unwrap(), None, 1_000);
+        let s = build(&meter.readings.lock().unwrap(), None, None, 1_000);
         let muse = s.providers.iter().find(|p| p.id == "muse").unwrap();
         assert_eq!(
             (&muse.limits, muse.note.as_deref(), muse.measured_at),
@@ -622,7 +638,7 @@ mod tests {
         let at = now - crate::quota::STALE_MS - 60_000;
         let mut readings = HashMap::new();
         readings.insert("muse", Reading { ok: Some((at, limits.clone())), error: Some(MUSE_NOTE.into()) });
-        let s = build(&readings, None, now);
+        let s = build(&readings, None, None, now);
         let muse = s.providers.iter().find(|p| p.id == "muse").unwrap();
         assert_eq!((&muse.limits, muse.note.as_deref(), muse.measured_at), (&limits, None, Some(at)));
     }
@@ -635,7 +651,7 @@ mod tests {
         let held = |five: Option<Window>, weekly: Option<Window>| {
             let mut readings = HashMap::new();
             readings.insert("muse", Reading { ok: Some((now - 1_000, Limits { five_hour: five, weekly })), error: None });
-            build(&readings, None, now).providers.into_iter().find(|p| p.id == "muse").unwrap()
+            build(&readings, None, None, now).providers.into_iter().find(|p| p.id == "muse").unwrap()
         };
         let past = || Some(w(10.0, Some("1970-01-01T00:00:01Z")));
         let future = || Some(w(20.0, Some("2026-10-20T00:00:00Z")));
@@ -711,7 +727,8 @@ mod tests {
         readings.insert("anthropic", Reading { ok: Some((now - 1_000, limits.clone())), error: Some("geçici".into()) });
         readings.insert("glm", Reading { ok: Some((now - crate::quota::STALE_MS - 1, limits.clone())), error: Some("z.ai kota ucu HTTP 500".into()) });
         let tokens: BTreeMap<String, u64> = [("anthropic".into(), 1_000), ("local".into(), 5)].into();
-        let s = build(&readings, Some(&tokens), now);
+        let week: BTreeMap<String, u64> = [("anthropic".into(), 3_000), ("glm".into(), 7)].into();
+        let s = build(&readings, Some(&tokens), Some(&week), now);
         assert_eq!(s.providers.iter().map(|p| p.id).collect::<Vec<_>>(), PROVIDERS);
         let [claude, claude2, glm, muse] = &s.providers[..] else { panic!() };
         assert_eq!(claude2.note.as_deref(), Some("henüz ölçülmedi"), "ikinci hesap ayrı satır");
@@ -719,7 +736,9 @@ mod tests {
         assert_eq!((&glm.limits, glm.note.as_deref()), (&Limits::default(), Some("z.ai kota ucu HTTP 500")), "bayat ölçüm gösterilmez");
         assert_eq!(muse.note.as_deref(), Some("henüz ölçülmedi"));
         assert_eq!((claude.today_tokens, glm.today_tokens, s.today_tokens), (Some(1_000), Some(0), Some(1_005)));
-        assert_eq!(build(&readings, None, now).today_tokens, None, "okunamayan token uydurulmaz");
+        assert_eq!(s.week_tokens, Some(3_007));
+        let none = build(&readings, None, None, now);
+        assert_eq!((none.today_tokens, none.week_tokens), (None, None), "okunamayan token uydurulmaz");
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["providers"][0]["fiveHour"]["remainingPercent"], 40.0);
         assert_eq!(v["providers"][2]["weekly"], Value::Null);
@@ -736,8 +755,9 @@ mod tests {
     fn midnight_is_local_start_of_day() {
         use chrono::TimeZone;
         let t = chrono::Local.with_ymd_and_hms(2026, 10, 15, 13, 45, 0).unwrap();
-        let m = local_midnight(t);
-        assert_eq!(chrono::Local.timestamp_millis_opt(m).unwrap(), chrono::Local.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap());
+        let at = |m| chrono::Local.timestamp_millis_opt(m).unwrap();
+        assert_eq!(at(local_midnight(t, 0)), chrono::Local.with_ymd_and_hms(2026, 10, 15, 0, 0, 0).unwrap());
+        assert_eq!(at(local_midnight(t, 6)), chrono::Local.with_ymd_and_hms(2026, 10, 9, 0, 0, 0).unwrap(), "7 gün: bugün dahil");
     }
 
     struct Fixed(Result<Limits, String>);
@@ -784,7 +804,7 @@ mod tests {
         assert_eq!(got.providers[0].limits.weekly, Some(w(45.0, None)));
         assert_eq!(got.providers[1].limits, glm);
         assert_eq!((&got.providers[2].limits, got.providers[2].note.as_deref()), (&Limits::default(), Some("henüz ölçülmedi")));
-        assert_eq!(got.today_tokens, Some(0));
+        assert_eq!((got.today_tokens, got.week_tokens), (Some(0), Some(0)));
         let events = sink.0.lock().unwrap().clone();
         assert_eq!(events.len(), 2, "her ölçüm görüntüyü değiştirdi");
         assert_eq!(events[1]["providers"][1]["fiveHour"]["remainingPercent"], 10.0);

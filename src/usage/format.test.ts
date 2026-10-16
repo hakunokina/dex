@@ -1,7 +1,7 @@
 // #118: hover kartı metinleri.
 import { strict as assert } from "node:assert";
 import { describe, it } from "node:test";
-import { resetShort, severity, updatedAgo } from "./format.ts";
+import { resetShort, severity, tokenCell, updatedAgo } from "./format.ts";
 
 describe("updatedAgo", () => {
   it("null boş döner", () => assert.equal(updatedAgo(null, 1_000), ""));
@@ -37,5 +37,24 @@ describe("severity", () => {
     assert.equal(severity(p(90, 8)), "critical");
     assert.equal(severity(p(20, 90)), "low");
     assert.equal(severity(p(null, 60)), "ok");
+  });
+});
+
+describe("tokenCell (#2139)", () => {
+  const snap = { providers: [], todayTokens: 1_500, weekTokens: 9_000, updatedAt: 0 };
+  it("bugün", () => {
+    const c = tokenCell(snap, "today");
+    assert.deepEqual([c.cap, c.tokens], ["bugün", 1_500]);
+    assert.match(c.title, /^Bugün Dex ajanları: 1\.500 token .*tıkla: 7 gün$/);
+  });
+  it("7 gün", () => {
+    const c = tokenCell(snap, "week");
+    assert.deepEqual([c.cap, c.tokens], ["7 gün", 9_000]);
+    assert.match(c.title, /^Son 7 gün Dex ajanları: 9\.000 token .*tıkla: bugün$/);
+  });
+  it("eski dexd: weekTokens yok → null", () => {
+    const { weekTokens: _, ...old } = snap;
+    assert.equal(tokenCell(old, "week").tokens, null);
+    assert.match(tokenCell(old, "week").title, /: -- token/);
   });
 });

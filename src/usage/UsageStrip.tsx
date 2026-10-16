@@ -1,4 +1,4 @@
-// #54: Dex penceresinin sağ kenarındaki kullanım şeridi (TM Edge Dock'u gibi): bugünün token'ı,
+// #54: Dex penceresinin sağ kenarındaki kullanım şeridi (TM Edge Dock'u gibi): bugünün (#2139: ya da 7 günün) token'ı,
 // sağlayıcı başına kalan kota halkası. #139: yer ayırmaz, sahnenin üstünde yüzer (usage.css).
 // #1861: veri etkin takımın sunucusundan (dexd); halkada dış yay 5 saat, iç yay haftalık pencere.
 // #2034: konum bu cihazın tercihi — sağ/sol kenarda dikey (sahnede) ya da üst başlıkta yatay.
@@ -6,10 +6,10 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from
 import { useTeams } from "../team/store";
 import { callHost, hostOf, LOCAL, onEvent } from "../api/hosts";
 import { gpuStripCell, type GpuOverview } from "../gpu/view";
-import { useStripPlace, useStripVisible, useUsage } from "./store";
+import { setStripRange, useStripPlace, useStripRange, useStripVisible, useUsage } from "./store";
 import { cardSpot, type CardSpot, type StripPlace } from "./place";
 import { providerMeta } from "./providers";
-import { WINDOWS, resetShort, severity, updatedAgo } from "./format";
+import { WINDOWS, resetShort, severity, tokenCell, updatedAgo } from "./format";
 import type { ProviderUsage, UsageStatus } from "./types";
 import "./usage.css";
 
@@ -176,6 +176,7 @@ const OFF_TEXT: Record<Exclude<UsageStatus, "live">, string> = {
 export function UsageStrip({ slot }: { slot: "stage" | "top" }) {
   const visible = useStripVisible();
   const place = useStripPlace();
+  const range = useStripRange();
   const { activeId } = useTeams();
   const { status, snap } = useUsage(activeId ? hostOf(activeId) : LOCAL);
   const [now, setNow] = useState(Date.now);
@@ -220,11 +221,17 @@ export function UsageStrip({ slot }: { slot: "stage" | "top" }) {
 
   return (
     <aside {...shell}>
-      <div className="usage-cell usage-today"
-        title={`Bugün Dex ajanları: ${snap.todayTokens?.toLocaleString("tr-TR") ?? "--"} token (girdi + çıktı + önbellek)`}>
-        <span className="usage-cap">bugün</span>
-        <span className="usage-big">{snap.todayTokens === null ? "--" : compactTokens(snap.todayTokens)}</span>
-      </div>
+      {(() => {
+        // #2139: tıklama (ya da Enter/Space) bugün ↔ 7 gün.
+        const c = tokenCell(snap, range);
+        return (
+          <button type="button" className="usage-cell usage-today" data-range={range} title={c.title} aria-label={c.title}
+            onClick={() => setStripRange(range === "today" ? "week" : "today")}>
+            <span className="usage-cap">{c.cap}</span>
+            <span className="usage-big">{c.tokens === null ? "--" : compactTokens(c.tokens)}</span>
+          </button>
+        );
+      })()}
       <GpuCell />
       <div className="usage-provs" data-tauri-drag-region={place === "top" ? true : undefined}>
         {snap.providers.map((p) => <Ring key={p.id} p={p} now={now} onHover={onHover} />)}

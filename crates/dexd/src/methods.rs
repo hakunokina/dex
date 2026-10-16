@@ -393,7 +393,7 @@ mod tests {
         // #1861: the strip's snapshot — the three providers, Dex agents' tokens since local midnight.
         let strip = call(&core,"usage_get",&serde_json::json!({})).unwrap();
         assert_eq!(strip["providers"].as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect::<Vec<_>>(), ["anthropic","glm","muse"]);
-        assert!(strip["todayTokens"].is_u64() && METHODS.contains(&"usage_get"));
+        assert!(strip["todayTokens"].is_u64() && strip["weekTokens"].is_u64() && METHODS.contains(&"usage_get"));
         core.shutdown();
     }
 

@@ -13,7 +13,6 @@ const hot = import.meta.hot;
 export interface TeamCost {
   status: "loading" | "ready" | "error" | "unsupported";
   today?: UsageSummary;
-  week?: UsageSummary;
   /** Tüm zamanlar — görev kartları devretme toplamını buradan alır. */
   all?: UsageSummary;
   error?: string;
@@ -21,7 +20,6 @@ export interface TeamCost {
 
 const LOADING: TeamCost = { status: "loading" };
 const DEBOUNCE_MS = 1500;
-const DAY = 86_400_000;
 
 const teams = kept(hot, "teams", () => new Map<string, TeamCost>());
 const watchers = kept(hot, "watchers", () => new Map<string, number>());
@@ -43,9 +41,8 @@ async function load(teamId: string) {
   try {
     // Sıralı: ilk çağrı transcript'leri artımsal okur, sonrakiler yalnız SQLite toplar.
     const all = await ask();
-    const week = await ask(today - 6 * DAY);
     const day = await ask(today);
-    set(teamId, { status: "ready", today: day, week, all });
+    set(teamId, { status: "ready", today: day, all });
   } catch (e) {
     const error = String(e);
     if (error.includes("bilinmeyen metot")) return set(teamId, { status: "unsupported" });

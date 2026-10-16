@@ -6,8 +6,7 @@ import { AGENTS, getStatus } from "../agents";
 import { toggleBoard, useBoardOpen } from "../board/store";
 import { openPanel } from "../layout/panels";
 import { openTeamMenu } from "../team/TeamBar";
-import { useTeamCost } from "../usage/costStore";
-import { COST_HINT, breakdownParts, costText, warningText } from "../usage/costFormat";
+import { watchTeamCost } from "../usage/costStore";
 import { useCountUp } from "../motion";
 import { useDelegations } from "../delegations";
 import { roleQueueSummary } from "../delegationsModel";
@@ -17,7 +16,8 @@ import { WorkersBulkButton } from "../team/WorkersBulk";
 export function OfficeBar({ teamId, active }: { teamId: string; active: boolean }) {
   const [counts, setCounts] = useState({ working: 0, idle: 0 });
   const boardOpen = useBoardOpen();
-  const cost = useTeamCost(active ? teamId : null);
+  // Çip/hover maliyeti (agentToday) izlenen takımdan okunur; token metni şeritte (#2139).
+  useEffect(() => (active ? watchTeamCost(teamId) : undefined), [active, teamId]);
   const delegations = useDelegations();
   const { roles } = useTeams();
   const queue = roleQueueSummary(delegations, teamId, roles);
@@ -54,7 +54,6 @@ export function OfficeBar({ teamId, active }: { teamId: string; active: boolean 
         </span>
         {queue.count > 0 && <span className="office-queue-tip" aria-hidden="true">{queue.title}</span>}
       </span>
-      <TeamCost cost={cost} />
       {/* #70: the board button left the top bar; the palette and ` still open it too. */}
       <button className={`office-bar-btn${boardOpen ? " on" : ""}`} onClick={toggleBoard} aria-pressed={boardOpen} title="Görevler (` · terminaldeyken Ctrl+`)" aria-label="Görevler">
         <SquareKanban />
@@ -73,26 +72,5 @@ export function OfficeBar({ teamId, active }: { teamId: string; active: boolean 
         <Settings />
       </button>
     </div>
-  );
-}
-
-/** #209: takımın bugün / 7 gün toplamı (API eşdeğeri); eski dexd'de yok. */
-function TeamCost({ cost }: { cost: ReturnType<typeof useTeamCost> }) {
-  if (!cost || cost.status === "unsupported") return null;
-  if (cost.status === "loading") return <span className="office-cost muted" aria-busy="true" aria-label="Takım maliyeti yükleniyor"><span className="skel office-cost-skel" /></span>;
-  if (cost.status === "error") return <span className="office-cost muted" title={`Maliyet alınamadı: ${cost.error}`}>maliyet —</span>;
-  const today = costText(cost.today?.total) || "0 tok";
-  const week = costText(cost.week?.total) || "0 tok";
-  const title = [
-    `Bugün — ${breakdownParts(cost.today!.total).join(" · ")}`,
-    `7 gün — ${breakdownParts(cost.week!.total).join(" · ")}`,
-    COST_HINT,
-    warningText(cost.week!.warnings),
-    ...(cost.error ? [`Son yenileme başarısız: ${cost.error}`] : []),
-  ].filter(Boolean).join("\n");
-  return (
-    <span className="office-cost" tabIndex={0} title={title} aria-label={`Takım maliyeti. ${title}`}>
-      <b>Bugün</b> {today} <span className="sep">·</span> <b>7g</b> {week}
-    </span>
   );
 }
