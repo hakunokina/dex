@@ -6,6 +6,7 @@ import { useState } from "react";
 import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 import { addHost, removeHost, repairHost, useHosts } from "../api/hosts";
 import { HOST_STATUS_TEXT } from "../settings/Hosts";
+import { askConfirm } from "../confirm";
 
 const DEVICE = "Dex telefon";
 
@@ -118,8 +119,10 @@ function HostRow({ id, name, url, status }: { id: string; name: string; url: str
       <button
         className="m-danger"
         disabled={busy}
-        onClick={() => {
-          if (confirm(`"${name}" kaldırılsın mı? Takımları telefondan düşer; sunucuda çalışmaya devam eder.`)) void act(() => removeHost(id));
+        onClick={async () => {
+          if (await askConfirm(`"${name}" kaldırılsın mı?
+
+Takımları telefondan düşer; sunucuda çalışmaya devam eder.`, { confirmLabel: "Kaldır" })) void act(() => removeHost(id));
         }}
       >
         Kaldır

@@ -2,7 +2,7 @@
 // leader's "Temiz oturum" asks for a hand-over note, then restarts it once with `fresh`. The leader is
 // the fake `claude` (e2e/fake-claude.rs).
 import type { Locator, Page } from "@playwright/test";
-import { isolatedTest as test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+import { isolatedTest as test, expect, answerConfirm, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
 const fontPx = (pane: Locator) => pane.locator(".xterm-rows").evaluate((el) => parseFloat(getComputedStyle(el).fontSize));
 
@@ -70,18 +70,16 @@ test("lider Temiz oturum: önce devir notu istemi gider; İptal oturumu korur, �
   const resets = async () => (await calls(app)).filter((c) => c.cmd === "leader_reset" && c.args.action === "begin");
   const session = async () => (await dexd.call<{ id: string; startedAt: number }[]>("pty.list")).filter((p) => p.id === leader.id);
 
-  app.once("dialog", (d) => {
-    expect(d.message()).toContain("konuşma geçmişi yeni oturuma taşınmaz");
-    void d.dismiss();
-  });
   await button.click();
+  await expect(app.getByRole("alertdialog", { name: "Temiz oturum açılsın mı?" })).toBeVisible();
+  expect(await answerConfirm(app, false)).toContain("konuşma geçmişi yeni oturuma taşınmaz");
   await app.waitForTimeout(500);
   expect(await resets()).toHaveLength(0);
 
   // Accept → the prompt goes into the idle leader; the pane says so and the button waits.
   const first = (await session())[0].startedAt;
-  app.once("dialog", (d) => void d.accept());
   await button.click();
+  await answerConfirm(app, true);
   await expect(strip).toContainText("Devir notu yazılıyor");
   await expect(rows).toContainText("RX:[Dex-Sistem] Oturumun sıfırlanacak");
   await expect(button).toBeDisabled();
@@ -94,8 +92,8 @@ test("lider Temiz oturum: önce devir notu istemi gider; İptal oturumu korur, �
 
   // Again: the first prompt left the leader working (the fake sends no Stop), so this one waits its
   // turn. Reset without waiting for the note: one fresh session, painted clean.
-  app.once("dialog", (d) => void d.accept());
   await button.click();
+  await answerConfirm(app, true);
   await expect(strip).toContainText("istemi sırada");
   await strip.getByRole("button", { name: "Şimdi sıfırla" }).click();
   await expect(strip).toBeHidden();

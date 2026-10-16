@@ -1,6 +1,7 @@
 // FIX-5: the palette's open/close store + global shortcut, without the panel UI. Imported by
 // `App` (first-open chunk) so Ctrl+K works before the palette view itself loads lazily.
 import { useSyncExternalStore } from "react";
+import { inConfirm } from "../confirmModel";
 
 let isOpen = false;
 let returnFocus: HTMLElement | null = null;
@@ -23,7 +24,7 @@ function onKey(e: KeyboardEvent) {
     e.preventDefault();
     e.stopImmediatePropagation();
     setPaletteOpen(!isOpen, true);
-  } else if (isOpen && e.key === "Escape") {
+  } else if (isOpen && e.key === "Escape" && !inConfirm(e.target)) {
     e.preventDefault();
     e.stopImmediatePropagation();
     setPaletteOpen(false, true);

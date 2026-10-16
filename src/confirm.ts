@@ -1,12 +1,49 @@
-// #2051: the yes/no before a destructive act. In Tauri the dialog plugin (2.7.x) replaces window.confirm
-// with an async call to a command it no longer has ("dialog.confirm not allowed. Command not found"), and
-// the Promise it returns is truthy: `if (!confirm(..)) return` went on without asking. The plugin's own
-// `confirm` (its `message` command, `dialog:allow-message`) is awaited instead; a plain browser keeps the native one.
-import { confirm } from "@tauri-apps/plugin-dialog";
-import { WEB } from "./api/platform";
+// #2051: the yes/no before a destructive act is awaited — in Tauri window.confirm returns a truthy Promise.
+// #2145: the question is Dex's own dialog (ConfirmDialog, themed), not the dialog plugin's native Windows
+// box; it renders into its own root over everything, so any caller (in or out of React) can await it.
+import { createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { ConfirmDialog } from "./settings/kit/ConfirmDialog";
+import { confirmParts, serial } from "./confirmModel";
 
-/** True only when the patron chose Tamam. */
-export async function askConfirm(text: string): Promise<boolean> {
-  if (WEB) return window.confirm(text);
-  return confirm(text, { title: "Dex", kind: "warning", okLabel: "Tamam", cancelLabel: "İptal" });
+export type ConfirmOpts = {
+  title?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  /** Destructive (default): the primary is red and focus opens on İptal. */
+  danger?: boolean;
+};
+
+const queue = serial();
+
+/** True only when the patron chose Tamam; Esc, İptal and a click outside are false. Calls queue up. */
+export function askConfirm(text: string, opts: ConfirmOpts = {}): Promise<boolean> {
+  return queue(() => show(text, opts));
+}
+
+function show(text: string, opts: ConfirmOpts): Promise<boolean> {
+  const { title, body } = confirmParts(text, opts.title);
+  const back = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const host = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(host);
+  return new Promise((resolve) => {
+    let done = false;
+    const close = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      root.unmount();
+      host.remove();
+      if (back?.isConnected) back.focus();
+      resolve(ok);
+    };
+    root.render(createElement(ConfirmDialog, {
+      title,
+      body,
+      confirmLabel: opts.confirmLabel ?? "Tamam",
+      cancelLabel: opts.cancelLabel ?? "İptal",
+      danger: opts.danger ?? true,
+      onConfirm: () => close(true),
+      onCancel: () => close(false),
+    }));
+  });
 }

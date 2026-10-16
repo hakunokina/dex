@@ -3,7 +3,7 @@
 // default, read-only parts) and the notes tab's colour (red with content, white when empty).
 // #2086: one "Notlar" panel (shared + team note); the message append shows faint in the leader's header.
 import type { Page } from "@playwright/test";
-import { isolatedTest as test, expect, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+import { isolatedTest as test, expect, answerConfirm, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
 interface LeaderPrompt { systemAppend: string; messageAppend: string; pendingRestart: boolean }
 interface Part { id: string; title: string; editable: boolean; overridden: boolean }
@@ -108,15 +108,13 @@ test("Takım notu: ekleme alanları kaydeder, sarı kuşak, lider başlığında
   // An unsaved draft: closing asks (awaited, #2062); İptal keeps the overlay and the draft, Tamam closes.
   await text.press("Control+End");
   await text.pressSequentially(" taslak");
-  let asked = false;
-  app.once("dialog", (d) => { asked = true; void d.dismiss(); });
   await dialog.getByRole("button", { name: "Kapat" }).click();
-  await expect.poll(() => asked).toBe(true);
+  expect(await answerConfirm(app, false)).toContain("kaydedilmemiş değişiklik");
   await expect(dialog).toBeVisible();
   await expect(text).toHaveValue(/ taslak$/);
-  app.once("dialog", (d) => void d.accept());
 
   await app.keyboard.press("Escape");
+  await answerConfirm(app, true);
   await expect(dialog).toHaveCount(0);
   await expect(open).toBeFocused();
 

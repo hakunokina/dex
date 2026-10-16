@@ -1,7 +1,7 @@
 // #916: süreç paneli — Kart'taki CPU düğmesi açar; ajan başına CPU/RAM, en ağır üstte; alt süreç
 // listesi açılır, kapat yalnız çocukta ve onayla; kapalıyken istek yok. Ağaç ancak Windows job'undan
 // gelir: agent_processes / kill_agent_process köprüde hazır cevaplanır (__dexFake).
-import { test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+import { test, expect, answerConfirm, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
 const proc = (pid: number, x: Record<string, unknown>) => ({ pid, ppid: 1, name: `p${pid}.exe`, cmd: `p${pid}`, cpuPct: 0, memMb: 0, kind: "other", root: false, ...x });
 
@@ -70,14 +70,22 @@ test("Süreç paneli: ağır ajan üstte, alt süreci onayla kapatır, kapalıyk
   const kill = list.getByRole("button", { name: "chrome.exe (pid 201) sürecini sonlandır" });
 
   // Onay reddedilirse istek gitmez; kabulde ajan + pid ile gider.
-  app.once("dialog", (d) => void d.dismiss());
   await kill.click();
+  await answerConfirm(app, false);
+  await expect(kill).toBeFocused();
+  // #2145: Dex's own dialog (no native box) — Esc and a click outside cancel too.
+  const ask = app.getByRole("alertdialog", { name: /alt süreci kapatılsın mı\?/ });
+  await kill.click();
+  await expect(ask).toBeVisible();
+  await app.keyboard.press("Escape");
+  await expect(ask).toHaveCount(0);
+  await kill.click();
+  await expect(ask).toBeVisible();
+  await app.mouse.click(4, 4);
+  await expect(ask).toHaveCount(0);
   expect((await calls(app)).filter((c) => c.cmd === "kill_agent_process")).toHaveLength(0);
-  app.once("dialog", (d) => {
-    expect(d.message()).toContain("pid 201");
-    void d.accept();
-  });
   await kill.click();
+  expect(await answerConfirm(app, true)).toContain("pid 201");
   await expect.poll(async () => (await calls(app)).filter((c) => c.cmd === "kill_agent_process").map((c) => c.args))
     .toEqual([{ agent: worker.id, pid: 201 }]);
   await expect(heads.first()).toBeFocused(); // odak panelde kalır (satır süreçle gider)

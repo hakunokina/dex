@@ -6,6 +6,7 @@ import { createPortal } from "react-dom";
 import { Lock, X } from "lucide-react";
 import { callHost, onEvent } from "../api/hosts";
 import { askConfirm } from "../confirm";
+import { inConfirm } from "../confirmModel";
 import { audienceLabel, channelLabel, replacePart, type PromptPart, type PromptParts } from "./notePrompts";
 
 type Load = { phase: "loading" } | { phase: "error"; text: string } | { phase: "ready"; data: PromptParts };
@@ -75,7 +76,7 @@ export function PromptPartsDialog({ host, onClose }: { host: string; onClose: ()
   onEsc.current = () => (confirmReset ? endConfirm() : void close());
   useEffect(() => {
     const key = (e: globalThis.KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (e.key !== "Escape" || inConfirm(e.target)) return;
       e.stopPropagation();
       onEsc.current();
     };
