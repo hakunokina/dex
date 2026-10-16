@@ -1,7 +1,8 @@
 // #1859 Günlük motivasyon: her sabah 04:45'te (uygulama kapalıyken de; WorkManager) eşli dexd
 // host'larından o günün üç cümlesini (`motivation_today`) çeker, JezLauncher'a ContentProvider
-// `call` ile yazar, sonucu aynı host'a `motivation_result` ile bildirir. Bildirim/FCM yok: PC'ye
-// erişilemiyorsa metin de yoktur. Zamanlama/karar: MotivationPlan.kt. Host adresi + jeton:
+// `call` ile yazar, sonucu aynı host'a `motivation_result` ile bildirir. Bildirim yok: PC'ye
+// erişilemiyorsa metin de yoktur. #2090: dexd cümleleri kaydedince FCM data mesajı (`kind: motivation`)
+// bugünün işini hemen koşturur (DexMessagingService → MotivationWork.pushed); 04:45 işi yedektir. Zamanlama/karar: MotivationPlan.kt. Host adresi + jeton:
 // HostTokensPlugin (Keystore'lu şifreli tercihler). Manifest (izin + queries): motivation.xml,
 // build-apk.sh ekler. Jeton ve cümleler loglanmaz.
 
@@ -9,6 +10,7 @@ package com.hakunokina.dex.hosttokens
 
 import android.content.Context
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.work.BackoffPolicy
@@ -16,9 +18,12 @@ import androidx.work.Constraints
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequest
+import androidx.work.OutOfQuotaPolicy
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.Worker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -53,6 +58,9 @@ object MotivationWork {
     private const val PREFS = "dex-motivation"
     private const val LAST = "last-written"
 
+    /** Worker girdisi: push ile kurulan iş pencere ve "bugün yazıldı" denetimini atlar (kayıt yeni). */
+    const val PUSHED = "pushed"
+
     /** Yarınki (ya da bugünkü, 04:45 öncesiyse) 04:45 işi; 04:45–12:00 arası ve bugün yazılmadıysa hemen.
      *  `afterRun`: koşan işten çağrı — sonraki iş hep ertesi gün (MotivationPlan.nextAfterRun). */
     fun ensure(context: Context, afterRun: Boolean = false) {
@@ -61,18 +69,56 @@ object MotivationWork {
         val next = if (afterRun) MotivationPlan.nextAfterRun(now, tz) else MotivationPlan.nextRun(now, tz)
         enqueue(context, MotivationPlan.day(next, tz), next - now)
         val today = MotivationPlan.day(now, tz)
-        if (MotivationPlan.inWindow(now, tz) && lastWritten(context) != today) enqueue(context, today, 0)
+        if (!MotivationPlan.inWindow(now, tz) || lastWritten(context) == today) return
+        // Koşan iş bugünün işidir; REPLACE onu (kendini) iptal ederdi.
+        if (afterRun) enqueue(context, today, 0) else replaceUnlessRunning(context, today)
     }
 
-    private fun enqueue(context: Context, day: String, delayMs: Long) {
-        val req = OneTimeWorkRequest.Builder(MotivationWorker::class.java)
+    /** #2090: dexd bugünün cümlelerini kaydetti (FCM). Backoff'ta bekleyen ya da süren işin yerine hemen
+     *  koşar; süren iş kaydı henüz görmemiş olabilir. */
+    fun pushed(context: Context, date: String) {
+        if (!MotivationPlan.isToday(date, System.currentTimeMillis(), TimeZone.getDefault())) return
+        enqueue(context, date, 0, ExistingWorkPolicy.REPLACE, pushed = true)
+    }
+
+    /** #2090 uygulama açılışı: backoff'ta (15 dk × n) bekleyen bugünün işi hemen denenir; süren iş kalır.
+     *  Bekleyen/bitmiş iş için REPLACE'in KEEP'ten farkı yalnız backoff beklemesidir. */
+    private fun replaceUnlessRunning(context: Context, day: String) {
+        val infos = WorkManager.getInstance(context).getWorkInfosForUniqueWork(name(day))
+        infos.addListener({
+            val running = try {
+                infos.get().any { it.state == WorkInfo.State.RUNNING }
+            } catch (e: Exception) {
+                false
+            }
+            if (!running) enqueue(context, day, 0, ExistingWorkPolicy.REPLACE)
+        }, { it.run() })
+    }
+
+    private fun name(day: String) = "$TAG-$day"
+
+    private fun enqueue(
+        context: Context,
+        day: String,
+        delayMs: Long,
+        policy: ExistingWorkPolicy = ExistingWorkPolicy.KEEP,
+        pushed: Boolean = false,
+    ) {
+        val b = OneTimeWorkRequest.Builder(MotivationWorker::class.java)
             .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.LINEAR, MotivationPlan.BACKOFF_MINUTES, TimeUnit.MINUTES)
             .addTag(TAG)
-            .build()
-        // KEEP: bekleyen/süren aynı günün işi (backoff'ta olsa da) olduğu gibi kalır.
-        WorkManager.getInstance(context).enqueueUniqueWork("$TAG-$day", ExistingWorkPolicy.KEEP, req)
+        if (pushed) {
+            b.setInputData(workDataOf(PUSHED to true))
+            // Expedited: high-priority FCM'nin verdiği kısa izinde Doze'a takılmadan koşar. Android 12
+            // öncesinde ön plan servisi + bildirim ister (getForegroundInfo); orada normal iş.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                b.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            }
+        }
+        // KEEP (varsayılan): bekleyen/süren aynı günün işi (backoff'ta olsa da) olduğu gibi kalır.
+        WorkManager.getInstance(context).enqueueUniqueWork(name(day), policy, b.build())
     }
 
     private fun prefs(context: Context) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -104,7 +150,8 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
             // Uygulamanın bir sonraki açılışında yeniden kurulur.
         }
         val today = MotivationPlan.day(now, tz)
-        if (!MotivationPlan.shouldFetch(MotivationWork.lastWritten(ctx), now, tz)) return Result.success()
+        val pushed = inputData.getBoolean(MotivationWork.PUSHED, false)
+        if (!pushed && !MotivationPlan.shouldFetch(MotivationWork.lastWritten(ctx), now, tz)) return Result.success()
         val misses = mutableListOf<MotivationPlan.Miss>()
         val hosts = try {
             HostTokensPlugin.hosts(ctx)
@@ -114,7 +161,7 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
         }
         // Boş liste = adresler henüz yazılmadı (ilk açılış): retry; HostTokensPlugin.keepUrl da yeniden kurar.
         for ((url, token) in hosts) {
-            val miss = fromHost(ctx, url, token, today) ?: return Result.success()
+            val miss = fromHost(ctx, url, token, today, pushed) ?: return Result.success()
             misses += miss
         }
         val retry = MotivationPlan.retry(misses, MotivationPlan.pastWindow(System.currentTimeMillis(), tz))
@@ -123,12 +170,13 @@ class MotivationWorker(context: Context, params: WorkerParameters) : Worker(cont
     }
 
     /** null: kayıt bu host'tan geldi ve yazma denendi (sonuç ne olursa olsun bugünün işi biter). */
-    private fun fromHost(ctx: Context, url: String, token: String, today: String): MotivationPlan.Miss? {
+    private fun fromHost(ctx: Context, url: String, token: String, today: String, pushed: Boolean): MotivationPlan.Miss? {
         try {
             HostRpc.open(url, token).use { rpc ->
                 val lines = parse(rpc.call("motivation_today", JSONObject()))
                     ?.takeIf { it.date == today } ?: return MotivationPlan.Miss.EMPTY
-                if (MotivationWork.lastWritten(ctx) == lines.date) return null
+                // Push: kayıt yeni (düzenlenmiş olabilir); launcher aynı tarihin üzerine yazar.
+                if (!pushed && MotivationWork.lastWritten(ctx) == lines.date) return null
                 val (ok, error) = write(ctx, lines)
                 if (ok) MotivationWork.markWritten(ctx, lines.date)
                 val result = JSONObject().put("date", lines.date).put("ok", ok)

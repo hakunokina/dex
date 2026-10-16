@@ -89,6 +89,14 @@ class MotivationPlanTest {
     }
 
     @Test
+    fun pushOnlyForToday() {
+        assertTrue(MotivationPlan.isToday("2026-10-15", at(2026, 10, 15, 7, 30), tz))
+        assertTrue(MotivationPlan.isToday("2026-10-15", at(2026, 10, 15, 13), tz))
+        assertFalse(MotivationPlan.isToday("2026-10-14", at(2026, 10, 15, 0, 10), tz))
+        assertFalse(MotivationPlan.isToday("2026-10-15T07:30", at(2026, 10, 15, 7, 30), tz))
+    }
+
+    @Test
     fun dateFormat() {
         assertTrue(MotivationPlan.validDate("2026-10-15"))
         assertFalse(MotivationPlan.validDate("2026-10-15T05:00"))
