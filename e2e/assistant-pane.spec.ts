@@ -26,7 +26,7 @@ test("Asistan: üye ekleme, Core grubunda 4. sekme, doğrudan yazım, dar görü
   }, team.id);
   const before = await coreGroup().boundingBox();
   const beforeGroups = await groups();
-  await app.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
+  await app.getByRole("navigation", { name: "Takımlar" }).getByRole("button", { name: "Yeni takım", exact: true }).click();
   const newTeamForm = app.getByRole("dialog", { name: "Yeni takım", exact: true });
   const crew = newTeamForm.getByRole("combobox", { name: /^Worker \d rolü$/ });
   await expect(crew).toHaveCount(4);
