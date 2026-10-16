@@ -2,7 +2,7 @@ import { useSyncExternalStore } from "react";
 import { MOBILE } from "../api/platform";
 import { onEvent } from "../api/hosts";
 import { kept } from "../hot";
-import { createSoundGate, normalizeSoundSettings, soundForEvent, type SoundEvent, type SoundKind, type SoundSettings } from "./model";
+import { SOUND_LABELS, createSoundGate, normalizeSoundSettings, soundForEvent, type SoundEvent, type SoundKind, type SoundSettings } from "./model";
 import { synthesize } from "./synth";
 
 const KEY = "dex.sounds";
@@ -15,6 +15,8 @@ const box = kept(hot, "sound", () => ({
   view: { settings: readSettings(), error: null as string | null, audioError: null as string | null },
   context: null as AudioContext | null,
   accept: createSoundGate(),
+  /** Custom sound files (public/sounds/<kind>.<ext>): buffer, null = none, absent = not loaded yet. */
+  files: new Map<SoundKind, AudioBuffer | null>(),
   listeners: new Set<() => void>(),
 }));
 function publish(settings: SoundSettings, error: string | null, audioError = box.view.audioError) {
@@ -44,11 +46,44 @@ function audio() {
   if (typeof AudioContext === "undefined") throw new Error("Bu cihazda ses oynatma desteklenmiyor.");
   if (!box.context || box.context.state === "closed") {
     const ctx = box.context = new AudioContext();
+    box.files.clear();
+    preloadFiles(ctx);
     ctx.onstatechange = () => {
       if (box.context === ctx && ctx.state === "running") clearAudioError();
     };
   }
   return box.context;
+}
+const SOUND_EXTS = ["opus", "mp3", "wav", "ogg"];
+/** First playable `public/sounds/<kind>.<ext>`; Vite's SPA fallback (text/html) counts as missing. */
+async function loadFile(ctx: AudioContext, kind: SoundKind): Promise<AudioBuffer | null> {
+  for (const ext of SOUND_EXTS) {
+    try {
+      const res = await fetch(`/sounds/${kind}.${ext}`);
+      if (!res.ok || (res.headers.get("content-type") ?? "").includes("text/html")) continue;
+      return await ctx.decodeAudioData(await res.arrayBuffer());
+    } catch { /* next extension */ }
+  }
+  return null;
+}
+function preloadFiles(ctx: AudioContext) {
+  for (const kind of Object.keys(SOUND_LABELS) as SoundKind[]) {
+    if (box.files.has(kind)) continue;
+    box.files.set(kind, null);
+    void loadFile(ctx, kind).then((buffer) => box.files.set(kind, buffer));
+  }
+}
+/** A custom file if one is loaded, else the built-in synth. */
+function play(ctx: AudioContext, kind: SoundKind, volume: number) {
+  const buffer = box.files.get(kind);
+  if (!buffer) return synthesize(ctx, kind, volume);
+  const source = ctx.createBufferSource();
+  const gain = ctx.createGain();
+  source.buffer = buffer;
+  gain.gain.value = volume;
+  source.connect(gain).connect(ctx.destination);
+  source.onended = () => { source.disconnect(); gain.disconnect(); };
+  source.start();
 }
 const failed = (error: unknown) => publish(box.view.settings, box.view.error, error instanceof Error ? error.message : "Ses çalınamadı.");
 
@@ -63,7 +98,7 @@ export function soundEvent(event: SoundEvent) {
       void ctx.resume().catch(failed);
       throw new Error("Sesleri etkinleştirmek için Dex'te bir kez tıklayın veya bir tuşa basın.");
     }
-    synthesize(ctx, kind, box.view.settings.volume);
+    play(ctx, kind, box.view.settings.volume);
     clearAudioError();
   } catch (error) { failed(error); }
 }
@@ -83,7 +118,7 @@ export async function previewSound(kind: SoundKind) {
   }
   if (ctx.state !== "running") throw new Error("Ses aygıtı hazır değil. Yeniden deneyin.");
   if (box.view.settings.volume === 0) throw new Error("Dinlemek için ses düzeyini artırın.");
-  synthesize(ctx, kind, box.view.settings.volume);
+  play(ctx, kind, box.view.settings.volume);
   clearAudioError();
 }
 
