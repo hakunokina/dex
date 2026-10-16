@@ -21,9 +21,11 @@ test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar
   await expect(projects).toBeVisible();
   await expect(projects.getByText("git", { exact: true })).toBeVisible();
   await expect(projects.getByRole("button", { name: "Kategori altında klasör aç" })).toHaveCount(0);
-  await projects.locator("summary", { hasText: "Kategori kökünü değiştir" }).click();
-  const chooseRoot = projects.getByRole("button", { name: "Kategori kökü seç", exact: true });
-  await chooseRoot.focus();
+  // #2137: the backfilled app-data placeholder is not a category root — the projects' real
+  // parent is suggested instead, and creating stays closed until the patron accepts it.
+  await expect(projects.getByText("Kategori kökü:")).toBeVisible();
+  const useRoot = projects.getByRole("button", { name: "Kullan", exact: true });
+  await useRoot.focus();
   await app.keyboard.press("Enter");
   await expect.poll(async () => (await calls(app)).filter(c => c.cmd === "team_update" && c.args.id === team.id && (c.args.patch as { workspaceRoot?: string }).workspaceRoot).length).toBe(1);
   await projects.getByRole("textbox", { name: "Yeni klasör adı" }).fill("İkinci");

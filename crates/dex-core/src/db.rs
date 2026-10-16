@@ -1450,10 +1450,11 @@ mod project_migration_tests {
         );
 
         projects::set_default(&c, "default", None).unwrap();
-        let workspace = crate::teams::get_team(&c, &fixture.0, "default")
-            .unwrap()
-            .workspace_root
-            .unwrap();
+        // The backfilled app-data placeholder is not a category root: the team presents it as
+        // unset, while session resolution still falls back to that same folder.
+        let team = crate::teams::get_team(&c, &fixture.0, "default").unwrap();
+        assert!(team.workspace_root.is_none());
+        let workspace = crate::teams::service_dir(&fixture.0, "default").join("workspace");
         assert_resumed(None, std::path::Path::new(&workspace));
         for p in [&legacy, &second] {
             projects::archive(&c, "default", &p.id, |_| false).unwrap();

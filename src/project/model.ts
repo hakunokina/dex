@@ -3,7 +3,7 @@
 
 export type ProjectErrorCode =
   | "project_required" | "project_not_found" | "project_unavailable" | "project_busy"
-  | "project_root_conflict" | "project_mismatch" | "project_branch_mismatch";
+  | "project_root_conflict" | "project_mismatch" | "project_branch_mismatch" | "project_category_unset";
 
 /** crates/dex-core/src/projects.rs `Project`; `id`/`teamId` qualified, `host` added here. */
 export interface Project {
@@ -47,6 +47,7 @@ export const PROJECT_ERROR_TEXT: Record<ProjectErrorCode, string> = {
   project_root_conflict: "Bu klasör/repo zaten başka bir projeye bağlı.",
   project_mismatch: "Proje adı ya da klasör/repo bağı geçersiz; ad benzersiz, repo kökü en üst klasör olmalı.",
   project_branch_mismatch: "Dal bu klasörün checkout'uyla uyuşmuyor.",
+  project_category_unset: "Kategori kökü kullanılamıyor — önce bir kategori kökü seç ya da önerilen kökü kullan.",
 };
 
 const errText = (err: unknown) => (err instanceof Error ? err.message : String(err));
