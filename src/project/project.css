@@ -52,3 +52,6 @@
   font: var(--fw-medium) var(--fs-2xs) / 16px var(--font-mono); color: var(--muted);
   border: 1px solid var(--line); border-radius: var(--r-pill); padding: 0 6px;
 }
+.project-add-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
+.project-add-row label:only-child { grid-column: 1 / -1; }
+@container (max-width: 520px) { .project-add-row { grid-template-columns: 1fr; } }

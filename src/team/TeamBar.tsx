@@ -566,6 +566,7 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
     <div className="team-pop team-settings" onKeyDown={(e) => e.key === "Escape" && onClose()}>
       <h3>
         {team.name} <span className="team-kind">{team.kind === "main" ? "proje" : "alt takım"}</span>
+        <span className="team-head-memory"><span>Hafıza</span><code>{team.memoryDir ?? "—"}</code></span>
         <button className="icon-btn close" onClick={onClose} title="Kapat"><X /></button>
       </h3>
       <dl className="team-info">
@@ -588,8 +589,6 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
             </dd>
           </>
         )}
-        <dt>Hafıza</dt>
-        <dd><code>{team.memoryDir ?? "—"}</code></dd>
       </dl>
 
       {projectList && <ProjectsSection teamId={team.id} />}

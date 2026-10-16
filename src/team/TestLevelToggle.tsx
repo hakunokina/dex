@@ -32,9 +32,9 @@ export function TestLevelToggle({ level, onChange }: {
     <div className="team-test-level" aria-busy={busy}>
       <button type="button" role="switch" aria-label="Tam testler" aria-checked={level === "full"}
         aria-describedby={hintId} aria-disabled={busy} onClick={() => void toggle()}>
-        Test: {level === "full" ? "Tam" : "Hafif"}
+        <span>Test: {level === "full" ? "Tam" : "Hafif"}</span>
+        <span id={hintId} className="team-test-hint">Tam: testler dahil. Hafif: yalnız derleme + tip kontrolü. Yeni oturumlarda geçerli.</span>
       </button>
-      <p id={hintId} className="team-note">Tam: testler dahil. Hafif: yalnız derleme + tip kontrolü. Yeni oturumlarda geçerli.</p>
       {busy && <span className="team-note" role="status">Kaydediliyor…</span>}
       {error && <p className="team-err" role="alert">{error}</p>}
     </div>

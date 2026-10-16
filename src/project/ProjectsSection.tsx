@@ -245,14 +245,16 @@ function AddProject({ teamId, host, start, categoryRoot, suggestedRoot, run }: {
             })} />
           </details>
         </>}
-        <label>Yeni klasör adı<input aria-label="Yeni klasör adı" placeholder="ör. Site" value={name} onChange={e => setName(e.target.value)} /></label>
       </>}
       {existing && <div className="team-dir">
         <span title={root ?? ""}>{root ?? "klasör seçilmedi"}</span>
         <FolderButton host={host} teamId={teamId} label="Klasör seç…" start={categoryRoot ?? start} onPick={dir => { setRoot(dir); if (!name.trim()) setName(folderName(dir)); }} />
       </div>}
-      {existing && root && <label>Proje adı<input aria-label="Proje adı" value={name} onChange={e => setName(e.target.value)} /></label>}
-      <label>Merge dalı<input aria-label="Merge dalı" placeholder="Boş: checkout’taki dal" value={branch} onChange={e => setBranch(e.target.value)} /></label>
+      <div className="project-add-row">
+        {!existing && <label>Yeni klasör adı<input aria-label="Yeni klasör adı" placeholder="ör. Site" value={name} onChange={e => setName(e.target.value)} /></label>}
+        {existing && root && <label>Proje adı<input aria-label="Proje adı" value={name} onChange={e => setName(e.target.value)} /></label>}
+        <label>Merge dalı<input aria-label="Merge dalı" placeholder="Boş: checkout’taki dal" value={branch} onChange={e => setBranch(e.target.value)} /></label>
+      </div>
       <div className="team-actions">
         <button type="submit" className="primary" disabled={!name.trim() || (existing ? !root : !categoryRoot || !!suggestedRoot)}>{existing ? "Proje ekle" : "Oluştur ve bağla"}</button>
       </div>
