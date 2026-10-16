@@ -1,6 +1,7 @@
 // FIX-5: the board's open/close store without the views, so the shortcut and the palette
 // (`openBoard`) stay in the first-open chunk while `Board`/`BoardView` load lazily.
 import { useSyncExternalStore } from "react";
+import { inConfirm } from "../confirmModel";
 
 let open = false;
 const subs = new Set<() => void>();
@@ -32,7 +33,7 @@ function onKey(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     toggleBoard();
-  } else if (e.key === "Escape" && isBoardOpen()) {
+  } else if (e.key === "Escape" && isBoardOpen() && !inConfirm(e.target)) {
     toggleBoard();
   }
 }

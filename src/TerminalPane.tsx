@@ -349,7 +349,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
       "konuşma geçmişi yeni oturuma taşınmaz." +
       (out ? `\n\nLider ${out} devretmenin sonucunu bekliyor; sonuçlar yeni oturuma teslim edilir ama bağlamı kaybolur.` : "") +
       "\n\nDevam edilsin mi?";
-    if (!(await askConfirm(text))) return;
+    if (!(await askConfirm(text, { title: "Temiz oturum açılsın mı?" }))) return;
     setAsking(true);
     // No session: the core starts the fresh one at once.
     if (!runningRef.current) freshRef.current = true;

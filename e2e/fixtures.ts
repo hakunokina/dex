@@ -147,6 +147,16 @@ export { expect };
 
 export const calls = (page: Page) => page.evaluate(() => window.__dexCalls as RecordedCall[]);
 
+/** #2145: answers askConfirm's in-app dialog (destructive: opens on İptal) and returns its text. */
+export async function answerConfirm(page: Page, ok: boolean): Promise<string> {
+  const dialog = page.getByRole("alertdialog");
+  await expect(dialog.getByRole("button", { name: "İptal", exact: true })).toBeFocused();
+  const text = await dialog.innerText();
+  await dialog.getByRole("button", { name: ok ? "Tamam" : "İptal", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  return text;
+}
+
 /** Selects a team by its tab in the top bar (its name may carry a status badge: "Oto 0 1", #27). */
 export const openTeam = (page: Page, name: string) =>
   page

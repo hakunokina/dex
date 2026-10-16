@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 import type { Page } from "@playwright/test";
-import { isolatedTest as test, expect, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
+import { isolatedTest as test, expect, answerConfirm, calls, newTeam, openTeam, paneOf, teamAgents } from "./fixtures";
 
 /** #2141: the top-bar picker is a button + listbox, not a native <select>. */
 const pickProject = async (app: Page, name: string) => {
@@ -54,15 +54,13 @@ test("projeler: bağla, düzenle, seç, yeni terminal, arşiv/yeniden aç ve dar
   await pickProject(app, original.name);
   await expect(picker).toHaveText(original.name);
   // #2051: İptal → arşivlenmez, istek gitmez.
-  let asked = false;
-  app.once("dialog", d => { asked = true; void d.dismiss(); });
   await site.getByRole("button", { name: "Arşivle" }).click();
-  await expect.poll(() => asked).toBe(true);
+  expect(await answerConfirm(app, false)).toContain("arşivlensin mi?");
   await app.waitForTimeout(300);
   expect((await calls(app)).filter(c => c.cmd === "project_archive")).toHaveLength(0);
   await expect(site).toHaveCount(1);
-  app.on("dialog", d => d.accept());
   await site.getByRole("button", { name: "Arşivle" }).click();
+  await answerConfirm(app, true);
   await expect(site).toHaveCount(0);
   await projects.getByRole("button", { name: "Arşivdekiler (1)" }).click();
   await expect(site).toContainText("arşivde");
@@ -140,8 +138,12 @@ test("proje hafızası: tek grafikte yalnız seçili proje; oturum başlığı k
   await app.keyboard.press("Enter");
   const projects = app.getByRole("region", { name: "Projeler", exact: true });
   const row = (p: { name: string }) => projects.locator(".project-row", { has: app.getByText(p.name, { exact: true }) });
-  app.on("dialog", d => d.accept());
   await row(p2).getByRole("button", { name: "Arşivle" }).focus();
+  await app.keyboard.press("Enter");
+  // Keyboard: Tab leaves İptal for Tamam, Enter confirms.
+  await expect(app.getByRole("alertdialog").getByRole("button", { name: "İptal", exact: true })).toBeFocused();
+  await app.keyboard.press("Tab");
+  await expect(app.getByRole("alertdialog").getByRole("button", { name: "Tamam", exact: true })).toBeFocused();
   await app.keyboard.press("Enter");
   await expect(scope).toHaveValue("");
   await expect(node2).toHaveCount(0);
@@ -152,6 +154,7 @@ test("proje hafızası: tek grafikte yalnız seçili proje; oturum başlığı k
   await expect.poll(async () => (await dexd.call<{ id: string }[]>("pty.list")).some(p => p.id === leader.id)).toBe(true);
   await row(p1).getByRole("button", { name: "Arşivle" }).focus();
   await app.keyboard.press("Enter");
+  await answerConfirm(app, true);
   await expect(projects.getByRole("alert")).toHaveText(/süren iş.*açık oturum var/);
   await expect(row(p1)).not.toContainText("arşivde");
   await expect(scope.locator(`option[value="${p1.id}"]`)).toHaveCount(1);
