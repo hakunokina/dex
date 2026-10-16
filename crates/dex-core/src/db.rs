@@ -470,7 +470,7 @@ const MIGRATIONS: &[&str] = &[
     crate::job_change::SCHEMA,
     // 44 (#2104): a closed card that is not "done" work — the leader's patron-approved cancel, or
     // a failed/unreported card a same-titled new card replaced. Additive column + index + trigger;
-    // the one-time UPDATEs close today's stale cards (guarded, a second run changes nothing).
+    // the one-time UPDATE closes the leader-confirmed stale cards (guarded, a second run changes nothing).
     // Revert: `UPDATE tasks SET status='todo', closed_reason=NULL WHERE closed_reason IS NOT NULL;
     // DROP TRIGGER tasks_reopen; DROP INDEX delegations_task;` (the column stays, NULL).
     TASK_CLOSED,
@@ -481,22 +481,17 @@ const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK
     CREATE TRIGGER IF NOT EXISTS tasks_reopen AFTER UPDATE OF status ON tasks
     WHEN NEW.status <> 'done' AND NEW.closed_reason IS NOT NULL
     BEGIN UPDATE tasks SET closed_reason = NULL WHERE id = NEW.id; END;
-    UPDATE tasks SET status = 'done', closed_reason = 'cancelled', updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
-    WHERE status <> 'done' AND id IN (SELECT d.task_id FROM delegations d JOIN job_changes j ON j.delegation_id = d.id
-        WHERE j.action = 'cancel' AND d.status = 'failed' AND d.summary LIKE 'lider iptal etti%'
-        AND d.id = (SELECT MAX(x.id) FROM delegations x WHERE x.task_id = d.task_id));
-    UPDATE tasks SET status = 'done', closed_reason = 'superseded', updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
-    WHERE status = 'todo' AND (SELECT x.status FROM delegations x WHERE x.task_id = tasks.id ORDER BY x.id DESC LIMIT 1) IN ('failed','done_no_report')
-    AND NOT EXISTS (SELECT 1 FROM plan_items i WHERE i.task_id = tasks.id)
-    AND EXISTS (SELECT 1 FROM tasks n WHERE n.id > tasks.id AND n.team_id IS tasks.team_id AND n.project_id IS tasks.project_id AND n.title = tasks.title);
-    -- The leader confirmed these by hand (2026-10-16): #2056 → #2057 merged, #2077's fix landed as
-    -- b6c5245, the embedding job was cancelled by the patron. Each guarded by its job link.
-    UPDATE tasks SET status = 'done', closed_reason = CASE id WHEN 1258 THEN 'cancelled' ELSE 'superseded' END,
+    -- #2110: only the cards the leader confirmed by hand (2026-10-16), no general rule: #2056 → #2057
+    -- merged, #2077's fix landed as b6c5245, the embedding job and #2076 were cancelled by the patron.
+    -- Each guarded by its job link, so another DB changes nothing.
+    UPDATE tasks SET status = 'done', closed_reason = CASE WHEN id IN (1258, 1483) THEN 'cancelled' ELSE 'superseded' END,
         updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
     WHERE status = 'todo' AND (
         (id = 1462 AND EXISTS (SELECT 1 FROM delegations WHERE id = 2056 AND task_id = 1462 AND status = 'failed'))
         OR (id = 1484 AND EXISTS (SELECT 1 FROM delegations WHERE id = 2077 AND task_id = 1484 AND status = 'done_no_report'))
-        OR (id = 1258 AND EXISTS (SELECT 1 FROM delegations WHERE id = 1853 AND task_id = 1258 AND status = 'done')));";
+        OR (id = 1258 AND EXISTS (SELECT 1 FROM delegations WHERE id = 1853 AND task_id = 1258 AND status = 'done'))
+        OR (id = 1483 AND EXISTS (SELECT 1 FROM delegations d JOIN job_changes j ON j.delegation_id = d.id
+            WHERE d.id = 2076 AND d.task_id = 1483 AND d.status = 'failed' AND j.action = 'cancel')));";
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
 const STALE_PROPOSALS: &str = "
@@ -567,8 +562,10 @@ mod task_closed_migration_tests {
                 (3,'gitleaks','todo','kaan',2,2,'default'), (4,'elle','todo',NULL,1,1,'default'),
                 (5,'bitti','done','kaan',1,1,'default'), (6,'sürüyor','doing','kaan',1,1,'default'),
                 (1258,'embedding','todo','kaan',1,1,'default'), (1462,'çakışma','todo','kaan',1,1,'default'),
-                (1484,'ikili','todo','kaan',1,1,'default'), (1485,'ikili','todo','kaan',1,1,'other');
-            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at) VALUES(1,'default','timur','backend','opus','anthropic','r',1);
+                (1483,'ikili','todo','kaan',1,1,'default'), (1484,'ikili','todo','kaan',1,1,'default'),
+                (1485,'ikili','todo','kaan',1,1,'other');
+            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at) VALUES
+                (1,'default','timur','backend','opus','anthropic','r',1), (2,'default','timur','backend','opus','anthropic','r',1);
             INSERT INTO delegations(id,from_agent,to_agent,team_id,prompt,status,summary,task_id,created_at,updated_at) VALUES
                 (10,'timur','kaan','default','p','failed','lider iptal etti (patron onayıyla): r',1,1,1),
                 (11,'timur','kaan','default','p','failed','x',2,1,1),
@@ -576,8 +573,9 @@ mod task_closed_migration_tests {
                 (13,'timur','kaan','default','p','running',NULL,6,1,1),
                 (1853,'timur','kaan','default','p','done','ara rapor',1258,1,1),
                 (2056,'timur','kaan','default','p','failed','başlatılamadı',1462,1,1),
+                (2076,'timur','kaan','default','p','failed','lider iptal etti (patron onayıyla): r',1483,1,1),
                 (2077,'timur','kaan','default','p','done_no_report','x',1484,1,1);
-            INSERT INTO job_changes(proposal_id,action,delegation_id,reason) VALUES(1,'cancel',10,'r');",
+            INSERT INTO job_changes(proposal_id,action,delegation_id,reason) VALUES(1,'cancel',10,'r'), (2,'cancel',2076,'r');",
         )
         .unwrap();
         let count = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap() };
@@ -594,9 +592,10 @@ mod task_closed_migration_tests {
             };
             let at = |s: &str, r: Option<&str>| (s.to_string(), r.map(String::from));
             let want = [
-                (1, at("done", Some("cancelled"))), (2, at("done", Some("superseded"))), (3, at("todo", None)),
+                // #2110: no general rule — a cancelled or same-titled card off the confirmed list stays.
+                (1, at("todo", None)), (2, at("todo", None)), (3, at("todo", None)),
                 (4, at("todo", None)), (5, at("done", None)), (6, at("doing", None)),
-                (1258, at("done", Some("cancelled"))), (1462, at("done", Some("superseded"))),
+                (1258, at("done", Some("cancelled"))), (1462, at("done", Some("superseded"))), (1483, at("done", Some("cancelled"))),
                 (1484, at("done", Some("superseded"))), (1485, at("todo", None)),
             ];
             let got: Vec<(i64, (String, Option<String>))> = rows.into_iter().map(|(i, s, r)| (i, (s, r))).collect();

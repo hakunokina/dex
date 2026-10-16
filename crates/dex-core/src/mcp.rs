@@ -1876,7 +1876,7 @@ fn create_targeted_job(
     // #1768: taskId yoksa pano kartını Dex açar (servis işleri hariç: onların panosu ayrı takımda).
     if d.task_id.is_none() && d.service_team_id.is_none() {
         let snapshot = delegate::ProjectSnapshot::from(&context);
-        let task = delegate::auto_task(&tx, &d.to_agent, &d.team_id, title, &d.prompt, d.patron_words.as_deref(), &snapshot)?;
+        let task = delegate::auto_task(&tx, &d.to_agent, role, &d.team_id, title, &d.prompt, d.patron_words.as_deref(), &snapshot)?;
         d.task_id = Some(task.id);
     }
     if let Some(f) = fix_of {

@@ -647,7 +647,7 @@ mod tests {
 
     fn job(c: &Connection, to: &str) -> Delegation {
         let lead = lead(c);
-        let task = delegate::auto_task(c, to, "default", Some("kart"), "iş", None, &delegate::ProjectSnapshot {
+        let task = delegate::auto_task(c, to, None, "default", Some("kart"), "iş", None, &delegate::ProjectSnapshot {
             project_id: None, project_root: None, merge_branch: None, repo_key: None,
         }).unwrap();
         delegate::insert(c, delegate::NewDelegation {
