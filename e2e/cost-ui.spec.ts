@@ -39,13 +39,11 @@ test("Maliyet: görev kartı, Kart toplamı ve çip hover'ı; eski dexd'de gizli
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
 
-  // Kart araç çubuğu: bugün / 7 gün, klavyeyle odaklanır, kırılım etikette.
+  // #2139: Kart araç çubuğunda token/maliyet metni yok (bugün/7 gün kullanım şeridinde).
   const bar = app.getByRole("group", { name: "Kart araçları" });
-  const total = bar.locator(".office-cost");
-  await expect(total).toHaveText("Bugün 12.3K tok · $0.41 · 7g 12.3K tok · $0.41");
-  await expect(total).toHaveAttribute("aria-label", /Girdi 1\.0K · Çıktı 2\.0K · Cache okuma 9\.0K · yazma 300.*API eşdeğer maliyeti/s);
-  await total.focus();
-  await expect(total).toBeFocused();
+  await expect(bar.getByRole("button", { name: "Görevler" })).toBeVisible();
+  await expect(bar.locator(".office-cost")).toHaveCount(0);
+  await expect(bar).not.toContainText("tok");
 
   // Görev kartı: işin toplamı.
   await bar.getByRole("button", { name: "Görevler" }).click();
@@ -71,7 +69,7 @@ test("Maliyet: görev kartı, Kart toplamı ve çip hover'ı; eski dexd'de gizli
   await expect(hover).toContainText("12.3K tok · $0.41 · API eşdeğeri");
   await expect(hover).toContainText("girdi 1.0K · çıktı 2.0K · cache 9.0K/300");
 
-  // Dar görünüm: araç çubuğu taşmaz (toplam kısalır).
+  // Dar görünüm: araç çubuğu taşmaz.
   await app.setViewportSize({ width: 720, height: 700 });
   await expect.poll(() => bar.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
 

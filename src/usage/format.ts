@@ -1,8 +1,23 @@
 // Hover kartının Türkçe metinleri (UsageStrip.tsx kullanır; saf fonksiyonlar → birim testli).
-import type { ProviderUsage } from "./types";
+import type { ProviderUsage, UsageSnapshot } from "./types";
 
 /** #1861: şeridin iki penceresi, gösterim sırasıyla. */
 export const WINDOWS = [["fiveHour", "5 saat"], ["weekly", "Haftalık"]] as const;
+
+/** #2139: şeridin token hücresi bugün ↔ son 7 gün arasında tıklamayla geçer. */
+export type TokenRange = "today" | "week";
+
+/** Hücre etiketi, title metni ve sayı; okunamayan / eski dexd'de olmayan değer `null` ("--"). */
+export function tokenCell(snap: UsageSnapshot, range: TokenRange): { cap: string; title: string; tokens: number | null } {
+  const tokens = range === "today" ? snap.todayTokens : snap.weekTokens ?? null;
+  const span = range === "today" ? "Bugün" : "Son 7 gün";
+  const next = range === "today" ? "7 gün" : "bugün";
+  return {
+    cap: range === "today" ? "bugün" : "7 gün",
+    title: `${span} Dex ajanları: ${tokens?.toLocaleString("tr-TR") ?? "--"} token (girdi + çıktı + önbellek) — tıkla: ${next}`,
+    tokens,
+  };
+}
 
 /** Halkanın tonu: iki pencereden az kalanına göre; ölçüm yoksa "unknown". */
 export function severity(p: ProviderUsage): "unknown" | "critical" | "low" | "ok" {

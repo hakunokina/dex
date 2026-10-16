@@ -21,6 +21,9 @@
 }
 .usage-strip:hover::before, .usage-strip:focus-within::before { background: color-mix(in srgb, var(--surface-1) 96%, transparent); }
 .usage-cell { display: flex; flex-direction: column; align-items: center; gap: 1px; padding-bottom: var(--sp-2); border-bottom: 1px solid var(--line); }
+/* #2139: token hücresi düğme — tıklama bugün ↔ 7 gün; görünüm hücreyle aynı. */
+button.usage-today { margin: 0; padding-inline: 0; border-width: 0 0 1px; background: none; font: inherit; color: inherit; cursor: pointer; }
+button.usage-today:hover .usage-cap { color: var(--text-2); }
 .usage-cap { font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
 .usage-big { font-size: var(--fs-md); font-weight: var(--fw-semibold); color: var(--text); line-height: 1.2; }
 .usage-sub { font-size: var(--fs-xs); color: var(--text-2); }

@@ -13,6 +13,7 @@ const LIVE = {
     { id: "muse", fiveHour: null, weekly: null, note: "Muse anahtar ucu kullanım bildirmiyor", measuredAt: null, todayTokens: 0 },
   ],
   todayTokens: 221_700_000,
+  weekTokens: 1_500_000_000 as number | undefined,
   updatedAt: 0,
 };
 
@@ -28,7 +29,7 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   const team = await newTeam(dexd, `Şerit ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   await app.addInitScript(fakeUsage, LIVE);
-  await app.evaluate(() => localStorage.removeItem("dex.usageStrip"));
+  await app.evaluate(() => { localStorage.removeItem("dex.usageStrip"); localStorage.removeItem("dex.usageStripRange"); });
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
@@ -68,6 +69,29 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   await expect(strip).toContainText("221.7M");
   await expect(strip).not.toContainText("tok/s");
   await expect(strip).not.toContainText("$");
+  // #2139: token hücresi tıklamayla bugün ↔ 7 gün; klavyeyle de; seçim cihazda kalır.
+  const tokens = strip.getByRole("button", { name: /Dex ajanları/ });
+  await expect(tokens).toHaveAttribute("data-range", "today");
+  await expect(tokens).toHaveAttribute("title", /^Bugün Dex ajanları: 221\.700\.000 token .*tıkla: 7 gün$/);
+  await tokens.click();
+  await expect(tokens).toHaveAttribute("data-range", "week");
+  await expect(tokens.locator(".usage-cap")).toHaveText("7 gün");
+  await expect(tokens.locator(".usage-big")).toHaveText("1.5B");
+  await expect(tokens).toHaveAttribute("aria-label", /^Son 7 gün Dex ajanları: 1\.500\.000\.000 token .*tıkla: bugün$/);
+  expect(await app.evaluate(() => localStorage.getItem("dex.usageStripRange"))).toBe("week");
+  await tokens.focus();
+  await app.keyboard.press("Enter");
+  await expect(tokens).toHaveAttribute("data-range", "today");
+  await expect(tokens.locator(".usage-cap")).toHaveText("bugün");
+  await expect(tokens.locator(".usage-big")).toHaveText("221.7M");
+  await app.keyboard.press("Space");
+  await expect(tokens).toHaveAttribute("data-range", "week");
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect(tokens).toHaveAttribute("data-range", "week");
+  await expect(tokens.locator(".usage-big")).toHaveText("1.5B");
+  await tokens.click();
+  await expect(tokens).toHaveAttribute("data-range", "today");
   const claude = strip.locator('[data-provider="anthropic"]');
   await expect(claude.locator('.usage-pct[data-window="fiveHour"]')).toHaveText("66%");
   await expect(claude.locator('.usage-pct[data-window="weekly"]')).toHaveText("41%");
@@ -150,6 +174,18 @@ test("Kullanım şeridi: dexd görüntüsü 5 saat + haftalık halkalar, olayla 
   }, LIVE);
   await expect(strip.locator('[data-provider="glm"] .usage-pct[data-window="weekly"]')).toHaveText("50%");
   await expect(strip.locator('[data-provider="glm"]')).toHaveClass(/ok/);
+  // #2139: eski dexd weekTokens göndermez — 7 gün modunda "--".
+  await app.evaluate((s) => {
+    const { weekTokens: _, ...old } = { ...s, updatedAt: Date.now() + 2 };
+    const sock = (window.__dexSockets ?? []).filter((w) => w.readyState === WebSocket.OPEN).at(-1);
+    if (!sock) throw new Error("açık soket yok");
+    sock.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ event: "usage-snapshot", payload: old }) }));
+  }, LIVE);
+  await tokens.click();
+  await expect(tokens.locator(".usage-cap")).toHaveText("7 gün");
+  await expect(tokens.locator(".usage-big")).toHaveText("--");
+  await tokens.click();
+  await expect(tokens.locator(".usage-big")).toHaveText("221.7M");
 
   await app.getByRole("button", { name: "Ayarlar", exact: true }).click();
   await app.getByRole("tablist", { name: "Ayar bölümleri" }).getByRole("tab", { name: "Genel" }).click();
@@ -223,7 +259,7 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
   await app.addInitScript(fakeUsage, LIVE);
   // Çekirdek sürüm bandı (host-warn, z --z-banner) açık: kart sahnedeki bant ve terminalin üstünde kalmalı.
   await app.addInitScript(() => { window.__dexOld = { ...window.__dexOld, commit: "0ld0000000", commitTime: 1 }; });
-  await app.evaluate(() => { localStorage.removeItem("dex.usageStrip"); localStorage.removeItem("dex.usageStripPlace"); });
+  await app.evaluate(() => { localStorage.removeItem("dex.usageStrip"); localStorage.removeItem("dex.usageStripPlace"); localStorage.removeItem("dex.usageStripRange"); });
   await app.reload();
   await openTeam(app, team.name);
   await paneOf(app, leader.name);
@@ -268,9 +304,21 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
     const [c, rb] = [await card.boundingBox(), await ring.boundingBox()];
     return { c: c!, ring: rb! };
   };
+  // #2139: her konumda token hücresi bugün ↔ 7 gün geçer.
+  const flips = async (where: string) => {
+    const tokens = strip.getByRole("button", { name: /Dex ajanları/ });
+    await tokens.click();
+    await expect(tokens.locator(".usage-cap"), where).toHaveText("7 gün");
+    await expect(tokens.locator(".usage-big"), where).toHaveText("1.5B");
+    await tokens.click();
+    await expect(tokens.locator(".usage-cap"), where).toHaveText("bugün");
+    await expect(tokens.locator(".usage-big"), where).toHaveText("221.7M");
+  };
+  await flips("right");
 
   // Sol: sol kenara yaslı, dikeyde ortalı, sahneyi daraltmaz; kart şeridin sağında.
   await choose("Sol", "left");
+  await flips("left");
   let g = await geo();
   expect(g.inBar).toBe(false);
   expect(Math.round(g.strip.left)).toBe(Math.round(g.body.left));
@@ -285,6 +333,7 @@ test("Kullanım şeridi: konum sağ / sol / üst başlık, 1280 ve 2560 genişli
   // Üst başlık: pencere düğmelerinin hemen solunda, başlığa sığar; takım çipleri şeridin solunda biter.
   await choose("Üst başlık", "top");
   await expect(app.locator(".team-stage:not(.hidden) .host-banner")).toBeVisible();
+  await flips("top");
   for (const width of [2560, 1280]) {
     await app.setViewportSize({ width, height: 900 });
     g = await geo();

@@ -25,6 +25,8 @@ export interface UsageSnapshot {
   providers: ProviderUsage[];
   /** Bugün tüm sağlayıcılarda Dex ajanlarının token'ı (input + output + cache). */
   todayTokens: number | null;
+  /** #2139: son 7 gün (bugün dahil), aynı tanımla; eski dexd'de yok. */
+  weekTokens?: number | null;
   /** epoch ms */
   updatedAt: number;
 }

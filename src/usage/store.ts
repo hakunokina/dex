@@ -5,10 +5,12 @@ import { useEffect, useSyncExternalStore } from "react";
 import { callHost, hostSupports, onHostUp } from "../api/hosts";
 import { kept, listenKept } from "../hot";
 import { parsePlace, type StripPlace } from "./place";
+import type { TokenRange } from "./format";
 import type { UsageSnapshot, UsageStatus } from "./types";
 
 const KEY = "dex.usageStrip";
 const PLACE_KEY = "dex.usageStripPlace";
+const RANGE_KEY = "dex.usageStripRange";
 const VISIBLE_EVENT = "dex:usage-strip";
 const hot = import.meta.hot;
 
@@ -100,3 +102,20 @@ export function setStripPlace(place: StripPlace) {
 }
 
 export const useStripPlace = () => useSyncExternalStore(subscribeVisible, stripPlace);
+
+/** #2139: token hücresinin aralığı (bugün / 7 gün), bu cihazın tercihi. */
+export function stripRange(): TokenRange {
+  try {
+    return localStorage.getItem(RANGE_KEY) === "week" ? "week" : "today";
+  } catch { /* storage blocked: the default */ }
+  return "today";
+}
+
+export function setStripRange(range: TokenRange) {
+  try {
+    localStorage.setItem(RANGE_KEY, range);
+  } catch { /* still applies for this run */ }
+  window.dispatchEvent(new Event(VISIBLE_EVENT));
+}
+
+export const useStripRange = () => useSyncExternalStore(subscribeVisible, stripRange);

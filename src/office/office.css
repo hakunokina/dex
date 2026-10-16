@@ -44,15 +44,6 @@
   font: var(--fs-xs) / var(--lh) var(--font-ui); white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .office-queue:not(.dismissed):is(:hover, :focus-within) .office-queue-tip { visibility: visible; }
-.office-cost-skel { display: inline-block; width: 96px; height: 10px; vertical-align: middle; } /* Modern §2: cost loading */
-/* #209: takım maliyeti (bugün / 7 gün) — sayaçtan sonra, dar Kart'ta önce o kısalır. */
-.office-cost {
-  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  margin-right: var(--sp-2); padding: 0 2px; border-radius: var(--r-sm);
-  color: var(--muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums;
-}
-.office-cost b { color: var(--text); font-weight: var(--fw-semibold); }
-.office-cost .sep { color: var(--faint); }
 .office-bar-btn {
   display: inline-flex; align-items: center; justify-content: center; flex: none;
   width: var(--ctl-h); height: var(--ctl-h); padding: 0; border: 0; border-radius: var(--r-sm);
