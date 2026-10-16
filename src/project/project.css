@@ -40,6 +40,30 @@
 .project-pick:hover { border-color: var(--line-strong); }
 .project-pick:focus-visible { outline: 2px solid var(--team-hi); outline-offset: 2px; }
 .project-pick option { background: var(--surface-pop); }
+/* #2141: the top-bar picker is a button + listbox (its list ends in the "+" new-folder row). */
+button.project-pick { display: inline-flex; align-items: center; gap: 2px; padding: 0 2px 0 var(--sp-2); }
+button.project-pick:disabled { opacity: 0.6; cursor: default; }
+button.project-pick svg { flex: none; width: 14px; height: 14px; color: var(--muted); }
+.project-pick-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-pick-pop {
+  position: fixed; z-index: var(--z-team-pop); overflow-y: auto; box-sizing: border-box;
+  width: min(240px, calc(100vw - 16px)); padding: var(--sp-1); display: flex; flex-direction: column; gap: 2px;
+  background: var(--surface-pop); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: var(--shadow-pop);
+}
+.project-pick-pop ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.project-pick-item {
+  display: flex; align-items: center; width: 100%; min-height: 28px; box-sizing: border-box; padding: 0 var(--sp-2);
+  font: inherit; font-size: var(--fs-xs); color: var(--text); background: none; border: 1px solid transparent; border-radius: var(--r-sm);
+  cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left;
+}
+.project-pick-item:hover, .project-pick-item:focus-visible { background: var(--hover); }
+.project-pick-item:focus-visible { outline: 2px solid var(--team-hi); outline-offset: -2px; }
+.project-pick-item[aria-selected="true"] { color: var(--team-hi); background: var(--team-soft); }
+.project-pick-item.add { justify-content: center; color: var(--muted); border-color: var(--line); border-style: dashed; }
+.project-pick-item.add svg { width: 14px; height: 14px; }
+input.project-pick-item.add { cursor: text; justify-content: flex-start; color: var(--text); border-style: solid; border-color: var(--team-line); background: var(--surface-2); }
+.project-pick-hint, .project-pick-err { margin: 0; padding: 2px var(--sp-2); font-size: var(--fs-2xs); color: var(--muted); }
+.project-pick-err { color: var(--red-hi); overflow-wrap: anywhere; }
 .project-memory { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .project-memory > .mem-map, .project-memory > .mem-state { flex: 1; min-height: 0; }
 .project-memory-scope { display: flex; align-items: center; flex-wrap: wrap; gap: var(--sp-2); padding: var(--sp-2); color: var(--muted); font-size: var(--fs-xs); }

@@ -100,6 +100,18 @@ export const activeProjects = (list: readonly Project[]) => list.filter((p) => p
  */
 export const showsProjects = (list: readonly Project[]) => activeProjects(list).length > 1;
 
+/** "Yeni klasör aç" needs a saved category root; a pending suggestion must be accepted first ("Kullan"). */
+export const folderCategoryReady = (categoryRoot: string | null, suggestedRoot: string | null) => !!categoryRoot && !suggestedRoot;
+
+/** Top-bar picker: arrow/Home/End move over `n` rows (projects + the "+" row), clamped at the ends. */
+export function pickStep(i: number, key: string, n: number): number {
+  if (key === "Home") return 0;
+  if (key === "End") return n - 1;
+  if (key === "ArrowDown") return Math.min(i + 1, n - 1);
+  if (key === "ArrowUp") return Math.max(i - 1, 0);
+  return i;
+}
+
 export const projectName = (list: readonly Project[], id: string | null | undefined) =>
   (id && list.find((p) => p.id === id)?.name) || null;
 
