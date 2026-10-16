@@ -1,6 +1,7 @@
 // #1719 FCM: Echo bir paylaşıma cevap verince host data mesajı yollar — `{ type: "inbox_reply", id,
 // task? }`, içerik YOK. Burada yerel bildirim kurulur ("Echo cevap verdi"; görev varsa "Echo · Repo
 // incele"); dokunma MainActivity'yi `dex://reply/<id>` ile açar (PushPlugin.take → cevap ekranı).
+// #2090: `{ kind: "motivation", date }` (bildirimsiz) bugünün motivasyon işini hemen koşturur.
 // Manifest kaydı build-apk.sh (push-service.xml). Jeton ve içerik loglanmaz.
 
 package com.hakunokina.dex.hosttokens
@@ -25,6 +26,15 @@ class DexMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         val data = message.data
+        if (data["kind"] == "motivation") {
+            val date = data["date"] ?: return
+            try {
+                MotivationWork.pushed(applicationContext, date)
+            } catch (e: Exception) {
+                // WorkManager kurulamadı; 04:45 / açılış yolu sürer.
+            }
+            return
+        }
         if (data["type"] != "inbox_reply") return
         val id = data["id"]?.takeIf { ID.matches(it) } ?: return
         notify(id, TASKS[data["task"]])
