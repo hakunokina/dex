@@ -89,7 +89,35 @@ test("uygulama açılır, çekirdeğe bağlanır; UI'dan takım kurulur ve ekibi
   await expect(kart).toContainText("çalışıyor");
   await expect(kart).toContainText("boşta");
   await expect(kart).not.toContainText("bekliyor");
-  for (const b of ["Görevler", "Yeni takım", "Takım ayarları", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  for (const b of ["Görevler", "Yeni takım", "Tüm worker'lar", "Takım ayarları", "Ayarlar"]) await expect(kart.getByRole("button", { name: b, exact: true })).toBeVisible();
+  // Tüm worker'lar: popover düğmenin yerinde açılır, seçimler içinde, Esc odağı düğmeye döndürür.
+  const bulkBtn = kart.getByRole("button", { name: "Tüm worker'lar", exact: true });
+  await bulkBtn.click();
+  const bulk = app.getByRole("dialog", { name: "Tüm worker'lar", exact: true });
+  await expect(bulk.getByRole("combobox", { name: "Worker'ların sağlayıcısı" })).toBeFocused();
+  await expect(bulk.getByRole("combobox", { name: "Worker'ların modeli" })).toBeVisible();
+  await expect(bulk.getByRole("button", { name: "Uygula", exact: true })).toBeVisible();
+  expect(await bulk.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return r.left >= 0 && r.right <= window.innerWidth && r.top >= 0 && r.bottom <= window.innerHeight;
+  })).toBe(true);
+  await app.keyboard.press("Escape");
+  await expect(bulk).toHaveCount(0);
+  await expect(bulkBtn).toBeFocused();
+  // Takım ayarları: Sağlayıcılar bölümü ve Tüm worker'lar yok; Test + Takımı kopyala altta yan yana.
+  await kart.getByRole("button", { name: "Takım ayarları", exact: true }).click();
+  const settings = app.locator(".team-settings");
+  await expect(settings.getByRole("switch", { name: "Tam testler" })).toBeVisible();
+  await expect(settings.getByRole("button", { name: "Takımı kopyala", exact: true })).toBeVisible();
+  await expect(settings.getByRole("region", { name: "Sağlayıcılar", exact: true })).toHaveCount(0);
+  await expect(settings.getByText(/Sağlayıcılar'da yönet/)).toHaveCount(0);
+  await expect(settings.getByRole("combobox", { name: "Worker'ların sağlayıcısı" })).toHaveCount(0);
+  expect(await settings.evaluate((el) => {
+    const test = el.querySelector<HTMLElement>(".team-test-level button")!.getBoundingClientRect();
+    const copy = [...el.querySelectorAll<HTMLElement>("button")].find((b) => b.textContent?.trim() === "Takımı kopyala")!.getBoundingClientRect();
+    return Math.abs(test.top - copy.top) <= 2 && copy.left >= test.right && test.width > 80 && copy.width > 80;
+  })).toBe(true);
+  await settings.locator(".close").click();
   // #70/#73: the top bar holds only team tabs | DEX logo | crew chips, plus the window controls.
   const bar = app.locator("header.topbar");
   // Only the leader and the red (working/waiting or job-carrying) workers get a chip; a new team's workers are quiet.

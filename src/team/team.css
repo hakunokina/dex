@@ -137,6 +137,7 @@
   .team-settings .team-add { grid-template-columns: 1fr; }
   .team-settings .team-actions { flex-direction: column; }
   .team-settings .team-actions button { width: 100%; }
+  .team-settings .team-bottom-actions { grid-template-columns: 1fr; }
 }
 
 /* Visited workspaces stay mounted to preserve their terminals; only the active one is visible. */
@@ -147,9 +148,13 @@
 }
 .team-stage.hidden { visibility: hidden; pointer-events: none; }
 
-/* Sağlayıcı anahtarları Ayarlar › Sunucu › Sağlayıcılar'da; burada yalnız bağlantı notu. */
-.team-providers { border-top: 1px solid var(--line); padding-top: var(--sp-2); }
-.team-providers h4 { margin: 0 0 6px; font-size: var(--fs-xs); color: var(--muted); font-weight: var(--fw-medium); }
+/* Alt sıra: Test düzeyi (açıklamasıyla) + Takımı kopyala yan yana, geniş. */
+.team-bottom-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); align-items: start; border-top: 1px solid var(--line); padding-top: var(--sp-2); }
+.team-bottom-actions.solo { grid-template-columns: 1fr; }
+.team-bottom-actions .team-test-level { flex-direction: column; flex-wrap: nowrap; align-items: stretch; gap: var(--sp-1); min-width: 0; }
+.team-bottom-actions .team-test-level button { width: 100%; }
+.team-bottom-actions .team-test-level .team-note { flex: none; }
+.team-bottom-actions .team-copy-btn { width: 100%; }
 .team-link { background: none; border: 0; padding: 0; color: var(--text); text-decoration: underline; cursor: pointer; font: inherit; }
 /* DEX-24: escalated worker questions stack above member proposals in one bottom-right column. */
 .patron-cards {
@@ -164,10 +169,8 @@
 .ask-muted { color: var(--muted); }
 .ask-options { justify-content: flex-start; flex-wrap: wrap; }
 
-/* DEX-30: all-workers engine/provider/model bar + the row's "waiting for session end" tag. */
-.team-bulk { display: flex; flex-direction: column; gap: var(--sp-1); padding: 6px 0; border-bottom: 1px solid var(--line); }
-.team-bulk-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: var(--fs-sm); }
-.team-bulk-row select { max-width: 170px; }
+/* DEX-30: all-workers provider/model form (Kart popover'ında) + the row's "waiting for session end" tag. */
+.team-bulk { display: flex; flex-direction: column; gap: var(--sp-2); }
 .team-warn { margin: 0; font-size: var(--fs-xs); color: var(--amber); }
 .team-pending { margin-left: var(--sp-1); font: var(--fw-semibold) 10px var(--font-mono); color: var(--amber); background: var(--amber-soft); border-radius: var(--r-xs); padding: 0 4px; }
 

@@ -16,19 +16,20 @@ import {
   type TeamKind, type TeamProfile, type TeamCloneTemplate,
 } from "./api";
 import {
-  addAgent, chainBack, createTeam, isRunning, membersOf, patchAgent, patchTeam, removeAgent, removeTeam, restartPending, selectTeam,
-  setAgentChain, setWorkersModel, useTeams,
+  addAgent, chainBack, createTeam, isRunning, membersOf, patchAgent, patchTeam, removeAgent, removeTeam, selectTeam,
+  setAgentChain, useTeams,
 } from "./store";
 import "./team.css";
 import { Server, X } from "lucide-react";
 import { getSnapshot as getLayoutSnapshot, subscribe as subscribeLayout } from "../layout/store";
-import { applyFavoriteLayout, applyFavoriteToAll, openSettings, saveFavoriteLayout } from "../layout/panels";
+import { applyFavoriteLayout, applyFavoriteToAll, saveFavoriteLayout } from "../layout/panels";
 import { isActive } from "../layout/rackOrder";
 import { teamAccent } from "./accent";
 import { providerModels } from "./providerModels";
 import { fitConvertedModels, normalizeCloneTemplate } from "./cloneTemplate";
 import { TestLevelToggle } from "./TestLevelToggle";
-import { assistantTaken, isAssignable, memberRoles } from "./rolePolicy";
+import { nextTestLevel } from "./testLevel";
+import { assistantTaken, memberRoles } from "./rolePolicy";
 import { ConfirmDialog } from "../settings/kit/ConfirmDialog";
 import { askConfirm } from "../confirm";
 
@@ -567,7 +568,6 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
         {team.name} <span className="team-kind">{team.kind === "main" ? "proje" : "alt takım"}</span>
         <button className="icon-btn close" onClick={onClose} title="Kapat"><X /></button>
       </h3>
-      <TestLevelToggle key={team.id} level={team.testLevel} onChange={(testLevel) => patchTeam(team.id, { testLevel })} />
       <dl className="team-info">
         {team.host !== LOCAL && (
           <>
@@ -593,10 +593,6 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
       </dl>
 
       {projectList && <ProjectsSection teamId={team.id} />}
-
-      {hostSupports(host, "team_clone_template") && <button type="button" onClick={() => void openTeamMenu("new", host, team.id).catch(e => setError(String(e)))}>Takımı kopyala</button>}
-
-      <WorkersBulk teamId={team.id} providers={providers} />
 
       <table className="team-members">
         <thead>
@@ -691,7 +687,14 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
       </form>
       {role === "assistant" && assistantTaken(members) && <p className="team-warn" role="status">Takımda zaten bir asistan var</p>}
 
-      <ProvidersMovedNote teamId={team.id} host={team.host} hostLabel={hostName(host)} />
+      {(nextTestLevel(team.testLevel) !== null || hostSupports(host, "team_clone_template")) && (
+        <div className={`team-bottom-actions${nextTestLevel(team.testLevel) !== null && hostSupports(host, "team_clone_template") ? "" : " solo"}`}>
+          <TestLevelToggle key={team.id} level={team.testLevel} onChange={(testLevel) => patchTeam(team.id, { testLevel })} />
+          {hostSupports(host, "team_clone_template") && (
+            <button type="button" className="team-copy-btn" onClick={() => void openTeamMenu("new", host, team.id).catch(e => setError(String(e)))}>Takımı kopyala</button>
+          )}
+        </div>
+      )}
       {providerError && <p className="team-err" role="alert">{providerError}</p>}
 
       {error && <p className="team-err" role="alert">{error}</p>}
@@ -777,14 +780,6 @@ export function TeamPanel({ teamId, onClose, onReset }: { teamId: string; onClos
   );
 }
 
-/** DEX-30: DEX-13's wording — without a token the session fails at start, so say it before. */
-function tokenWarning(providers: ProviderInfo[], provider: string): string | null {
-  if (provider === "anthropic") return null;
-  const p = providers.find((x) => x.id === provider);
-  if (p?.account) return p.hasToken ? null : `${p.label} hesabı bağlı değil — Ayarlar › Sağlayıcılar'dan bağla`;
-  return p && !p.hasToken ? `${p.label} anahtarı yok — Ayarlar › Sağlayıcılar'dan içe aktar ya da gir` : null;
-}
-
 /** DEX-17: sağlayıcı id → görünen ad. */
 function labelOf(providers: ProviderInfo[], id: string): string {
   return providers.find((x) => x.id === id)?.label ?? id;
@@ -793,112 +788,4 @@ function labelOf(providers: ProviderInfo[], id: string): string {
 function pendingText(p: PendingModel, providers: ProviderInfo[]): string {
   const prov = providers.find((x) => x.id === (p.provider || "anthropic"))?.label ?? p.provider;
   return `${prov} · ${p.model}`;
-}
-
-const RESTART_CONFIRM = (n: number) =>
-  `${n} çalışan worker durdurulup yeni ayarla yeniden başlatılsın mı?\n\n` +
-  "Model/sağlayıcısı değişenler aynı oturumu yeni modelle sürdürür.\n" +
-  "Yarıdaki devredilmiş işleri raporsuz kapanır; lider bunu görür.";
-
-/** DEX-30: one provider/model for every worker of the team; leaders are never touched. */
-function WorkersBulk({ teamId, providers }: {
-  teamId: string;
-  providers: ProviderInfo[];
-}) {
-  const [provider, setProvider] = useState("anthropic");
-  const [model, setModel] = useState("claude-sonnet-5-5");
-  const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const models = providerModels(providers, provider);
-  // The list can change under the choice (live catalogs); never send a model it doesn't hold.
-  const chosen = models.some((m) => m.id === model) ? model : models[0]?.id ?? "";
-  const workers = membersOf(teamId).filter((a) => a.kind === "worker" && isAssignable(a));
-  const waiting = workers.filter((a) => a.pending && isRunning(a.id));
-  const warn = tokenWarning(providers, provider);
-  const noModels = !chosen ? "Bu sağlayıcının model listesi boş" : null;
-
-  const act = async (f: () => Promise<string>) => {
-    setBusy(true);
-    setError(null);
-    try {
-      setNote(await f());
-    } catch (err) {
-      setNote(null);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <section className="team-bulk" aria-label="Tüm worker'lar">
-      <div className="team-bulk-row">
-        <b>Tüm worker'lar</b>
-        <select value={provider} aria-label="Worker'ların sağlayıcısı" disabled={busy}
-          onChange={(e) => { setProvider(e.target.value); setModel(""); }}>
-          {providers.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
-        </select>
-        <select value={chosen} aria-label="Worker'ların modeli" disabled={busy || !models.length}
-          onChange={(e) => setModel(e.target.value)}>
-          {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-        </select>
-        <button className="primary" disabled={busy || !chosen || !workers.length}
-          title={noModels ?? (workers.length ? "Yalnız worker'lar değişir; lider(ler)e dokunulmaz" : "Takımda worker yok")}
-          onClick={() => void act(async () => {
-            const out = await setWorkersModel(teamId, { engine: "claude", provider, model: chosen });
-            return `${out.applied.length} worker değişti` +
-              (out.pending.length ? ` · ${out.pending.length} çalışan worker oturumu kapanınca geçecek` : "");
-          })}>
-          Uygula
-        </button>
-        {waiting.length > 0 && (
-          <button disabled={busy} title="Bekleyen değişikliği şimdi uygula: çalışanları durdurup yeniden başlatır"
-            onClick={async () => {
-              if (!(await askConfirm(RESTART_CONFIRM(waiting.length)))) return;
-              void act(async () => {
-                const unstarted = await restartPending(teamId);
-                const names = unstarted.map((id) => workers.find((a) => a.id === id)?.name ?? id);
-                return `${waiting.length - unstarted.length} worker yeniden başlatıldı` +
-                  (names.length ? ` · pane'i olmadığı için başlatılamadı: ${names.join(", ")}` : "");
-              });
-            }}>
-            Çalışanları yeniden başlat ({waiting.length})
-          </button>
-        )}
-      </div>
-      {warn && (
-        <p className="team-warn" role="status">
-          {warn}{" "}
-          <button
-            type="button"
-            className="team-link"
-            onClick={() => void openSettings(teamId, "providers", `provider-${provider}`)}
-          >
-            Ayarlar › Sağlayıcılar'da ilgili karta git →
-          </button>
-        </p>
-      )}
-      {noModels && <p className="team-warn" role="status">{noModels}</p>}
-      {note && <p className="team-note" role="status">{note}</p>}
-      {error && <p className="team-err" role="alert">{error}</p>}
-    </section>
-  );
-}
-
-/** Sağlayıcı anahtarları sunucu düzeyinde: Ayarlar › Sunucu › Sağlayıcılar'da. */
-function ProvidersMovedNote({ teamId, host, hostLabel }: { teamId: string; host: string; hostLabel: string }) {
-  return (
-    <section className="team-providers" aria-label="Sağlayıcılar">
-      <h4>Sağlayıcılar</h4>
-      <p className="team-note">
-        {host === LOCAL
-          ? "Anahtarlar bu bilgisayarın kilit deposunda (OS keyring) saklanır; bu takıma özel değildir."
-          : `Anahtarlar ${hostLabel} sunucusunda saklanır; bu bilgisayara inmez, bu takıma özel değildir.`}{" "}
-        <button type="button" className="team-link" onClick={() => void openSettings(teamId, "providers")}>
-          Ayarlar › Sağlayıcılar'da yönet →
-        </button>
-      </p>
-    </section>
-  );
 }

@@ -12,6 +12,7 @@ import { useCountUp } from "../motion";
 import { useDelegations } from "../delegations";
 import { roleQueueSummary } from "../delegationsModel";
 import { useTeams } from "../team/store";
+import { WorkersBulkButton } from "../team/WorkersBulk";
 
 export function OfficeBar({ teamId, active }: { teamId: string; active: boolean }) {
   const [counts, setCounts] = useState({ working: 0, idle: 0 });
@@ -61,6 +62,7 @@ export function OfficeBar({ teamId, active }: { teamId: string; active: boolean 
       <button className="office-bar-btn" onClick={() => void openTeamMenu("new")} title="Yeni takım" aria-label="Yeni takım">
         <Plus />
       </button>
+      <WorkersBulkButton teamId={teamId} />
       <button className="office-bar-btn" onClick={() => void openPanel(teamId, "team")} title="Takım ayarları" aria-label="Takım ayarları">
         <Users />
       </button>
