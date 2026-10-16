@@ -1,5 +1,6 @@
-//! #1718: content-free FCM HTTP v1 ping for a stored inbox reply (`{type, id}` data only; the
-//! phone fetches the reply over its authenticated host connection).
+//! #1718: content-free FCM HTTP v1 pings — a stored inbox reply (`{type, id}`) and, #2089, the
+//! day's motivation lines (`{kind, date}`). Data only; the phone fetches the content over its
+//! authenticated host connection.
 //!
 //! Config: the patron's Firebase service-account JSON at `<data_dir>/fcm-service-account.json`
 //! (never in the repo; too large for the Windows credential store's 2560-byte blob). Missing →
@@ -87,11 +88,11 @@ impl Push {
         Ok(token)
     }
 
-    fn send(&self, sa: &ServiceAccount, device: &str, reply: i64) -> Sent {
+    fn send(&self, sa: &ServiceAccount, device: &str, data: &Value) -> Sent {
         let access = match self.access_token(sa) { Ok(t) => t, Err(e) => return e };
         let url = format!("{}/v1/projects/{}/messages:send", self.endpoints.lock().unwrap().1, sa.project_id);
         // Data only: no notification title/body ever leaves the host.
-        let body = json!({ "message": { "token": device, "data": { "type": "inbox_reply", "id": reply.to_string() }, "android": { "priority": "HIGH" } } });
+        let body = json!({ "message": { "token": device, "data": data, "android": { "priority": "HIGH" } } });
         match http().post(&url).set("Authorization", &format!("Bearer {access}")).send_json(body) {
             Ok(_) => Sent::Ok,
             Err(ureq::Error::Status(code, r)) => {
@@ -150,12 +151,22 @@ impl crate::Core {
 
     /// Off the hook thread: a slow Google never delays the Stop answer.
     pub(crate) fn push_notify(&self, reply: i64) {
-        let weak = self.weak_self.clone();
-        std::thread::spawn(move || if let Some(core) = weak.upgrade() { core.push_send_all(reply); });
+        self.push_spawn(json!({ "type": "inbox_reply", "id": reply.to_string() }));
     }
 
-    /// Returns how many devices accepted the ping.
-    fn push_send_all(&self, reply: i64) -> usize {
+    /// #2089: the day's lines were saved; the phone pulls them via `motivation_today` now
+    /// instead of waiting for its 04:45 job (which stays as the fallback).
+    pub(crate) fn push_motivation(&self, date: &str) {
+        self.push_spawn(json!({ "kind": "motivation", "date": date }));
+    }
+
+    fn push_spawn(&self, data: Value) {
+        let weak = self.weak_self.clone();
+        std::thread::spawn(move || if let Some(core) = weak.upgrade() { core.push_send_all(&data); });
+    }
+
+    /// Returns how many devices accepted the ping. `data`: FCM data map (string values only).
+    fn push_send_all(&self, data: &Value) -> usize {
         let Ok(_gate) = self.push.gate.lock() else { return 0 };
         let Some(sa) = self.push_account() else { return 0 };
         let Ok(tokens) = with(&self.db, |c| {
@@ -165,7 +176,7 @@ impl crate::Core {
         }) else { return 0 };
         let mut sent = 0;
         for token in tokens {
-            match self.push.send(&sa, &token, reply) {
+            match self.push.send(&sa, &token, data) {
                 Sent::Ok => sent += 1,
                 Sent::Unregistered => {
                     let _ = with(&self.db, |c| c.execute("DELETE FROM push_tokens WHERE token=?1", [&token]).map(|_| ()).map_err(|e| e.to_string()));
@@ -254,7 +265,8 @@ mod tests {
         let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
         assert!(!core.push_configured());
         assert_eq!(core.push_register("dev-ok", "android").unwrap()["pushConfigured"], false);
-        assert_eq!(core.push_send_all(1), 0, "unconfigured push is silent");
+        let reply = |id: i64| json!({ "type": "inbox_reply", "id": id.to_string() });
+        assert_eq!(core.push_send_all(&reply(1)), 0, "unconfigured push is silent");
         let pem = test_key(&root);
         let public = ring::signature::RsaKeyPair::from_pkcs8(&pkcs8(&pem).unwrap()).unwrap();
         let public = ring::signature::KeyPair::public_key(&public).as_ref().to_vec();
@@ -267,8 +279,8 @@ mod tests {
         }).to_string()).unwrap();
         for t in ["dev-gone", "dev-bad"] { core.push_register(t, "android").unwrap(); }
         assert_eq!(core.push_register("dev-ok", "android").unwrap()["pushConfigured"], true);
-        assert_eq!(core.push_send_all(7), 1);
-        assert_eq!(core.push_send_all(8), 1);
+        assert_eq!(core.push_send_all(&reply(7)), 1);
+        assert_eq!(core.push_send_all(&reply(8)), 1);
         let tokens: Vec<String> = with(&core.db, |c| {
             let mut s = c.prepare("SELECT token FROM push_tokens ORDER BY token").map_err(|e| e.to_string())?;
             let r = s.query_map([], |r| r.get(0)).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string()); r
@@ -284,6 +296,43 @@ mod tests {
         assert_eq!(core.push_register("x", "ios").unwrap_err().code, "push_platform");
         assert_eq!(core.push_register("a b", "android").unwrap_err().code, "push_token");
         core.push_unregister("dev-ok").unwrap();
+        core.shutdown();
+    }
+
+    #[test]
+    fn motivation_set_pings_every_device_with_kind_and_date_only() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.dex/tmp").join(format!("push-mot-{}-{}", std::process::id(), crate::agents::next_seq()));
+        let core = crate::Core::start(crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") }, crate::Events::new(crate::events::NullSink)).unwrap();
+        core.push_register("dev-a", "android").unwrap();
+        // Unconfigured push never fails the set: motivation::tests::today_and_result_flow.
+        let pem = test_key(&root);
+        let public = ring::signature::RsaKeyPair::from_pkcs8(&pkcs8(&pem).unwrap()).unwrap();
+        let public = ring::signature::KeyPair::public_key(&public).as_ref().to_vec();
+        let seen = Arc::new(Seen::default());
+        let base = fake(public, seen.clone());
+        *core.push.endpoints.lock().unwrap() = (format!("{base}/token"), base.clone());
+        std::fs::write(core.paths.data_dir.join(SERVICE_ACCOUNT_FILE), json!({
+            "project_id":"fixture","client_email":"dex-fixture-service-account","private_key":pem
+        }).to_string()).unwrap();
+        core.push_register("dev-b", "android").unwrap();
+        let sends = |n: usize| {
+            let until = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let got: Vec<Value> = seen.0.lock().unwrap().iter().filter(|(p, _, _)| p.ends_with("messages:send"))
+                    .map(|(_, _, b)| serde_json::from_str(b).unwrap()).collect();
+                if got.len() >= n || std::time::Instant::now() > until { return got; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let date = core.motivation_set("sabah", "öğle", "akşam").unwrap()["date"].as_str().unwrap().to_string();
+        let first = sends(2);
+        assert_eq!(first.len(), 2, "{first:?}");
+        for device in ["dev-a", "dev-b"] {
+            assert!(first.contains(&json!({"message":{"token":device,"data":{"kind":"motivation","date":date},"android":{"priority":"HIGH"}}})), "{first:?}");
+        }
+        // Same day again: sent again.
+        core.motivation_set("sabah2", "öğle2", "akşam2").unwrap();
+        assert_eq!(sends(4).len(), 4);
         core.shutdown();
     }
 

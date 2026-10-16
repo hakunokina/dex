@@ -1,7 +1,8 @@
 //! #1858: the patron's daily three lines. Once a day (04:30 local, or the first tick after it)
 //! the leader gets a `[Dex-Motivasyon]` turn and saves them with `motivation_set`; the phone
 //! pulls them over the host RPC (`motivation_today`) and reports delivery (`motivation_result`).
-//! No push: no PC, no text. The lines are personal data: never logged.
+//! #2089: saving them sends the phone a data-only FCM ping (`{kind, date}`, no text) so it pulls
+//! at once; its 04:45 job is the fallback. No PC, no text. The lines are personal data: never logged.
 use crate::db::with;
 use crate::inbox::Error;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -141,6 +142,8 @@ impl crate::Core {
     pub fn motivation_set(&self, morning: &str, noon: &str, evening: &str) -> Result<Value, String> {
         let date = today();
         with(&self.db, |c| set(c, &date, morning, noon, evening, now_ms()))?;
+        // Off the DB lock and the MCP thread; a failed or unconfigured push never fails the set.
+        self.push_motivation(&date);
         Ok(json!({ "ok": true, "date": date }))
     }
 
