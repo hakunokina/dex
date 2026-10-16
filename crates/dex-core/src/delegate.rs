@@ -800,15 +800,15 @@ pub(crate) fn first_line(s: &str) -> String {
 pub(crate) fn auto_task(
     conn: &Connection,
     to_agent: &str,
+    role: Option<&str>,
     team_id: &str,
     title: Option<&str>,
     prompt: &str,
     patron_words: Option<&str>,
     snapshot: &ProjectSnapshot,
 ) -> Result<crate::db::tasks::Task, String> {
-    let title = title
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
+    let given = title.map(str::trim).filter(|t| !t.is_empty());
+    let title = given
         .map(String::from)
         .unwrap_or_else(|| {
             let meaningful = crate::review::first_meaningful_line(prompt, 80);
@@ -829,13 +829,37 @@ pub(crate) fn auto_task(
     conn.execute("UPDATE tasks SET project_id=?2 WHERE id=?1", params![task.id, snapshot.project_id])
         .map_err(e)?;
     task.project_id = snapshot.project_id.clone();
+    if given.is_some() {
+        close_superseded(conn, &task, to_agent, role)?;
+    }
     Ok(task)
+}
+
+/// #2104: the leader sent a failed/unreported job again without its `taskId`: the older card of
+/// the team/project with the same leader-given title (#2110: never a derived one) whose newest job
+/// did not succeed and went to the same target (the role for a role job, else the agent) is closed,
+/// not left in "Yapılacak" next to its replacement. Plan cards stay with `plan::step`.
+fn close_superseded(conn: &Connection, new: &crate::db::tasks::Task, agent: &str, role: Option<&str>) -> Result<(), String> {
+    conn.execute(
+        "UPDATE tasks SET status='done', closed_reason='superseded', updated_at=?5
+         WHERE id < ?1 AND status='todo' AND team_id IS ?2 AND project_id IS ?3 AND title = ?4
+           AND EXISTS (SELECT 1 FROM delegations x
+             WHERE x.id = (SELECT MAX(y.id) FROM delegations y WHERE y.task_id = tasks.id)
+               AND x.status IN ('failed','done_no_report')
+               AND (SELECT q.role_slug FROM delegation_role_queue q WHERE q.delegation_id = x.id) IS ?7
+               AND (?7 IS NOT NULL OR x.to_agent = ?6))
+           AND NOT EXISTS (SELECT 1 FROM plan_items i WHERE i.task_id = tasks.id)",
+        params![new.id, new.team_id, new.project_id, new.title, now(), agent, role],
+    )
+    .map_err(e)?;
+    Ok(())
 }
 
 /// #1768: sıradan bir devretme (inceleme ya da plan öğesi değil) kapandığında
 /// bağlı pano kartını günceller: `done` + (dalsız ya da birleşmiş) → `done`;
 /// `failed` / `done_no_report` → `todo`. Açık dal varken `done` kartı `doing`
-/// bırakır (birleştirmede `done` olur). Kart yoksa/silinmişse no-op.
+/// bırakır (birleştirmede `done` olur). Kart yoksa/silinmişse ya da kapatılmışsa
+/// (#2104 `closed_reason`) no-op.
 pub(crate) fn sync_task(conn: &Connection, id: i64) -> Result<(), String> {
     let d = get(conn, id)?;
     let Some(task) = d.task_id else { return Ok(()) };
@@ -848,8 +872,10 @@ pub(crate) fn sync_task(conn: &Connection, id: i64) -> Result<(), String> {
     if plan_owned {
         return Ok(()); // plan kartını plan::step yönetir
     }
-    if crate::db::tasks::get(conn, task).is_err() {
-        return Ok(());
+    match crate::db::tasks::get(conn, task) {
+        // #2104: a cancelled/superseded card stays closed; a late event of its job must not reopen it.
+        Ok(t) if t.closed_reason.is_none() => {}
+        _ => return Ok(()),
     }
     let done = match d.status.as_str() {
         "done" => {
@@ -2779,13 +2805,13 @@ mod tests {
     #[test]
     fn auto_task_title_prefers_given_then_meaningful_line() {
         let c = mem();
-        let t = auto_task(&c, "kaan", "default", Some("  Kart  "), "x", None, &snap()).unwrap();
+        let t = auto_task(&c, "kaan", None, "default", Some("  Kart  "), "x", None, &snap()).unwrap();
         assert_eq!((t.title, t.status, t.agent_id), ("Kart".into(), "doing".into(), Some("kaan".into())));
-        let t = auto_task(&c, "kaan", "default", None, "## Amaç\n\nPatronun sözü\nAsıl iş", None, &snap()).unwrap();
+        let t = auto_task(&c, "kaan", None, "default", None, "## Amaç\n\nPatronun sözü\nAsıl iş", None, &snap()).unwrap();
         assert_eq!(t.title, "Asıl iş");
-        let t = auto_task(&c, "kaan", "default", None, "## Sadece başlık", None, &snap()).unwrap();
+        let t = auto_task(&c, "kaan", None, "default", None, "## Sadece başlık", None, &snap()).unwrap();
         assert_eq!(t.title, "## Sadece başlık");
-        let t = auto_task(&c, "kaan", "default", None, "iş yap", Some("patron sözü"), &snap()).unwrap();
+        let t = auto_task(&c, "kaan", None, "default", None, "iş yap", Some("patron sözü"), &snap()).unwrap();
         assert!(t.description.starts_with("## Patronun sözü\npatron sözü\n\n"), "{}", t.description);
     }
 
@@ -2823,6 +2849,73 @@ mod tests {
             sync_task(&c, d.id).unwrap();
             assert_eq!(crate::db::tasks::get(&c, t).unwrap().status, "todo", "{end}");
         }
+    }
+
+    #[test]
+    fn new_same_titled_card_closes_the_failed_one_and_a_closed_card_stays_closed() {
+        let c = mem();
+        let card = |title: &str| auto_task(&c, "kaan", None, "default", Some(title), "x", None, &snap()).unwrap().id;
+        let (old, unreported, running, other) = (card("gitleaks"), card("gitleaks"), card("gitleaks"), card("başka"));
+        let failed = job_with_task(&c, old);
+        set_status(&c, failed.id, "failed").unwrap();
+        sync_task(&c, failed.id).unwrap();
+        let d = job_with_task(&c, unreported);
+        set_status(&c, d.id, "done_no_report").unwrap();
+        sync_task(&c, d.id).unwrap();
+        job_with_task(&c, running);
+        let o = job_with_task(&c, other);
+        set_status(&c, o.id, "failed").unwrap();
+        sync_task(&c, o.id).unwrap();
+        let get = |t: i64| crate::db::tasks::get(&c, t).unwrap();
+        assert_eq!((get(old).status, get(unreported).status), ("todo".into(), "todo".into()));
+        let new = card("gitleaks");
+        for t in [old, unreported] {
+            assert_eq!((get(t).status.as_str(), get(t).closed_reason.as_deref()), ("done", Some("superseded")), "{t}");
+        }
+        assert_eq!((get(running).status, get(running).closed_reason), ("doing".into(), None), "a live job's card stays");
+        assert_eq!((get(other).status, get(other).closed_reason), ("todo".into(), None), "another title stays");
+        assert_eq!(get(new).status, "doing");
+        // A late event of the replaced job does not reopen its card.
+        sync_task(&c, failed.id).unwrap();
+        assert_eq!(get(old).status, "done");
+        // Moved back by hand: open again, the reason goes (tasks_reopen).
+        crate::db::tasks::update(&c, old, crate::db::tasks::TaskPatch { status: Some("todo".into()), ..Default::default() }).unwrap();
+        assert_eq!((get(old).status, get(old).closed_reason), ("todo".into(), None));
+        assert_eq!(get(old).delegation_id, Some(failed.id), "the card's number is its newest job");
+    }
+
+    #[test]
+    fn superseded_needs_the_leader_given_title_and_the_same_target() {
+        let c = mem();
+        let get = |t: i64| crate::db::tasks::get(&c, t).unwrap();
+        let failed_card = |title: Option<&str>| {
+            let t = auto_task(&c, "kaan", None, "default", title, "Patronun isteği (aynen):\nA", None, &snap()).unwrap().id;
+            let d = job_with_task(&c, t);
+            set_status(&c, d.id, "failed").unwrap();
+            sync_task(&c, d.id).unwrap();
+            (t, d.id)
+        };
+        // A derived title never closes a card, even when it matches.
+        let (derived, _) = failed_card(None);
+        let again = auto_task(&c, "kaan", None, "default", None, "Patronun isteği (aynen):\nA", None, &snap()).unwrap();
+        assert_eq!(again.title, get(derived).title);
+        assert_eq!((get(derived).status, get(derived).closed_reason), ("todo".into(), None), "derived title");
+        // The given title, another target (agent, or a role for an agent job): stays.
+        let (other, _) = failed_card(Some("gitleaks"));
+        auto_task(&c, "timur", None, "default", Some("gitleaks"), "x", None, &snap()).unwrap();
+        auto_task(&c, "kaan", Some("backend"), "default", Some("gitleaks"), "x", None, &snap()).unwrap();
+        assert_eq!((get(other).status, get(other).closed_reason), ("todo".into(), None), "another target");
+        // The given title, the same agent: closed.
+        auto_task(&c, "kaan", None, "default", Some("gitleaks"), "x", None, &snap()).unwrap();
+        assert_eq!((get(other).status, get(other).closed_reason.as_deref()), ("done".into(), Some("superseded")));
+        // A role job is matched by its role, not by the worker it went to.
+        let (pooled, job) = failed_card(Some("rol"));
+        c.execute("INSERT INTO delegation_role_queue(delegation_id,team_id,role_slug) VALUES(?1,'default','backend')", [job]).unwrap();
+        auto_task(&c, "kaan", None, "default", Some("rol"), "x", None, &snap()).unwrap();
+        auto_task(&c, "kaan", Some("qa"), "default", Some("rol"), "x", None, &snap()).unwrap();
+        assert_eq!((get(pooled).status, get(pooled).closed_reason), ("todo".into(), None), "agent job or another role");
+        auto_task(&c, "timur", Some("backend"), "default", Some("rol"), "x", None, &snap()).unwrap();
+        assert_eq!((get(pooled).status, get(pooled).closed_reason.as_deref()), ("done".into(), Some("superseded")));
     }
 
     #[test]

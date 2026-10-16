@@ -468,7 +468,30 @@ const MIGRATIONS: &[&str] = &[
     // Additive, IF NOT EXISTS. Before commit: ROLLBACK. After commit: keep the table; revert only
     // the application (reject the pending cards, see job_change::SCHEMA).
     crate::job_change::SCHEMA,
+    // 44 (#2104): a closed card that is not "done" work — the leader's patron-approved cancel, or
+    // a failed/unreported card a same-titled new card replaced. Additive column + index + trigger;
+    // the one-time UPDATE closes the leader-confirmed stale cards (guarded, a second run changes nothing).
+    // Revert: `UPDATE tasks SET status='todo', closed_reason=NULL WHERE closed_reason IS NOT NULL;
+    // DROP TRIGGER tasks_reopen; DROP INDEX delegations_task;` (the column stays, NULL).
+    TASK_CLOSED,
 ];
+
+const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK (closed_reason IN ('cancelled','superseded'));
+    CREATE INDEX IF NOT EXISTS delegations_task ON delegations(task_id);
+    CREATE TRIGGER IF NOT EXISTS tasks_reopen AFTER UPDATE OF status ON tasks
+    WHEN NEW.status <> 'done' AND NEW.closed_reason IS NOT NULL
+    BEGIN UPDATE tasks SET closed_reason = NULL WHERE id = NEW.id; END;
+    -- #2110: only the cards the leader confirmed by hand (2026-10-16), no general rule: #2056 → #2057
+    -- merged, #2077's fix landed as b6c5245, the embedding job and #2076 were cancelled by the patron.
+    -- Each guarded by its job link, so another DB changes nothing.
+    UPDATE tasks SET status = 'done', closed_reason = CASE WHEN id IN (1258, 1483) THEN 'cancelled' ELSE 'superseded' END,
+        updated_at = CAST(strftime('%s','now') AS INTEGER) * 1000
+    WHERE status = 'todo' AND (
+        (id = 1462 AND EXISTS (SELECT 1 FROM delegations WHERE id = 2056 AND task_id = 1462 AND status = 'failed'))
+        OR (id = 1484 AND EXISTS (SELECT 1 FROM delegations WHERE id = 2077 AND task_id = 1484 AND status = 'done_no_report'))
+        OR (id = 1258 AND EXISTS (SELECT 1 FROM delegations WHERE id = 1853 AND task_id = 1258 AND status = 'done'))
+        OR (id = 1483 AND EXISTS (SELECT 1 FROM delegations d JOIN job_changes j ON j.delegation_id = d.id
+            WHERE d.id = 2076 AND d.task_id = 1483 AND d.status = 'failed' AND j.action = 'cancel')));";
 
 /// Migration 38. Idempotent on its own: a second run finds no pending match.
 const STALE_PROPOSALS: &str = "
@@ -516,6 +539,72 @@ const PLAN_SNAPSHOT_GUARD: &str = "CREATE TRIGGER IF NOT EXISTS plan_items_proje
     WHEN (OLD.project_id IS NOT NULL AND NEW.project_id IS NOT OLD.project_id) OR NEW.project_root IS NOT OLD.project_root
       OR NEW.merge_branch IS NOT OLD.merge_branch OR NEW.repo_key IS NOT OLD.repo_key
     BEGIN SELECT RAISE(ABORT,'project_mismatch'); END;";
+
+#[cfg(test)]
+mod task_closed_migration_tests {
+    use super::*;
+
+    /// #2104: stale cards close once (cancel / same-titled replacement / the leader-confirmed
+    /// three), nothing else moves, no row is deleted; a second migrate changes nothing.
+    #[test]
+    fn closes_cancelled_and_replaced_cards_once_and_keeps_the_rest() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let at = MIGRATIONS.iter().position(|sql| *sql == TASK_CLOSED).unwrap();
+        for (i, sql) in MIGRATIONS[..at].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        c.execute_batch(SEED_DEFAULT_TEAM).unwrap();
+        c.execute_batch(
+            "INSERT INTO teams(id,name,kind,created_at) VALUES('other','o','main',1);
+            INSERT INTO tasks(id,title,status,agent_id,created_at,updated_at,team_id) VALUES
+                (1,'iptal','todo','kaan',1,1,'default'), (2,'gitleaks','todo','kaan',1,1,'default'),
+                (3,'gitleaks','todo','kaan',2,2,'default'), (4,'elle','todo',NULL,1,1,'default'),
+                (5,'bitti','done','kaan',1,1,'default'), (6,'sürüyor','doing','kaan',1,1,'default'),
+                (1258,'embedding','todo','kaan',1,1,'default'), (1462,'çakışma','todo','kaan',1,1,'default'),
+                (1483,'ikili','todo','kaan',1,1,'default'), (1484,'ikili','todo','kaan',1,1,'default'),
+                (1485,'ikili','todo','kaan',1,1,'other');
+            INSERT INTO member_proposals(id,team_id,leader,role_slug,model,provider,reason,created_at) VALUES
+                (1,'default','timur','backend','opus','anthropic','r',1), (2,'default','timur','backend','opus','anthropic','r',1);
+            INSERT INTO delegations(id,from_agent,to_agent,team_id,prompt,status,summary,task_id,created_at,updated_at) VALUES
+                (10,'timur','kaan','default','p','failed','lider iptal etti (patron onayıyla): r',1,1,1),
+                (11,'timur','kaan','default','p','failed','x',2,1,1),
+                (12,'timur','kaan','default','p','done_no_report','x',3,1,1),
+                (13,'timur','kaan','default','p','running',NULL,6,1,1),
+                (1853,'timur','kaan','default','p','done','ara rapor',1258,1,1),
+                (2056,'timur','kaan','default','p','failed','başlatılamadı',1462,1,1),
+                (2076,'timur','kaan','default','p','failed','lider iptal etti (patron onayıyla): r',1483,1,1),
+                (2077,'timur','kaan','default','p','done_no_report','x',1484,1,1);
+            INSERT INTO job_changes(proposal_id,action,delegation_id,reason) VALUES(1,'cancel',10,'r'), (2,'cancel',2076,'r');",
+        )
+        .unwrap();
+        let count = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get(0)).unwrap() };
+        let before = count(&c);
+        migrate(&mut c).unwrap();
+        for run in 0..2 {
+            if run == 1 {
+                migrate(&mut c).unwrap();
+            }
+            let rows: Vec<(i64, String, Option<String>)> = {
+                let mut st = c.prepare("SELECT id,status,closed_reason FROM tasks ORDER BY id").unwrap();
+                let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+                rows.collect::<Result<_, _>>().unwrap()
+            };
+            let at = |s: &str, r: Option<&str>| (s.to_string(), r.map(String::from));
+            let want = [
+                // #2110: no general rule — a cancelled or same-titled card off the confirmed list stays.
+                (1, at("todo", None)), (2, at("todo", None)), (3, at("todo", None)),
+                (4, at("todo", None)), (5, at("done", None)), (6, at("doing", None)),
+                (1258, at("done", Some("cancelled"))), (1462, at("done", Some("superseded"))), (1483, at("done", Some("cancelled"))),
+                (1484, at("done", Some("superseded"))), (1485, at("todo", None)),
+            ];
+            let got: Vec<(i64, (String, Option<String>))> = rows.into_iter().map(|(i, s, r)| (i, (s, r))).collect();
+            assert_eq!(got, want.to_vec(), "run {run}");
+            assert_eq!(count(&c), before, "no card is deleted");
+        }
+        println!("task_closed migration: tasks before/after={before}/{}; 2 runs", count(&c));
+    }
+}
 
 #[cfg(test)]
 mod job_model_migration_tests {
@@ -1409,6 +1498,10 @@ pub mod tasks {
         pub agent_id: Option<String>,
         pub team_id: Option<String>,
         pub project_id: Option<String>,
+        /// #2104: the newest job of the card (its number on the board), from the DB.
+        pub delegation_id: Option<i64>,
+        /// #2104: `cancelled` / `superseded` on a closed (`done`) card that is not done work.
+        pub closed_reason: Option<String>,
         pub created_at: i64,
         pub updated_at: i64,
     }
@@ -1439,7 +1532,7 @@ pub mod tasks {
         Option::<String>::deserialize(d).map(Some)
     }
 
-    const COLS: &str = "id, title, description, status, agent_id, created_at, updated_at, team_id, project_id";
+    const COLS: &str = "id, title, description, status, agent_id, created_at, updated_at, team_id, project_id, (SELECT MAX(d.id) FROM delegations d WHERE d.task_id = tasks.id), closed_reason";
 
     fn row(r: &Row) -> rusqlite::Result<Task> {
         Ok(Task {
@@ -1452,6 +1545,8 @@ pub mod tasks {
             updated_at: r.get(6)?,
             team_id: r.get(7)?,
             project_id: r.get(8)?,
+            delegation_id: r.get(9)?,
+            closed_reason: r.get(10)?,
         })
     }
 
@@ -1513,6 +1608,9 @@ pub mod tasks {
         }
         if let Some(v) = p.status {
             check_status(&v)?;
+            if v != "done" {
+                t.closed_reason = None; // the `tasks_reopen` trigger clears the row
+            }
             t.status = v;
         }
         if let Some(v) = p.agent_id {

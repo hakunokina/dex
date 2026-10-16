@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { doingRank, LIVE_LABEL, plainPreview, taskLive } from "./taskLive.ts";
+import { cardNumber, doingRank, LIVE_LABEL, plainPreview, taskLive } from "./taskLive.ts";
 import type { AgentStatus } from "../agents.ts";
 
 const job = (patch = {}) => ({
@@ -35,6 +35,19 @@ test("devretme bitti ama görev açık → Birleştirme bekliyor; görev bittiys
     { kind: "merge", delegationId: 1740 });
   assert.deepEqual(taskLive(task({ status: "done" }), "local", [job({ status: "done" })], statusOf("idle")),
     { kind: null, delegationId: 1740 });
+});
+
+test("Yapılacak'a dönmüş raporsuz/başarısız kartta Birleştirme bekliyor rozeti yok (#2104)", () => {
+  for (const status of ["done", "done_no_report"] as const)
+    assert.deepEqual(taskLive(task({ status: "todo" }), "local", [job({ status })], statusOf("idle")),
+      { kind: null, delegationId: 1740 });
+});
+
+test("her kartın numarası: işi varsa #iş (canlı listeden ya da DB'den), yoksa T#görev (#2104)", () => {
+  assert.equal(cardNumber({ id: 12, delegationId: 1700 }, { delegationId: 1740 }), "#1740");
+  assert.equal(cardNumber({ id: 12, delegationId: 1700 }, { delegationId: null }), "#1700");
+  assert.equal(cardNumber({ id: 928 }, { delegationId: null }), "T#928");
+  assert.equal(cardNumber({ id: 928, delegationId: null }, { delegationId: null }), "T#928");
 });
 
 test("en yeni devretme kazanır; başka host/görev karışmaz; devretmesiz görevde numara yok", () => {

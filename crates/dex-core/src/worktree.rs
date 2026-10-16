@@ -550,6 +550,67 @@ pub fn pending(conn: &Connection, agent: Option<&str>) -> Result<Vec<Wt>, String
     Ok(rows)
 }
 
+/// #2104: a finished job whose card still waits in "Sürüyor" for a merge that would change
+/// nothing (its branch is already in the target, or holds only merges of landed branches) and
+/// whose tree is clean counts as landed: `merged_at` is set, the card syncs, [`sweep`] cleans it.
+/// Only cards still `doing`, so a start runs git for the few stuck ones, not for history.
+/// Git runs without the DB lock.
+fn settle_noop_branches(db: &Db) -> Result<(), String> {
+    let stuck = with(db, |c| {
+        let mut st = c
+            .prepare(&format!(
+                "SELECT {COLS} FROM {FROM} JOIN tasks t ON t.id = d.task_id
+                 WHERE w.merged_at IS NULL AND w.removed_at IS NULL AND d.status = 'done'
+                   AND t.status = 'doing' AND t.closed_reason IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM plan_items i WHERE i.delegation_id = d.id)
+                   AND NOT EXISTS (SELECT 1 FROM delegation_reviews r WHERE r.review_id = d.id)
+                 ORDER BY w.delegation_id"
+            ))
+            .map_err(e)?;
+        let rows = st.query_map([], row).map_err(e)?;
+        let mut out = Vec::new();
+        for w in rows {
+            out.push(w.map_err(e)?);
+        }
+        Ok(out)
+    })?;
+    for w in stuck {
+        if !lands_as_noop(&w) {
+            continue;
+        }
+        with(db, |c| {
+            let n = c
+                .execute(
+                    "UPDATE delegation_worktrees SET merged_at = ?2 WHERE delegation_id = ?1 AND merged_at IS NULL AND removed_at IS NULL",
+                    params![w.delegation_id, now()],
+                )
+                .map_err(e)?;
+            if n == 1 {
+                delegate::sync_task(c, w.delegation_id)?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Merging the branch into its target would leave the target's tree as it is, and its tree (if
+/// still there) has nothing uncommitted. Any git error: not proven, the job stays waiting.
+fn lands_as_noop(w: &Wt) -> bool {
+    let target = w.merge_branch.as_deref().map(|b| format!("refs/heads/{b}")).unwrap_or_else(|| "HEAD".into());
+    let branch = format!("refs/heads/{}", w.branch);
+    if w.path.is_dir() && !git(&w.path, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty()) {
+        return false;
+    }
+    let (Ok(merged), Ok(tree)) = (
+        git(&w.root, &["merge-tree", "--write-tree", &target, &branch]),
+        git(&w.root, &["rev-parse", &format!("{target}^{{tree}}")]),
+    ) else {
+        return false;
+    };
+    merged.lines().next() == Some(tree.as_str())
+}
+
 /// What [`sweep`] could not clean, for logging only; never a blocking leader notification.
 #[derive(Debug)]
 pub struct Leftover {
@@ -565,6 +626,7 @@ pub struct Leftover {
 pub fn sweep(db: &Db) -> Result<Vec<Leftover>, String> {
     let mut out = Vec::new();
     let mut told = Vec::new();
+    settle_noop_branches(db)?;
     for w in with(db, |c| pending(c, None))? {
         if let Err(err) = clean(db, w.delegation_id, 1) {
             told.push(w.path.clone());
@@ -1873,6 +1935,46 @@ pub(crate) mod tests {
         std::fs::remove_file(wt.join("full").join("x.txt")).unwrap();
         assert!(sweep(&db).unwrap().is_empty());
         assert!(warnings().is_empty(), "successful cleanup clears the warning");
+    }
+
+    /// #2104: a done job's card, still "doing", whose merge would change nothing: the start sweep
+    /// lands it (card done, tree and branch gone); own commits or uncommitted work keep waiting.
+    #[test]
+    fn start_sweep_lands_a_finished_branch_with_nothing_to_merge() {
+        let root = repo("noop");
+        let db = db_for(&root);
+        let carded = |d: &Delegation| {
+            with(&db, |c| {
+                let t = crate::db::tasks::create(c, crate::db::tasks::NewTask {
+                    title: format!("kart {}", d.id), description: String::new(), status: Some("doing".into()),
+                    agent_id: Some("kaan".into()), team_id: Some("default".into()),
+                })?;
+                c.execute("UPDATE delegations SET task_id = ?2 WHERE id = ?1", params![d.id, t.id]).map_err(e)?;
+                Ok(t.id)
+            })
+            .unwrap()
+        };
+        let (noop, own, dirty) = (job(&db, "kaan"), job(&db, "kaan"), job(&db, "kaan"));
+        let trees: Vec<Wt> = [&noop, &own, &dirty].iter().map(|d| prepare(&db, d).unwrap().unwrap()).collect();
+        std::fs::write(trees[1].path.join("b.txt"), "b\n").unwrap();
+        commit(&trees[1].path, "b ekle");
+        std::fs::write(trees[2].path.join("c.txt"), "c\n").unwrap();
+        let cards: Vec<i64> = [&noop, &own, &dirty].iter().map(|d| carded(d)).collect();
+        for d in [&noop, &own, &dirty] {
+            finish(&db, d.id);
+            with(&db, |c| delegate::sync_task(c, d.id)).unwrap();
+        }
+        let status = |t: i64| with(&db, |c| crate::db::tasks::get(c, t)).unwrap().status;
+        assert!(cards.iter().all(|t| status(*t) == "doing"), "open branches keep the cards before the sweep");
+        sweep(&db).unwrap();
+        assert_eq!(status(cards[0]), "done");
+        let row = with(&db, |c| get(c, noop.id)).unwrap().unwrap();
+        assert!(row.merged_at.is_some() && row.removed_at.is_some() && !trees[0].path.exists(), "{row:?}");
+        assert!(!has_branch(&root, &trees[0].branch));
+        assert_eq!((status(cards[1]), status(cards[2])), ("doing".into(), "doing".into()));
+        assert!(trees[1].path.is_dir() && trees[2].path.join("c.txt").is_file(), "own work stays");
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a\n");
+        assert!(!root.join("b.txt").exists(), "nothing lands in the target");
     }
 
     /// #888: a second project of the default team on its own repository.

@@ -225,7 +225,7 @@ test("görev panosu: görev oluşturulur, listede ve çekirdekte görünür", as
 
 test("görev panosu: kartta ham markdown yok, Sürüyor başlığı dağılımı gösterir", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Pano Sade ${test.info().workerIndex}`);
-  await dexd.call("task_create", { task: {
+  const created = await dexd.call<{ id: number }>("task_create", { task: {
     teamId: team.id, title: "Markdown görev", status: "doing",
     description: "## Patronun sözü\n**Kalın** ve `kod` ile ilk cümle. İkinci cümle.",
   } });
@@ -240,8 +240,8 @@ test("görev panosu: kartta ham markdown yok, Sürüyor başlığı dağılımı
   await expect(board.getByText("## Patronun sözü")).toHaveCount(0);
   await expect(board.getByText("**Kalın**")).toHaveCount(0);
   await expect(board.getByText("Kalın ve kod ile ilk cümle. İkinci cümle.")).toBeVisible();
-  // Devretmesiz görevde iş numarası yok; başlık dağılımı gösterir.
-  await expect(board.locator(".board-num")).toHaveCount(0);
+  // #2104: devretmesiz görevde pano görevinin kendi numarası (T#); başlık dağılımı gösterir.
+  await expect(board.locator(".board-num")).toHaveText(`T#${created.id}`);
   await expect(board.locator('[data-status="doing"] header')).toContainText("0 çalışıyor · 0 sırada · 1 bekliyor");
 });
 
