@@ -121,6 +121,8 @@ export interface LocalStatus {
   models: LocalModel[];
   /** LiteLLM has a DB → `/model/new` works. */
   registry: boolean;
+  /** #2192: server type; missing on older hosts → LiteLLM. oMLX finds models in its model folder, no add/delete. */
+  kind?: "litellm" | "omlx";
 }
 export const setLocalBaseUrl = (host: string, url: string) => callHost<void>(host, "provider_local_set_base_url", { url });
 export const localStatus = (host: string) => callHost<LocalStatus>(host, "provider_local_status");

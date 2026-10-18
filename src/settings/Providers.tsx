@@ -259,6 +259,7 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
   const [busy, setBusy] = useState(false);
   const [name, setName] = useState("");
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
+  const omlx = status?.kind === "omlx";
 
   async function saveKey(token: string) {
     try {
@@ -339,33 +340,40 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
         }
       />
       <details className="set-fold">
-        <summary><b>Modeller ({status?.models.length ?? 0})</b><span>Harici: LiteLLM</span></summary>
+        <summary><b>Modeller ({status?.models.length ?? 0})</b><span>{omlx ? "Harici: oMLX" : "Harici: LiteLLM"}</span></summary>
         <div className="set-pad">
           {!status ? (
             <p className="set-note">Bağlantıyı test edin ya da adres ve anahtarı girin.</p>
           ) : (
             <>
               <p className="set-note" role="status">
-                Bağlı · {status.models.length} model · kayıt {status.registry ? "açık" : "kapalı (sunucuda LiteLLM veritabanı yok)"}
+                {omlx
+                  ? `Bağlı · ${status.models.length} model · oMLX: modeller sunucunun model klasöründen kendiliğinden bulunur`
+                  : <>Bağlı · {status.models.length} model · kayıt {status.registry ? "açık" : "kapalı (sunucuda LiteLLM veritabanı yok)"}</>}
               </p>
               <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 8 }}>
                 {status.models.map((m) => (
                   <li key={m.id} className="set-field">
                     <code>{m.id}</code>
                     {m.backend && <span className="set-note">{m.backend}</span>}
-                    <button
-                      type="button"
-                      className="set-icon-btn"
-                      disabled={!m.removable || busy}
-                      title={m.removable ? "Sunucudan sil" : "Sunucunun config dosyasında — Dex'ten silinmez"}
-                      aria-label={`${m.id} modelini sil`}
-                      onClick={() => setConfirmModel(m.id)}
-                    >
-                      <Trash2 />
-                    </button>
+                    {!omlx && (
+                      <button
+                        type="button"
+                        className="set-icon-btn"
+                        disabled={!m.removable || busy}
+                        title={m.removable ? "Sunucudan sil" : "Sunucunun config dosyasında — Dex'ten silinmez"}
+                        aria-label={`${m.id} modelini sil`}
+                        onClick={() => setConfirmModel(m.id)}
+                      >
+                        <Trash2 />
+                      </button>
+                    )}
                   </li>
                 ))}
               </ul>
+              {omlx ? (
+                <p className="set-note">Model eklemek ya da kaldırmak için sunucudaki oMLX model klasörüne koyun ya da oradan silin; Dex'ten ekleme/silme yok.</p>
+              ) : (
               <span className="set-field">
                 <input
                   value={name} aria-label="Kaydedilecek model adı" placeholder="model adı (motordaki kimlik)"
@@ -374,6 +382,7 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
                 />
                 <button type="button" className="primary" disabled={busy || !name.trim()} onClick={() => void addModel()}>Model ekle</button>
               </span>
+              )}
             </>
           )}
         </div>
