@@ -576,6 +576,9 @@ pub const REGISTRY_OFF: &str = "Sunucuda model kaydı kapalı: LiteLLM'e veritab
 config dosyasından geliyor. Açmak için LiteLLM'e DATABASE_URL + STORE_MODEL_IN_DB=True verilmeli; o zamana dek \
 yeni model sunucu config'ine elle yazılır.";
 
+/// #2190: oMLX'te kayıt API'si yok; modeller sunucunun model klasöründen kendiliğinden bulunur.
+pub const OMLX_MANAGED: &str = "Sunucu oMLX: modeller sunucunun model klasöründen kendiliğinden bulunur, Dex'ten ekleme/silme yok — modeli sunucudaki oMLX model klasörüne koy ya da oradan kaldır.";
+
 pub fn set_base_url(url: &str) -> Result<(), String> {
     let u = url.trim().trim_end_matches('/');
     (u.starts_with("http://") || u.starts_with("https://"))
@@ -735,7 +738,10 @@ fn backend_health_url(base: &str, api_base: &str) -> Option<String> {
 pub fn local_loading(model: &str) -> Option<String> {
     let (base, token) = local_conn().ok()?;
     let info = model_info(&base, &token).ok()?;
-    let row = info.get("data")?.as_array()?.iter().find(|r| r.get("model_name").and_then(|n| n.as_str()) == Some(model))?;
+    let Some(row) = info.get("data")?.as_array()?.iter().find(|r| r.get("model_name").and_then(|n| n.as_str()) == Some(model)) else {
+        // oMLX: LiteLLM kaydı yok; ipucu motorun `/v1/models/status`'unda.
+        return omlx_loading_hint(&models_status(&base, &token)?, model);
+    };
     let url = backend_health_url(&base, row.pointer("/litellm_params/api_base")?.as_str()?)?;
     let backend = row.pointer("/litellm_params/model").and_then(|m| m.as_str()).unwrap_or(model);
     let health = call(http().get(&url).timeout(std::time::Duration::from_secs(5)), None).ok()?;
@@ -751,10 +757,36 @@ fn loading_hint(health: &serde_json::Value, want: &str) -> Option<String> {
     (name(health.get("current")).as_deref() != Some(want)).then(|| format!("model yükleniyor: {want}"))
 }
 
+/// #2190: oMLX `/v1/models/status` → `{"models":[{"id","loaded","is_loading",…}]}`. LiteLLM'de bu
+/// yol yok (hata ya da `models`'siz gövde) — oMLX'i bundan tanırız.
+fn models_status(base: &str, token: &str) -> Option<serde_json::Value> {
+    let req = http().get(&format!("{base}/v1/models/status")).set("Authorization", &format!("Bearer {token}"));
+    call(req.timeout(std::time::Duration::from_secs(5)), None).ok()
+}
+
+fn is_omlx(status: &serde_json::Value) -> bool {
+    status.get("models").is_some_and(|m| m.is_array())
+}
+
+/// oMLX isteğe göre yükler: model yüklü değilse ya da yükleniyorsa ilk yanıt onu bekler.
+fn omlx_loading_hint(status: &serde_json::Value, want: &str) -> Option<String> {
+    let row = status.get("models")?.as_array()?.iter().find(|m| m.get("id").and_then(|i| i.as_str()) == Some(want))?;
+    let flag = |k: &str| row.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+    (flag("is_loading") || !flag("loaded")).then(|| format!("model yükleniyor: {want}"))
+}
+
+fn registry_guard(status: Option<serde_json::Value>) -> Result<(), String> {
+    match status {
+        Some(s) if is_omlx(&s) => Err(OMLX_MANAGED.to_string()),
+        _ => Ok(()),
+    }
+}
+
 /// Metinle model kaydı: motor modeli sunuyor mu → LiteLLM `/model/new` → güncel liste.
 pub fn local_add(name: &str) -> Result<LocalStatus, String> {
     let name = check_model_name(name)?;
     let (base, token) = local_conn()?;
+    registry_guard(models_status(&base, &token))?;
     let info = model_info(&base, &token)?;
     if parse_model_info(&info).iter().any(|m| m.id == name) {
         return Err(format!("{name} zaten kayıtlı"));
@@ -790,6 +822,7 @@ pub fn local_add(name: &str) -> Result<LocalStatus, String> {
 pub fn local_delete(name: &str) -> Result<LocalStatus, String> {
     let name = check_model_name(name)?;
     let (base, token) = local_conn()?;
+    registry_guard(models_status(&base, &token))?;
     let info = model_info(&base, &token)?;
     let rows: Vec<&serde_json::Value> = info
         .get("data")
@@ -1062,6 +1095,39 @@ mod tests {
         assert_eq!(h(serde_json::json!({ "status": "ok", "current": "gpt-oss-120b", "active": [] })).as_deref(), Some("model yükleniyor: qwen3-coder-next"));
         assert_eq!(h(serde_json::json!({ "status": "ok", "current": "qwen3-coder-next", "active": ["x"] })), None, "yüklü: yalnız yavaş");
         assert_eq!(h(serde_json::json!({ "status": "loading", "current": "hosted_vllm/glm-4.7-flash" })).as_deref(), Some("model yükleniyor: glm-4.7-flash"));
+    }
+
+    // ── #2190: oMLX ──
+
+    #[test]
+    fn omlx_models_list_from_v1_models() {
+        // oMLX'te `/model/info` yok; `model_info` `/v1/models`'a düşer.
+        let v = serde_json::json!({ "object": "list", "data": [
+            { "id": "gpt-oss-120b-heretic-v2", "object": "model", "owned_by": "omlx", "max_model_len": 131072 }
+        ]});
+        assert_eq!(parse_model_info(&v), vec![LocalModel { id: "gpt-oss-120b-heretic-v2".into(), backend: None, removable: false }]);
+    }
+
+    #[test]
+    fn omlx_status_says_which_model_is_loading() {
+        let st = |loaded, loading| serde_json::json!({ "models": [
+            { "id": "gpt-oss-120b-heretic-v2", "loaded": loaded, "is_loading": loading, "model_context_length": 131072 }
+        ]});
+        let h = |v: serde_json::Value| omlx_loading_hint(&v, "gpt-oss-120b-heretic-v2");
+        assert_eq!(h(st(false, false)).as_deref(), Some("model yükleniyor: gpt-oss-120b-heretic-v2"), "yüklü değil: ilk istek yükler");
+        assert_eq!(h(st(false, true)).as_deref(), Some("model yükleniyor: gpt-oss-120b-heretic-v2"));
+        assert_eq!(h(st(true, false)), None, "yüklü: yalnız yavaş");
+        assert_eq!(omlx_loading_hint(&st(false, true), "baska-model"), None, "listede yok → bilinmiyor");
+    }
+
+    #[test]
+    fn omlx_rejects_add_and_delete_litellm_passes() {
+        let omlx = serde_json::json!({ "models": [{ "id": "m", "loaded": false, "is_loading": false }] });
+        assert_eq!(registry_guard(Some(omlx)).unwrap_err(), OMLX_MANAGED);
+        assert_eq!(registry_guard(Some(serde_json::json!({ "models": [] }))).unwrap_err(), OMLX_MANAGED);
+        // LiteLLM: yol yok (hata → None) ya da `models`'siz gövde → kayıt akışı aynen sürer.
+        assert!(registry_guard(None).is_ok());
+        assert!(registry_guard(Some(serde_json::json!({ "error": { "message": "not found" } }))).is_ok());
     }
 
     #[test]
