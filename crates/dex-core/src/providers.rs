@@ -647,13 +647,22 @@ pub struct LocalModel {
     pub removable: bool,
 }
 
+/// #2192: yerel sunucunun türü — arayüz metinleri ve Ekle/Sil buna göre.
+#[derive(Serialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalKind {
+    Litellm,
+    Omlx,
+}
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalStatus {
     pub base_url: String,
     pub models: Vec<LocalModel>,
-    /// LiteLLM'e DB bağlı mı → `/model/new` çalışır mı.
+    /// LiteLLM'e DB bağlı mı → `/model/new` çalışır mı (oMLX'te hep `false`).
     pub registry: bool,
+    pub kind: LocalKind,
 }
 
 fn parse_model_info(v: &serde_json::Value) -> Vec<LocalModel> {
@@ -679,11 +688,13 @@ fn model_info(base: &str, token: &str) -> Result<serde_json::Value, String> {
 pub fn local_status() -> Result<LocalStatus, String> {
     let (base, token) = local_conn()?;
     let models = parse_model_info(&model_info(&base, &token)?);
-    let registry = call(http().get(&format!("{base}/health/readiness")), None)
-        .ok()
-        .and_then(|v| v.get("db").and_then(|d| d.as_str()).map(|d| d.eq_ignore_ascii_case("connected")))
-        .unwrap_or(false);
-    Ok(LocalStatus { base_url: base, models, registry })
+    let kind = local_kind(models_status(&base, &token).as_ref());
+    let registry = kind == LocalKind::Litellm
+        && call(http().get(&format!("{base}/health/readiness")), None)
+            .ok()
+            .and_then(|v| v.get("db").and_then(|d| d.as_str()).map(|d| d.eq_ignore_ascii_case("connected")))
+            .unwrap_or(false);
+    Ok(LocalStatus { base_url: base, models, registry, kind })
 }
 
 fn check_model_name(name: &str) -> Result<&str, String> {
@@ -766,6 +777,10 @@ fn models_status(base: &str, token: &str) -> Option<serde_json::Value> {
 
 fn is_omlx(status: &serde_json::Value) -> bool {
     status.get("models").is_some_and(|m| m.is_array())
+}
+
+fn local_kind(status: Option<&serde_json::Value>) -> LocalKind {
+    if status.is_some_and(is_omlx) { LocalKind::Omlx } else { LocalKind::Litellm }
 }
 
 /// oMLX isteğe göre yükler: model yüklü değilse ya da yükleniyorsa ilk yanıt onu bekler.
@@ -1123,9 +1138,11 @@ mod tests {
     #[test]
     fn omlx_rejects_add_and_delete_litellm_passes() {
         let omlx = serde_json::json!({ "models": [{ "id": "m", "loaded": false, "is_loading": false }] });
+        assert_eq!(local_kind(Some(&omlx)), LocalKind::Omlx);
         assert_eq!(registry_guard(Some(omlx)).unwrap_err(), OMLX_MANAGED);
         assert_eq!(registry_guard(Some(serde_json::json!({ "models": [] }))).unwrap_err(), OMLX_MANAGED);
         // LiteLLM: yol yok (hata → None) ya da `models`'siz gövde → kayıt akışı aynen sürer.
+        assert_eq!(local_kind(None), LocalKind::Litellm);
         assert!(registry_guard(None).is_ok());
         assert!(registry_guard(Some(serde_json::json!({ "error": { "message": "not found" } }))).is_ok());
     }
