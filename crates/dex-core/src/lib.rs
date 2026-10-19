@@ -308,6 +308,20 @@ impl Core {
         core.usage_restore_muse();
         core.quota_watch();
         core.usage_watch();
+        // #2208: yerel bağlam önbelleği Ayarlar açılmadan da dolsun — açılışta bir kez,
+        // sonra 10 dk'da bir. Yapılandırma yoksa hiç istek atılmaz, hata loglanmaz.
+        #[cfg(not(test))]
+        {
+            let weak = core.weak_self.clone();
+            std::thread::spawn(move || loop {
+                let Some(core) = weak.upgrade() else { return };
+                if core.instance.lock().unwrap().is_none() {
+                    return; // shutdown
+                }
+                providers::refresh_local_contexts(std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            });
+        }
         #[cfg(not(test))]
         core.maintenance_watch();
         #[cfg(not(test))]

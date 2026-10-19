@@ -265,7 +265,51 @@ pub fn has_model(def: &ProviderDef, model: &str) -> bool {
 /// Sağlayıcının çocuk claude env'i. `None` → anthropic: env'e dokunma.
 /// Err → bilinmeyen sağlayıcı ya da jeton yok (mesaj kullanıcıya ne yapacağını söyler).
 pub fn spawn_env(provider: Option<&str>, model: Option<&str>) -> Result<Option<Vec<(String, String)>>, String> {
+    // #2208: Ayarlar hiç açılmadıysa önbellek boştur; yerel spawn'da bir kez, kısa
+    // zaman aşımıyla doldurmayı dene. Başarısızlık spawn'ı kırmaz — 131072 yedeği.
+    if provider == Some(LOCAL) {
+        ensure_local_contexts_with(&keyring_secret, std::time::Duration::from_secs(3));
+    }
     spawn_env_with(&keyring_secret, provider, model)
+}
+
+/// #2208: önbellek boşsa bağlamları bir kez çekmeyi dener; doluysa ağa çıkmaz.
+/// Yapılandırma yoksa `local_conn_from` hata verir ve hiç istek atılmaz; ağ hatası
+/// sessizce yutulur (log gürültüsü yok). Doluysa/doldurulduysa `true`.
+pub(crate) fn ensure_local_contexts_with(secret: Secret, timeout: std::time::Duration) -> bool {
+    if !LOCAL_CONTEXTS.read().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        return true;
+    }
+    refresh_local_contexts_with(secret, timeout)
+}
+
+/// #2208: yalnız bağlam pencerelerini çeker (`/v1/models` + oMLX `/v1/models/status`)
+/// ve önbelleğe yazar. Boş sonuç (LiteLLM penceresi / ağ hatası) önbelleğe dokunmaz.
+pub(crate) fn refresh_local_contexts_with(secret: Secret, timeout: std::time::Duration) -> bool {
+    let Ok((base, token)) = local_conn_from(secret) else { return false };
+    let auth = format!("Bearer {token}");
+    let mut contexts = std::collections::BTreeMap::new();
+    // Toplam süre `timeout` ile sınırlı: ikinci istek yalnız kalan süreyi kullanır.
+    let start = std::time::Instant::now();
+    for path in ["/v1/models", "/v1/models/status"] {
+        let Some(remaining) = timeout.checked_sub(start.elapsed()) else { break };
+        if remaining.is_zero() {
+            break;
+        }
+        if let Ok(v) = call(http().get(&format!("{base}{path}")).set("Authorization", &auth).timeout(remaining), None) {
+            contexts.extend(parse_model_contexts(&v));
+        }
+    }
+    if contexts.is_empty() {
+        return false;
+    }
+    set_local_contexts(contexts);
+    true
+}
+
+/// #2208: dexd açılış/periyodik dolumu (gerçek kasa ile).
+pub(crate) fn refresh_local_contexts(timeout: std::time::Duration) -> bool {
+    refresh_local_contexts_with(&keyring_secret, timeout)
 }
 
 /// Kasa hesabı → değer. `Ok(None)` = kayıt yok; `Err` = kasa açılamadı. Testler kendi haritasını
@@ -655,8 +699,12 @@ fn base_url_from(secret: Secret) -> Result<String, String> {
 }
 
 fn local_conn() -> Result<(String, String), String> {
-    let base = base_url_from(&keyring_secret)?;
-    let token = keyring_secret(LOCAL)?.ok_or_else(|| "Yerel LLM jetonu yok — Takım → Sağlayıcılar'dan gir".to_string())?;
+    local_conn_from(&keyring_secret)
+}
+
+fn local_conn_from(secret: Secret) -> Result<(String, String), String> {
+    let base = base_url_from(secret)?;
+    let token = secret(LOCAL)?.ok_or_else(|| "Yerel LLM jetonu yok — Takım → Sağlayıcılar'dan gir".to_string())?;
     Ok((base, token))
 }
 
@@ -1304,6 +1352,45 @@ mod tests {
         // oMLX status gövdesindeki bağlam da okunur.
         let st = serde_json::json!({ "models": [{ "id": "s1", "model_context_length": 262144 }] });
         assert_eq!(parse_model_contexts(&st).get("s1"), Some(&262144));
+    }
+
+    #[test]
+    fn local_contexts_fill_on_empty_cache_and_skip_when_unconfigured() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits2 = hits.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                hits2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reader = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).map(|n| n > 2).unwrap_or(false) {
+                    line.clear();
+                }
+                let body = r#"{"data":[{"id":"kat-fill-test","max_model_len":262144}]}"#;
+                write!(s, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let timeout = std::time::Duration::from_secs(3);
+        set_local_contexts(std::collections::BTreeMap::new());
+        // Yapılandırılmamış (jeton yok): adres olsa bile hiç istek atılmaz.
+        let no_token = vault(&[(BASE_URL_ACCOUNT, base.as_str())]);
+        assert!(!ensure_local_contexts_with(&no_token, timeout));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "jeton yokken istek atıldı");
+        // Boş önbellek + yapılandırma var: doldurma çağrısı yapılır, pencere 262144 olur.
+        let full = vault(&[(BASE_URL_ACCOUNT, base.as_str()), ("local", "localtoken123456")]);
+        assert!(ensure_local_contexts_with(&full, timeout));
+        assert!(hits.load(std::sync::atomic::Ordering::SeqCst) > 0, "doldurma isteği gitmedi");
+        let got = LOCAL_CONTEXTS.read().unwrap().get("kat-fill-test").copied();
+        assert_eq!(got, Some(262144));
+        // Dolu önbellek: yeniden istek yok.
+        let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(ensure_local_contexts_with(&full, timeout));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before, "dolu önbellekte istek atıldı");
+        set_local_contexts(std::collections::BTreeMap::new());
     }
 
     #[test]
