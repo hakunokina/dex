@@ -147,8 +147,8 @@ pub static PROVIDERS: &[ProviderDef] = &[
             ("ANTHROPIC_DEFAULT_HAIKU_MODEL", "{model}"),
             ("CLAUDE_CODE_SUBAGENT_MODEL", "{model}"),
             // CLI bilinmeyen modeli 200k sanıp sunucunun penceresini aşabilir;
-            // yerel sağlayıcı için 131.072 token sınırı kullanılır.
-            ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "131072"),
+            // `{context}`: modelin `max_model_len`'i (önbellekten), bilinmiyorsa 131072.
+            ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "{context}"),
         ],
         live: true,
     },
@@ -162,6 +162,51 @@ const CONTEXT: &[(&str, &str, &str)] = &[("muse", "muse-spark-", "1048576"), ("m
 fn context_tokens(provider: &str, model: &str) -> Option<&'static str> {
     let model = model.to_ascii_lowercase();
     CONTEXT.iter().find(|(p, pre, _)| *p == provider && model.starts_with(pre)).map(|c| c.2)
+}
+
+/// #2200: yerel model → `max_model_len` (oMLX `/v1/models`). `spawn_env` ağsız/eşzamanlı olduğu
+/// için `local_status` yenilemesi buraya yazar, spawn buradan okur (LIVE deseninin aynısı).
+static LOCAL_CONTEXTS: std::sync::RwLock<std::collections::BTreeMap<String, u64>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+const LOCAL_FALLBACK_CONTEXT: u64 = 131_072;
+
+pub fn set_local_contexts(contexts: std::collections::BTreeMap<String, u64>) {
+    *LOCAL_CONTEXTS.write().unwrap_or_else(|e| e.into_inner()) = contexts;
+}
+
+fn local_context(model: &str, contexts: &std::collections::BTreeMap<String, u64>) -> u64 {
+    contexts.get(model).copied().filter(|n| *n > 0).unwrap_or(LOCAL_FALLBACK_CONTEXT)
+}
+
+/// `/v1/models` (`data[].max_model_len`) ve `/model/info` gövdelerinden pencere haritası.
+fn parse_model_contexts(v: &serde_json::Value) -> std::collections::BTreeMap<String, u64> {
+    let mut out = std::collections::BTreeMap::new();
+    if let Some(rows) = v.get("data").and_then(|d| d.as_array()) {
+        for r in rows {
+            let Some(id) = r.get("model_name").or_else(|| r.get("id")).and_then(|i| i.as_str()) else { continue };
+            let n = r
+                .get("max_model_len")
+                .or_else(|| r.pointer("/model_info/max_model_len"))
+                .and_then(|n| n.as_u64());
+            if let Some(n) = n.filter(|n| *n > 0) {
+                out.insert(id.to_string(), n);
+            }
+        }
+    }
+    // oMLX `/v1/models/status`: `models[].model_context_length` (varsa) da aynı bilgi.
+    if let Some(rows) = v.get("models").and_then(|d| d.as_array()) {
+        for r in rows {
+            let Some(id) = r.get("id").and_then(|i| i.as_str()) else { continue };
+            let n = r
+                .get("max_model_len")
+                .or_else(|| r.get("model_context_length"))
+                .and_then(|n| n.as_u64());
+            if let Some(n) = n.filter(|n| *n > 0) {
+                out.insert(id.to_string(), n);
+            }
+        }
+    }
+    out
 }
 
 // ── Canlı katalog (GLM/Muse) ─────────────────────────────────────────────────
@@ -236,6 +281,16 @@ fn spawn_env_with(
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Result<Option<Vec<(String, String)>>, String> {
+    let contexts = LOCAL_CONTEXTS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    spawn_env_ctx(secret, provider, model, &contexts)
+}
+
+fn spawn_env_ctx(
+    secret: Secret,
+    provider: Option<&str>,
+    model: Option<&str>,
+    local_contexts: &std::collections::BTreeMap<String, u64>,
+) -> Result<Option<Vec<(String, String)>>, String> {
     // Claude hesapları env'e dokunmaz (ek hesabın `CLAUDE_CONFIG_DIR`'ı pty.rs'te).
     let Some(id) = provider.filter(|p| !crate::claude_accounts::is_claude(p)) else {
         return Ok(None);
@@ -258,6 +313,10 @@ fn spawn_env_with(
     for (k, v) in def.env {
         if *v == "{context}" {
             if let Some(n) = model.as_deref().and_then(|m| context_tokens(id, m)) {
+                env.push((k.to_string(), n.to_string()));
+            } else if id == LOCAL {
+                // LiteLLM gövdesinde pencere yok → önbellek boş → yedek 131072 (davranış değişmez).
+                let n = model.as_deref().map(|m| local_context(m, local_contexts)).unwrap_or(LOCAL_FALLBACK_CONTEXT);
                 env.push((k.to_string(), n.to_string()));
             }
             continue;
@@ -579,6 +638,9 @@ yeni model sunucu config'ine elle yazılır.";
 /// #2190: oMLX'te kayıt API'si yok; modeller sunucunun model klasöründen kendiliğinden bulunur.
 pub const OMLX_MANAGED: &str = "Sunucu oMLX: modeller sunucunun model klasöründen kendiliğinden bulunur, Dex'ten ekleme/silme yok — modeli sunucudaki oMLX model klasörüne koy ya da oradan kaldır.";
 
+/// #2200: `/v1/models/status`'a hiç cevap yok (zaman aşımı/bağlantı hatası) — tür bilinmiyor, fail-open yok.
+pub const STATUS_UNKNOWN: &str = "Yerel LLM sunucu durumu okunamadı, tekrar dene.";
+
 pub fn set_base_url(url: &str) -> Result<(), String> {
     let u = url.trim().trim_end_matches('/');
     (u.starts_with("http://") || u.starts_with("https://"))
@@ -653,6 +715,8 @@ pub struct LocalModel {
 pub enum LocalKind {
     Litellm,
     Omlx,
+    /// #2200: durum ucu cevap vermedi — ekle/sil açık değil.
+    Unknown,
 }
 
 #[derive(Serialize, Debug)]
@@ -687,8 +751,15 @@ fn model_info(base: &str, token: &str) -> Result<serde_json::Value, String> {
 /// Bağlantı testi + canlı model listesi (üye formu da bunu kullanır).
 pub fn local_status() -> Result<LocalStatus, String> {
     let (base, token) = local_conn()?;
-    let models = parse_model_info(&model_info(&base, &token)?);
-    let kind = local_kind(models_status(&base, &token).as_ref());
+    let info = model_info(&base, &token)?;
+    let models = parse_model_info(&info);
+    let probe = models_status_probe(&base, &token);
+    let mut contexts = parse_model_contexts(&info);
+    if let StatusProbe::Omlx(s) = &probe {
+        contexts.extend(parse_model_contexts(s));
+    }
+    set_local_contexts(contexts);
+    let kind = probe.kind();
     let registry = kind == LocalKind::Litellm
         && call(http().get(&format!("{base}/health/readiness")), None)
             .ok()
@@ -770,17 +841,60 @@ fn loading_hint(health: &serde_json::Value, want: &str) -> Option<String> {
 
 /// #2190: oMLX `/v1/models/status` → `{"models":[{"id","loaded","is_loading",…}]}`. LiteLLM'de bu
 /// yol yok (hata ya da `models`'siz gövde) — oMLX'i bundan tanırız.
+/// #2200: durum probunun üç sonucu. HTTP cevabı (herhangi kod) + `models` dizisi yok → LiteLLM
+/// (canlı LiteLLM bu yola 500 + hata gövdesi döner); hiç cevap yok → Unknown, LiteLLM sayılmaz.
+#[derive(Debug, Clone, PartialEq)]
+enum StatusProbe {
+    Omlx(serde_json::Value),
+    Litellm,
+    Unknown,
+}
+
+impl StatusProbe {
+    fn kind(&self) -> LocalKind {
+        match self {
+            Self::Omlx(_) => LocalKind::Omlx,
+            Self::Litellm => LocalKind::Litellm,
+            Self::Unknown => LocalKind::Unknown,
+        }
+    }
+    fn from_response(status: Option<u16>, body: Option<&serde_json::Value>) -> Self {
+        match body {
+            Some(v) if is_omlx(v) => Self::Omlx(v.clone()),
+            Some(_) => Self::Litellm,
+            // Cevap geldi ama gövde okunamadıysa da sunucu var: tür LiteLLM sayılır.
+            None if status.is_some() => Self::Litellm,
+            None => Self::Unknown,
+        }
+    }
+}
+
+fn models_status_probe(base: &str, token: &str) -> StatusProbe {
+    let req = http()
+        .get(&format!("{base}/v1/models/status"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5));
+    match req.call() {
+        Ok(r) => {
+            let code = r.status();
+            StatusProbe::from_response(Some(code), r.into_json::<serde_json::Value>().ok().as_ref())
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            StatusProbe::from_response(Some(code), r.into_json::<serde_json::Value>().ok().as_ref())
+        }
+        Err(ureq::Error::Transport(_)) => StatusProbe::Unknown,
+    }
+}
+
 fn models_status(base: &str, token: &str) -> Option<serde_json::Value> {
-    let req = http().get(&format!("{base}/v1/models/status")).set("Authorization", &format!("Bearer {token}"));
-    call(req.timeout(std::time::Duration::from_secs(5)), None).ok()
+    match models_status_probe(base, token) {
+        StatusProbe::Omlx(v) => Some(v),
+        _ => None,
+    }
 }
 
 fn is_omlx(status: &serde_json::Value) -> bool {
     status.get("models").is_some_and(|m| m.is_array())
-}
-
-fn local_kind(status: Option<&serde_json::Value>) -> LocalKind {
-    if status.is_some_and(is_omlx) { LocalKind::Omlx } else { LocalKind::Litellm }
 }
 
 /// oMLX isteğe göre yükler: model yüklü değilse ya da yükleniyorsa ilk yanıt onu bekler.
@@ -790,10 +904,11 @@ fn omlx_loading_hint(status: &serde_json::Value, want: &str) -> Option<String> {
     (flag("is_loading") || !flag("loaded")).then(|| format!("model yükleniyor: {want}"))
 }
 
-fn registry_guard(status: Option<serde_json::Value>) -> Result<(), String> {
-    match status {
-        Some(s) if is_omlx(&s) => Err(OMLX_MANAGED.to_string()),
-        _ => Ok(()),
+fn registry_guard(probe: &StatusProbe) -> Result<(), String> {
+    match probe {
+        StatusProbe::Omlx(_) => Err(OMLX_MANAGED.to_string()),
+        StatusProbe::Litellm => Ok(()),
+        StatusProbe::Unknown => Err(STATUS_UNKNOWN.to_string()),
     }
 }
 
@@ -801,7 +916,7 @@ fn registry_guard(status: Option<serde_json::Value>) -> Result<(), String> {
 pub fn local_add(name: &str) -> Result<LocalStatus, String> {
     let name = check_model_name(name)?;
     let (base, token) = local_conn()?;
-    registry_guard(models_status(&base, &token))?;
+    registry_guard(&models_status_probe(&base, &token))?;
     let info = model_info(&base, &token)?;
     if parse_model_info(&info).iter().any(|m| m.id == name) {
         return Err(format!("{name} zaten kayıtlı"));
@@ -837,7 +952,7 @@ pub fn local_add(name: &str) -> Result<LocalStatus, String> {
 pub fn local_delete(name: &str) -> Result<LocalStatus, String> {
     let name = check_model_name(name)?;
     let (base, token) = local_conn()?;
-    registry_guard(models_status(&base, &token))?;
+    registry_guard(&models_status_probe(&base, &token))?;
     let info = model_info(&base, &token)?;
     let rows: Vec<&serde_json::Value> = info
         .get("data")
@@ -1138,13 +1253,57 @@ mod tests {
     #[test]
     fn omlx_rejects_add_and_delete_litellm_passes() {
         let omlx = serde_json::json!({ "models": [{ "id": "m", "loaded": false, "is_loading": false }] });
-        assert_eq!(local_kind(Some(&omlx)), LocalKind::Omlx);
-        assert_eq!(registry_guard(Some(omlx)).unwrap_err(), OMLX_MANAGED);
-        assert_eq!(registry_guard(Some(serde_json::json!({ "models": [] }))).unwrap_err(), OMLX_MANAGED);
-        // LiteLLM: yol yok (hata → None) ya da `models`'siz gövde → kayıt akışı aynen sürer.
-        assert_eq!(local_kind(None), LocalKind::Litellm);
-        assert!(registry_guard(None).is_ok());
-        assert!(registry_guard(Some(serde_json::json!({ "error": { "message": "not found" } }))).is_ok());
+        let probe = StatusProbe::from_response(Some(200), Some(&omlx));
+        assert_eq!(probe.kind(), LocalKind::Omlx);
+        assert_eq!(registry_guard(&probe).unwrap_err(), OMLX_MANAGED);
+        assert_eq!(registry_guard(&StatusProbe::from_response(Some(200), Some(&serde_json::json!({ "models": [] })))).unwrap_err(), OMLX_MANAGED);
+        // LiteLLM: `models`'siz gövde (404/500 hata gövdesi dahil) → kayıt akışı aynen sürer.
+        for code in [404, 500] {
+            let p = StatusProbe::from_response(Some(code), Some(&serde_json::json!({ "error": { "message": "not found" } })));
+            assert_eq!(p.kind(), LocalKind::Litellm, "HTTP {code}");
+            assert!(registry_guard(&p).is_ok(), "HTTP {code}");
+        }
+        // Hiç cevap yok (bağlantı hatası/zaman aşımı) → bilinmiyor, ekle/sil reddi.
+        let unknown = StatusProbe::from_response(None, None);
+        assert_eq!(unknown, StatusProbe::Unknown);
+        assert_eq!(unknown.kind(), LocalKind::Unknown);
+        assert_eq!(registry_guard(&unknown).unwrap_err(), STATUS_UNKNOWN);
+        assert!(STATUS_UNKNOWN.contains("sunucu durumu okunamadı, tekrar dene"));
+    }
+
+    #[test]
+    fn local_context_from_max_model_len_and_fallback() {
+        let list = serde_json::json!({ "object": "list", "data": [
+            { "id": "kat-test", "max_model_len": 262144 },
+            { "id": "laguna-test", "max_model_len": 262144 },
+            { "id": "gpt-oss-test", "max_model_len": 131072 },
+            { "id": "no-len-test" }
+        ]});
+        let contexts = parse_model_contexts(&list);
+        assert_eq!(contexts.get("kat-test"), Some(&262144));
+        assert_eq!(contexts.get("gpt-oss-test"), Some(&131072));
+        assert!(!contexts.contains_key("no-len-test"));
+        let v = vault(&[(BASE_URL_ACCOUNT, "http://10.0.0.5:4000"), ("local", "localtoken123456")]);
+        let ctx = |m: &str| {
+            spawn_env_ctx(&v, Some("local"), Some(m), &contexts)
+                .unwrap().unwrap().into_iter()
+                .find(|(k, _)| k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS").unwrap().1
+        };
+        assert_eq!(ctx("kat-test"), "262144");
+        assert_eq!(ctx("laguna-test"), "262144");
+        assert_eq!(ctx("gpt-oss-test"), "131072");
+        assert_eq!(ctx("no-len-test"), "131072", "penceresi bilinmeyen modelde yedek");
+        assert_eq!(ctx("hic-gorulmemis"), "131072");
+        // LiteLLM: pencere bilgisi yok → önbellek boş → değişmez 131072.
+        assert_eq!(
+            spawn_env_ctx(&v, Some("local"), Some("kat-test"), &std::collections::BTreeMap::new())
+                .unwrap().unwrap().into_iter()
+                .find(|(k, _)| k == "CLAUDE_CODE_MAX_CONTEXT_TOKENS").unwrap().1,
+            "131072"
+        );
+        // oMLX status gövdesindeki bağlam da okunur.
+        let st = serde_json::json!({ "models": [{ "id": "s1", "model_context_length": 262144 }] });
+        assert_eq!(parse_model_contexts(&st).get("s1"), Some(&262144));
     }
 
     #[test]

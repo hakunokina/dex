@@ -260,6 +260,8 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
   const [name, setName] = useState("");
   const [confirmModel, setConfirmModel] = useState<string | null>(null);
   const omlx = status?.kind === "omlx";
+  const unknown = status?.kind === "unknown";
+  const noRegistry = omlx || unknown;
 
   async function saveKey(token: string) {
     try {
@@ -340,7 +342,7 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
         }
       />
       <details className="set-fold">
-        <summary><b>Modeller ({status?.models.length ?? 0})</b><span>{omlx ? "Harici: oMLX" : "Harici: LiteLLM"}</span></summary>
+        <summary><b>Modeller ({status?.models.length ?? 0})</b><span>{omlx ? "Harici: oMLX" : unknown ? "Harici: bilinmiyor" : "Harici: LiteLLM"}</span></summary>
         <div className="set-pad">
           {!status ? (
             <p className="set-note">Bağlantıyı test edin ya da adres ve anahtarı girin.</p>
@@ -349,14 +351,16 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
               <p className="set-note" role="status">
                 {omlx
                   ? `Bağlı · ${status.models.length} model · oMLX: modeller sunucunun model klasöründen kendiliğinden bulunur`
-                  : <>Bağlı · {status.models.length} model · kayıt {status.registry ? "açık" : "kapalı (sunucuda LiteLLM veritabanı yok)"}</>}
+                  : unknown
+                    ? "Bağlı · sunucu durumu okunamadı, tekrar dene"
+                    : <>Bağlı · {status.models.length} model · kayıt {status.registry ? "açık" : "kapalı (sunucuda LiteLLM veritabanı yok)"}</>}
               </p>
               <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 8 }}>
                 {status.models.map((m) => (
                   <li key={m.id} className="set-field">
                     <code>{m.id}</code>
                     {m.backend && <span className="set-note">{m.backend}</span>}
-                    {!omlx && (
+                    {!noRegistry && (
                       <button
                         type="button"
                         className="set-icon-btn"
@@ -371,8 +375,8 @@ function LocalCard({ host, provider, status, setStatus, initialSecs, reload }: {
                   </li>
                 ))}
               </ul>
-              {omlx ? (
-                <p className="set-note">Model eklemek ya da kaldırmak için sunucudaki oMLX model klasörüne koyun ya da oradan silin; Dex'ten ekleme/silme yok.</p>
+              {noRegistry ? (
+                <p className="set-note">{omlx ? "Model eklemek ya da kaldırmak için sunucudaki oMLX model klasörüne koyun ya da oradan silin; Dex'ten ekleme/silme yok." : "Sunucu durumu okunamadı, tekrar dene."}</p>
               ) : (
               <span className="set-field">
                 <input
