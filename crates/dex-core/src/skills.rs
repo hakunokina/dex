@@ -1,9 +1,10 @@
-//! Process skills (DEX-23): four workflow skills embedded in the binary and loaded
+//! Process skills (DEX-23): workflow skills embedded in the binary and loaded
 //! per-role into Claude sessions.
 //!
-//! Only the four skills Timur marked "net gerekecek" are here; the roles'
-//! wider `preset.skills` lists are deliberately NOT imported. A fifth skill later
-//! is: one `SKILL.md` dir + one `role_skills` row per role ("cımbızla ekleme").
+//! Only patron-approved skills are here (four at DEX-23; plan-check and
+//! eval-leak-check added at #2236); the roles' wider `preset.skills` lists are
+//! deliberately NOT imported. Another skill later is: one `SKILL.md` dir + one
+//! `role_skills` row per role ("cımbızla ekleme").
 //!
 //! Loading: at spawn, [`Skills::plugin_dir_for_agent`] materializes a per-process
 //! plugin dir (`<config_dir>/dex-skills-<pid>/dex-<role>/`) holding only that
@@ -22,6 +23,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("test-driven-development", include_str!("../skills/test-driven-development/SKILL.md")),
     ("requesting-code-review", include_str!("../skills/requesting-code-review/SKILL.md")),
     ("one-three-one-rule", include_str!("../skills/one-three-one-rule/SKILL.md")),
+    ("plan-check", include_str!("../skills/plan-check/SKILL.md")),
+    ("eval-leak-check", include_str!("../skills/eval-leak-check/SKILL.md")),
 ];
 
 fn body(name: &str) -> Option<&'static str> {
@@ -155,12 +158,14 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// The mapping Timur approved for DEX-23: skill → roles.
+    /// The patron-approved mapping (DEX-23; plan-check/eval-leak-check at #2236): skill → roles.
     const EXPECTED: &[(&str, &[&str])] = &[
         ("systematic-debugging", &["backend", "frontend", "data-engineer", "devops", "qa", "code-automation"]),
         ("test-driven-development", &["backend", "frontend", "data-engineer", "code-automation"]),
         ("requesting-code-review", &["code-review", "backend", "frontend"]),
         ("one-three-one-rule", &["lead", "pm"]),
+        ("plan-check", &["lead"]),
+        ("eval-leak-check", &["explorer", "qa"]),
     ];
 
     #[test]
@@ -192,19 +197,26 @@ mod tests {
         assert!(skills_for_role(&c, "marketing").unwrap().is_empty());
         assert!(skills_for_role(&c, "yok").unwrap().is_empty());
         assert!(skills_for_agent(&c, "yok").unwrap().is_empty());
-        // Only the four skills exist anywhere in the table.
+        // Only the six approved skills exist anywhere in the table.
         let n: i64 = c.query_row("SELECT COUNT(DISTINCT skill) FROM role_skills", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 4);
+        assert_eq!(n, 6);
+        // The two new skills stay on their approved roles only.
+        for (skill, roles) in [("plan-check", 1), ("eval-leak-check", 2)] {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE skill = ?1", [skill], |r| r.get(0)).unwrap();
+            assert_eq!(n, roles, "{skill}");
+        }
     }
 
     #[test]
-    fn backend_gets_three_lead_gets_one() {
+    fn backend_gets_three_lead_gets_two() {
         let c = crate::db::open(Path::new(":memory:")).unwrap();
         assert_eq!(
             skills_for_role(&c, "backend").unwrap(),
             vec!["systematic-debugging", "test-driven-development", "requesting-code-review"]
         );
-        assert_eq!(skills_for_role(&c, "lead").unwrap(), vec!["one-three-one-rule"]);
+        assert_eq!(skills_for_role(&c, "lead").unwrap(), vec!["one-three-one-rule", "plan-check"]);
+        assert_eq!(skills_for_role(&c, "explorer").unwrap(), vec!["eval-leak-check"]);
+        assert_eq!(skills_for_role(&c, "qa").unwrap(), vec!["systematic-debugging", "eval-leak-check"]);
     }
 
     #[test]
@@ -220,13 +232,21 @@ mod tests {
         assert!(back.join("skills").join("test-driven-development").join("SKILL.md").is_file());
         assert!(back.join("skills").join("requesting-code-review").join("SKILL.md").is_file());
         assert!(!back.join("skills").join("one-three-one-rule").exists());
+        assert!(!back.join("skills").join("plan-check").exists());
+        assert!(!back.join("skills").join("eval-leak-check").exists());
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(back.join(".claude-plugin").join("plugin.json")).unwrap()).unwrap();
         assert_eq!(manifest["name"], "dex-backend");
 
         let lead = s.plugin_dir(&c, "lead").unwrap().expect("lead has skills");
         assert!(lead.join("skills").join("one-three-one-rule").join("SKILL.md").is_file());
+        assert!(lead.join("skills").join("plan-check").join("SKILL.md").is_file());
         assert!(!lead.join("skills").join("systematic-debugging").exists());
+        assert!(!lead.join("skills").join("eval-leak-check").exists());
+
+        let explorer = s.plugin_dir(&c, "explorer").unwrap().expect("explorer has skills");
+        assert!(explorer.join("skills").join("eval-leak-check").join("SKILL.md").is_file());
+        assert!(!explorer.join("skills").join("plan-check").exists());
 
         assert!(s.plugin_dir(&c, "marketing").unwrap().is_none());
         let _ = std::fs::remove_dir_all(&root);
@@ -243,6 +263,19 @@ mod tests {
         // No foreign workflow concepts leaked in: Dex MCP is task_*/delegate/report/plan_*.
         for leak in ["agentspace_", "AgentSpace", "create_task", "codebase-memory", "/code-review"] {
             assert!(!all.contains(leak), "leak: {leak}");
+        }
+        // #2236 skills: Dex-shaped (bound to plan/delegate/effort/memory_search), and no
+        // by-name dependency on their paperthin idea sources.
+        let plan_check = body("plan-check").unwrap();
+        for needle in ["`plan`", "`delegate`", "`effort`", "memory_search", "first_nail"] {
+            assert!(plan_check.contains(needle), "plan-check missing {needle}");
+        }
+        let eval_leak = body("eval-leak-check").unwrap();
+        for needle in ["memory_search", "Verifier = designer", "Tautology", "Shared hallucination"] {
+            assert!(eval_leak.contains(needle), "eval-leak-check missing {needle}");
+        }
+        for foreign in ["hate", "modelchk", "mandela"] {
+            assert!(!plan_check.contains(foreign) && !eval_leak.contains(foreign), "foreign skill dependency: {foreign}");
         }
     }
 }

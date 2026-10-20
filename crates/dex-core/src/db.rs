@@ -479,7 +479,19 @@ const MIGRATIONS: &[&str] = &[
     // Before commit: ROLLBACK. After commit: keep the table/indexes; revert only the application
     // (full undo in catchup::SCHEMA).
     crate::catchup::SCHEMA,
+    // 46 (#2236): two more approved process skills — plan-check (lead), eval-leak-check
+    // (explorer, qa). Additive; INSERT OR IGNORE makes a second run a no-op. Before commit:
+    // ROLLBACK. After commit, full undo: DELETE FROM role_skills WHERE skill IN
+    // ('plan-check','eval-leak-check'); (the table and the other rows stay).
+    PROCESS_SKILLS_46,
 ];
+
+/// Migration 46. Idempotent on its own: the (role_slug, skill) PK + OR IGNORE
+/// makes a second run change nothing.
+const PROCESS_SKILLS_46: &str = "INSERT OR IGNORE INTO role_skills (role_slug, skill) VALUES
+    ('lead', 'plan-check'),
+    ('explorer', 'eval-leak-check'),
+    ('qa', 'eval-leak-check');";
 
 const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK (closed_reason IN ('cancelled','superseded'));
     CREATE INDEX IF NOT EXISTS delegations_task ON delegations(task_id);
@@ -850,6 +862,33 @@ mod job_model_migration_tests {
         for _ in 0..2 { migrate(&mut clean).unwrap(); }
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
         println!("motivation migration: preserved={before:?}; v{version} + clean DB 2 runs");
+    }
+
+    #[test]
+    fn process_skills_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let version = MIGRATIONS.iter().position(|sql| *sql == PROCESS_SKILLS_46).unwrap();
+        for (i, sql) in MIGRATIONS[..version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        let count = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM role_skills", [], |r| r.get(0)).unwrap() };
+        let before = count(&c);
+        assert_eq!(before, 15); // migration 8 rows, untouched by 46
+        for _ in 0..2 {
+            migrate(&mut c).unwrap();
+            c.execute_batch(PROCESS_SKILLS_46).unwrap();
+            assert_eq!(count(&c), before + 3);
+        }
+        for (role, skill) in [("lead", "plan-check"), ("explorer", "eval-leak-check"), ("qa", "eval-leak-check")] {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE role_slug=?1 AND skill=?2", [role, skill], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1, "{role}/{skill}");
+        }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        assert_eq!(count(&clean), 18);
+        println!("process skills migration: before/after={before}/{}; v{version} + clean DB 2 runs", count(&c));
     }
 
     #[test]
