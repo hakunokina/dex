@@ -28,6 +28,7 @@ pub mod inbox;
 pub mod inbox_reply;
 pub mod layout;
 pub mod leader_reset;
+pub mod loop_guard;
 pub mod mcp;
 pub mod memory;
 pub mod model_news;
@@ -153,6 +154,8 @@ pub struct Core {
     leader_pastes: Mutex<HashMap<String, plan::LeaderPaste>>,
     /// #2055: workers' Claude task lists → their running job's progress.
     progress: progress::Tracker,
+    /// #2242: aynı çağrıyı art arda tekrarlama bekçisi (ajan başına, bellek içi).
+    loop_guard: loop_guard::Guard,
     /// #2055: agent → its last hook time (`States::hook_at`) when its leader got the stall note;
     /// the same silence is told once, whichever client's watchdog asks.
     stall_noted: Mutex<HashMap<String, u64>>,
@@ -261,6 +264,7 @@ impl Core {
             sleeping_leaders: Mutex::default(),
             leader_pastes: Mutex::default(),
             progress: progress::Tracker::default(),
+            loop_guard: loop_guard::Guard::default(),
             stall_noted: Mutex::default(),
             claude_turns: claude_turn::Turns::default(),
             worker_note_receipts: worker_notes::Receipts::default(),
@@ -473,6 +477,15 @@ impl Core {
 
     pub(crate) fn delegation_hook_prepared(&self, agent: &str, event: &str, body: &Value, preserve_failure: bool, stop: Option<&claude_turn::Stop>) -> Option<String> {
         if event == "PostToolUse" { self.progress_on_hook(agent, body); }
+        // #2242: PostToolUse son çıktıyı tutar ve seri eşikteyse uyarıyı hazırlar (aşağıda cevaba
+        // eklenir); yeni tur seriyi, oturum sonu durumu temizler.
+        if event == "UserPromptSubmit" { self.loop_guard.reset_turn(agent); }
+        if event == "SessionEnd" { self.loop_guard.forget(agent); }
+        let loop_warning = match event {
+            "PostToolUse" => self.loop_guard_post(agent, body, false),
+            "PostToolUseFailure" => self.loop_guard_post(agent, body, true),
+            _ => None,
+        };
         if matches!(event, "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "Stop") {
             self.worker_notes_reconcile(agent);
             if event == "UserPromptSubmit" { self.worker_notes_prompt_received(agent, body); }
@@ -506,6 +519,8 @@ impl Core {
                 return Some(out);
             }
         }
+        // #2242: tekrar bekçisi sayar (izin ve test bütçesi reddi sayılmaz; kararlara dokunmaz).
+        if event == "PreToolUse" { self.loop_guard_pre(agent, body); }
         // DEX-24: a worker waiting for its leader's answer keeps its job; questions/answers ride along.
         // DEX-17: zincir geçişinde devretme satırlarına dokunulmaz (failed OLMAZ), soru-cevap akar.
         let out = questions::on_hook_pending(&self.db, &self.events, agent, event, body, pending.as_ref(), || {
@@ -518,6 +533,14 @@ impl Core {
         });
         // Plan #114: the patron's per-message append rides the leader's own prompts.
         let out = if event == "UserPromptSubmit" { prompts::with_message_append(&self.db, agent, body, out) } else { out };
+        // #2242: tekrar uyarısı PostToolUse cevabının bağlamına eklenir; mevcut kararı ezmez.
+        let out = match loop_warning {
+            Some(text) => match worker_notes::merge(event, out.clone(), &text) {
+                Ok(merged) => merged,
+                Err(err) => { eprintln!("dex loop guard hook: {err}"); out }
+            },
+            None => out,
+        };
         if event == "PreToolUse" { diagnostics::permit_hook_reply(agent, body, out.as_deref()); }
         if let Some(pending) = pending.filter(|_| is_blocked(&out)) {
             if let (Some(stop), Some(reply)) = (stop, out.as_deref().and_then(|o| serde_json::from_str::<Value>(o).ok())) {
