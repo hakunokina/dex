@@ -17,9 +17,12 @@
 //!   gösterilir. Süresi geçmiş pencere (`resets_at` < şimdi) geçersizdir: "--" ve
 //!   [`MUSE_STALE_NOTE`]. Hiç değer yoksa "--" ve ölçüm notu.
 //! Ölçüm aralığı quota.rs'nin kademesi ([`crate::quota::next_delay`]); bayatlık sınırı da onun
-//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir — yalnız Muse'ta saklanan son
-//! değer pencereleri geçerliyse `measured_at` ile gösterilmeye devam eder. Jeton, anahtar ve
-//! yanıt gövdesi loglanmaz; hata yalnız durum kodu ya da kısa neden.
+//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir — Muse'ta ve (#2247) Claude
+//! hesaplarında saklanan son değer pencereleri geçerliyse `measured_at` ile gösterilmeye devam
+//! eder. #2247: Claude'da bayat değerin yanında neden (`HTTP 429`) `note`'ta durur; şerit "son
+//! ölçüm X dk önce + neden" gösterir. Bu yalnız gösterim: zincir eşiği (`quota::State`) kendi
+//! taze ölçümünü ister, saklanan değerden beslenmez. Jeton, anahtar ve yanıt gövdesi loglanmaz;
+//! hata yalnız durum kodu ya da kısa neden.
 //!
 //! Bugünün token'ı: Dex ajanlarının transcript kullanımı (`cost.rs`, sağlayıcı-farkında), bu
 //! makinenin yerel gece yarısından beri input + output + cache okuma + cache yazma. Dex dışındaki
@@ -156,6 +159,12 @@ fn real_sources() -> Sources {
     vec![("glm", Arc::new(ZaiLimits)), ("muse", Arc::new(MuseLimits))]
 }
 
+/// Son başarılı ölçümü `settings`'te saklanan ve bayatsa da gösterilen sağlayıcılar: Muse (#1987)
+/// ve Claude hesapları (#2247).
+fn persisted(id: &str) -> bool {
+    id == "muse" || crate::claude_accounts::is_claude(id)
+}
+
 /// Görüntü: taze ölçüm pencereleri gösterir; yoksa "--" ve nedeni.
 fn build(
     readings: &HashMap<&'static str, Reading>,
@@ -169,20 +178,25 @@ fn build(
             let r = readings.get(id);
             let fresh = r.and_then(|r| r.ok.as_ref()).filter(|(at, _)| now - at <= crate::quota::STALE_MS);
             let today = tokens.map(|t| t.get(id).copied().unwrap_or(0));
-            if id == "muse" {
-                // #1987: bayatlık sınırı Muse'a işlemez — saklanan son değer, pencereleri
-                // geçerliyse `measured_at` ile gösterilmeye devam eder.
+            if persisted(id) {
+                // #1987/#2247: bayatlık sınırı burada "--" yapmaz — saklanan son değer, pencereleri
+                // geçerliyse `measured_at` ile gösterilmeye devam eder. Claude'da bayat değerin
+                // nedeni (`HTTP 429`) notta kalır; Muse'a bayatlık işlemez (#1987), notu yok.
                 let shown =
                     fresh.map(|(at, l)| (*at, l.clone())).or_else(|| r.and_then(|r| r.ok.as_ref()).map(|(at, l)| (*at, l.clone())));
                 if let Some((at, limits)) = shown {
+                    let stale_note = || {
+                        (id != "muse").then(|| r.and_then(|r| r.error.clone()).unwrap_or_else(|| "ölçüm bayat".into()))
+                    };
                     let live = drop_expired(&limits, now);
                     if live.five_hour.is_some() || live.weekly.is_some() {
-                        return ProviderUsage { id, limits: live, note: None, measured_at: Some(at), today_tokens: today };
+                        let note = if fresh.is_some() { None } else { stale_note() };
+                        return ProviderUsage { id, limits: live, note, measured_at: Some(at), today_tokens: today };
                     }
                     return ProviderUsage {
                         id,
                         limits: Limits::default(),
-                        note: Some(MUSE_STALE_NOTE.into()),
+                        note: Some(stale_note().unwrap_or_else(|| MUSE_STALE_NOTE.into())),
                         measured_at: None,
                         today_tokens: today,
                     };
@@ -421,33 +435,42 @@ impl LimitSource for MuseLimits {
     }
 }
 
-// ── Son başarılı Muse okumasının kalıcılığı (`settings` satırı; migration yok) ──
+// ── Son başarılı okumanın kalıcılığı (`settings` satırı; migration yok) ──────
 
-/// `settings` anahtarı: JSON `{measuredAt, limits}`; satır yoksa/bozuksa ölçüm yok.
-const MUSE_LAST_KEY: &str = "usage_muse_last";
+/// `settings` anahtarı (`usage_muse_last`, `usage_anthropic_last`, …): JSON `{measuredAt, limits}`;
+/// satır yoksa/bozuksa ölçüm yok. Muse'un #1987 anahtarı aynen korunur (eski satır okunur).
+fn last_key(id: &str) -> String {
+    format!("usage_{id}_last")
+}
 
 #[derive(Serialize, Deserialize)]
-struct MuseLast {
+struct Last {
     #[serde(rename = "measuredAt")]
     measured_at: i64,
     limits: Limits,
 }
 
-fn save_muse_last(conn: &Connection, at: i64, limits: &Limits) -> Result<(), String> {
-    let v = serde_json::to_string(&MuseLast { measured_at: at, limits: limits.clone() }).map_err(|e| e.to_string())?;
+fn save_last(conn: &Connection, id: &str, at: i64, limits: &Limits) -> Result<(), String> {
+    let v = serde_json::to_string(&Last { measured_at: at, limits: limits.clone() }).map_err(|e| e.to_string())?;
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        params![MUSE_LAST_KEY, v],
+        params![last_key(id), v],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn load_muse_last(conn: &Connection) -> Option<(i64, Limits)> {
+fn load_last(conn: &Connection, id: &str) -> Option<(i64, Limits)> {
     let raw: Option<String> =
-        conn.query_row("SELECT value FROM settings WHERE key = ?1", [MUSE_LAST_KEY], |r| r.get(0)).ok()?;
-    let last: MuseLast = serde_json::from_str(raw?.as_str()).ok()?;
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", [last_key(id)], |r| r.get(0)).ok()?;
+    let last: Last = serde_json::from_str(raw?.as_str()).ok()?;
     Some((last.measured_at, last.limits))
+}
+
+/// Geri alma: satırı sil (hesap bağlantısı kalkınca ya da elle). Yoksa sessiz.
+fn delete_last(conn: &Connection, id: &str) -> Result<(), String> {
+    conn.execute("DELETE FROM settings WHERE key = ?1", [last_key(id)]).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ── Core ─────────────────────────────────────────────────────────────────────
@@ -485,11 +508,11 @@ impl crate::Core {
                 Ok(limits) => {
                     r.ok = Some((now, limits.clone()));
                     r.error = None;
-                    if id == "muse" {
+                    if persisted(id) {
                         // dexd yeniden başlasa da kalsın; yazılamazsa ölçüm yine de gösterilir.
-                        let saved = crate::db::with(&self.db, |c| save_muse_last(c, now, &limits));
+                        let saved = crate::db::with(&self.db, |c| save_last(c, id, now, &limits));
                         if let Err(err) = saved {
-                            eprintln!("dex: Muse son ölçüm saklanamadı: {err}");
+                            eprintln!("dex: {id} son ölçüm saklanamadı: {err}");
                         }
                     }
                 }
@@ -505,11 +528,14 @@ impl crate::Core {
         self.usage_publish();
     }
 
-    /// Açılışta saklanan son Muse okumasını belleğe alır (yoksa/bozuksa "--" aynen kalır).
-    pub(crate) fn usage_restore_muse(&self) {
-        let loaded = crate::db::with(&self.db, |c| Ok(load_muse_last(c)));
-        if let Ok(Some((at, limits))) = loaded {
-            self.usage.readings.lock().unwrap().insert("muse", Reading { ok: Some((at, limits)), error: None });
+    /// Açılışta saklanan son okumaları (Muse + Claude hesapları) belleğe alır (yoksa/bozuksa "--"
+    /// aynen kalır). Yalnız şerit için: `quota::State` dokunulmaz, eşik taze ölçüm bekler.
+    pub(crate) fn usage_restore(&self) {
+        for id in PROVIDERS.into_iter().filter(|id| persisted(id)) {
+            let loaded = crate::db::with(&self.db, |c| Ok(load_last(c, id)));
+            if let Ok(Some((at, limits))) = loaded {
+                self.usage.readings.lock().unwrap().insert(id, Reading { ok: Some((at, limits)), error: None });
+            }
         }
     }
 
@@ -541,9 +567,15 @@ impl crate::Core {
         snap
     }
 
-    /// #2019: hesabın bağlantısı kalktı — son ölçümü unutulur, görüntü yayınlanır.
+    /// #2019: hesabın bağlantısı kalktı — son ölçümü unutulur (saklanan satır dahil: başka hesapla
+    /// bağlanınca eskisi geri gelmesin), görüntü yayınlanır.
     pub(crate) fn usage_forget(&self, id: &str) {
         self.usage.readings.lock().unwrap().remove(id);
+        if persisted(id) {
+            if let Err(err) = crate::db::with(&self.db, |c| delete_last(c, id)) {
+                eprintln!("dex: {id} saklanan son ölçüm silinemedi: {err}");
+            }
+        }
         self.usage_publish();
     }
 
@@ -670,14 +702,69 @@ mod tests {
     fn muse_last_round_trips_through_settings() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
-        assert_eq!(load_muse_last(&c), None);
+        assert_eq!(load_last(&c, "muse"), None);
         let limits = Limits { five_hour: Some(w(77.5, Some("2026-10-20T00:00:00Z"))), weekly: None };
-        save_muse_last(&c, 1_792_000_000_000, &limits).unwrap();
-        assert_eq!(load_muse_last(&c), Some((1_792_000_000_000, limits.clone())));
-        save_muse_last(&c, 1_792_000_001_000, &limits).unwrap();
-        assert_eq!(load_muse_last(&c).unwrap().0, 1_792_000_001_000, "upsert idempotent");
+        save_last(&c, "muse", 1_792_000_000_000, &limits).unwrap();
+        assert_eq!(load_last(&c, "muse"), Some((1_792_000_000_000, limits.clone())));
+        save_last(&c, "muse", 1_792_000_001_000, &limits).unwrap();
+        assert_eq!(load_last(&c, "muse").unwrap().0, 1_792_000_001_000, "upsert idempotent");
         c.execute("UPDATE settings SET value = 'bozuk' WHERE key = 'usage_muse_last'", []).unwrap();
-        assert_eq!(load_muse_last(&c), None);
+        assert_eq!(load_last(&c, "muse"), None);
+    }
+
+    /// #2247: Claude hesaplarının son okuması da ayrı anahtarlarda saklanır; silme idempotent.
+    #[test]
+    fn claude_last_persists_per_account() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+        assert!(persisted("anthropic") && persisted("anthropic-2") && persisted("muse") && !persisted("glm"));
+        let a = Limits { five_hour: Some(w(40.0, None)), weekly: Some(w(90.0, None)) };
+        let b = Limits { five_hour: Some(w(5.0, None)), weekly: None };
+        save_last(&c, "anthropic", 1, &a).unwrap();
+        save_last(&c, "anthropic-2", 2, &b).unwrap();
+        assert_eq!(load_last(&c, "anthropic"), Some((1, a.clone())));
+        assert_eq!(load_last(&c, "anthropic-2"), Some((2, b.clone())), "hesaplar birbirine karışmaz");
+        assert_eq!(load_last(&c, "muse"), None);
+        let keys: Vec<String> = c
+            .prepare("SELECT key FROM settings ORDER BY key")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(keys, ["usage_anthropic-2_last", "usage_anthropic_last"]);
+        delete_last(&c, "anthropic").unwrap();
+        delete_last(&c, "anthropic").unwrap();
+        assert_eq!((load_last(&c, "anthropic"), load_last(&c, "anthropic-2")), (None, Some((2, b))));
+    }
+
+    /// #2247: Claude'un bayat ölçümü "--" olmaz: değer + `measured_at` + neden notta (429 gibi);
+    /// taze ölçümde not yok; süresi geçmiş pencere düşer.
+    #[test]
+    fn claude_stale_reading_is_shown_with_reason() {
+        let now = 10_000_000;
+        let limits = Limits { five_hour: Some(w(40.0, None)), weekly: Some(w(90.0, Some("2026-10-20T00:00:00Z"))) };
+        let at = now - crate::quota::STALE_MS - 60_000;
+        let shown = |error: Option<&str>| {
+            let mut readings = HashMap::new();
+            readings.insert("anthropic", Reading { ok: Some((at, limits.clone())), error: error.map(str::to_string) });
+            build(&readings, None, None, now).providers.into_iter().find(|p| p.id == "anthropic").unwrap()
+        };
+        let p = shown(Some("kullanım uç noktası HTTP 429"));
+        assert_eq!((&p.limits, p.note.as_deref(), p.measured_at), (&limits, Some("kullanım uç noktası HTTP 429"), Some(at)));
+        let p = shown(None);
+        assert_eq!(p.note.as_deref(), Some("ölçüm bayat"), "hata yoksa da bayatlık söylenir");
+        // Taze ölçümde not yok (eski davranış).
+        let mut readings = HashMap::new();
+        readings.insert("anthropic", Reading { ok: Some((now - 1_000, limits.clone())), error: Some("geçici".into()) });
+        let p = build(&readings, None, None, now).providers.into_iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!((p.note.as_deref(), p.measured_at), (None, Some(now - 1_000)));
+        // Pencereleri geçmiş bayat değer: "--" ama neden hâlâ 429.
+        let mut readings = HashMap::new();
+        let expired = Limits { five_hour: Some(w(40.0, Some("1970-01-01T00:00:01Z"))), weekly: None };
+        readings.insert("anthropic", Reading { ok: Some((at, expired)), error: Some("kullanım uç noktası HTTP 429".into()) });
+        let p = build(&readings, None, None, now).providers.into_iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!((&p.limits, p.note.as_deref(), p.measured_at), (&Limits::default(), Some("kullanım uç noktası HTTP 429"), None));
     }
 
     /// #1987: kimlik yalnız OAuth oturumundan okunur; ham anahtar/girişsizlik ağa çıkarmaz.
@@ -809,13 +896,53 @@ mod tests {
         assert_eq!(events.len(), 2, "her ölçüm görüntüyü değiştirdi");
         assert_eq!(events[1]["providers"][1]["fiveHour"]["remainingPercent"], 10.0);
         // #1987: Muse hatası son değeri silmez; başarılı okuma `settings`'e yazılır.
-        let muse = Limits { five_hour: Some(w(30.0, Some("2026-10-20T00:00:00Z"))), weekly: None };
+        // Sıfırlanma ileride olmalı: geçmiş pencere `drop_expired` ile düşer (2026-10-20 fikstürü o gün çürüdü).
+        let muse = Limits { five_hour: Some(w(30.0, Some("2099-01-01T00:00:00Z"))), weekly: None };
         core.usage_record("muse", Ok(muse.clone()));
         core.usage_record("muse", Err(MUSE_NOTE.into()));
         let got = core.usage_get();
         assert_eq!(&got.providers[2].limits, &muse, "hata son değeri silmez");
         let at = got.providers[2].measured_at.unwrap();
-        assert_eq!(crate::db::with(&core.db, |c| Ok(load_muse_last(c))).unwrap(), Some((at, muse)));
+        assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "muse"))).unwrap(), Some((at, muse)));
+        // #2247: Claude ölçümü de saklanır (quota_tick yoluyla yazılmıştı).
+        let claude_at = got.providers[0].measured_at.unwrap();
+        let saved = crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap().unwrap();
+        assert_eq!((saved.0, saved.1.five_hour), (claude_at, Some(w(70.0, None))));
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2247: açılışta geri yüklenen eski Claude ölçümü şeritte görünür (bayat notuyla) ama zincir
+    /// eşiğine girmez: `quota::State` boş kalır, `quota_breached` false. Sonraki 429 değeri silmez.
+    #[test]
+    fn restored_claude_reading_shows_but_never_breaches() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/usage-restore-{}", std::process::id()));
+        let core = crate::Core::start(
+            crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
+            crate::Events::new(crate::events::NullSink),
+        )
+        .unwrap();
+        let now = crate::model_news::now_ms();
+        let old_at = now - crate::quota::STALE_MS - 60_000;
+        // %99 dolu eski ölçüm "önceki oturumdan" kalmış olsun (pencereleri geçerli).
+        let old = Limits { five_hour: Some(w(1.0, Some("2099-01-01T00:00:00Z"))), weekly: Some(w(50.0, None)) };
+        crate::db::with(&core.db, |c| save_last(c, "anthropic", old_at, &old)).unwrap();
+        core.usage_restore();
+        core.usage_restore();
+        let got = core.usage_get();
+        let claude = got.providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!((&claude.limits, claude.note.as_deref(), claude.measured_at), (&old, Some("ölçüm bayat"), Some(old_at)));
+        assert!(!core.quota_breached("anthropic"), "geri yüklenen ölçüm eşik değil");
+        assert!(core.quota.of("anthropic").unwrap().lock().unwrap().last.is_none(), "quota::State dokunulmaz");
+        // İlk canlı ölçüm 429: değer durur, not 429 olur.
+        core.usage_record("anthropic", Err("kullanım uç noktası HTTP 429".into()));
+        let got = core.usage_get();
+        let claude = got.providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!((&claude.limits, claude.note.as_deref()), (&old, Some("kullanım uç noktası HTTP 429")));
+        assert!(!core.quota_breached("anthropic"));
+        // Bağlantı kalkınca saklanan satır da gider.
+        core.usage_forget("anthropic");
+        assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap(), None);
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }

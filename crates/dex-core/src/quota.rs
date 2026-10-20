@@ -9,8 +9,10 @@
 //! bellekte, yenilenmez (CLI yeniler). Jeton ve yanıt gövdesi loglanmaz. Ölçüm aralığı kullanıma göre
 //! kademeli (#253, [`tier_delay`]): iki pencereden yüksek olanı %50 altı → 10 dk, %50–70 → 3 dk,
 //! %70+ → 60 sn. Hata (429 dahil) aralığı ikiye katlar (taban 60 sn, en çok 10 dk); sonraki başarılı
-//! ölçüm yeniden kademeye döner. Son başarılı ölçüm 15 dk'dan eskiyse eşik "bilinmiyor" sayılır →
-//! kimse yönlendirilmez (eski davranış: zincir yalnız kota bitince).
+//! ölçüm yeniden kademeye döner. #2247: hata yanıtında `Retry-After` (saniye ya da HTTP tarihi) varsa
+//! bir sonraki deneme en az o kadar ertelenir (tavan [`RETRY_AFTER_CAP_MS`]); başlık yoksa katlama
+//! sürer. Son başarılı ölçüm 15 dk'dan eskiyse eşik "bilinmiyor" sayılır → kimse yönlendirilmez
+//! (eski davranış: zincir yalnız kota bitince).
 
 use serde::Serialize;
 
@@ -25,6 +27,8 @@ pub const MAX_POLL_MS: u64 = 600_000;
 /// yalnız 60 sn kademesinde aşılabilir; orada 15 dk ≈ art arda birkaç başarısız deneme demek.
 pub const STALE_MS: i64 = 15 * 60_000;
 const _: () = assert!(STALE_MS > (MAX_POLL_MS + 13_000) as i64);
+/// #2247: ucun `Retry-After`'ına en çok bu kadar uyulur (bozuk/aşırı değer ölçümü saatlerce susturmasın).
+pub const RETRY_AFTER_CAP_MS: u64 = 30 * 60_000;
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
@@ -67,6 +71,22 @@ pub fn breach(u: &Usage) -> Option<Breach> {
 /// Ölçüm kaynağı; testler sahtesini verir (`Core::quota_set_source`).
 pub trait UsageSource: Send + Sync {
     fn read(&self) -> Result<Usage, String>;
+
+    /// #2247: son başarısız `read`'in `Retry-After` ipucu (ms); yoksa `None`. Yalnız hata sonrası okunur.
+    fn retry_after_ms(&self) -> Option<u64> {
+        None
+    }
+}
+
+/// `Retry-After` başlığı: saniye (`120`) ya da HTTP tarihi (`Wed, 21 Oct 2015 07:28:00 GMT`) →
+/// şimdiden itibaren ms. Okunamayan/geçmiş = `None` (çağrıcı mevcut geri çekilmeyi sürdürür).
+pub fn parse_retry_after(value: &str, now_ms: i64) -> Option<u64> {
+    let v = value.trim();
+    if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+        return v.parse::<u64>().ok()?.checked_mul(1000);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(v).ok()?.timestamp_millis();
+    (at > now_ms).then(|| (at - now_ms) as u64)
 }
 
 /// `/api/oauth/usage` gövdesi: `{"five_hour":{"utilization":42.0,"resets_at":"…"},"seven_day":{…}}`.
@@ -91,13 +111,28 @@ pub fn parse_usage(v: &serde_json::Value) -> Result<Usage, String> {
     })
 }
 
-/// Gerçek kaynak: abonelik OAuth jetonuyla kullanım uç noktası. `None` = asıl hesap
-/// (`model_news::claude_token`); `Some(dir)` = #2019 ek hesabın config dizini.
-pub struct OAuthUsage(pub Option<std::path::PathBuf>);
+/// Gerçek kaynak: abonelik OAuth jetonuyla kullanım uç noktası. `dir` `None` = asıl hesap
+/// (`model_news::claude_token`); `Some` = #2019 ek hesabın config dizini.
+pub struct OAuthUsage {
+    dir: Option<std::path::PathBuf>,
+    /// #2247: son hata yanıtının `Retry-After`'ı (ms); başarılı okuma ya da başlıksız hata siler.
+    retry_after: std::sync::Mutex<Option<u64>>,
+}
+
+impl OAuthUsage {
+    pub fn new(dir: Option<std::path::PathBuf>) -> Self {
+        Self { dir, retry_after: std::sync::Mutex::default() }
+    }
+}
 
 impl UsageSource for OAuthUsage {
+    fn retry_after_ms(&self) -> Option<u64> {
+        *self.retry_after.lock().unwrap()
+    }
+
     fn read(&self) -> Result<Usage, String> {
-        let token = match &self.0 {
+        *self.retry_after.lock().unwrap() = None;
+        let token = match &self.dir {
             None => crate::model_news::claude_token(),
             Some(dir) if !crate::claude_accounts::connected(dir) => return Err("hesap bağlı değil".into()),
             Some(dir) => crate::model_news::claude_token_in(dir),
@@ -114,8 +149,13 @@ impl UsageSource for OAuthUsage {
             .call();
         match resp {
             Ok(r) => parse_usage(&r.into_json().map_err(|_| "kullanım yanıtı JSON değil".to_string())?),
-            // Gövde/başlık loglanmaz: yalnız durum kodu.
-            Err(ureq::Error::Status(code, _)) => Err(format!("kullanım uç noktası HTTP {code}")),
+            // Gövde/başlık loglanmaz: yalnız durum kodu. `Retry-After` yalnız bir sonraki
+            // denemenin zamanlaması için bellekte tutulur.
+            Err(ureq::Error::Status(code, r)) => {
+                *self.retry_after.lock().unwrap() =
+                    r.header("Retry-After").and_then(|v| parse_retry_after(v, crate::model_news::now_ms()));
+                Err(format!("kullanım uç noktası HTTP {code}"))
+            }
             Err(ureq::Error::Transport(_)) => Err("kullanım uç noktasına ulaşılamadı".into()),
         }
     }
@@ -202,7 +242,7 @@ impl Accounts {
                     let source: std::sync::Arc<dyn UsageSource> = if cfg!(test) {
                         std::sync::Arc::new(NoUsage)
                     } else {
-                        std::sync::Arc::new(OAuthUsage(crate::claude_accounts::config_dir(data_dir, id)))
+                        std::sync::Arc::new(OAuthUsage::new(crate::claude_accounts::config_dir(data_dir, id)))
                     };
                     (id, std::sync::Mutex::default(), std::sync::Mutex::new(source))
                 })
@@ -248,6 +288,16 @@ pub fn next_delay(prev: u64, read: Option<&Usage>) -> u64 {
     }
 }
 
+/// #2247: [`next_delay`] + hatada ucun `Retry-After` ipucu: bekleme en az o kadar (tavan
+/// [`RETRY_AFTER_CAP_MS`]); ipucu yoksa ya da ölçüm başarılıysa aynen [`next_delay`].
+pub fn next_delay_hinted(prev: u64, read: Option<&Usage>, retry_after_ms: Option<u64>) -> u64 {
+    let base = next_delay(prev, read);
+    match (read, retry_after_ms) {
+        (None, Some(hint)) => base.max(hint.min(RETRY_AFTER_CAP_MS)),
+        _ => base,
+    }
+}
+
 /// İlk ölçüm açılıştan biraz sonra (kısa ömürlü test çekirdekleri uca istek atmasın).
 const FIRST_POLL_MS: u64 = 5_000;
 
@@ -269,7 +319,9 @@ impl crate::Core {
                         .quota_tick_for(provider)
                         .then(|| core.quota.of(provider).and_then(|q| q.lock().unwrap().last.clone()))
                         .flatten();
-                    delay = next_delay(delay, read.as_ref().map(|(_, u)| u));
+                    // #2247: 429 gibi hatada ucun söylediği kadar bekle (katlamadan kısa değilse).
+                    let hint = if read.is_none() { core.quota.source(provider).and_then(|s| s.retry_after_ms()) } else { None };
+                    delay = next_delay_hinted(delay, read.as_ref().map(|(_, u)| u), hint);
                 }
             });
         }
@@ -456,5 +508,48 @@ mod tests {
         assert_eq!(next_delay(MAX_POLL_MS, Some(&u(75.0, 0.0))), MIN_POLL_MS);
         assert_eq!(next_delay(MAX_POLL_MS, Some(&u(0.0, 60.0))), MID_POLL_MS);
         assert_eq!(next_delay(240_000, Some(&u(10.0, 10.0))), MAX_POLL_MS);
+    }
+
+    /// #2247: `Retry-After` saniye ya da HTTP tarihi; okunamayan/geçmiş = ipucu yok.
+    #[test]
+    fn retry_after_parses_seconds_and_http_date() {
+        let now = 1_445_412_480_000; // 2015-10-21T07:28:00Z
+        assert_eq!(parse_retry_after("120", now), Some(120_000));
+        assert_eq!(parse_retry_after(" 7 ", now), Some(7_000));
+        assert_eq!(parse_retry_after("0", now), Some(0));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:30:00 GMT", now), Some(120_000));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT", now), None, "geçmiş/şimdi = ipucu yok");
+        assert_eq!(parse_retry_after("yarın", now), None);
+        assert_eq!(parse_retry_after("", now), None);
+        assert_eq!(parse_retry_after("-5", now), None);
+    }
+
+    /// #2247: hatada ipucu beklemeyi uzatır (katlamadan kısa değilse), tavanı aşmaz; başarıda yok sayılır.
+    #[test]
+    fn retry_after_extends_backoff_with_cap() {
+        // İlk denemede 429 + Retry-After 300 sn: katlama 120 sn derdi, uç 300 sn dedi.
+        assert_eq!(next_delay_hinted(FIRST_POLL_MS, None, Some(300_000)), 300_000);
+        // Uç katlamadan kısa süre söylerse katlama kalır (daha sık vurulmaz).
+        assert_eq!(next_delay_hinted(MIN_POLL_MS, None, Some(5_000)), 120_000);
+        // Tavan: bir saat söylese bile 30 dk.
+        assert_eq!(next_delay_hinted(MIN_POLL_MS, None, Some(3_600_000)), RETRY_AFTER_CAP_MS);
+        // İpucu yok → eski geri çekilme aynen.
+        assert_eq!(next_delay_hinted(120_000, None, None), next_delay(120_000, None));
+        // Başarılı ölçümde bayat ipucu kademeyi değiştirmez.
+        assert_eq!(next_delay_hinted(MAX_POLL_MS, Some(&u(75.0, 0.0)), Some(900_000)), MIN_POLL_MS);
+    }
+
+    /// #2247: gerçek kaynak hata yanıtının başlığını ipucu olarak saklar, başarı/başlıksız hata siler.
+    #[test]
+    fn oauth_source_keeps_retry_hint_only_from_last_error() {
+        let s = OAuthUsage::new(None);
+        assert_eq!(s.retry_after_ms(), None);
+        *s.retry_after.lock().unwrap() = Some(42);
+        assert_eq!(s.retry_after_ms(), Some(42));
+        // Bağlı olmayan ek hesap: ağa çıkmadan hata, ipucu temizlenir.
+        let s2 = OAuthUsage::new(Some(std::env::temp_dir().join("dex-no-such-claude-account")));
+        *s2.retry_after.lock().unwrap() = Some(42);
+        assert!(s2.read().is_err());
+        assert_eq!(s2.retry_after_ms(), None);
     }
 }

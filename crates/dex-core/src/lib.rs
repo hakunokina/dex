@@ -309,8 +309,8 @@ impl Core {
         // Backend orchestration is ready; active plans resume exactly once per Core start.
         core.plan_resume()?;
         core.chain_schedule_existing();
-        // #1987: saklanan son Muse okuması belleğe (ölçüm iş parçacıkları başlamadan).
-        core.usage_restore_muse();
+        // #1987/#2247: saklanan son Muse + Claude okumaları belleğe (ölçüm iş parçacıkları başlamadan).
+        core.usage_restore();
         core.quota_watch();
         core.usage_watch();
         // #2208: yerel bağlam önbelleği Ayarlar açılmadan da dolsun — açılışta bir kez,
