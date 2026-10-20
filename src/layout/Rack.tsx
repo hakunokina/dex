@@ -2,8 +2,8 @@
 // that one's panel (or brings it forward) and focuses it. #42: one row in the top bar (no dock panel,
 // no height of its own); chips that don't fit scroll sideways (wheel, keyboard focus). #46: agents
 // only — shells show as panes, and "Yeni terminal" is on their group's header (Workspace.tsx).
-import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from "react";
-import { getStatus, type AgentStatus } from "../agents";
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type RefObject } from "react";
+import { getStatus, subscribeAgentStatus, type AgentStatus } from "../agents";
 import { STATUS_LABEL } from "../TerminalPane";
 import { activeCount, lastResultLine, unreadResult, useDelegations } from "../delegations";
 import { useQuestions, workerQuestion } from "../questions";
@@ -184,28 +184,20 @@ function SlowGlass({ title }: { title: string }) {
   );
 }
 
-/** One agent's status, polled like the rest of the UI (hooks feed `getStatus`, not React). */
+/** One agent's status, pushed by `subscribeAgentStatus` (hooks feed `getStatus`, not React). */
 export function useAgentStatus(id: string): AgentStatus {
   return useStatuses([id])[id] ?? "offline";
 }
 
+/** #2248: status as a store subscription (no poll). `useSyncExternalStore` needs a referentially
+ *  stable snapshot, so the record is rebuilt only when an id or a status actually changes. */
 function useStatuses(ids: string[]): Record<string, AgentStatus> {
   const key = ids.join();
-  const read = () => Object.fromEntries(ids.map(id => [id, getStatus(id)]));
-  const [s, setS] = useState(read);
-  useEffect(() => {
-    let last = "";
-    const tick = () => {
-      const next = read();
-      const sig = JSON.stringify(next);
-      if (sig !== last) {
-        last = sig;
-        setS(next);
-      }
-    };
-    tick();
-    const t = setInterval(tick, 400);
-    return () => clearInterval(t);
-  }, [key]);
-  return s;
+  const cache = useRef<{ sig: string; value: Record<string, AgentStatus> } | null>(null);
+  const snapshot = () => {
+    const sig = `${key}|${ids.map(id => getStatus(id)).join()}`;
+    if (cache.current?.sig !== sig) cache.current = { sig, value: Object.fromEntries(ids.map(id => [id, getStatus(id)])) };
+    return cache.current.value;
+  };
+  return useSyncExternalStore(subscribeAgentStatus, snapshot);
 }
