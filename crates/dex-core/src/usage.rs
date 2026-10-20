@@ -17,8 +17,9 @@
 //!   gösterilir. Süresi geçmiş pencere (`resets_at` < şimdi) geçersizdir: "--" ve
 //!   [`MUSE_STALE_NOTE`]. Hiç değer yoksa "--" ve ölçüm notu.
 //! Ölçüm aralığı quota.rs'nin kademesi ([`crate::quota::next_delay`]); bayatlık sınırı da onun
-//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir — Muse'ta ve (#2247) Claude
-//! hesaplarında saklanan son değer pencereleri geçerliyse `measured_at` ile gösterilmeye devam
+//! ([`crate::quota::STALE_MS`]): daha eski ölçüm "--" gösterilir — Muse'ta (`settings` satırı) ve
+//! (#2247) Claude hesaplarında (#2252: süreçler arası ortak dosya, `usage_share.rs`; `settings`
+//! satırı yok) saklanan son değer pencereleri geçerliyse `measured_at` ile gösterilmeye devam
 //! eder. #2247: Claude'da bayat değerin yanında neden (`HTTP 429`) `note`'ta durur; şerit "son
 //! ölçüm X dk önce + neden" gösterir. Bu yalnız gösterim: zincir eşiği (`quota::State`) kendi
 //! taze ölçümünü ister, saklanan değerden beslenmez. Jeton, anahtar ve yanıt gövdesi loglanmaz;
@@ -159,10 +160,16 @@ fn real_sources() -> Sources {
     vec![("glm", Arc::new(ZaiLimits)), ("muse", Arc::new(MuseLimits))]
 }
 
-/// Son başarılı ölçümü `settings`'te saklanan ve bayatsa da gösterilen sağlayıcılar: Muse (#1987)
-/// ve Claude hesapları (#2247).
-fn persisted(id: &str) -> bool {
+/// Son başarılı ölçümü bayatsa da gösterilen sağlayıcılar: Muse (#1987, `settings` satırı) ve
+/// Claude hesapları (#2247; #2252'den beri kaynak süreçler arası ortak dosya, `usage_share.rs`).
+fn held(id: &str) -> bool {
     id == "muse" || crate::claude_accounts::is_claude(id)
+}
+
+/// Son başarılı ölçümü `settings` satırında saklanan tek sağlayıcı: Muse. Claude hesaplarının
+/// #2247 satırı (`usage_anthropic_last`) #2252 ile kalktı: ortak dosya tek doğruluk kaynağı.
+fn persisted(id: &str) -> bool {
+    id == "muse"
 }
 
 /// Görüntü: taze ölçüm pencereleri gösterir; yoksa "--" ve nedeni.
@@ -178,7 +185,7 @@ fn build(
             let r = readings.get(id);
             let fresh = r.and_then(|r| r.ok.as_ref()).filter(|(at, _)| now - at <= crate::quota::STALE_MS);
             let today = tokens.map(|t| t.get(id).copied().unwrap_or(0));
-            if persisted(id) {
+            if held(id) {
                 // #1987/#2247: bayatlık sınırı burada "--" yapmaz — saklanan son değer, pencereleri
                 // geçerliyse `measured_at` ile gösterilmeye devam eder. Claude'da bayat değerin
                 // nedeni (`HTTP 429`) notta kalır; Muse'a bayatlık işlemez (#1987), notu yok.
@@ -437,10 +444,19 @@ impl LimitSource for MuseLimits {
 
 // ── Son başarılı okumanın kalıcılığı (`settings` satırı; migration yok) ──────
 
-/// `settings` anahtarı (`usage_muse_last`, `usage_anthropic_last`, …): JSON `{measuredAt, limits}`;
-/// satır yoksa/bozuksa ölçüm yok. Muse'un #1987 anahtarı aynen korunur (eski satır okunur).
+/// `settings` anahtarı (`usage_muse_last`): JSON `{measuredAt, limits}`; satır yoksa/bozuksa ölçüm
+/// yok. Muse'un #1987 anahtarı aynen korunur (eski satır okunur).
 fn last_key(id: &str) -> String {
     format!("usage_{id}_last")
+}
+
+/// #2252: #2247'nin Claude satırları artık okunmaz; açılışta bir kez silinir (idempotent). Geri
+/// alma gerekmez: bir sonraki ölçüm ortak dosyaya yazar.
+fn drop_claude_rows(conn: &Connection) -> Result<(), String> {
+    for id in crate::claude_accounts::ACCOUNTS {
+        conn.execute("DELETE FROM settings WHERE key = ?1", [last_key(id)]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -497,44 +513,70 @@ impl crate::Core {
         }
     }
 
-    /// Bir ölçümü yazar ve görüntüyü yayınlar. Hata son başarılı ölçümü silmez (Muse'ta
+    /// Bir ölçümü (şimdi) yazar ve görüntüyü yayınlar. Hata son başarılı ölçümü silmez (Muse'ta
     /// bayatlayınca bile gösterilir; penceresi geçmişse "--").
     pub(crate) fn usage_record(&self, id: &'static str, read: Result<Limits, String>) {
         let now = crate::model_news::now_ms();
+        match read {
+            Ok(limits) => self.usage_apply(id, Some((now, limits)), None),
+            Err(err) => self.usage_apply(id, None, Some(err)),
+        }
+    }
+
+    /// #2252: ölçüm anı dışarıdan (ortak dosyadaki ölçüm başka süreçten olabilir) ve son denemenin
+    /// hatası aynı adımda: `ok` varsa son değer olur; `error` varsa not olur, yoksa (ve `ok` varsa)
+    /// silinir. Aynı değerle tekrar çağrı görüntüyü değiştirmez, log üretmez.
+    pub(crate) fn usage_apply(&self, id: &'static str, ok: Option<(i64, Limits)>, error: Option<String>) {
         {
             let mut readings = self.usage.readings.lock().unwrap();
             let r = readings.entry(id).or_default();
-            match read {
-                Ok(limits) => {
-                    r.ok = Some((now, limits.clone()));
-                    r.error = None;
-                    if persisted(id) {
-                        // dexd yeniden başlasa da kalsın; yazılamazsa ölçüm yine de gösterilir.
-                        let saved = crate::db::with(&self.db, |c| save_last(c, id, now, &limits));
-                        if let Err(err) = saved {
-                            eprintln!("dex: {id} son ölçüm saklanamadı: {err}");
-                        }
-                    }
-                }
-                Err(err) => {
+            match error {
+                Some(err) => {
                     // Kalıcı neden (jeton yok) her denemede log'u doldurmasın: yalnız değişince.
                     if r.error.as_deref() != Some(err.as_str()) {
                         eprintln!("dex: {id} kullanımı okunamadı: {err}");
                     }
                     r.error = Some(err);
                 }
+                None if ok.is_some() => r.error = None,
+                None => {}
+            }
+            if let Some((at, limits)) = ok {
+                if persisted(id) && r.ok.as_ref().map(|(a, _)| *a) != Some(at) {
+                    // dexd yeniden başlasa da kalsın; yazılamazsa ölçüm yine de gösterilir.
+                    let saved = crate::db::with(&self.db, |c| save_last(c, id, at, &limits));
+                    if let Err(err) = saved {
+                        eprintln!("dex: {id} son ölçüm saklanamadı: {err}");
+                    }
+                }
+                r.ok = Some((at, limits));
             }
         }
         self.usage_publish();
     }
 
-    /// Açılışta saklanan son okumaları (Muse + Claude hesapları) belleğe alır (yoksa/bozuksa "--"
-    /// aynen kalır). Yalnız şerit için: `quota::State` dokunulmaz, eşik taze ölçüm bekler.
+    /// Açılışta saklanan son okumaları belleğe alır (yoksa/bozuksa "--" aynen kalır): Muse
+    /// `settings` satırından, Claude hesapları (#2252) ortak dosyadan — değer ve varsa son hata
+    /// notu. Yalnız şerit için: `quota::State` dokunulmaz, eşik taze ölçüm bekler (ilk tick dosya
+    /// tazeyse ağa çıkmadan onu uygular). #2247'nin Claude satırları burada temizlenir.
     pub(crate) fn usage_restore(&self) {
-        for id in PROVIDERS.into_iter().filter(|id| persisted(id)) {
-            let loaded = crate::db::with(&self.db, |c| Ok(load_last(c, id)));
-            if let Ok(Some((at, limits))) = loaded {
-                self.usage.readings.lock().unwrap().insert(id, Reading { ok: Some((at, limits)), error: None });
+        if let Err(err) = crate::db::with(&self.db, drop_claude_rows) {
+            eprintln!("dex: eski Claude ölçüm satırları silinemedi: {err}");
+        }
+        for id in PROVIDERS {
+            let reading = if persisted(id) {
+                let loaded = crate::db::with(&self.db, |c| Ok(load_last(c, id)));
+                loaded.ok().flatten().map(|(at, limits)| Reading { ok: Some((at, limits)), error: None })
+            } else if crate::claude_accounts::is_claude(id) {
+                self.quota.share(id).and_then(|s| s.read()).map(|s| Reading {
+                    ok: s.measured_at.zip(s.usage.as_ref()).map(|(at, u)| (at, Limits::from(u))),
+                    error: s.last_error,
+                })
+            } else {
+                None
+            };
+            if let Some(reading) = reading.filter(|r| r.ok.is_some()) {
+                self.usage.readings.lock().unwrap().insert(id, reading);
             }
         }
     }
@@ -567,14 +609,18 @@ impl crate::Core {
         snap
     }
 
-    /// #2019: hesabın bağlantısı kalktı — son ölçümü unutulur (saklanan satır dahil: başka hesapla
-    /// bağlanınca eskisi geri gelmesin), görüntü yayınlanır.
+    /// #2019: hesabın bağlantısı kalktı ya da yuvaya yeniden girildi — son ölçümü unutulur (saklanan
+    /// satır / #2252 ortak dosya dahil: başka hesapla bağlanınca eskisi geri gelmesin), görüntü
+    /// yayınlanır.
     pub(crate) fn usage_forget(&self, id: &str) {
         self.usage.readings.lock().unwrap().remove(id);
         if persisted(id) {
             if let Err(err) = crate::db::with(&self.db, |c| delete_last(c, id)) {
                 eprintln!("dex: {id} saklanan son ölçüm silinemedi: {err}");
             }
+        }
+        if let Some(share) = self.quota.share(id) {
+            share.clear();
         }
         self.usage_publish();
     }
@@ -712,19 +758,20 @@ mod tests {
         assert_eq!(load_last(&c, "muse"), None);
     }
 
-    /// #2247: Claude hesaplarının son okuması da ayrı anahtarlarda saklanır; silme idempotent.
+    /// #2252: Claude hesaplarının #2247 `settings` satırları artık tek kaynak değil — okunmaz ve
+    /// açılışta silinir (idempotent); Muse satırı kalır.
     #[test]
-    fn claude_last_persists_per_account() {
+    fn claude_settings_rows_are_dropped_only_muse_persists() {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
-        assert!(persisted("anthropic") && persisted("anthropic-2") && persisted("muse") && !persisted("glm"));
+        assert!(held("anthropic") && held("anthropic-2") && held("muse") && !held("glm"));
+        assert!(persisted("muse") && !persisted("anthropic") && !persisted("anthropic-2") && !persisted("glm"));
         let a = Limits { five_hour: Some(w(40.0, None)), weekly: Some(w(90.0, None)) };
-        let b = Limits { five_hour: Some(w(5.0, None)), weekly: None };
         save_last(&c, "anthropic", 1, &a).unwrap();
-        save_last(&c, "anthropic-2", 2, &b).unwrap();
-        assert_eq!(load_last(&c, "anthropic"), Some((1, a.clone())));
-        assert_eq!(load_last(&c, "anthropic-2"), Some((2, b.clone())), "hesaplar birbirine karışmaz");
-        assert_eq!(load_last(&c, "muse"), None);
+        save_last(&c, "anthropic-2", 2, &a).unwrap();
+        save_last(&c, "muse", 3, &a).unwrap();
+        drop_claude_rows(&c).unwrap();
+        drop_claude_rows(&c).unwrap();
         let keys: Vec<String> = c
             .prepare("SELECT key FROM settings ORDER BY key")
             .unwrap()
@@ -732,10 +779,8 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(keys, ["usage_anthropic-2_last", "usage_anthropic_last"]);
-        delete_last(&c, "anthropic").unwrap();
-        delete_last(&c, "anthropic").unwrap();
-        assert_eq!((load_last(&c, "anthropic"), load_last(&c, "anthropic-2")), (None, Some((2, b))));
+        assert_eq!(keys, ["usage_muse_last"]);
+        assert_eq!(load_last(&c, "muse"), Some((3, a)));
     }
 
     /// #2247: Claude'un bayat ölçümü "--" olmaz: değer + `measured_at` + neden notta (429 gibi);
@@ -904,16 +949,18 @@ mod tests {
         assert_eq!(&got.providers[2].limits, &muse, "hata son değeri silmez");
         let at = got.providers[2].measured_at.unwrap();
         assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "muse"))).unwrap(), Some((at, muse)));
-        // #2247: Claude ölçümü de saklanır (quota_tick yoluyla yazılmıştı).
+        // #2247/#2252: Claude ölçümü ortak dosyada (quota_tick yoluyla yazılmıştı), settings'te değil.
         let claude_at = got.providers[0].measured_at.unwrap();
-        let saved = crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap().unwrap();
-        assert_eq!((saved.0, saved.1.five_hour), (claude_at, Some(w(70.0, None))));
+        let shared = core.quota.share("anthropic").unwrap().read().unwrap();
+        assert_eq!((shared.measured_at, shared.usage.as_ref().map(|u| u.five_hour)), (Some(claude_at), Some(30.0)));
+        assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap(), None);
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// #2247: açılışta geri yüklenen eski Claude ölçümü şeritte görünür (bayat notuyla) ama zincir
-    /// eşiğine girmez: `quota::State` boş kalır, `quota_breached` false. Sonraki 429 değeri silmez.
+    /// #2247/#2252: açılışta ortak dosyadan geri yüklenen eski Claude ölçümü şeritte görünür (bayat
+    /// notuyla; dosyadaki son hata varsa o) ama zincir eşiğine girmez: `quota::State` boş kalır,
+    /// `quota_breached` false. Sonraki 429 değeri silmez. Eski `settings` satırı açılışta silinir.
     #[test]
     fn restored_claude_reading_shows_but_never_breaches() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/usage-restore-{}", std::process::id()));
@@ -924,11 +971,16 @@ mod tests {
         .unwrap();
         let now = crate::model_news::now_ms();
         let old_at = now - crate::quota::STALE_MS - 60_000;
-        // %99 dolu eski ölçüm "önceki oturumdan" kalmış olsun (pencereleri geçerli).
+        // %99 dolu eski ölçüm "başka süreçten/önceki oturumdan" kalmış olsun (pencereleri geçerli).
         let old = Limits { five_hour: Some(w(1.0, Some("2099-01-01T00:00:00Z"))), weekly: Some(w(50.0, None)) };
-        crate::db::with(&core.db, |c| save_last(c, "anthropic", old_at, &old)).unwrap();
+        let usage = crate::quota::Usage { five_hour: 99.0, seven_day: 50.0, five_hour_resets_at: Some("2099-01-01T00:00:00Z".into()), ..Default::default() };
+        let share = core.quota.share("anthropic").unwrap();
+        share.write(&crate::usage_share::Shared { measured_at: Some(old_at), usage: Some(usage), attempted_at: old_at, next_allowed_at: old_at, ..Default::default() }).unwrap();
+        // #2247'den kalan settings satırı: okunmaz, silinir.
+        crate::db::with(&core.db, |c| save_last(c, "anthropic", 1, &Limits::default())).unwrap();
         core.usage_restore();
         core.usage_restore();
+        assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap(), None, "eski satır temizlendi");
         let got = core.usage_get();
         let claude = got.providers.iter().find(|p| p.id == "anthropic").unwrap();
         assert_eq!((&claude.limits, claude.note.as_deref(), claude.measured_at), (&old, Some("ölçüm bayat"), Some(old_at)));
@@ -940,9 +992,17 @@ mod tests {
         let claude = got.providers.iter().find(|p| p.id == "anthropic").unwrap();
         assert_eq!((&claude.limits, claude.note.as_deref()), (&old, Some("kullanım uç noktası HTTP 429")));
         assert!(!core.quota_breached("anthropic"));
-        // Bağlantı kalkınca saklanan satır da gider.
+        // Dosyadaki son hata da geri yüklemede notta gelir.
+        share.write(&crate::usage_share::Shared { last_error: Some("kullanım uç noktası HTTP 429".into()), ..share.read().unwrap() }).unwrap();
+        core.usage.readings.lock().unwrap().remove("anthropic");
+        core.usage_restore();
+        let got = core.usage_get();
+        let claude = got.providers.iter().find(|p| p.id == "anthropic").unwrap();
+        assert_eq!((&claude.limits, claude.note.as_deref()), (&old, Some("kullanım uç noktası HTTP 429")));
+        // Bağlantı kalkınca ortak dosya da gider.
         core.usage_forget("anthropic");
-        assert_eq!(crate::db::with(&core.db, |c| Ok(load_last(c, "anthropic"))).unwrap(), None);
+        assert_eq!(share.read(), None);
+        assert!(core.usage_get().providers.iter().find(|p| p.id == "anthropic").unwrap().measured_at.is_none());
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);
     }

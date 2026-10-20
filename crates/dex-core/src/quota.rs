@@ -13,8 +13,14 @@
 //! bir sonraki deneme en az o kadar ertelenir (tavan [`RETRY_AFTER_CAP_MS`]); başlık yoksa katlama
 //! sürer. Son başarılı ölçüm 15 dk'dan eskiyse eşik "bilinmiyor" sayılır → kimse yönlendirilmez
 //! (eski davranış: zincir yalnız kota bitince).
+//!
+//! #2252: aynı jetonla birden çok Dex süreci (üretim + dev + `dexd serve`) ayrı ayrı ölçünce uç 429
+//! veriyordu. Artık hesap başına makine geneli bir durum dosyası var (`usage_share.rs`): her tick
+//! önce dosyaya bakar; ölçüm kademesinden tazeyse ya da `nextAllowedAt` gelmemişse uca gitmez,
+//! dosyadaki değeri kullanır. Gerekiyorsa OS kilidini alır, dosyayı yeniden okur, hâlâ gerekiyorsa
+//! ölçer ve atomik yazar. Kilidi alamayan beklemez. Döngünün uykusu da dosyanın `nextAllowedAt`'i.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub const FIVE_HOUR_LIMIT: f64 = 85.0;
 /// En kısa aralık: %70+ kademesi ve geri çekilmenin tabanı (ölçüm yok/bayat iken de buradan başlanır).
@@ -33,7 +39,7 @@ pub const RETRY_AFTER_CAP_MS: u64 = 30 * 60_000;
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
 /// Pencere doluluğu (yüzde, 0-100) ve uç noktanın bildirdiği sıfırlanma saati (RFC 3339, aynen).
-#[derive(Serialize, Debug, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Usage {
     pub five_hour: f64,
@@ -227,42 +233,79 @@ impl State {
     }
 }
 
-/// #2019: Claude hesabı başına ([`crate::claude_accounts::ACCOUNTS`]) son ölçüm ve kaynağı.
+/// #2019: Claude hesabı başına ([`crate::claude_accounts::ACCOUNTS`]) son ölçüm, kaynağı ve
+/// (#2252) süreçler arası ortak dosyası.
 pub struct Accounts(Vec<Account>);
 
-type Account = (&'static str, std::sync::Mutex<State>, std::sync::Mutex<std::sync::Arc<dyn UsageSource>>);
+struct Account {
+    id: &'static str,
+    state: std::sync::Mutex<State>,
+    source: std::sync::Mutex<std::sync::Arc<dyn UsageSource>>,
+    share: std::sync::Mutex<crate::usage_share::Store>,
+}
 
 impl Accounts {
-    /// Testte kaynaklar ağa çıkmaz ([`NoUsage`]); gerçekte her hesap kendi jetonuyla.
+    /// Testte kaynaklar ağa çıkmaz ([`NoUsage`]) ve ortak dosya veri dizini altındadır; gerçekte
+    /// her hesap kendi jetonuyla, dosya anahtarı jetonun config dizini.
     pub fn new(data_dir: &std::path::Path) -> Self {
+        let root = crate::usage_share::root(data_dir);
         Self(
             crate::claude_accounts::ACCOUNTS
                 .iter()
                 .map(|&id| {
-                    let source: std::sync::Arc<dyn UsageSource> = if cfg!(test) {
-                        std::sync::Arc::new(NoUsage)
-                    } else {
-                        std::sync::Arc::new(OAuthUsage::new(crate::claude_accounts::config_dir(data_dir, id)))
-                    };
-                    (id, std::sync::Mutex::default(), std::sync::Mutex::new(source))
+                    let dir = crate::claude_accounts::config_dir(data_dir, id);
+                    let source: std::sync::Arc<dyn UsageSource> =
+                        if cfg!(test) { std::sync::Arc::new(NoUsage) } else { std::sync::Arc::new(OAuthUsage::new(dir.clone())) };
+                    Account {
+                        id,
+                        state: std::sync::Mutex::default(),
+                        source: std::sync::Mutex::new(source),
+                        share: std::sync::Mutex::new(Self::store(&root, dir)),
+                    }
                 })
                 .collect(),
         )
     }
 
+    /// Ek hesabın anahtarı kendi dizini; asıl hesabınki `claude_accounts::main_dir()` (ev dizini
+    /// bile yoksa sabit bir ad: tek dosya, jeton zaten kasadan).
+    fn store(root: &std::path::Path, dir: Option<std::path::PathBuf>) -> crate::usage_share::Store {
+        let key = dir
+            .or_else(crate::claude_accounts::main_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("claude-main"));
+        crate::usage_share::Store::new(root.to_path_buf(), &key)
+    }
+
+    fn account(&self, provider: &str) -> Option<&Account> {
+        self.0.iter().find(|a| a.id == provider)
+    }
+
     /// Hesabın ölçüm durumu; Claude hesabı değilse `None`.
     pub fn of(&self, provider: &str) -> Option<&std::sync::Mutex<State>> {
-        self.0.iter().find(|(id, ..)| *id == provider).map(|(_, state, _)| state)
+        self.account(provider).map(|a| &a.state)
     }
 
     fn source(&self, provider: &str) -> Option<std::sync::Arc<dyn UsageSource>> {
-        self.0.iter().find(|(id, ..)| *id == provider).map(|(.., source)| source.lock().unwrap().clone())
+        self.account(provider).map(|a| a.source.lock().unwrap().clone())
+    }
+
+    /// #2252: hesabın ortak dosyası; Claude hesabı değilse `None`.
+    pub(crate) fn share(&self, provider: &str) -> Option<crate::usage_share::Store> {
+        self.account(provider).map(|a| a.share.lock().unwrap().clone())
     }
 
     #[cfg(test)]
     fn set_source(&self, provider: &str, source: std::sync::Arc<dyn UsageSource>) {
-        if let Some((.., s)) = self.0.iter().find(|(id, ..)| *id == provider) {
-            *s.lock().unwrap() = source;
+        if let Some(a) = self.account(provider) {
+            *a.source.lock().unwrap() = source;
+        }
+    }
+
+    /// Testte: iki çekirdek aynı "ev dizinini" paylaşsın (anahtarlar aynı kalır).
+    #[cfg(test)]
+    fn set_share_root(&self, data_dir: &std::path::Path, root: &std::path::Path) {
+        for a in &self.0 {
+            *a.share.lock().unwrap() = Self::store(root, crate::claude_accounts::config_dir(data_dir, a.id));
         }
     }
 }
@@ -303,8 +346,13 @@ const FIRST_POLL_MS: u64 = 5_000;
 
 impl crate::Core {
     /// Arka plan ölçümü: Claude hesabı başına bir iş parçacığı; çekirdek yaşadıkça
-    /// [`Self::quota_tick_for`], aralık [`next_delay`] ile.
+    /// [`Self::quota_tick_for`]. #2252: uyku ortak dosyanın `nextAllowedAt`'i (kademe, geri çekilme
+    /// ve `Retry-After` orada); dosya yoksa (kilit başkasında) kısa sürede yeniden bakılır.
+    /// Testte iş parçacığı yok: kısa ömürlü çekirdekler ortak dosyaya "kaynak yok" yazmasın.
     pub(crate) fn quota_watch(&self) {
+        if cfg!(test) {
+            return;
+        }
         for provider in crate::claude_accounts::ACCOUNTS {
             let weak = self.weak_self.clone();
             std::thread::spawn(move || {
@@ -315,39 +363,81 @@ impl crate::Core {
                     if core.instance.lock().unwrap().is_none() {
                         return; // shutdown
                     }
-                    let read = core
-                        .quota_tick_for(provider)
-                        .then(|| core.quota.of(provider).and_then(|q| q.lock().unwrap().last.clone()))
-                        .flatten();
-                    // #2247: 429 gibi hatada ucun söylediği kadar bekle (katlamadan kısa değilse).
-                    let hint = if read.is_none() { core.quota.source(provider).and_then(|s| s.retry_after_ms()) } else { None };
-                    delay = next_delay_hinted(delay, read.as_ref().map(|(_, u)| u), hint);
+                    let shared = core.quota_tick_shared(provider);
+                    delay = shared.map_or(crate::usage_share::RETRY_MS, |s| s.wait_ms(crate::model_news::now_ms()));
                 }
             });
         }
     }
 
-    /// Asıl Claude hesabının ölçümü ([`Self::quota_tick_for`]).
+    /// Asıl Claude hesabının zorunlu ölçümü: ortak dosya silinir, kaynak okunur
+    /// ([`Self::quota_tick_for`]; testler her tick'te yeni değer bekler).
     #[cfg(test)]
     pub(crate) fn quota_tick(&self) -> bool {
+        if let Some(share) = self.quota.share("anthropic") {
+            share.clear();
+        }
         self.quota_tick_for("anthropic")
     }
 
-    /// Bir hesabın ölçümü + eşik kararı. `false` = okunamadı (son ölçüm durur, bayatlarsa eşik
-    /// bilinmiyor). Hata nedeni `usage_record`'da yalnız değişince loglanır.
+    /// Bir hesabın ölçümü + eşik kararı. `false` = son deneme (bu ya da başka süreçte) okunamadı
+    /// (son ölçüm durur, bayatlarsa eşik bilinmiyor) ya da kilit başkasındaydı ve dosya yoktu.
+    /// Hata nedeni `usage_record`'da yalnız değişince loglanır.
     pub(crate) fn quota_tick_for(&self, provider: &'static str) -> bool {
-        let (Some(state), Some(source)) = (self.quota.of(provider), self.quota.source(provider)) else { return false };
-        let read = source.read();
-        // #1861: aynı ölçüm kullanım şeridine de gider (ikinci sorgu yok).
-        self.usage_record(provider, read.as_ref().map(crate::usage::Limits::from).map_err(Clone::clone));
-        let now = crate::model_news::now_ms();
-        let ok = match read {
-            Ok(u) => {
-                state.lock().unwrap().last = Some((now, u));
-                true
-            }
-            Err(_) => false,
+        self.quota_tick_shared(provider).is_some_and(|s| s.ok())
+    }
+
+    /// #2252: tek uçuş. Dosya tazeyse ya da `nextAllowedAt` gelmemişse ağa çıkmadan dosyadaki durum;
+    /// değilse kilit → yeniden oku → hâlâ gerekiyorsa ölç → yaz. Kilit başkasındaysa dosyadaki durum
+    /// (yoksa `None`: bu tick'te uygulanacak bir şey yok). Kilit dosyası açılamıyorsa kilitsiz ölçülür
+    /// (tek süreç gibi; yazılamazsa durum yalnız bellekte kalır).
+    fn quota_tick_shared(&self, provider: &'static str) -> Option<crate::usage_share::Shared> {
+        let (Some(state), Some(source), Some(share)) =
+            (self.quota.of(provider), self.quota.source(provider), self.quota.share(provider))
+        else {
+            return None;
         };
+        let now = crate::model_news::now_ms();
+        let mut shared = share.read();
+        if shared.as_ref().is_none_or(|s| s.due(now)) {
+            let (guard, measure) = match share.try_lock() {
+                Ok(Some(guard)) => (Some(guard), true),
+                // Başka süreç ölçüyor: beklenmez, dosyadaki (varsa) kullanılır.
+                Ok(None) => (None, false),
+                Err(e) => {
+                    eprintln!("dex: {provider} kullanım kilidi açılamadı, kilitsiz ölçülüyor: {e}");
+                    (None, true)
+                }
+            };
+            if measure {
+                // Kilit bizde: başka süreç az önce ölçmüş olabilir, yeniden oku.
+                shared = share.read();
+                if shared.as_ref().is_none_or(|s| s.due(now)) {
+                    let read = source.read();
+                    let now = crate::model_news::now_ms();
+                    let hint = if read.is_err() { source.retry_after_ms() } else { None };
+                    let next = crate::usage_share::Shared::after(shared.as_ref(), read, hint, now);
+                    if let Err(e) = share.write(&next) {
+                        eprintln!("dex: {provider} ortak kullanım dosyası yazılamadı: {e}");
+                    }
+                    shared = Some(next);
+                }
+            }
+            drop(guard);
+        }
+        let shared = shared?;
+        // #1861: aynı ölçüm kullanım şeridine de gider (ikinci sorgu yok); ölçüm anı dosyadaki.
+        let last = shared.measured_at.zip(shared.usage.as_ref());
+        self.usage_apply(provider, last.map(|(at, u)| (at, crate::usage::Limits::from(u))), shared.last_error.clone());
+        if let Some((at, u)) = last {
+            state.lock().unwrap().last = Some((at, u.clone()));
+        }
+        self.quota_decide(provider, state, now);
+        Some(shared)
+    }
+
+    /// Taze ölçüme göre eşik kararı ve uyarı bayrakları.
+    fn quota_decide(&self, provider: &'static str, state: &std::sync::Mutex<State>, now: i64) {
         let breach = state.lock().unwrap().breach_at(now);
         match breach {
             Some(b) => self.quota_switch(provider, &b),
@@ -358,7 +448,6 @@ impl crate::Core {
         if !q.full_at(now) {
             q.warned_full = false;
         }
-        ok
     }
 
     /// #2019: hesabın taze ölçümü eşiği aşıyor mu (zincir seçimi bu hesaba worker taşımaz).
@@ -374,6 +463,12 @@ impl crate::Core {
     #[cfg(test)]
     pub(crate) fn quota_set_source_for(&self, provider: &str, source: std::sync::Arc<dyn UsageSource>) {
         self.quota.set_source(provider, source);
+    }
+
+    /// #2252 testleri: ortak dosyanın kökü (iki çekirdek aynı "ev dizini"ni paylaşsın).
+    #[cfg(test)]
+    pub(crate) fn quota_set_share_root(&self, root: &std::path::Path) {
+        self.quota.set_share_root(&self.paths.data_dir, root);
     }
 }
 
@@ -537,6 +632,234 @@ mod tests {
         assert_eq!(next_delay_hinted(120_000, None, None), next_delay(120_000, None));
         // Başarılı ölçümde bayat ipucu kademeyi değiştirmez.
         assert_eq!(next_delay_hinted(MAX_POLL_MS, Some(&u(75.0, 0.0)), Some(900_000)), MIN_POLL_MS);
+    }
+
+    // ── #2252: süreçler arası tek ölçüm ──────────────────────────────────────
+
+    /// Sahte kaynak: kaç kez ağa "çıkıldığını" sayar.
+    struct Counting {
+        reads: std::sync::atomic::AtomicUsize,
+        value: std::sync::Mutex<Result<Usage, String>>,
+        hint: std::sync::Mutex<Option<u64>>,
+    }
+
+    impl Counting {
+        fn new(value: Result<Usage, String>) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self { reads: Default::default(), value: std::sync::Mutex::new(value), hint: Default::default() })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn set(&self, value: Result<Usage, String>) {
+            *self.value.lock().unwrap() = value;
+        }
+    }
+
+    impl UsageSource for Counting {
+        fn read(&self) -> Result<Usage, String> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.value.lock().unwrap().clone()
+        }
+        fn retry_after_ms(&self) -> Option<u64> {
+            *self.hint.lock().unwrap()
+        }
+    }
+
+    fn core(tag: &str, share_root: &std::path::Path) -> (std::sync::Arc<crate::Core>, std::sync::Arc<Counting>) {
+        let root = share_root.join(tag);
+        let core = crate::Core::start(
+            crate::Paths { data_dir: root.join("data"), config_dir: root.join("config") },
+            crate::Events::new(crate::events::NullSink),
+        )
+        .unwrap();
+        core.quota_set_share_root(&share_root.join("home"));
+        let src = Counting::new(Ok(u(20.0, 10.0)));
+        core.quota_set_source(src.clone());
+        (core, src)
+    }
+
+    fn share_root(tag: &str) -> std::path::PathBuf {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/quota-share-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    fn strip(core: &crate::Core) -> crate::usage::ProviderUsage {
+        core.usage_get().providers.into_iter().find(|p| p.id == "anthropic").unwrap()
+    }
+
+    /// Taze dosya varken ağa gidilmez: değer dosyadan, eşik ve şerit her zamanki gibi. Dosyada
+    /// jeton/gövde yok. Bağlantı unutulunca dosya silinir.
+    #[test]
+    fn fresh_shared_file_skips_network() {
+        let root = share_root("fresh");
+        let (core, src) = core("a", &root);
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 1);
+        for _ in 0..3 {
+            assert!(core.quota_tick_for("anthropic"));
+        }
+        assert_eq!(src.reads(), 1, "10 dk kademesinde ölçüm taze: uca gidilmez");
+        let share = core.quota.share("anthropic").unwrap();
+        let s = share.read().unwrap();
+        assert_eq!((s.usage.as_ref().map(|u| u.five_hour), s.last_error), (Some(20.0), None));
+        let at = s.measured_at.unwrap();
+        assert_eq!(core.quota.of("anthropic").unwrap().lock().unwrap().last.as_ref().map(|(a, _)| *a), Some(at));
+        let p = strip(&core);
+        assert_eq!((p.measured_at, p.note, p.limits.five_hour.map(|w| w.remaining_percent)), (Some(at), None, Some(80.0)));
+        // Kaynak değişse de dosya tazeyken eski değer: eşik dosyadaki değere göre.
+        src.set(Ok(u(90.0, 10.0)));
+        assert!(core.quota_tick_for("anthropic"));
+        assert!(!core.quota_breached("anthropic"));
+        assert_eq!(src.reads(), 1);
+        // Zorunlu ölçüm (test yardımcısı dosyayı siler) → yeni değer, eşik.
+        assert!(core.quota_tick());
+        assert_eq!(src.reads(), 2);
+        assert!(core.quota_breached("anthropic"));
+        // %90 → 60 sn kademesi: 61 sn önce ölçülmüş gibi dosya → uca gidilir.
+        let mut s = share.read().unwrap();
+        s.measured_at = Some(s.measured_at.unwrap() - MIN_POLL_MS as i64 - 1_000);
+        s.next_allowed_at = s.measured_at.unwrap() + MIN_POLL_MS as i64;
+        share.write(&s).unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 3);
+        // Dosyada jeton/gövde yok; anahtarın kaynağı var.
+        let dir = root.join("home");
+        let json = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap();
+        let raw = std::fs::read_to_string(&json).unwrap();
+        assert!(!raw.contains("accessToken") && !raw.contains("Bearer") && !raw.contains("utilization"), "{raw}");
+        assert!(raw.contains("\"configDir\""));
+        core.usage_forget("anthropic");
+        assert_eq!(share.read(), None, "bağlantı kalkınca dosya silinir");
+        assert!(strip(&core).measured_at.is_none());
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hatada `nextAllowedAt` (Retry-After dahil) gelene dek uca gidilmez; önceki değer ve neden
+    /// şeritte durur. Süre dolunca yeniden denenir.
+    #[test]
+    fn next_allowed_at_is_honoured_across_ticks() {
+        let root = share_root("hold");
+        let (core, src) = core("a", &root);
+        assert!(core.quota_tick_for("anthropic"));
+        let share = core.quota.share("anthropic").unwrap();
+        let good_at = share.read().unwrap().measured_at.unwrap();
+        // Ölçüm bayatlamış olsun (şerit bayatlığı da geçmiş); uç 429 + Retry-After 300 sn desin.
+        let mut s = share.read().unwrap();
+        s.measured_at = Some(good_at - STALE_MS - 1_000);
+        s.next_allowed_at = s.measured_at.unwrap();
+        share.write(&s).unwrap();
+        src.set(Err("kullanım uç noktası HTTP 429".into()));
+        *src.hint.lock().unwrap() = Some(300_000);
+        assert!(!core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 2);
+        let s = share.read().unwrap();
+        assert_eq!(s.last_error.as_deref(), Some("kullanım uç noktası HTTP 429"));
+        assert!(s.next_allowed_at - s.attempted_at == 300_000, "Retry-After kadar");
+        assert_eq!(s.usage.as_ref().map(|u| u.five_hour), Some(20.0), "önceki değer durur");
+        for _ in 0..3 {
+            assert!(!core.quota_tick_for("anthropic"));
+        }
+        assert_eq!(src.reads(), 2, "nextAllowedAt gelmeden uca gidilmez");
+        let p = strip(&core);
+        assert_eq!((p.note.as_deref(), p.limits.five_hour.map(|w| w.remaining_percent)), (Some("kullanım uç noktası HTTP 429"), Some(80.0)));
+        assert!(s.wait_ms(crate::model_news::now_ms()) > 290_000, "döngü o kadar uyur");
+        // Süre doldu (dosyada geçmişe çekilir): yeniden denenir, başarı notu siler.
+        let mut s = share.read().unwrap();
+        s.next_allowed_at = crate::model_news::now_ms() - 1;
+        share.write(&s).unwrap();
+        src.set(Ok(u(30.0, 10.0)));
+        *src.hint.lock().unwrap() = None;
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 3);
+        let p = strip(&core);
+        assert_eq!((p.note, p.limits.five_hour.map(|w| w.remaining_percent)), (None, Some(70.0)));
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Aynı ev dizinindeki iki çekirdek: biri ölçer, öteki dosyadan okur (ağa çıkmaz). Kilit
+    /// başkasındayken beklenmez, dosyadaki (bayat da olsa) değer kullanılır; kilit düşünce ölçülür.
+    #[test]
+    fn two_cores_share_one_measurement() {
+        let root = share_root("two");
+        let (a, src_a) = core("a", &root);
+        let (b, src_b) = core("b", &root);
+        assert!(a.quota_tick_for("anthropic"));
+        assert!(b.quota_tick_for("anthropic"));
+        assert_eq!((src_a.reads(), src_b.reads()), (1, 0), "tek ölçüm");
+        let at_a = a.quota.of("anthropic").unwrap().lock().unwrap().last.clone().unwrap();
+        let at_b = b.quota.of("anthropic").unwrap().lock().unwrap().last.clone().unwrap();
+        assert_eq!(at_a, at_b, "B, A'nın ölçümünü aynı anıyla kullanır");
+        assert_eq!(strip(&b).limits.five_hour.map(|w| w.remaining_percent), Some(80.0));
+        // Dosya bayat ve A kilidi tutuyor (ölçüm sürüyor): B beklemez, dosyadakini kullanır.
+        let share = a.quota.share("anthropic").unwrap();
+        let mut s = share.read().unwrap();
+        s.measured_at = Some(s.measured_at.unwrap() - MAX_POLL_MS as i64 - 1_000);
+        s.next_allowed_at = s.measured_at.unwrap();
+        share.write(&s).unwrap();
+        let guard = share.try_lock().unwrap().expect("A kilidi alır");
+        src_b.set(Ok(u(50.0, 10.0)));
+        assert!(b.quota_tick_for("anthropic"), "dosyadaki değer uygulanır");
+        assert_eq!(src_b.reads(), 0, "kilit başkasında: ağa çıkılmaz");
+        assert_eq!(share.read().unwrap().wait_ms(crate::model_news::now_ms()), crate::usage_share::RETRY_MS, "kısa sürede yeniden bakar");
+        drop(guard);
+        assert!(b.quota_tick_for("anthropic"));
+        assert_eq!(src_b.reads(), 1, "kilit düşünce B ölçer");
+        assert_eq!(share.read().unwrap().usage.as_ref().map(|u| u.five_hour), Some(50.0));
+        // A artık B'nin taze ölçümünü kullanır.
+        assert!(a.quota_tick_for("anthropic"));
+        assert_eq!(src_a.reads(), 1);
+        assert_eq!(a.quota.of("anthropic").unwrap().lock().unwrap().last.as_ref().map(|(_, u)| u.five_hour), Some(50.0));
+        // Kilit başkasında ve dosya yok: bu tick'te uygulanacak şey yok, durum dokunulmaz.
+        share.clear();
+        let guard = share.try_lock().unwrap().unwrap();
+        assert!(!b.quota_tick_for("anthropic"));
+        assert_eq!(src_b.reads(), 1);
+        assert_eq!(b.quota.of("anthropic").unwrap().lock().unwrap().last.as_ref().map(|(_, u)| u.five_hour), Some(50.0));
+        drop(guard);
+        a.shutdown();
+        b.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bozuk ya da çok eski dosya güvenle yok sayılır: ölçülür ve üstüne yazılır.
+    #[test]
+    fn corrupt_or_stale_file_is_replaced() {
+        let root = share_root("corrupt");
+        let (core, src) = core("a", &root);
+        let share = core.quota.share("anthropic").unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        let path = {
+            let dir = root.join("home");
+            std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "json")).unwrap()
+        };
+        std::fs::write(&path, "{yarım").unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 2, "bozuk dosya = yok");
+        assert!(share.read().is_some(), "üstüne yazıldı");
+        std::fs::write(&path, r#"{"measuredAt":"dün","usage":{"fiveHour":"çok"}}"#).unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 3);
+        // Çok eski ölçüm (bayat, nextAllowedAt geçmiş): ölçülür.
+        let mut s = share.read().unwrap();
+        s.measured_at = Some(1_000);
+        s.attempted_at = 1_000;
+        s.next_allowed_at = 1_000 + MAX_POLL_MS as i64;
+        share.write(&s).unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 4);
+        assert!(share.read().unwrap().fresh(crate::model_news::now_ms()));
+        // Saçma ileri tarihli nextAllowedAt (bozuk): tutmaz, ölçülür.
+        let mut s = share.read().unwrap();
+        s.measured_at = Some(1_000);
+        s.next_allowed_at = crate::model_news::now_ms() + 10 * RETRY_AFTER_CAP_MS as i64;
+        share.write(&s).unwrap();
+        assert!(core.quota_tick_for("anthropic"));
+        assert_eq!(src.reads(), 5);
+        core.shutdown();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// #2247: gerçek kaynak hata yanıtının başlığını ipucu olarak saklar, başarı/başlıksız hata siler.

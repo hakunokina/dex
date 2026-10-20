@@ -69,6 +69,7 @@ pub mod stack;
 pub mod teams;
 pub mod test_budget;
 pub mod usage;
+pub mod usage_share;
 pub mod worktree;
 mod merge_gate;
 
@@ -1484,6 +1485,9 @@ impl Core {
         // #2019: a Claude account's sign-in ended — its card and ring show the new state now.
         if let Some(provider) = claude_accounts::login_provider(id) {
             self.changed("providers-changed");
+            // #2252 (#2251 notu): yuvaya başka hesapla girilmiş olabilir — eski hesabın saklı
+            // ölçümü (bellek + ortak dosya) silinir; ardından yeni hesap ölçülür.
+            self.usage_forget(provider);
             let weak = self.weak_self.clone();
             std::thread::spawn(move || {
                 if let Some(core) = weak.upgrade() {
