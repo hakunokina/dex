@@ -108,8 +108,18 @@ export const getFavorite = (): FavoriteRec | null => state.favorite;
 export const getPopouts = () => state.popouts;
 export const getPopout = (agentId: string): PopoutRec | undefined => state.popouts[agentId];
 export const isPoppedOut = (agentId: string) => state.popouts[agentId]?.open === true;
+/** #2260: an open/close flip is written at once — a reload inside the debounce must not lose it (bounds/on-top stay debounced). */
 export function setPopout(agentId: string, rec: PopoutRec) {
+  const wasOpen = isPoppedOut(agentId);
   set(s => ({ ...s, popouts: { ...s.popouts, [agentId]: rec } }));
+  if (rec.open !== wasOpen) saveNow();
+}
+/** #2260: several records at once (startup reconciliation); open flips are written at once. */
+export function setPopouts(popouts: Record<string, PopoutRec>) {
+  if (popouts === state.popouts) return;
+  const flipped = Object.keys({ ...state.popouts, ...popouts }).some(id => (state.popouts[id]?.open === true) !== (popouts[id]?.open === true));
+  set(s => ({ ...s, popouts }));
+  if (flipped) saveNow();
 }
 /** Partial update of an existing record (a closed window keeps its place for the next time). */
 export function patchPopout(agentId: string, patch: Partial<PopoutRec>) {
@@ -120,11 +130,13 @@ export function patchPopout(agentId: string, patch: Partial<PopoutRec>) {
 }
 export function removePopout(agentId: string) {
   if (!state.popouts[agentId]) return;
+  const wasOpen = isPoppedOut(agentId);
   set(s => {
     const popouts = { ...s.popouts };
     delete popouts[agentId];
     return { ...s, popouts };
   });
+  if (wasOpen) saveNow();
 }
 
 /** Workspace reports every dockview change here (debounced to disk like the rest). */
@@ -206,13 +218,23 @@ export function syncSessionEngines(engineOf: Map<string, string>) {
 
 let saveTimer: number | undefined;
 
+function save() {
+  const sessions = Object.fromEntries(lastSession);
+  callLocal("layout_save", { layout: { version: 2, active: state.active, teams: state.teams, sessions, favorite: state.favorite, popouts: state.popouts } }).catch(() => {});
+}
+
 function scheduleSave() {
   if (!persist) return;
   window.clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(() => {
-    const sessions = Object.fromEntries(lastSession);
-    callLocal("layout_save", { layout: { version: 2, active: state.active, teams: state.teams, sessions, favorite: state.favorite, popouts: state.popouts } }).catch(() => {});
-  }, SAVE_DEBOUNCE_MS);
+  saveTimer = window.setTimeout(save, SAVE_DEBOUNCE_MS);
+}
+
+/** #2260: now, not in 400 ms — the pending debounced write is folded into this one. */
+function saveNow() {
+  if (!persist) return;
+  window.clearTimeout(saveTimer);
+  saveTimer = undefined;
+  save();
 }
 
 /** Load layout.json once at startup; a bad team entry is skipped (it gets its default layout). */

@@ -78,7 +78,7 @@ async function hostPart(host: string, cache: Record<string, HostPart>): Promise<
   }
 }
 
-async function reload() {
+async function reload(ready = true) {
   // S5-A: the Android build has no in-process core — its teams/commands don't exist there.
   const hosts = [...(hasLocalCore ? [LOCAL] : []), ...remoteHosts().map(h => h.id)];
   const cache = readCache();
@@ -111,7 +111,7 @@ async function reload() {
   layout.syncSessionEngines(new Map(agents.map(a => [a.id, a.engine])));
   if (activeId) layout.setActiveTeam(activeId);
 
-  emit({ ready: true, teams, agents, roles: state.roles, activeId });
+  emit({ ready, teams, agents, roles: state.roles, activeId });
 }
 
 // #1720: the newest role fetch wins; writing re-sorts the members by the new role order. Not `kept`:
@@ -123,11 +123,17 @@ const init = kept(hot, "init", () => ({ started: null as Promise<void> | null, l
 const reloadLatest = latest(hot, "reload", () => reload());
 export const refreshTeams = () => reloadLatest();
 
-/** Layout first (so defaults never overwrite a saved file), then teams. Idempotent. */
-export function initTeams(): Promise<void> {
+/**
+ * Layout first (so defaults never overwrite a saved file), then teams. Idempotent.
+ * #2260 `beforeReady`: runs once with the teams loaded but before `ready` mounts any pane — the
+ * main window settles which leaders live in their own window there, so no pane subscribes too early.
+ */
+export function initTeams(beforeReady?: () => Promise<void> | void): Promise<void> {
   init.started ??= (async () => {
     await Promise.all([layout.hydrate(), initHosts()]);
-    await reload();
+    await reload(false);
+    await beforeReady?.();
+    emit({ ...state, ready: true });
     api.onTeamsChanged(() => void reloadLatest().catch(() => {}));
     // Added / removed / (re)connected host: its teams come, go or refresh.
     subscribeHosts(() => void reloadLatest().catch(() => {}));

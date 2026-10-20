@@ -5,14 +5,38 @@
 // `?pane=lead` (src/lead/LeadWindow.tsx); it is opened here with `WebviewWindow` — no shell
 // command, only the create permission (src-tauri/capabilities/default.json). The shell reports a
 // destroyed pop-out (`dex:lead-closed`) and closes them all with the main window (popout.rs).
+// #2260: the living windows, not layout.json, decide who is popped out. Before any pane mounts the
+// main window asks the shell for its `lead-*` windows and brings the records in line (`adoptPopouts`,
+// run by initTeams before `ready`); it owns no PTY until then. A reload inside the save debounce
+// thus finds its pop-out alive and leaves it the PTY instead of subscribing a second view.
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { onEvent } from "../api/hosts";
+import { kept } from "../hot";
 import { releasePty, setPtyPolicy } from "../pty";
-import { getTeam, membersOf } from "../team/store";
-import { getPopout, getPopouts, isPoppedOut, patchPopout, removePopout, setPopout } from "./store";
-import { detachAction, parseBounds, popoutLabel, popoutUrl, popoutWindowOptions, type PopoutRec } from "./popout";
+import { getTeam, getTeamsSnapshot, membersOf } from "../team/store";
+import { getPopout, getPopouts, patchPopout, removePopout, setPopout, setPopouts } from "./store";
+import { detachAction, isPopoutLabel, mainWindowOwns, parseBounds, popoutLabel, popoutUrl, popoutWindowOptions, reconcilePopouts, type PopoutRec } from "./popout";
 
-setPtyPolicy(id => !isPoppedOut(id));
+/** `lead-*` labels alive at startup (null = not asked yet) and whether the records were brought in line with them. */
+const probe = kept(import.meta.hot, "probe", () => ({ live: null as Set<string> | null, reconciled: false }));
+
+setPtyPolicy(id => mainWindowOwns(probe.reconciled, getPopouts(), id));
+
+/** Which pop-out windows live. No shell (browser, e2e without the mock) → none: the records decide. */
+async function liveLabels(): Promise<Set<string>> {
+  try {
+    return new Set((await WebviewWindow.getAll()).map(w => w.label).filter(isPopoutLabel));
+  } catch {
+    return new Set();
+  }
+}
+
+/** Startup, teams loaded, before `ready`: a leader whose window lives is popped out whatever the file said. */
+export async function adoptPopouts() {
+  probe.live ??= await liveLabels();
+  setPopouts(reconcilePopouts(getPopouts(), probe.live, getTeamsSnapshot().agents));
+  probe.reconciled = true; // the policy opens: panes may subscribe from here, the popped-out ones excepted
+}
 
 const windowOf = (agentId: string) => WebviewWindow.getByLabel(popoutLabel(agentId)).catch(() => null);
 
@@ -64,11 +88,15 @@ export async function reattachLeader(agentId: string) {
   patchPopout(agentId, { open: false });
 }
 
-/** Startup, after the teams are in: windows remembered open come back at their last place. */
+/** Startup, after `ready`: windows remembered open but not alive come back at their last place. */
 export async function restorePopouts() {
+  if (!probe.reconciled) await adoptPopouts();
+  const live = probe.live ?? new Set<string>();
+  probe.live = null; // consumed: from here the records own the answer (a closed window reports itself)
   for (const [agentId, rec] of Object.entries(getPopouts())) {
     if (!rec.open) continue;
     void releasePty(agentId); // an online signal may have subscribed before the layout was read
+    if (live.has(popoutLabel(agentId))) continue;
     await openWindow(agentId, rec);
   }
 }

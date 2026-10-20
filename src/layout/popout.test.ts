@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { detachAction, parseLeadQuery, parsePopouts, popoutLabel, popoutUrl, popoutWindowOptions, POPOUT_SIZE } from "./popout.ts";
+import { detachAction, mainWindowOwns, parseLeadQuery, parsePopouts, popoutLabel, popoutUrl, popoutWindowOptions, POPOUT_SIZE, reconcilePopouts } from "./popout.ts";
 
 test("label: the agent id in Tauri's allowed set, host-qualified ids included", () => {
   assert.equal(popoutLabel("kaan"), "lead-kaan");
@@ -51,4 +51,27 @@ test("window options: the last place wins over the default size; on-top carried"
   const placed = popoutWindowOptions({ ...base, bounds: { x: 5, y: 6, width: 400, height: 260 } }, "T", "u");
   assert.deepEqual([placed.x, placed.y, placed.width, placed.height], [5, 6, 400, 260]);
   assert.equal(placed.minWidth, POPOUT_SIZE.minWidth);
+});
+
+test("#2260: a living window makes the leader popped out even without a record; the policy waits for the answer", () => {
+  const live = new Set(["main", "lead-kaan"]);
+  const agents = [{ id: "kaan", teamId: "t" }, { id: "ece", teamId: "t" }];
+  // Empty record (reload inside the save debounce) + living `lead-kaan` → kaan is out, ece stays here.
+  const rec = reconcilePopouts({}, live, agents);
+  assert.deepEqual(rec, { kaan: { teamId: "t", open: true, onTop: false, bounds: null } });
+  assert.equal(mainWindowOwns(true, rec, "kaan"), false, "the main window does not subscribe to kaan's PTY");
+  assert.equal(mainWindowOwns(true, rec, "ece"), true);
+  // Before the reconciliation nothing is owned: no subscription ahead of it, whatever the file said.
+  assert.equal(mainWindowOwns(false, {}, "ece"), false);
+  assert.equal(mainWindowOwns(false, {}, "kaan"), false);
+  assert.equal(mainWindowOwns(true, { kaan: { ...rec.kaan, open: false } }, "kaan"), true, "a closed window: the pane is back here");
+});
+
+test("#2260: reconciliation keeps a closed record's place and on-top, leaves open records and unknown labels alone", () => {
+  const closed = { teamId: "t", open: false, onTop: true, bounds: { x: 1, y: 2, width: 400, height: 300 } };
+  const open = { teamId: "t", open: true, onTop: false, bounds: null };
+  const before = { kaan: closed, ece: open };
+  const after = reconcilePopouts(before, new Set(["lead-kaan", "lead-ece", "lead-gone"]), [{ id: "kaan", teamId: "t" }, { id: "ece", teamId: "t" }]);
+  assert.deepEqual(after, { kaan: { ...closed, open: true }, ece: open });
+  assert.equal(reconcilePopouts(before, new Set(["main"]), [{ id: "kaan", teamId: "t" }]), before, "nothing alive: the same object, no save");
 });

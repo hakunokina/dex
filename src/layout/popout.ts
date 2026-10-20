@@ -85,3 +85,23 @@ export function popoutWindowOptions(rec: PopoutRec, title: string, url: string) 
     backgroundColor: "#0e0f11",
   };
 }
+
+// ---- #2260: the living windows, not layout.json, say which leaders are popped out ----
+
+/**
+ * The main window's PTY policy: nothing is owned until the records are reconciled with the living
+ * windows (no subscription ahead of that), then every leader not shown in its own window.
+ */
+export const mainWindowOwns = (reconciled: boolean, popouts: Record<string, PopoutRec>, agentId: string): boolean =>
+  reconciled && popouts[agentId]?.open !== true;
+
+/** Records brought in line with the living windows: a leader whose window lives is open (place/on-top kept). */
+export function reconcilePopouts(popouts: Record<string, PopoutRec>, live: ReadonlySet<string>, agents: readonly { id: string; teamId: string }[]): Record<string, PopoutRec> {
+  let out = popouts;
+  for (const a of agents) {
+    if (!live.has(popoutLabel(a.id)) || out[a.id]?.open === true) continue;
+    const prev = out[a.id];
+    out = { ...out, [a.id]: { teamId: a.teamId, open: true, onTop: prev?.onTop ?? false, bounds: prev?.bounds ?? null } };
+  }
+  return out;
+}

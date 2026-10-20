@@ -79,3 +79,49 @@ test("lider pane'i pencereye ayrılır: ana pencere aboneliği bırakır, yer tu
   await expect(placeholder).toHaveCount(0);
   await expect((await paneOf(app, leader.name)).locator(".xterm-rows")).toContainText("fake-claude hazir");
 });
+
+// #2260: layout.json is not the truth, the living windows are. The open flip is written at once (no
+// 400 ms debounce), and at startup a living `lead-*` window makes its leader popped out even when
+// the file never got the record — the pane stays a placeholder, this page takes no subscription.
+test("ayır → hemen yenile: yer tutucu kalır, ana sayfa abone olmaz; kayıtsız yaşayan pencere de ayrılmış sayılır", async ({ app, dexd }) => {
+  const n = test.info().workerIndex;
+  const team = await newTeam(dexd, `PiP yarış ${n}`);
+  const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
+  const label = `lead-${leader.id}`;
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect((await paneOf(app, leader.name)).locator(".xterm-rows")).toContainText("fake-claude hazir");
+  const region = app.getByRole("region", { name: leader.name, exact: true });
+  const placeholder = app.getByRole("status").filter({ hasText: "Ayrı pencerede açık" });
+  const savedOpen = async (page: Page, open: boolean) =>
+    (await calls(page)).some((c) => c.cmd === "layout_save" && (c.args.layout as { popouts?: Record<string, { open?: boolean }> })?.popouts?.[leader.id]?.open === open);
+
+  // Detach, reload as soon as the write is on its way (well inside the old debounce).
+  await region.getByRole("button", { name: `${leader.name}: pencereye ayır` }).click();
+  await expect.poll(() => savedOpen(app, true)).toBe(true);
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect(placeholder).toBeVisible();
+  await app.waitForTimeout(600);
+  expect((await attaches(app, leader.id)).length).toBe(0);
+  await placeholder.getByRole("button", { name: "Geri al" }).click();
+  await expect(placeholder).toHaveCount(0);
+  await expect((await paneOf(app, leader.name)).locator(".xterm-rows")).toContainText("fake-claude hazir");
+  await expect.poll(() => savedOpen(app, false)).toBe(true);
+
+  // The file says closed (as after a lost write) but the shell lists the window alive: popped out, no subscription,
+  // and the record is brought in line at once.
+  await app.evaluate((l) => localStorage.setItem("dex.e2e.windows", JSON.stringify([l])), label);
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect(placeholder).toBeVisible();
+  await app.waitForTimeout(600);
+  expect((await attaches(app, leader.id)).length).toBe(0);
+  expect(await savedOpen(app, true)).toBe(true);
+  // The window gone: the pane returns with this page's own subscription.
+  await app.evaluate(() => localStorage.removeItem("dex.e2e.windows"));
+  await placeholder.getByRole("button", { name: "Geri al" }).click();
+  await expect(placeholder).toHaveCount(0);
+  await expect((await paneOf(app, leader.name)).locator(".xterm-rows")).toContainText("fake-claude hazir");
+  expect((await attaches(app, leader.id)).length).toBe(1);
+});
