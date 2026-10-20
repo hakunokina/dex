@@ -3,7 +3,7 @@ import { getStatus } from "../agents";
 import { STALL_CHOICES, setStallMinutes, stallMinutes } from "../stall";
 import { createTask } from "../board/api";
 import { openBoard } from "../board/store";
-import { applyFavoriteLayout, applyFavoriteToAll, hasFavorite, openAgent, openNotes, openPanel, openSettings, openShell, resetLayout, revealAgent, saveFavoriteLayout } from "../layout/panels";
+import { applyFavoriteLayout, applyFavoriteToAll, hasFavorite, openAgent, openCatchup, openNotes, openPanel, openSettings, openShell, resetLayout, revealAgent, saveFavoriteLayout } from "../layout/panels";
 import { requestStart, startAgent } from "../launcher";
 import { killPty } from "../pty";
 import { getTeamsSnapshot, selectTeam, setWorkersModel } from "../team/store";
@@ -60,6 +60,8 @@ export function buildCommands(bridge: Bridge): Command[] {
     { id: "office.panel", title: "Ajan kartını aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "kart pcb office panel", run: () => void openPanel(activeId, "office"), restoreFocus: true },
     // #46/#2086: the notes are one free panel; closed, it comes back here.
     { id: "notes.open", title: "Notları aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "not notlar notes ortak takım", run: () => void openNotes(activeId) },
+    // #2235: the closed "Sen yokken" tab comes back here.
+    { id: "catchup.open", title: "Sen yokken özetini aç", hint: `Düzen · ${teamName(activeId)}`, keywords: "sen yokken catchup özet bekleyen değişen yeni", run: () => void openCatchup(activeId) },
     // #47: the Kart's Ayarlar button, for when the Kart is closed.
     { id: "settings.open", title: "Ayarlar", hint: "Ayarlar", keywords: "settings tercihler görünüm genel", run: () => void openPanel(activeId, "settings") },
     // DEX-31: app settings as a floating panel; the limits live under Sunucu › Kaynak sınırları.
