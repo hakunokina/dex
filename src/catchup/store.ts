@@ -70,13 +70,14 @@ for (const ev of ["delegations-changed", "questions-changed", "proposals-changed
 }
 
 /**
- * Advance the cursor to what is on screen (`generatedAt`, never "now" — a job that
- * finished after the fetch must still show up next time). The list itself stays.
+ * Advance the cursor to the snapshot the patron actually saw (`shownAt` — its
+ * `generatedAt`, pinned by the caller when its wait started, never "now" and never a
+ * refresh that landed in the meantime; a job that finished after that snapshot must
+ * still show up next time). The list itself stays.
  */
-export async function ackShown(teamId: string): Promise<boolean> {
-  const entry = box.map.get(teamId);
-  if (!entry?.data) return false;
-  await ackCatchup(teamId, entry.data.generatedAt);
+export async function ackShown(teamId: string, shownAt: number): Promise<boolean> {
+  if (!box.map.get(teamId)?.data) return false;
+  await ackCatchup(teamId, shownAt);
   return true;
 }
 

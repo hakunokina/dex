@@ -10,26 +10,20 @@ import { getDelegations } from "../delegations";
 import { getQuestions } from "../questions";
 import { getProposals } from "../team/Proposals";
 import { openAgent, openPanel, openSettings } from "../layout/panels";
-import { ACK_MS, ackDue, isEmpty, kindLabel, sections, targetFor, visibleItems, whenAgo, type Resolved, type Section } from "./model";
+import { ACK_MS, ackWait, isEmpty, kindLabel, resolveRef, sections, targetFor, visibleItems, whenAgo, type Resolved, type Section } from "./model";
 import { ackShown, ensureCatchup, retryCatchup, useCatchup } from "./store";
 import "./catchup.css";
 
-/** Resolve a row's `ref` to its agents from the lists the client already keeps (no extra fetch). */
+/** Resolve a row's `ref` from the lists the client already keeps (no extra fetch), this team's host only. */
 function resolve(teamId: string, item: CatchupItem): Resolved {
-  if (typeof item.ref !== "number") return {};
   const host = hostOf(teamId);
-  const ref = item.ref;
-  if (item.kind === "question_escalated" || item.kind === "question_open") {
-    const q = getQuestions().find(q => q.host === host && q.id === ref);
-    return q ? { worker: q.worker, leader: q.leader } : {};
-  }
-  if (item.kind === "member_proposal" || item.kind === "model_approval" || item.kind === "job_change_approval") {
-    const p = getProposals().find(p => p.host === host && p.id === ref);
-    if (p) return { leader: p.leader };
-    // A proposal-less model approval carries the delegation id instead: fall through.
-  }
-  const d = getDelegations().find(d => d.host === host && d.id === ref);
-  return d ? { worker: d.toAgent || undefined, leader: d.fromAgent } : {};
+  return resolveRef(item, {
+    questions: getQuestions().filter(q => q.host === host),
+    proposals: getProposals().filter(p => p.host === host),
+    delegations: getDelegations()
+      .filter(d => d.host === host)
+      .map(d => ({ id: d.id, worker: d.toAgent || undefined, leader: d.fromAgent })),
+  });
 }
 
 function go(teamId: string, item: CatchupItem) {
@@ -49,8 +43,9 @@ export function CatchupPage({ teamId, visible }: { teamId: string; visible: bool
 
   // Hidden teams' pages stay mounted; only the one on screen fetches (each call scans the memory graph).
   useEffect(() => { if (visible) ensureCatchup(teamId); }, [visible, teamId]);
-  // A new team (or a snapshot replaced wholesale) starts un-acked.
-  useEffect(() => { setAcked(false); setAckErr(null); }, [teamId]);
+  // A new team — or a refreshed snapshot — starts un-acked and waits its own 10 s.
+  const generatedAt = entry?.status === "ready" ? entry.data?.generatedAt : undefined;
+  useEffect(() => { setAcked(false); setAckErr(null); }, [teamId, generatedAt]);
 
   useEffect(() => {
     const on = () => setFocused(true);
@@ -60,11 +55,11 @@ export function CatchupPage({ teamId, visible }: { teamId: string; visible: bool
     return () => { window.removeEventListener("focus", on); window.removeEventListener("blur", off); };
   }, []);
 
-  const ack = async () => {
+  const ack = async (shownAt: number) => {
     if (acking.current || acked) return;
     acking.current = true;
     try {
-      if (await ackShown(teamId)) { setAcked(true); setAckErr(null); }
+      if (await ackShown(teamId, shownAt)) { setAcked(true); setAckErr(null); }
     } catch (e) {
       setAckErr(`"Okudum" iletilemedi: ${e}`);
     } finally {
@@ -72,14 +67,16 @@ export function CatchupPage({ teamId, visible }: { teamId: string; visible: bool
     }
   };
 
-  const due = ackDue({ visible, focused, acked, hasData: entry?.status === "ready" });
+  // The wait is keyed by the snapshot's generatedAt: a refresh re-arms a fresh
+  // 10 s for the new snapshot, and the timer acks the value it was armed with.
+  const wait = ackWait({ visible, focused, acked, generatedAt });
   useEffect(() => {
-    if (!due) return;
-    const t = setTimeout(() => void ack(), ACK_MS);
+    if (wait === null) return;
+    const t = setTimeout(() => void ack(wait), ACK_MS);
     return () => clearTimeout(t);
-    // `ack` reads refs/state at fire time; the timer restarts only when the conditions flip.
+    // `ack` reads refs/state at fire time; the value acked stays the armed `wait`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [due, teamId]);
+  }, [wait, teamId]);
 
   if (!entry || entry.status === "loading") {
     return <div className="catchup"><p className="catchup-state" role="status">Sen yokken olanlar okunuyor…</p></div>;
@@ -106,7 +103,7 @@ export function CatchupPage({ teamId, visible }: { teamId: string; visible: bool
       {entry.error && <p className="catchup-err" role="alert">Yenileme başarısız, liste eski olabilir: {entry.error}</p>}
       {ackErr && <p className="catchup-err" role="alert">{ackErr}</p>}
       <div className="catchup-foot">
-        <button className="catchup-btn" disabled={acked} onClick={() => void ack()} aria-disabled={acked || undefined}>
+        <button className="catchup-btn" disabled={acked} onClick={() => void ack(data.generatedAt)} aria-disabled={acked || undefined}>
           {acked ? <><Check /> Okundu</> : "Okudum"}
         </button>
         {acked && <span className="catchup-hint" role="status">Bir sonraki açılışta yalnız yeniler gelir.</span>}

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ackDue, bucketCount, isEmpty, kindLabel, sections, SECTION_LIMIT, targetFor, visibleItems, waitingCount, whenAgo } from "./model.ts";
+import { ackWait, bucketCount, isEmpty, kindLabel, resolveRef, sections, SECTION_LIMIT, targetFor, visibleItems, waitingCount, whenAgo, type RefSources } from "./model.ts";
 import type { Catchup, CatchupItem, CatchupKind } from "../api/catchup.ts";
 
 const item = (kind: CatchupKind, ref: number | string = 1): CatchupItem => ({ kind, id: `${kind}:${ref}`, title: "t", at: 0, ref });
@@ -53,6 +53,35 @@ test("tıklama hedefi: panel düzeyi eşleme", () => {
   assert.deepEqual(targetFor(item("memory", "shared/x"), both), { type: "memory" });
 });
 
+test("ref çözümü: her tür kendi tablosundan, çakışan devretme id'si yanlış ajanı açmaz (#2240)", () => {
+  // GPU isteği #42, plan #42 ve öneri #42 ile aynı sayılı devretme #42 aynı anda var.
+  const s: RefSources = {
+    questions: [{ id: 7, worker: "qw", leader: "ql" }],
+    proposals: [{ id: 9, leader: "pl" }],
+    delegations: [{ id: 42, worker: "dw", leader: "dl" }, { id: 5, worker: "w5", leader: "l5" }],
+  };
+  // Başka tabloya ait ref'ler devretme listesinde aranmaz; GPU doğrudan Ayarlar › GPU'ya düşer.
+  assert.deepEqual(resolveRef(item("gpu_approval", 42), s), {});
+  assert.deepEqual(targetFor(item("gpu_approval", 42), resolveRef(item("gpu_approval", 42), s)), { type: "gpu" });
+  assert.deepEqual(targetFor(item("gpu_approval", 42), { leader: "dl" }), { type: "gpu" });
+  assert.deepEqual(resolveRef(item("plan_done", 42), s), {});
+  assert.deepEqual(resolveRef(item("member_proposal", 42), s), {});
+  assert.deepEqual(resolveRef(item("job_change_approval", 42), s), {});
+  assert.deepEqual(resolveRef(item("memory", "shared/x"), s), {});
+  // Kendi kaynağında bulunanlar çözülür.
+  assert.deepEqual(resolveRef(item("question_open", 7), s), { worker: "qw", leader: "ql" });
+  assert.deepEqual(resolveRef(item("member_proposal", 9), s), { leader: "pl" });
+  assert.deepEqual(resolveRef(item("delegation_done", 42), s), { worker: "dw", leader: "dl" });
+  assert.deepEqual(resolveRef(item("merge_waiting", 5), s), { worker: "w5", leader: "l5" });
+  assert.deepEqual(resolveRef(item("review_fix", 5), s), { worker: "w5", leader: "l5" });
+  // model_approval: önce öneri; önerisiz dalda çekirdek devretme id'si verir.
+  assert.deepEqual(resolveRef(item("model_approval", 9), s), { leader: "pl" });
+  assert.deepEqual(resolveRef(item("model_approval", 5), s), { worker: "w5", leader: "l5" });
+  // Kaynağında yoksa boş (başka listeye kayma yok).
+  assert.deepEqual(resolveRef(item("question_escalated", 42), s), {});
+  assert.deepEqual(resolveRef(item("delegation_failed", 9), s), {});
+});
+
 test("etiketler Türkçe; bilinmeyen tür imzalısı kalır", () => {
   assert.equal(kindLabel("question_escalated"), "Soru sana çıktı");
   assert.equal(kindLabel("delegation_merged"), "Birleşti");
@@ -67,11 +96,25 @@ test("göreli zaman: az önce / dk / sa / gün, gelecek az önceye kısılır", 
   assert.equal(whenAgo(now - 2 * 86_400_000, now), "2 gün önce");
 });
 
-test("ack yalnız görünür + odaklı + verili + ack'lenmemişken", () => {
-  const base = { visible: true, focused: true, acked: false, hasData: true };
-  assert.equal(ackDue(base), true);
-  assert.equal(ackDue({ ...base, visible: false }), false);
-  assert.equal(ackDue({ ...base, focused: false }), false);
-  assert.equal(ackDue({ ...base, acked: true }), false);
-  assert.equal(ackDue({ ...base, hasData: false }), false);
+test("ack bekleyişi yalnız görünür + odaklı + verili + ack'lenmemişken, değeri snapshot'ın generatedAt'i", () => {
+  const base = { visible: true, focused: true, acked: false, generatedAt: 1000 };
+  assert.equal(ackWait(base), 1000);
+  assert.equal(ackWait({ ...base, visible: false }), null);
+  assert.equal(ackWait({ ...base, focused: false }), null);
+  assert.equal(ackWait({ ...base, acked: true }), null);
+  assert.equal(ackWait({ ...base, generatedAt: undefined }), null);
+});
+
+test("ack yarış: bekleyiş ortasında yenilenen snapshot eski bekleyişle ack'lenmez (#2240)", () => {
+  const base = { visible: true, focused: true, acked: false };
+  // Panel T1 ile açıldı; sayaç bu değer için kuruldu.
+  const armed = ackWait({ ...base, generatedAt: 1000 });
+  assert.equal(armed, 1000);
+  // 9. saniyede host olayı listeyi T2 ile değiştirdi: bekleyiş kimliği değişir
+  // (sayaç T2 için baştan kurulur), kurulu değer T1 olarak kalır — ateş eden
+  // sayaç ~1 sn görülen T2'yi değil, görülen T1'i ack'ler.
+  const rearmed = ackWait({ ...base, generatedAt: 2000 });
+  assert.notEqual(rearmed, armed);
+  assert.equal(armed, 1000);
+  assert.equal(rearmed, 2000);
 });

@@ -69,13 +69,56 @@ export function targetFor(item: Pick<CatchupItem, "kind">, r: Resolved): Target 
   switch (item.kind) {
     case "memory": return { type: "memory" };
     case "plan_done": case "plan_cancelled": return { type: "board" };
-    case "gpu_approval": return r.leader ? { type: "agent", agentId: r.leader } : { type: "gpu" };
+    case "gpu_approval": return { type: "gpu" };
     case "question_escalated": case "question_open":
       return r.worker ? { type: "agent", agentId: r.worker } : r.leader ? { type: "agent", agentId: r.leader } : { type: "board" };
     case "member_proposal": case "job_change_approval":
       return r.leader ? { type: "agent", agentId: r.leader } : { type: "board" };
     default: // delegations + model_approval (its ref may be a delegation id)
       return r.worker ? { type: "agent", agentId: r.worker } : r.leader ? { type: "agent", agentId: r.leader } : { type: "board" };
+  }
+}
+
+/** Host-filtered local lists a row's numeric `ref` can be resolved against. */
+export interface RefSources {
+  questions: { id: number; worker?: string; leader?: string }[];
+  proposals: { id: number; leader?: string }[];
+  delegations: { id: number; worker?: string; leader?: string }[];
+}
+
+/**
+ * Resolve a row's agents from the list its `ref` actually belongs to (dex-core::catchup):
+ * questions → questions, proposals → member_proposals, delegations/merge/review →
+ * delegations. Kinds whose `ref` names another table (`gpu_approval` → gpu_requests,
+ * `plan_*` → plans, `memory` → graph id) resolve to nothing — looking their number up in
+ * delegations opens an unrelated same-id job's agents on a collision (#2240). The one
+ * overlap is `model_approval`: usually a proposal id, but core's proposal-less branch
+ * emits a delegation id, so proposals first, then delegations.
+ */
+export function resolveRef(item: Pick<CatchupItem, "kind" | "ref">, s: RefSources): Resolved {
+  if (typeof item.ref !== "number") return {};
+  const ref = item.ref;
+  const deleg = (): Resolved => {
+    const d = s.delegations.find(d => d.id === ref);
+    return d ? { worker: d.worker, leader: d.leader } : {};
+  };
+  switch (item.kind) {
+    case "question_escalated": case "question_open": {
+      const q = s.questions.find(q => q.id === ref);
+      return q ? { worker: q.worker, leader: q.leader } : {};
+    }
+    case "member_proposal": case "job_change_approval": {
+      const p = s.proposals.find(p => p.id === ref);
+      return p ? { leader: p.leader } : {};
+    }
+    case "model_approval": {
+      const p = s.proposals.find(p => p.id === ref);
+      return p ? { leader: p.leader } : deleg();
+    }
+    case "gpu_approval": case "plan_done": case "plan_cancelled": case "memory":
+      return {};
+    default: // delegation_* + merge_waiting + review_fix
+      return deleg();
   }
 }
 
@@ -88,7 +131,12 @@ export function whenAgo(at: number, now: number): string {
   return `${Math.floor(min / (24 * 60))} gün önce`;
 }
 
-/** The 10 s auto-ack fires only while the panel is on screen and the window focused. */
+/**
+ * The 10 s auto-ack waits only while the panel is on screen and the window focused.
+ * Returns the `generatedAt` the wait belongs to (null: not waiting). The caller arms its
+ * timer for exactly this value and re-arms when it changes, so a refresh landing mid-wait
+ * starts its own wait instead of being acked after ~1 s on screen (#2240).
+ */
 export const ACK_MS = 10_000;
-export const ackDue = (o: { visible: boolean; focused: boolean; acked: boolean; hasData: boolean }): boolean =>
-  o.visible && o.focused && !o.acked && o.hasData;
+export const ackWait = (o: { visible: boolean; focused: boolean; acked: boolean; generatedAt?: number }): number | null =>
+  o.visible && o.focused && !o.acked && o.generatedAt !== undefined ? o.generatedAt : null;
