@@ -17,7 +17,7 @@ import { toast } from "../toast/store";
 import { remapDock, type FavoriteTarget } from "./favorite";
 import { migrateNotesDock, NOTES_ID, NOTES_TITLE } from "./notesDock";
 import { focusSetting, selectSettingsTab, type SettingsTab } from "../settings/tab";
-import { movePlaysFx, workerGroups, type WorkerRows } from "./workerGroups";
+import { movePlaysFx, reconcileWorkerRows, workerGroups, workerStep, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
 import { opensAssistant } from "./assistantPlacement";
@@ -44,42 +44,68 @@ function rememberWorkerRows(teamId: string, api: DockviewApi, pair: WorkerRows) 
   }
 }
 
+/**
+ * The rows as recorded (this session, else the panel params a saved layout carries), checked against
+ * the geometry every time (#2267): the group under the Kart is the working row, its left neighbour the
+ * finished row; a record that disagrees is replaced. A replaced layout (load/favourite/reset) drops the
+ * session record first; shell closes/reconcile don't.
+ */
 function workerRowsOf(teamId: string, api: DockviewApi) {
   const saved = workerRows.get(api);
-  // Shell closes/reconcile bump rebuilds too; only a replaced layout invalidates surviving group roles.
   if (saved) {
     for (const id of saved.working) if (!api.getGroup(id)) saved.working.delete(id);
-    if (saved.working.size || saved.done && api.getGroup(saved.done)) return saved;
+    if (saved.done && !api.getGroup(saved.done)) delete saved.done;
   }
   const office = api.getPanel("office");
   const groups = api.groups.filter(g => g.api.location.type === "grid" && g.panels.some(p => kindOf(teamId, p.id) === "worker"));
   const done = groups.find(g => g.panels.some(p => p.params?.workerRow === "done" && p.params?.workerRowGroup === g.id))?.id;
   const working = new Set(groups.filter(g => g.panels.some(p => p.params?.workerRow === "working" && p.params?.workerRowGroup === g.id)).map(g => g.id));
-  const pair = done || working.size ? { done, working } : (office ? workerGroups(office.group.element.getBoundingClientRect(), groups.map(g => {
+  const recorded = saved ?? { working, ...(done ? { done } : {}) };
+  const geo = office ? workerGroups(office.group.element.getBoundingClientRect(), groups.map(g => {
     const box = g.element.getBoundingClientRect();
     return { id: g.id, left: box.left, top: box.top, width: box.width, height: box.height };
-  })) : { working: new Set<string>() });
-  rememberWorkerRows(teamId, api, pair);
+  })) : undefined;
+  const pair = reconcileWorkerRows(recorded, geo);
+  if (pair !== saved) rememberWorkerRows(teamId, api, pair);
   return pair;
 }
 
-/** Only already open workers in the managed groups follow their job; other placements belong to the patron. */
+/**
+ * A worker's panel follows its job: a closed one opens in the working row when the job starts (#2267,
+ * without taking the focus), an open one in the managed rows moves between them; any other placement
+ * belongs to the patron. Without a working row the job starts in a new group under the Kart.
+ */
 export function moveWorkerPanel(agentId: string, finished: boolean) {
   for (const [teamId, api] of apis) {
-    const pane = api.getPanel(agentPanelId(agentId));
-    if (!pane || kindOf(teamId, pane.id) !== "worker") continue;
+    const id = agentPanelId(agentId);
+    if (kindOf(teamId, id) !== "worker") continue;
+    const shown = api.getPanel(id);
+    if (shown && shown.group.api.location.type !== "grid") continue;
     const pair = workerRowsOf(teamId, api);
-    const managed = finished ? pair.working.has(pane.group.id) : pane.group.id === pair.done;
-    if (!managed || pane.group.api.location.type !== "grid") continue;
+    const step = workerStep(shown?.group.id ?? null, pair, finished);
+    if (!step) continue;
+    if (step === "open") {
+      const spec = agentSpec(teamId, agentId);
+      if (!spec) continue;
+      quietly(teamId, () => {
+        const p = add(teamId, api, { ...spec, inactive: true });
+        pair.working.add(p.group.id);
+        rememberWorkerRows(teamId, api, pair);
+      });
+      continue;
+    }
+    const pane = shown!;
     const working = workingGroupsOf(api, pair);
     const targetId = finished ? pair.done : working[working.length - 1]?.id;
     let target = targetId ? api.panels.find(p => p.group.id === targetId)?.group : undefined;
     const from = pane.group.element.getBoundingClientRect();
+    const office = api.getPanel("office");
     quietly(teamId, () => {
-      const referenceGroup = finished
-        ? working.sort((a, b) => a.element.getBoundingClientRect().left - b.element.getBoundingClientRect().left)[0] ?? pane.group
-        : pane.group;
-      target ??= api.addGroup({ referenceGroup, direction: finished ? "left" : "right" });
+      if (!target && finished) {
+        const referenceGroup = working.sort((a, b) => a.element.getBoundingClientRect().left - b.element.getBoundingClientRect().left)[0] ?? pane.group;
+        target = api.addGroup({ referenceGroup, direction: "left" });
+      }
+      target ??= office ? api.addGroup({ referencePanel: office, direction: "below" }) : api.addGroup({ referenceGroup: pane.group, direction: "right" });
       pane.api.moveTo({ group: target, position: "center", skipSetActive: true });
       if (finished) pair.done = pane.group.id;
       else pair.working.add(pane.group.id);
@@ -224,13 +250,16 @@ function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
     return api.addPanel({ ...spec, position: anchor ? { referenceGroup: anchor.group } : { direction: "right" } });
   }
   if (kind === "worker") {
+    // #2267: the working row under the Kart — a tab of its last group (a wide one splits), else a new group under the Kart.
     const pair = workerRowsOf(teamId, api);
     const groups = workingGroupsOf(api, pair);
     const working = groups[groups.length - 1];
-    const done = pair.done ? api.getGroup(pair.done) : undefined;
-    if (done) {
-      return api.addPanel({ ...spec, position: working ? { referenceGroup: working.id } : { referenceGroup: done.id, direction: "right" } });
+    if (working) {
+      const split = working.api.width >= 2 * MIN_CELL_W;
+      return api.addPanel({ ...spec, position: split ? { referenceGroup: working.id, direction: "right" } : { referenceGroup: working.id } });
     }
+    const office = api.getPanel("office");
+    if (office) return api.addPanel({ ...spec, position: { referencePanel: office, direction: "below" } });
   }
   const peers = api.panels.filter(p => {
     const k = kindOf(teamId, p.id);

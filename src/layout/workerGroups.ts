@@ -11,6 +11,33 @@ export function workerGroups(office: Box, groups: readonly (Box & { id: string }
     && Math.abs(g.left + g.width - working.left) <= 8 && Math.abs(g.top - working.top) <= 8);
   return { working: new Set([working.id]), ...(done ? { done: done.id } : {}) };
 }
+/**
+ * #2267: the patron's rule is positional — the group under the Kart is the working row, its left
+ * neighbour the finished row. A recorded role (panel params / this session) is kept while it agrees
+ * with that geometry; a record that puts the "done" row under the Kart (a working row that emptied and
+ * went away, or a stale save) is dropped and the geometry decides. No geometry (hidden team, nothing
+ * under the Kart) → the record stands. Returns `recorded` itself when nothing changes.
+ */
+export function reconcileWorkerRows(recorded: WorkerRows, geo: WorkerRows | undefined): WorkerRows {
+  const under = geo && [...geo.working][0];
+  if (!under) return recorded;
+  if (recorded.working.has(under)) {
+    if (recorded.done || !geo.done || recorded.working.has(geo.done)) return recorded;
+    return { working: recorded.working, done: geo.done };
+  }
+  const done = geo.done ?? (recorded.done !== under ? recorded.done : undefined);
+  return { working: new Set([under]), ...(done ? { done } : {}) };
+}
+/**
+ * What a job transition does to the worker's panel: a closed panel opens in the working row when its
+ * job starts (#2267); an open one moves between the rows it is in; a placement outside both rows is
+ * the patron's and stays. `groupId` null = the panel is closed.
+ */
+export function workerStep(groupId: string | null, rows: WorkerRows, finished: boolean): "open" | "working" | "done" | null {
+  if (groupId === null) return finished ? null : "open";
+  if (finished) return rows.working.has(groupId) ? "done" : null;
+  return groupId === rows.done ? "working" : null;
+}
 export function workerMoves(before: readonly Job[], after: readonly Job[]): { agentId: string; finished: boolean }[] {
   const previous = new Map(before.map(job => [job.id, job]));
   const moves: { agentId: string; finished: boolean }[] = [];
