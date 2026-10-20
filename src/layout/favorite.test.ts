@@ -74,3 +74,10 @@ test("girdi değişmez", () => {
   remapDock(fav.dock, fav, target);
   assert.equal(JSON.stringify(fav.dock), before);
 });
+
+test("#2266: favoride boş kaydedilmiş sabit terminal grubu kalır, yuvası düşen grup yine budanır", () => {
+  const dock = dockOf({ office: { id: "office" }, "shell:S1": { id: "shell:S1", params: { shellId: "S1" } } }, [["office"], [], ["shell:S1"]]);
+  const { dock: out } = remapDock(dock, { ...fav, dock, leaders: [], workers: [], shells: ["S1"] }, { leaders: [], workers: [], shells: [] });
+  const leaves = (out.grid.root as { data: { data: { id: string; views: string[] } }[] }).data.map(l => l.data);
+  assert.deepEqual(leaves.map(l => [l.id, l.views]), [["g0", ["office"]], ["g1", []]]);
+});

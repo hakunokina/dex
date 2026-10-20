@@ -32,6 +32,8 @@ export interface LayoutState {
   assistant?: string;
   /** #2235: Dex already added the "Sen yokken" tab once; closed by the patron, it stays closed (palette reopens it). */
   catchup?: boolean;
+  /** #2266: id of the fixed terminal group — the one grid group that stays (empty) when its last tab closes. */
+  shellGroup?: string;
 }
 
 export interface Layouts {
@@ -154,6 +156,12 @@ export function setCatchupOffered(teamId: string) {
   if (state.teams[teamId] && !state.teams[teamId].catchup) setTeam(teamId, t => ({ ...t, catchup: true }));
 }
 
+/** #2266: the fixed terminal group's id (dockview group ids survive its JSON); undefined until resolved. */
+export const shellGroupOf = (teamId: string) => state.teams[teamId]?.shellGroup;
+export function setShellGroup(teamId: string, id: string | undefined) {
+  if (state.teams[teamId] && state.teams[teamId].shellGroup !== id) setTeam(teamId, t => ({ ...t, shellGroup: id }));
+}
+
 /** DEX-29: new shell; returns its id (the caller opens its panel). */
 export function addShell(teamId: string, cwd: string | null): string {
   const id = qid(hostOf(teamId), crypto.randomUUID());
@@ -268,11 +276,15 @@ function parseFavorite(raw: unknown): FavoriteRec | null {
 }
 
 function parseTeam(team: unknown): LayoutState | null {
-  const { dock, shells, assistant, catchup } = (team ?? {}) as { dock?: unknown; shells?: unknown; assistant?: unknown; catchup?: unknown };
+  const { dock, shells, assistant, catchup, shellGroup } = (team ?? {}) as { dock?: unknown; shells?: unknown; assistant?: unknown; catchup?: unknown; shellGroup?: unknown };
   if (!Array.isArray(shells)) return null;
   // dockview validates its own JSON at fromJSON; a rejected one falls back to the default layout there.
   const d = typeof dock === "object" && dock !== null && "grid" in dock ? (dock as SerializedDockview) : null;
-  return { dock: d, shells: parseShells(shells), ...(typeof assistant === "string" ? { assistant } : {}), ...(catchup === true ? { catchup } : {}) };
+  return {
+    dock: d, shells: parseShells(shells),
+    ...(typeof assistant === "string" ? { assistant } : {}), ...(catchup === true ? { catchup } : {}),
+    ...(typeof shellGroup === "string" && shellGroup ? { shellGroup } : {}),
+  };
 }
 
 /**
