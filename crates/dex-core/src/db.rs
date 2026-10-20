@@ -474,6 +474,11 @@ const MIGRATIONS: &[&str] = &[
     // Revert: `UPDATE tasks SET status='todo', closed_reason=NULL WHERE closed_reason IS NOT NULL;
     // DROP TRIGGER tasks_reopen; DROP INDEX delegations_task;` (the column stays, NULL).
     TASK_CLOSED,
+    // 45 (Plan #124): "sen yokken" imleci + takım kapsamlı catchup sorgu indeksleri. Additive,
+    // IF NOT EXISTS; versioned runner tek sefer uygular, tekrar açılış idempotent.
+    // Before commit: ROLLBACK. After commit: keep the table/indexes; revert only the application
+    // (full undo in catchup::SCHEMA).
+    crate::catchup::SCHEMA,
 ];
 
 const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK (closed_reason IN ('cancelled','superseded'));

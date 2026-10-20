@@ -3,6 +3,7 @@
 
 pub mod browser;
 pub mod agents;
+pub mod catchup;
 pub mod chain;
 pub mod chat;
 pub mod claude_accounts;
