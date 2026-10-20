@@ -7,6 +7,7 @@ import { callHost, qid, qOpt, splitId } from "./api/hosts";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { findAgent, markPromptUnsure } from "./agents";
 import { pastePing, pingable } from "./delegations";
+import { POPOUT } from "./api/platform";
 import { kept, listenKept } from "./hot";
 
 const hot = import.meta.hot;
@@ -56,6 +57,7 @@ listenKept<Mark>(hot, "dex-first-reply", ({ payload }, host) => {
 });
 
 async function tell(m: Mark) {
+  if (POPOUT) return; // #2258: the main window tells
   const name = findAgent(m.agentId)?.name ?? m.agentId;
   if (m.leader && pingable(m.leader)) pastePing(m.leader, `[Dex] ${name} ilk yanıtı alamadı: ${m.text} Ayrıntı bu mesajın ekinde.`);
   let ok = await isPermissionGranted();

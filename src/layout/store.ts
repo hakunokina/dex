@@ -8,6 +8,7 @@ import { callLocal, hostOf, qid, splitId } from "../api/hosts";
 import type { SerializedDockview } from "dockview-react";
 import { kept } from "../hot";
 import type { FavoriteRec } from "./favorite";
+import { parsePopouts, type PopoutRec } from "./popout";
 
 /** A patron shell (DEX-29): persisted by id + cwd, never by session. */
 export interface ShellRec {
@@ -38,15 +39,24 @@ export interface Layouts {
   teams: Record<string, LayoutState>;
   /** Patron düzeni: bir takımdan kaydedilir, yeni ve mevcut takımlara uygulanır. */
   favorite: FavoriteRec | null;
+  /** #2258: leader panes shown in their own window, by agent id (reopened at startup while `open`). */
+  popouts: Record<string, PopoutRec>;
 }
 
 const SAVE_DEBOUNCE_MS = 400;
 
 // Kept across vite hot updates (DEX-18): a reset layout would drop every panel.
 const hot = import.meta.hot;
-const box = kept(hot, "state", () => ({ state: { active: null, teams: {}, favorite: null } as Layouts }));
+const box = kept(hot, "state", () => ({ state: { active: null, teams: {}, favorite: null, popouts: {} } as Layouts }));
 let state = box.state;
 const listeners = kept(hot, "listeners", () => new Set<() => void>());
+// A hot update from a pre-#2258 module hands over a state without `popouts`.
+state.popouts ??= {};
+/** #2258: a pop-out window reads the layout but never writes it — the main window owns layout.json. */
+let persist = true;
+export function setLayoutPersistence(on: boolean) {
+  persist = on;
+}
 
 // Last known session per agent, with the engine that wrote it. Persisted as `sessions`; every agent
 // panel reads its resume id from here. engine null = pre-DEX-34 entry, bound to the agent's engine on the first reload.
@@ -92,6 +102,30 @@ export function setFavorite(fav: FavoriteRec | null) {
   set(s => ({ ...s, favorite: fav }));
 }
 export const getFavorite = (): FavoriteRec | null => state.favorite;
+
+// ---- #2258: pop-out leader panes ----
+
+export const getPopouts = () => state.popouts;
+export const getPopout = (agentId: string): PopoutRec | undefined => state.popouts[agentId];
+export const isPoppedOut = (agentId: string) => state.popouts[agentId]?.open === true;
+export function setPopout(agentId: string, rec: PopoutRec) {
+  set(s => ({ ...s, popouts: { ...s.popouts, [agentId]: rec } }));
+}
+/** Partial update of an existing record (a closed window keeps its place for the next time). */
+export function patchPopout(agentId: string, patch: Partial<PopoutRec>) {
+  const cur = state.popouts[agentId];
+  if (!cur) return;
+  if ((Object.keys(patch) as (keyof PopoutRec)[]).every(k => cur[k] === patch[k])) return;
+  setPopout(agentId, { ...cur, ...patch });
+}
+export function removePopout(agentId: string) {
+  if (!state.popouts[agentId]) return;
+  set(s => {
+    const popouts = { ...s.popouts };
+    delete popouts[agentId];
+    return { ...s, popouts };
+  });
+}
 
 /** Workspace reports every dockview change here (debounced to disk like the rest). */
 export function setDock(teamId: string, dock: SerializedDockview | null) {
@@ -173,10 +207,11 @@ export function syncSessionEngines(engineOf: Map<string, string>) {
 let saveTimer: number | undefined;
 
 function scheduleSave() {
+  if (!persist) return;
   window.clearTimeout(saveTimer);
   saveTimer = window.setTimeout(() => {
     const sessions = Object.fromEntries(lastSession);
-    callLocal("layout_save", { layout: { version: 2, active: state.active, teams: state.teams, sessions, favorite: state.favorite } }).catch(() => {});
+    callLocal("layout_save", { layout: { version: 2, active: state.active, teams: state.teams, sessions, favorite: state.favorite, popouts: state.popouts } }).catch(() => {});
   }, SAVE_DEBOUNCE_MS);
 }
 
@@ -188,7 +223,7 @@ export async function hydrate() {
   } catch {
     return;
   }
-  const raw = file as { active?: unknown; teams?: Record<string, unknown>; sessions?: Record<string, unknown>; favorite?: unknown } | null;
+  const raw = file as { active?: unknown; teams?: Record<string, unknown>; sessions?: Record<string, unknown>; favorite?: unknown; popouts?: unknown } | null;
   for (const [agentId, rec] of Object.entries(raw?.sessions ?? {})) {
     const parsed = parseSession(rec);
     if (parsed) lastSession.set(agentId, parsed);
@@ -198,7 +233,7 @@ export async function hydrate() {
     const parsed = parseTeam(t) ?? parseLegacyTeam(t);
     if (parsed) teams[id] = parsed;
   }
-  box.state = state = { active: typeof raw?.active === "string" ? raw.active : null, teams, favorite: parseFavorite(raw?.favorite) };
+  box.state = state = { active: typeof raw?.active === "string" ? raw.active : null, teams, favorite: parseFavorite(raw?.favorite), popouts: parsePopouts(raw?.popouts) };
   for (const l of listeners) l();
 }
 

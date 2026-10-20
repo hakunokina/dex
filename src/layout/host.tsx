@@ -9,7 +9,7 @@ import { TerminalPane } from "../TerminalPane";
 import { ShellPane } from "../ShellPane";
 import { getStatus, subscribeAgentStatus } from "../agents";
 import { useTeams } from "../team/store";
-import { getSnapshot, shellPtyId, subscribe, type ShellRec } from "./store";
+import { getSnapshot, isPoppedOut, shellPtyId, subscribe, type ShellRec } from "./store";
 import { agentPanelId, shellPanelId } from "./panels";
 
 export { agentPanelId, shellPanelId };
@@ -104,10 +104,12 @@ function AgentSlot({ teamId, agentId, opened, focused, onFocus }: {
   teamId: string; agentId: string; opened: boolean; focused: boolean; onFocus: () => void;
 }) {
   const status = useSyncExternalStore(subscribeAgentStatus, () => getStatus(agentId));
+  // #2258: a leader shown in its own window has no view here — its PTY is that window's (pty.ts policy).
+  const out = useSyncExternalStore(subscribe, () => isPoppedOut(agentId));
   const [mounted, setMounted] = useState(false);
   const needed = opened || status !== "offline";
   if (needed && !mounted) setMounted(true);
-  if (!needed && !mounted) return null;
+  if (out || (!needed && !mounted)) return null;
   return createPortal(
     <TerminalPane teamId={teamId} agentId={agentId} focused={focused} onFocus={onFocus} />,
     slotFor(agentPanelId(agentId)),

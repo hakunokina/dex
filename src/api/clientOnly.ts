@@ -21,8 +21,9 @@ export const CLIENT_ONLY: readonly string[] = [
   "snip_hotkey_set",
 ];
 
-/** Events the shell emits itself, not the core (#1861: none since the usage strip moved to dexd). */
-export const SHELL_EVENTS: readonly string[] = [];
+/** Events the shell emits itself, not the core. #2258: a leader pop-out window's closing (src-tauri/src/popout.rs)
+ *  and what that window's page reports to the main one (its place, its on-top switch; src/lead/LeadWindow.tsx). */
+export const SHELL_EVENTS: readonly string[] = ["dex:lead-closed", "dex:lead-bounds", "dex:lead-ontop"];
 
 export const isClientOnly = (method: string) => CLIENT_ONLY.includes(method);
 export const isShellEvent = (event: string) => SHELL_EVENTS.includes(event);

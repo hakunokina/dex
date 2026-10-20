@@ -50,6 +50,27 @@ function handOver(me: Live, sink: PtySink) {
 }
 const live = kept(import.meta.hot, "live", () => new Map<string, Live>());
 
+// #2258: one window shows one PTY. The main window hands a popped-out leader's PTY to its window
+// (src/layout/popoutWindows.ts) and a pop-out window takes only its own leader's; nothing here
+// subscribes to a PTY the policy denies, so dexd never has two of our views on one session.
+let owned: (id: string) => boolean = () => true;
+export function setPtyPolicy(allowed: (id: string) => boolean) {
+  owned = allowed;
+}
+
+/** Drop this window's subscription to `id` entirely (the pane now lives in another window). */
+export async function releasePty(id: string) {
+  const s = live.get(id);
+  if (!s) return;
+  live.delete(id);
+  try {
+    await s.attachment;
+  } catch {
+    return; // never subscribed
+  }
+  await s.remoteDetach?.();
+}
+
 export async function spawnPty(o: SpawnOptions, sink: PtySink) {
   const me: Live = { relay: new PtyRelay(false) };
   handOver(me, sink);
@@ -86,6 +107,7 @@ export async function spawnPty(o: SpawnOptions, sink: PtySink) {
 
 /** Subscribe on the backend's online signal, before React or xterm is ready. */
 export async function capturePty(id: string, generation?: number) {
+  if (!owned(id)) return;
   const current = live.get(id);
   if (current && !current.relay.ended && (generation === undefined || current.generation === generation)) return current.attachment;
   const me = connectPty(id, current?.sink, generation);
@@ -125,6 +147,7 @@ function connectPty(id: string, sink?: PtySink, generation?: number): Live {
  * "no session" would make a shell pane spawn a new one over the server's live session.
  */
 export async function attachPty(id: string, sink: PtySink): Promise<boolean> {
+  if (!owned(id)) return false;
   const [host] = splitId(id);
   if (!isHostUp(host)) await whenHostUp(host);
   const current = live.get(id);

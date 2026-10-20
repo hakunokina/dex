@@ -4,6 +4,7 @@ import { callHost, LOCAL, onHostUp, qid, qOpt, remoteHosts, splitId } from "./ap
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { findAgent, getStatus, idleFor, inputState } from "./agents";
 import { writePty } from "./pty";
+import { POPOUT } from "./api/platform";
 import { kept, listenKept } from "./hot";
 import { toast } from "./toast/store";
 import { moveWorkerPanel } from "./layout/panels";
@@ -189,6 +190,7 @@ export function pingable(agentId: string) {
 
 /** One line as a new turn; the UserPromptSubmit hook attaches the payload. */
 export function pastePing(agentId: string, note: string) {
+  if (POPOUT) return; // #2258: the main window pings; a pop-out would paste the note a second time
   // Bracketed paste keeps the note one literal input; Enter goes separately so it is not part of the paste.
   void writePty(agentId, `\x1b[200~${note}\x1b[201~`)
     .then(() => new Promise((r) => setTimeout(r, 150)))
@@ -197,6 +199,7 @@ export function pastePing(agentId: string, note: string) {
 }
 
 async function notifyDone(d: Delegation) {
+  if (POPOUT) return;
   let ok = await isPermissionGranted();
   if (!ok) ok = (await requestPermission()) === "granted";
   if (!ok) return;

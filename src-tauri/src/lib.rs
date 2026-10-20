@@ -53,6 +53,8 @@ mod secrets;
 #[cfg(all(desktop, feature = "inproc-core"))]
 mod settings;
 #[cfg(desktop)]
+mod popout;
+#[cfg(desktop)]
 mod snip;
 #[cfg(desktop)]
 mod snip_hotkey;
@@ -105,6 +107,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(snip_hotkey::plugin())
+        // #2258: leader pop-out windows go with the main window; a closed one is reported to it.
+        .on_window_event(popout::on_window_event)
         .setup(|app| {
             snip_hotkey::init(app.handle())?;
             #[cfg(not(feature = "inproc-core"))]

@@ -3,6 +3,7 @@ import { AGENTS, getStatus } from "./agents";
 import { openAgent, openPanel, openSettings } from "./layout/panels";
 import { PaneHost } from "./layout/host";
 import { mountedTeams } from "./layout/mountedTeams";
+import { listenPopouts, restorePopouts } from "./layout/popoutWindows";
 import { Rack } from "./layout/Rack";
 import { initTeams, useTeams } from "./team/store";
 import { useTeamViewing } from "./team/useTeamViewing";
@@ -57,8 +58,13 @@ export default function App() {
 
   useEffect(() => {
     const stopSounds = initSounds();
-    void initTeams();
-    return stopSounds;
+    // #2258: leader windows left open last time come back once the teams are known.
+    const stopPopouts = listenPopouts();
+    void initTeams().then(restorePopouts);
+    return () => {
+      stopSounds?.();
+      stopPopouts();
+    };
   }, []);
 
   // Lightweight hosts watch every team; workspaces are constructed on first visit and then retained.

@@ -7,6 +7,7 @@ import { callHost, LOCAL, onHostUp, qid, remoteHosts } from "./api/hosts";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { getStatus } from "./agents";
 import { pastePing, pingable } from "./delegations";
+import { POPOUT } from "./api/platform";
 import { kept, listenKept } from "./hot";
 import { soundEvent } from "./sound";
 
@@ -134,6 +135,7 @@ async function notifyEscalated() {
   const fresh = rows.filter((q) => q.status === "escalated" && !told.has(q.key));
   if (!fresh.length) return;
   for (const q of fresh) told.add(q.key);
+  if (POPOUT) return; // #2258: the main window notifies
   soundEvent("question_escalated");
   if (document.hasFocus()) return; // DEX-28: the patron is looking at Dex, the card is enough
   let ok = await isPermissionGranted();

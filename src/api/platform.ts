@@ -10,5 +10,11 @@ export const WEB = typeof window !== "undefined" && !("__TAURI_INTERNALS__" in w
 /** Browser token persistence is restricted; desktop/APK use their native secret store. */
 export const WEB_TOKEN_STORAGE = WEB && browserTokensAllowed(import.meta.env.DEV, window.location.origin);
 export const MOBILE = PLATFORM === "android" || PLATFORM === "ios" || WEB;
+/**
+ * #2258: a leader pop-out window (`?pane=lead`, src/lead/LeadWindow.tsx). It shows one pane and
+ * nothing else: the patron-side reactions (desktop notifications, sounds, pings pasted to a leader,
+ * stall notes) stay with the main window, or every event would act twice.
+ */
+export const POPOUT = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("pane") === "lead";
 /** Whether the in-process core (dex-core commands) exists in this build. */
 export const hasLocalCore = !MOBILE;

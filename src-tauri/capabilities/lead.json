@@ -1,0 +1,13 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "lead",
+  "description": "#2258: a leader's pop-out window (src/lead/LeadWindow.tsx). Only what its own bar does: drag, the on-top switch, close; its place is read through core:window:default (position/size/scale). No notifications or dialogs — those are the main window's.",
+  "windows": ["lead-*"],
+  "platforms": ["linux", "macOS", "windows"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-always-on-top",
+    "core:window:allow-close"
+  ]
+}
