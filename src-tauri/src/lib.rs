@@ -35,6 +35,8 @@ mod logs;
 #[cfg(all(desktop, feature = "inproc-core"))]
 mod notes;
 #[cfg(all(desktop, feature = "inproc-core"))]
+mod catchup;
+#[cfg(all(desktop, feature = "inproc-core"))]
 mod plan;
 #[cfg(all(desktop, feature = "inproc-core"))]
 mod providers;
@@ -233,6 +235,8 @@ pub fn run() {
             tailnet::tailnet_device_revoke,
             notes::note_get,
             notes::note_set,
+            catchup::catchup,
+            catchup::catchup_ack,
             hosts::host_token_get,
             hosts::host_token_set,
             hosts::host_token_delete,
