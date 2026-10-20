@@ -30,6 +30,12 @@ function untilText(iso: string, now: number): string {
 
 const pctText = (n: number | undefined) => (n === undefined ? "--" : `${Math.round(n)}%`);
 
+/** #2247: değer var ama bayat (dexd `note` verdi): "20 dk önce güncellendi — kullanım uç noktası HTTP 429". */
+function staleHint(p: ProviderUsage, now: number): string {
+  if (!p.note || severity(p) === "unknown") return "";
+  return [updatedAgo(p.measuredAt, now), p.note].filter(Boolean).join(" — ");
+}
+
 /** Halka yayları: dış 5 saat, iç haftalık (ortada logo). */
 const ARCS = [{ k: "fiveHour", r: 15.5 }, { k: "weekly", r: 11.5 }] as const;
 
@@ -41,7 +47,7 @@ function Ring({ p, now, onHover }: { p: ProviderUsage; now: number; onHover: (id
     : [m.label, ...WINDOWS.map(([k, label]) => {
       const w = p[k];
       return w ? [`${label}: %${Math.round(w.remainingPercent)} kalan`, w.resetsAt && untilText(w.resetsAt, now)].filter(Boolean).join(", ") : `${label}: --`;
-    })].join("\n");
+    }), staleHint(p, now)].filter(Boolean).join("\n");
   // TM dock'u gibi: halka marka renginde, harcanan kısım o rengin soluk tonu, ortada logo metin renginde.
   const brand = m.color.startsWith("#") ? m.color : undefined;
   return (
@@ -107,6 +113,9 @@ function ProviderCard({ p, now, anchor, place, onHover }: {
       </div>
       {updatedAgo(p.measuredAt, now) && (
         <div className="usage-card-updated">{updatedAgo(p.measuredAt, now)}</div>
+      )}
+      {p.note && severity(p) !== "unknown" && (
+        <div className="usage-card-updated" data-stale="">{p.note}</div>
       )}
       {severity(p) === "unknown" ? (
         <div className="usage-card-empty">şu an veri yok{p.note ? ` — ${p.note}` : ""}</div>
