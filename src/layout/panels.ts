@@ -3,12 +3,12 @@
 // `openAgent`/`openPanel`/… without pulling `dockview-react` into the first-open chunk —
 // the `Workspace` component itself loads lazily.
 import type {
-  AddPanelOptions, DockviewApi, IDockviewPanel,
+  AddPanelOptions, DockviewApi, IDockviewGroupPanel, IDockviewPanel,
 } from "dockview-react";
 import { kept } from "../hot";
 import { requestFocus } from "../launcher";
 import { killPty } from "../pty";
-import { addShell, assistantOffered, catchupOffered, getFavorite, getSnapshot, removeShell, setAssistantOffered, setCatchupOffered, setDock, setFavorite, shellPtyId } from "./store";
+import { addShell, assistantOffered, catchupOffered, getFavorite, getSnapshot, removeShell, setAssistantOffered, setCatchupOffered, setDock, setFavorite, setShellGroup, shellGroupOf, shellPtyId } from "./store";
 import { getActiveTeamId, membersOf } from "../team/store";
 import { isAssignable } from "../team/rolePolicy";
 import { newShellCwd, resolveShellCwd } from "../project/store";
@@ -21,6 +21,7 @@ import { movePlaysFx, workerGroups, type WorkerRows } from "./workerGroups";
 import { playCircuit } from "../office/circuitFx";
 import { ReadyActions } from "./readyActions";
 import { opensAssistant } from "./assistantPlacement";
+import { removesEmptyGroup, resolveShellGroup } from "./shellGroup";
 
 const hot = import.meta.hot;
 const apis = kept(hot, "apis", () => new Map<string, DockviewApi>());
@@ -250,19 +251,13 @@ function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
     if (api.height) p.group.api.setSize({ height: Math.round(api.height * NOTES_H) });
     return p;
   }
-  if (kind === "procs") {
-    const shell = api.panels.find(p => kindOf(teamId, p.id) === "shell");
-    if (shell) return api.addPanel({ ...spec, position: { referenceGroup: shell.group } });
+  if (kind === "procs" || kind === "shell") {
+    // #65/#2266: one terminal group — a new shell (or Süreçler) tabs onto it, empty or not; none → a new row at the bottom left.
+    const home = shellGroup(teamId, api);
+    if (home) return api.addPanel({ ...spec, position: { referenceGroup: home.id } });
   }
   if (kind === "shell") {
-    // #65: one terminal group — a new shell tabs onto it; none open → a new row at the bottom left.
-    const shells = api.panels.filter(p => p.id.startsWith("shell:"));
-    const shell = shells[shells.length - 1];
-    if (shell) return api.addPanel({ ...spec, position: { referenceGroup: shell.group } });
-    const box = (p: IDockviewPanel) => p.group.element.getBoundingClientRect();
-    const workers = peers.filter(p => kindOf(teamId, p.id) === "worker")
-      .sort((a, b) => box(b).bottom - box(a).bottom || box(a).left - box(b).left);
-    const ref = workers[0] ?? office;
+    const ref = shellRowAnchor(teamId, api);
     if (ref) return api.addPanel({ ...spec, position: { referencePanel: ref, direction: "below" } });
   }
   if (last) {
@@ -279,6 +274,49 @@ function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
     return api.addPanel({ ...spec, position: { referenceGroup: leader.group, direction: "left" } });
   }
   return api.addPanel({ ...spec, ...(office ? { position: { referencePanel: office, direction: "below" } } : {}) });
+}
+
+/** Where a terminal row starts when there is none: under the lowest worker, else under the Kart. */
+function shellRowAnchor(teamId: string, api: DockviewApi): IDockviewPanel | undefined {
+  const box = (p: IDockviewPanel) => p.group.element.getBoundingClientRect();
+  const workers = api.panels.filter(p => kindOf(teamId, p.id) === "worker")
+    .sort((a, b) => box(b).bottom - box(a).bottom || box(a).left - box(b).left);
+  return workers[0] ?? api.getPanel("office");
+}
+
+// ---- #2266: the fixed terminal group — its pane (and "Yeni terminal") stays when every tab is closed ----
+
+/** The fixed group as it stands (remembered id first, then the terminal's group, then an empty one); null when none. */
+export function shellGroup(teamId: string, api: DockviewApi): IDockviewGroupPanel | null {
+  const grid = api.groups.filter(g => g.api.location.type === "grid");
+  const id = resolveShellGroup(grid.map(g => ({ id: g.id, panels: g.panels.map(p => p.id) })), shellGroupOf(teamId));
+  return (id && api.getGroup(id)) || null;
+}
+
+/**
+ * Resolve and remember the fixed group; a layout without one (saved before #2266, or the patron
+ * dragged its last tab away) gets an empty one at the terminal row's default spot and size, once.
+ */
+export function ensureShellGroup(teamId: string, api: DockviewApi): IDockviewGroupPanel | null {
+  if (!api.totalPanels) return null;
+  let g: IDockviewGroupPanel | null = shellGroup(teamId, api);
+  if (!g) {
+    quietly(teamId, () => {
+      const ref = shellRowAnchor(teamId, api);
+      g = api.addGroup(ref ? { referencePanel: ref, direction: "below" } : { direction: "below" });
+      if (api.height) g.api.setSize({ height: Math.round(api.height * SHELLS_H) });
+    });
+  }
+  setShellGroup(teamId, g?.id);
+  return g;
+}
+
+/** Close a tab: a group emptied this way goes — except the fixed terminal group, whose pane stays. */
+export function closePanel(api: DockviewApi, panel: IDockviewPanel) {
+  const teamId = [...apis].find(([, a]) => a === api)?.[0];
+  const removeEmptyGroup = teamId === undefined || removesEmptyGroup(shellGroup(teamId, api)?.id ?? null, panel.group.id);
+  // DockviewApi.removePanel drops the options; the component (public on the api object) takes them.
+  (api as unknown as { component: { removePanel(p: IDockviewPanel, o: { removeEmptyGroup: boolean }): void } }).component.removePanel(panel, { removeEmptyGroup });
 }
 
 function open(teamId: string, spec: Spec | null, onOpened?: () => void): boolean {
@@ -357,7 +395,7 @@ function quietly(teamId: string, f: () => void) {
 export function closeShell(teamId: string, shellId: string) {
   const api = apis.get(teamId);
   const p = api?.getPanel(shellPanelId(shellId));
-  if (api && p) quietly(teamId, () => api.removePanel(p));
+  if (api && p) quietly(teamId, () => closePanel(api, p));
   killPty(shellPtyId(shellId)).catch(() => {});
   removeShell(teamId, shellId);
 }
@@ -371,6 +409,7 @@ export function resetLayout(teamId: string) {
     workerRows.delete(api);
     buildDefault(teamId, api);
   });
+  ensureShellGroup(teamId, api);
   if (getFavorite()) lockOffice(api);
 }
 
@@ -414,6 +453,7 @@ function showFavorite(teamId: string, api: DockviewApi): boolean {
   if (!fav) return false;
   const { dock } = remapDock(migrateNotesDock(fav.dock), fav, favoriteTarget(teamId, fav.shells.length));
   workerRows.delete(api);
+  setShellGroup(teamId, undefined); // the favourite's group ids are another layout's
   quietly(teamId, () => {
     try {
       api.fromJSON(dock);
@@ -429,6 +469,7 @@ function showFavorite(teamId: string, api: DockviewApi): boolean {
   api.getPanel(NOTES.id)?.api.setTitle(NOTES.title ?? "");
   api.getPanel(CATCHUP.id)?.api.setTitle(CATCHUP.title ?? "");
   if (api.totalPanels === 0) buildDefault(teamId, api);
+  ensureShellGroup(teamId, api);
   lockOffice(api);
   return true;
 }
@@ -443,6 +484,7 @@ export function applyFavoriteLayout(teamId: string): boolean {
   const api = apis.get(teamId);
   if (api) return showFavorite(teamId, api);
   const { dock } = remapDock(migrateNotesDock(fav.dock), fav, favoriteTarget(teamId, fav.shells.length));
+  setShellGroup(teamId, undefined);
   setDock(teamId, dock);
   return true;
 }
@@ -486,6 +528,7 @@ const SHELLS_H = 0.3;
  * fit at MIN_CELL_W.
  */
 function buildDefault(teamId: string, api: DockviewApi) {
+  setShellGroup(teamId, undefined); // a fresh grid: the new shell row becomes the fixed group
   const members = membersOf(teamId);
   const leaders = members.filter(a => a.kind === "leader").map(a => a.id);
   const t = getSnapshot().teams[teamId];
@@ -602,7 +645,7 @@ export function reconcile(teamId: string, api: DockviewApi) {
   const agents = new Set(membersOf(teamId).map(a => agentPanelId(a.id)));
   const shells = new Set((getSnapshot().teams[teamId]?.shells ?? []).map(s => shellPanelId(s.id)));
   const stale = api.panels.filter(p => (p.id.startsWith("agent:") && (!agents.has(p.id) || (p.params?.assistant || p.params?.assistantDirection) && kindOf(teamId, p.id) !== "assistant")) || (p.id.startsWith("shell:") && !shells.has(p.id)));
-  if (stale.length) quietly(teamId, () => stale.forEach(p => api.removePanel(p)));
+  if (stale.length) quietly(teamId, () => stale.forEach(p => closePanel(api, p)));
   syncAssistantPanel(teamId, api);
   syncCatchupPanel(teamId, api);
 }
@@ -623,6 +666,7 @@ export function load(teamId: string, api: DockviewApi) {
       } catch (e) {
         console.warn("dockview düzeni okunamadı, varsayılana dönülüyor:", e);
         api.clear();
+        setShellGroup(teamId, undefined);
       }
     }
     reconcile(teamId, api);
@@ -640,6 +684,7 @@ export function load(teamId: string, api: DockviewApi) {
     if (notes) notes.group.locked = false;
     if (getFavorite()) lockOffice(api);
   });
+  ensureShellGroup(teamId, api);
   centerFloats(api);
 }
 
