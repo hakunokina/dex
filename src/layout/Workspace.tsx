@@ -12,7 +12,7 @@ import {
   type GetTabContextMenuItemsParams, type resolveMessages,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
-import { Boxes, Brain, CircuitBoard, Cpu, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, Users, X } from "lucide-react";
+import { Boxes, Brain, CircuitBoard, Cpu, History, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, Users, X } from "lucide-react";
 import { hostOf } from "../api/hosts";
 import { requestStart } from "../launcher";
 import { killPty } from "../pty";
@@ -33,9 +33,12 @@ import { noteFilled } from "./notePrompts";
 import { OfficeBar } from "../office/OfficeBar";
 import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
 import {
-  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isNotes, load, openPanel, openShell, reconcile,
+  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isCatchup, isNotes, load, openPanel, openShell, reconcile,
   resetLayout, shellPanelId, unbindApi,
 } from "./panels";
+import { ensureCatchup, useCatchup } from "../catchup/store";
+import { waitingCount } from "../catchup/model";
+import "../catchup/catchup.css";
 import "./workspace.css";
 
 const Office = lazy(() => import("../office/Office").then(m => ({ default: m.Office })));
@@ -43,6 +46,7 @@ const BoardView = lazy(() => import("../board/Board").then(m => ({ default: m.Bo
 const SettingsView = lazy(() => import("../settings/Settings").then(m => ({ default: m.SettingsView })));
 const TeamPanel = lazy(() => import("../team/TeamBar").then(m => ({ default: m.TeamPanel })));
 const NotesPage = lazy(() => import("./NotesPage").then(m => ({ default: m.NotesPage })));
+const CatchupPage = lazy(() => import("../catchup/CatchupPage").then(m => ({ default: m.CatchupPage })));
 const Procs = lazy(() => import("../procs/Procs").then(m => ({ default: m.Procs })));
 const MemoryView = lazy(() => import("../memory/MemoryMap").then(m => ({ default: m.MemoryMap })));
 
@@ -103,6 +107,18 @@ function NotesPanel() {
   return lazyPanel(<NotesPage teamId={teamId} />);
 }
 
+/** #2235: `visible` = this tab on screen in the team on screen — the auto-ack's gate. */
+function CatchupPanel({ api }: IDockviewPanelProps) {
+  const { teamId, active } = useContext(WorkspaceCtx);
+  const [visible, setVisible] = useState(api.isVisible);
+  useEffect(() => {
+    setVisible(api.isVisible);
+    const d = api.onDidVisibilityChange(e => setVisible(e.isVisible));
+    return () => d.dispose();
+  }, [api]);
+  return lazyPanel(<CatchupPage teamId={teamId} visible={active && visible} />);
+}
+
 /** S4: limits and first-reply thresholds are the team's host's (a remote team → its server). */
 function SettingsPanel() {
   const { teamId } = useContext(WorkspaceCtx);
@@ -145,6 +161,7 @@ const COMPONENTS = {
   agent: AgentPanel,
   shell: ShellPanel,
   notes: NotesPanel,
+  catchup: CatchupPanel,
 };
 
 /** Agent tab: status dot + name + the rack's marks, so a tabbed-away worker still shows its state. */
@@ -248,12 +265,30 @@ function NotesTab({ api }: IDockviewPanelHeaderProps) {
   );
 }
 
-const TABS = { agent: AgentTab, shell: ShellTab, fixed: FixedTab, notes: NotesTab };
+/** #2235: the badge is the waiting count alone; the snapshot is fetched once for the team on
+ *  screen (the store refreshes it on host events — no polling, each call scans the memory graph). */
+function CatchupTab({ api }: IDockviewPanelHeaderProps) {
+  const { teamId, active } = useContext(WorkspaceCtx);
+  const entry = useCatchup(teamId);
+  useEffect(() => { if (active) ensureCatchup(teamId); }, [active, teamId]);
+  const waiting = entry?.data ? waitingCount(entry.data) : 0;
+  return (
+    <div className="dex-tab" title={waiting ? `${api.title} · ${waiting} seni bekliyor` : api.title}>
+      <History className="dex-tab-icon" />
+      <span className="dex-tab-name">{api.title}</span>
+      {waiting > 0 && <span className="catchup-badge" role="status" aria-label={`${waiting} seni bekliyor`}>{waiting}</span>}
+      <TabClose api={api} title={`${api.title} sekmesini kapat`} />
+    </div>
+  );
+}
+
+const TABS = { agent: AgentTab, shell: ShellTab, fixed: FixedTab, notes: NotesTab, catchup: CatchupTab };
 
 function FallbackTab(props: IDockviewPanelHeaderProps) {
   if (props.api.id.startsWith("agent:")) return <AgentTab {...props as IDockviewPanelHeaderProps<{ agentId: string }>} />;
   if (props.api.id.startsWith("shell:")) return <ShellTab {...props as IDockviewPanelHeaderProps<{ shellId: string }>} />;
   if (isNotes(props.api.id)) return <NotesTab {...props} />;
+  if (isCatchup(props.api.id)) return <CatchupTab {...props} />;
   return <FixedTab {...props} />;
 }
 

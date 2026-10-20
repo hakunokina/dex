@@ -1,0 +1,54 @@
+/* #2235: "Sen yokken" — the notes panel's language (surface, section heads, tokens); rows are
+   full-width buttons so the whole row is the target and the keyboard path is the tab order. */
+.catchup {
+  display: flex; flex-direction: column; height: 100%; min-height: 0; overflow-y: auto;
+  background: var(--surface-1); padding: var(--sp-2) var(--sp-3) var(--sp-3);
+}
+.catchup-state { margin: var(--sp-2) 0; font-size: var(--fs-sm); color: var(--text-2); }
+.catchup-sec { flex: none; }
+.catchup-sec + .catchup-sec { margin-top: var(--sp-3); border-top: 1px solid var(--line); padding-top: var(--sp-2); }
+.catchup-sec-head {
+  margin: 0 0 var(--sp-1); font-size: var(--fs-sm); font-weight: var(--fw-semibold); color: var(--text-2);
+}
+.catchup-none { margin: 0; font-size: var(--fs-xs); color: var(--text-2); }
+.catchup-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; }
+.catchup-row {
+  display: flex; align-items: baseline; gap: var(--sp-2); width: 100%; min-height: 36px; text-align: left;
+  padding: var(--sp-1) var(--sp-2); border: 0; border-radius: var(--r-sm);
+  background: transparent; color: var(--text); cursor: pointer;
+  font: var(--fw-regular) var(--fs-sm)/var(--lh) var(--font-ui);
+}
+.catchup-row:hover { background: var(--hover); }
+.catchup-kind { flex: none; font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; }
+.catchup-kind.k-waiting { color: var(--amber); }
+.catchup-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catchup-at { flex: none; font-size: var(--fs-xs); color: var(--text-2); white-space: nowrap; }
+.catchup-more {
+  min-height: 32px; padding: 0 var(--sp-2); border: 0; border-radius: var(--r-sm);
+  background: transparent; color: var(--text-2); font-size: var(--fs-xs); cursor: pointer;
+}
+.catchup-more:hover { background: var(--hover); color: var(--text); }
+.catchup-more-note { margin: 0; padding: var(--sp-1) var(--sp-2); font-size: var(--fs-xs); color: var(--text-2); }
+.catchup-err { margin: var(--sp-2) 0 0; font-size: var(--fs-xs); color: var(--red-hi); line-height: var(--lh); }
+.catchup-foot {
+  flex: none; display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
+  margin-top: auto; padding-top: var(--sp-3);
+}
+.catchup-hint { font-size: var(--fs-xs); color: var(--text-2); }
+.catchup-btn {
+  display: inline-flex; align-items: center; gap: var(--sp-1); min-height: var(--ctl-h); padding: 0 var(--sp-2);
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm); background: transparent; color: var(--text);
+  font-size: var(--fs-sm); cursor: pointer;
+}
+.catchup-btn svg { width: 14px; height: 14px; }
+.catchup-btn:hover:not(:disabled) { background: var(--hover); }
+.catchup-btn:disabled { opacity: 0.5; cursor: default; }
+.catchup :is(button):focus-visible { outline: 2px solid var(--text-2); outline-offset: 2px; }
+
+/* Tab badge: the waiting count, in the dock tab's mark language (pane-ask family). */
+.catchup-badge {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
+  background: var(--red-soft); color: var(--amber);
+  font: var(--fw-semibold) var(--fs-xs)/1 var(--font-mono);
+}

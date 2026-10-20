@@ -4,8 +4,9 @@
 // Döngü: panel açılırken `fetchCatchup(team)` (since yok → sunucu imleci; imleç yoksa son 24
 // saat, üst sınır 7 gün). Gelen `since` panel açık kaldıkça tutulur ve sonraki çekişlerde geri
 // verilir (snapshot — kalemler kaybolmaz). Panel görünür + pencere odaklıyken 10 sn sonra ya da
-// "Okudum" ile `ackCatchup(team, Date.now())` çağrılır: bu yalnız DB imlecini ilerletir,
-// ekrandaki listeyi değiştirmez. Eski host (metot yok) → `null`, UI paneli göstermez.
+// "Okudum" ile `ackCatchup(team, gösterilen verinin generatedAt'i)` çağrılır — `Date.now()`
+// DEĞİL, yoksa çekiş ile ack arasında biten iş hiç görünmeden imlecin gerisinde kalır. Ack yalnız
+// DB imlecini ilerletir, ekrandaki listeyi değiştirmez. Eski host (metot yok) → `null`, UI paneli göstermez.
 import { callHost, hostSupports, splitId } from "./hosts";
 
 export type CatchupKind =

@@ -8,7 +8,7 @@ import type {
 import { kept } from "../hot";
 import { requestFocus } from "../launcher";
 import { killPty } from "../pty";
-import { addShell, assistantOffered, getFavorite, getSnapshot, removeShell, setAssistantOffered, setDock, setFavorite, shellPtyId } from "./store";
+import { addShell, assistantOffered, catchupOffered, getFavorite, getSnapshot, removeShell, setAssistantOffered, setCatchupOffered, setDock, setFavorite, shellPtyId } from "./store";
 import { getActiveTeamId, membersOf } from "../team/store";
 import { isAssignable } from "../team/rolePolicy";
 import { newShellCwd, resolveShellCwd } from "../project/store";
@@ -116,10 +116,10 @@ export const boundApi = (teamId: string) => apis.get(teamId);
 export const agentPanelId = (agentId: string) => `agent:${agentId}`;
 export const shellPanelId = (shellId: string) => `shell:${shellId}`;
 
-type Kind = "leader" | "assistant" | "worker" | "shell" | "office" | "board" | "settings" | "team" | "notes" | "memory" | "procs";
+type Kind = "leader" | "assistant" | "worker" | "shell" | "office" | "board" | "settings" | "team" | "notes" | "catchup" | "memory" | "procs";
 
 function kindOf(teamId: string, panelId: string): Kind | null {
-  if (panelId === "office" || panelId === "board" || panelId === "settings" || panelId === "team" || panelId === "memory" || panelId === "procs") return panelId;
+  if (panelId === "office" || panelId === "board" || panelId === "settings" || panelId === "team" || panelId === "memory" || panelId === "procs" || panelId === "catchup") return panelId;
   if (panelId.startsWith("shell:")) return "shell";
   if (isNotes(panelId)) return "notes";
   if (panelId.startsWith("agent:")) {
@@ -151,6 +151,11 @@ export const FIXED: Record<"office" | "board" | "settings" | "team" | "memory" |
 export const NOTES: Spec = { id: NOTES_ID, component: "notes", tabComponent: "notes", title: NOTES_TITLE };
 const isNotes = (panelId: string) => panelId === NOTES_ID;
 export { isNotes, quietly };
+
+// ---- #2235: "Sen yokken" — the catch-up summary, a tab of Core's group (Core | Notlar | Sen yokken | Echo). ----
+
+export const CATCHUP: Spec = { id: "catchup", component: "catchup", tabComponent: "catchup", title: "Sen yokken" };
+export const isCatchup = (panelId: string) => panelId === CATCHUP.id;
 
 /** The notes' share of the workspace in the default screen, and when reopened. */
 const NOTES_W = 0.38;
@@ -211,6 +216,11 @@ function add(teamId: string, api: DockviewApi, spec: Spec): IDockviewPanel {
     const anchor = api.panels.find(p => kindOf(teamId, p.id) === "leader") ?? api.panels.find(p => isNotes(p.id));
     return api.addPanel({ ...spec, params: { ...spec.params, assistant: true },
       position: anchor ? { referenceGroup: anchor.group } : { direction: "right" } });
+  }
+  if (kind === "catchup") {
+    // #2235: a tab of Core's group, next to the notes (Echo, added later, stays last).
+    const anchor = api.panels.find(p => isNotes(p.id)) ?? api.panels.find(p => kindOf(teamId, p.id) === "leader");
+    return api.addPanel({ ...spec, position: anchor ? { referenceGroup: anchor.group } : { direction: "right" } });
   }
   if (kind === "worker") {
     const pair = workerRowsOf(teamId, api);
@@ -331,6 +341,9 @@ export const revealShell = (teamId: string, shellId: string) => open(teamId, she
 /** #46: reopen the closed notes panel (or bring it forward). */
 export const openNotes = (teamId: string) => open(teamId, NOTES);
 
+/** #2235: reopen the closed "Sen yokken" tab (or bring it forward). */
+export const openCatchup = (teamId: string) => open(teamId, CATCHUP);
+
 function quietly(teamId: string, f: () => void) {
   bulk.add(teamId);
   rebuilds.set(teamId, (rebuilds.get(teamId) ?? 0) + 1);
@@ -414,6 +427,7 @@ function showFavorite(teamId: string, api: DockviewApi): boolean {
   if (rack) api.removePanel(rack);
   api.getPanel("office")?.api.setTitle("Kart");
   api.getPanel(NOTES.id)?.api.setTitle(NOTES.title ?? "");
+  api.getPanel(CATCHUP.id)?.api.setTitle(CATCHUP.title ?? "");
   if (api.totalPanels === 0) buildDefault(teamId, api);
   lockOffice(api);
   return true;
@@ -494,6 +508,9 @@ function buildDefault(teamId: string, api: DockviewApi) {
   const notes = lead
     ? api.addPanel({ ...NOTES, inactive: true, position: { referenceGroup: lead.group } })
     : put(NOTES, office, "right");
+  // #2235: "Sen yokken" tabs onto the notes' group; the assistant (synced below) appends after it.
+  api.addPanel({ ...CATCHUP, inactive: true, position: { referenceGroup: notes.group } });
+  setCatchupOffered(teamId);
 
   const workers = members.filter(a => a.kind === "worker" && isAssignable(a)).map(a => agentSpec(teamId, a.id)!);
   // #65: a team without a shell gets one — its group carries "Yeni terminal", as on the patron's first team.
@@ -565,6 +582,21 @@ function syncAssistantPanel(teamId: string, api: DockviewApi, fresh = false) {
   });
 }
 
+/**
+ * #2235: a layout saved before the catch-up tab gets it once, tabbed onto Core's group without
+ * stealing the active tab. Closed by the patron after that, it stays closed (the palette reopens it).
+ */
+function syncCatchupPanel(teamId: string, api: DockviewApi) {
+  if (!api.totalPanels) return;
+  if (api.getPanel(CATCHUP.id)) {
+    setCatchupOffered(teamId);
+    return;
+  }
+  if (catchupOffered(teamId)) return;
+  setCatchupOffered(teamId);
+  quietly(teamId, () => add(teamId, api, { ...CATCHUP, inactive: true }));
+}
+
 /** Drop panels whose agent left the team or whose shell is gone. */
 export function reconcile(teamId: string, api: DockviewApi) {
   const agents = new Set(membersOf(teamId).map(a => agentPanelId(a.id)));
@@ -572,6 +604,7 @@ export function reconcile(teamId: string, api: DockviewApi) {
   const stale = api.panels.filter(p => (p.id.startsWith("agent:") && (!agents.has(p.id) || (p.params?.assistant || p.params?.assistantDirection) && kindOf(teamId, p.id) !== "assistant")) || (p.id.startsWith("shell:") && !shells.has(p.id)));
   if (stale.length) quietly(teamId, () => stale.forEach(p => api.removePanel(p)));
   syncAssistantPanel(teamId, api);
+  syncCatchupPanel(teamId, api);
 }
 
 export function load(teamId: string, api: DockviewApi) {
@@ -602,6 +635,7 @@ export function load(teamId: string, api: DockviewApi) {
     // FIX-3/#2086: a saved title wins over the spec's; the notes tab is "Notlar".
     const notes = api.getPanel(NOTES.id);
     notes?.api.setTitle(NOTES.title ?? "");
+    api.getPanel(CATCHUP.id)?.api.setTitle(CATCHUP.title ?? "");
     // #46: DEX-41 saved its notes group locked (no drops); the notes are a free panel now.
     if (notes) notes.group.locked = false;
     if (getFavorite()) lockOffice(api);

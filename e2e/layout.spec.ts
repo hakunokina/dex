@@ -51,7 +51,7 @@ test("Düzeni sıfırla: solda Kart üstte worker'lar altta, sağda lider tam bo
   expect(lead.width / full.width).toBeGreaterThan(0.37);
   expect(lead.width / full.width).toBeLessThan(0.43);
   expect(lead.height).toBeGreaterThan(full.height - 10);
-  expect(lead.tabs).toEqual(expect.arrayContaining(["Notlar"]));
+  expect(lead.tabs).toEqual(expect.arrayContaining(["Notlar", "Sen yokken"]));
   expect(Math.max(...all.map((g) => g.left + g.width))).toBe(lead.left + lead.width);
   const kart = all.find((g) => g.tabs.includes("Kart"))!;
   expect(kart.tabs).toEqual(["Kart", "Takım", "Ayarlar"]);
@@ -101,8 +101,8 @@ test("Notlar tek panel: eski iki sayfalı kayıtlı düzen tek Notlar'a göçer,
   const notesTabs = async () => (await groups(app)).map((g) => g.tabs.filter((t) => t.includes("Notlar"))).filter((t) => t.length);
   await expect.poll(notesTabs).toEqual([["Notlar"]]);
   const all = await groups(app);
-  expect(all.map((g) => g.tabs.length)).toEqual([1, 2]); // Kart | leader + Notlar — the emptied group is gone
-  expect(all[1].tabs).toEqual([leader.name, "Notlar"].map((t) => expect.stringContaining(t)));
+  expect(all.map((g) => g.tabs.length)).toEqual([1, 3]); // Kart | leader + Notlar + Sen yokken (#2235 bir kez eklenir) — the emptied group is gone
+  expect(all[1].tabs).toEqual([leader.name, "Notlar", "Sen yokken"].map((t) => expect.stringContaining(t)));
   const stageEl = app.locator(".team-stage:not(.hidden)");
   await stageEl.locator(".dv-tab", { hasText: "Notlar" }).click();
   await expect(stageEl.getByRole("heading", { name: /Ortak not/ })).toBeVisible();
@@ -266,8 +266,8 @@ test("İki satırlı kayıtlı düzen: sağ-alt grup boşalınca üstündeki lid
   await expect.poll(async () => (await tabsOf(leader.name)).height).toBeGreaterThan(full.height - 10);
   const all = await groups(app);
   const lead = await tabsOf(leader.name);
-  // #2086: the saved two pages came back as the one "Notlar" tab in their place.
-  expect(lead.tabs).toEqual([leader.name, "Notlar"].map((t) => expect.stringContaining(t)));
+  // #2086: the saved two pages came back as the one "Notlar" tab in their place; #2235 adds "Sen yokken" once.
+  expect(lead.tabs).toEqual([leader.name, "Notlar", "Sen yokken"].map((t) => expect.stringContaining(t)));
   expect(Math.max(...all.map((g) => g.left + g.width))).toBe(lead.left + lead.width);
   // The rest stays as it was, on the left: Kart over w1 + w2.
   expect(all).toHaveLength(3);

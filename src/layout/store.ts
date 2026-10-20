@@ -29,6 +29,8 @@ export interface LayoutState {
   seed?: { left: string[]; right: string[] };
   /** The assistant whose pane Dex already opened once; closed after that, it stays closed (rack reopens it). */
   assistant?: string;
+  /** #2235: Dex already added the "Sen yokken" tab once; closed by the patron, it stays closed (palette reopens it). */
+  catchup?: boolean;
 }
 
 export interface Layouts {
@@ -99,6 +101,11 @@ export function setDock(teamId: string, dock: SerializedDockview | null) {
 export const assistantOffered = (teamId: string) => state.teams[teamId]?.assistant;
 export function setAssistantOffered(teamId: string, agentId: string) {
   if (state.teams[teamId] && state.teams[teamId].assistant !== agentId) setTeam(teamId, t => ({ ...t, assistant: agentId }));
+}
+
+export const catchupOffered = (teamId: string) => state.teams[teamId]?.catchup === true;
+export function setCatchupOffered(teamId: string) {
+  if (state.teams[teamId] && !state.teams[teamId].catchup) setTeam(teamId, t => ({ ...t, catchup: true }));
 }
 
 /** DEX-29: new shell; returns its id (the caller opens its panel). */
@@ -204,11 +211,11 @@ function parseFavorite(raw: unknown): FavoriteRec | null {
 }
 
 function parseTeam(team: unknown): LayoutState | null {
-  const { dock, shells, assistant } = (team ?? {}) as { dock?: unknown; shells?: unknown; assistant?: unknown };
+  const { dock, shells, assistant, catchup } = (team ?? {}) as { dock?: unknown; shells?: unknown; assistant?: unknown; catchup?: unknown };
   if (!Array.isArray(shells)) return null;
   // dockview validates its own JSON at fromJSON; a rejected one falls back to the default layout there.
   const d = typeof dock === "object" && dock !== null && "grid" in dock ? (dock as SerializedDockview) : null;
-  return { dock: d, shells: parseShells(shells), ...(typeof assistant === "string" ? { assistant } : {}) };
+  return { dock: d, shells: parseShells(shells), ...(typeof assistant === "string" ? { assistant } : {}), ...(catchup === true ? { catchup } : {}) };
 }
 
 /**
