@@ -1,6 +1,6 @@
 import { test, expect, newTeam, openTeam, teamAgents, paneOf } from "./fixtures";
 
-test("açık worker bittiğinde sola, yeni işte sağa geçer; kapalı/elle taşınan panel ve odak korunur", async ({ app, dexd }) => {
+test("açık worker bittiğinde sola, yeni işte sağa geçer; işsiz/elle taşınan panel ve odak korunur", async ({ app, dexd }) => {
   await app.setViewportSize({ width: 1000, height: 720 });
   const team = await newTeam(dexd, "Worker grupları");
   const agents = await teamAgents(dexd, team.id);
@@ -10,14 +10,16 @@ test("açık worker bittiğinde sola, yeni işte sağa geçer; kapalı/elle taş
   await openTeam(app, team.name);
   await expect(app.locator("canvas.office")).toBeVisible();
   const setup = await app.evaluate(async ({ teamId, ids, leaderId }) => {
-    // Set up two rows and a manually placed worker using the real dock API.
+    // Set up two rows and a manually placed worker using the real dock API. #2267: the fourth worker
+    // has no job and sits in the working row as its anchor (the patron's idle Kernel-4), so the row
+    // never empties while the others move.
     const { boundApi, agentPanelId } = await import("/src/layout/panels.ts");
     const api = boundApi(teamId)!;
     const pane = (id: string) => api.getPanel(agentPanelId(id))!;
     const working = pane(ids[0]).group;
     pane(ids[1]).api.moveTo({ group: working, position: "left", skipSetActive: true });
     pane(ids[2]).api.moveTo({ group: pane(leaderId).group, skipSetActive: true });
-    api.removePanel(pane(ids[3]));
+    pane(ids[3]).api.moveTo({ group: working, skipSetActive: true });
     pane(leaderId).api.setActive();
     return { working: working.id, done: pane(ids[1]).group.id, other: pane(ids[2]).group.id };
   }, { teamId: team.id, ids: workers.map(a => a.id), leaderId: leader.id });
@@ -37,7 +39,7 @@ test("açık worker bittiğinde sola, yeni işte sağa geçer; kapalı/elle taş
   const emit = async (status: string, id = 1) => {
     const before = await app.evaluate(() => window.__dexCalls.filter(c => c.cmd === "delegation_list").length);
     await app.evaluate(({ status, id, workers, leader, team }) => {
-      const jobs = [workers[0], workers[2], workers[3]].map((worker, index) => ({
+      const jobs = [workers[0], workers[2]].map((worker, index) => ({
         id: id + index * 100, fromAgent: leader, toAgent: worker, teamId: team,
         serviceTeamId: null, prompt: "test", status, summary: "test", resultPath: null,
         taskId: null, createdAt: 1, updatedAt: id, deliveredAt: 1,
@@ -55,7 +57,7 @@ test("açık worker bittiğinde sola, yeni işte sağa geçer; kapalı/elle taş
   await expect(app.locator(".office-fx polyline")).toHaveCount(1);
   await expect(app.locator("[data-worker-focus]")).toBeFocused();
   expect(await groupOf(workers[2].id)).toBe(setup.other);
-  expect(await groupOf(workers[3].id)).toBeNull();
+  expect(await groupOf(workers[3].id)).toBe(setup.working);
   await expect(app.locator(".office-fx")).toHaveCount(0);
   await emit("running", 2);
   await expect.poll(() => groupOf(workers[0].id)).not.toBe(setup.done);
@@ -130,7 +132,77 @@ test("açık worker bittiğinde sola, yeni işte sağa geçer; kapalı/elle taş
   await emit("running", 5);
   await expect.poll(() => groupOf(workers[0].id)).not.toBe(savedGroup);
   expect(await groupOf(workers[2].id)).toBe(setup.other);
-  expect(await groupOf(workers[3].id)).toBeNull();
+  expect(await groupOf(workers[3].id)).toBe(setup.working);
+});
+
+// #2267 (the patron's screen): Kernel-1 left without a role, Kernel-4 under the Kart still carrying a
+// "done" record from days ago, Pixel-1 closed. A job for Pixel-1 opens its panel in the row under the
+// Kart without taking the keyboard or the tab; the stale record yields to the geometry; finished, the
+// panel goes to the row on the left. A closed worker without a job stays closed.
+test("kapalı worker paneli iş başlayınca Kart altındaki çalışan grupta açılır, bitince sola geçer; eski 'bitti' kaydı geometriye yenilir", async ({ app, dexd }) => {
+  await app.setViewportSize({ width: 1000, height: 720 });
+  const team = await newTeam(dexd, "Kapalı worker");
+  const agents = await teamAgents(dexd, team.id);
+  const leader = agents.find(a => a.kind === "leader")!;
+  const workers = agents.filter(a => a.kind === "worker");
+  await app.reload();
+  await openTeam(app, team.name);
+  await expect(app.locator("canvas.office")).toBeVisible();
+  const setup = await app.evaluate(async ({ teamId, ids }) => {
+    const { boundApi, agentPanelId } = await import("/src/layout/panels.ts");
+    const api = boundApi(teamId)!;
+    const pane = (id: string) => api.getPanel(agentPanelId(id))!;
+    api.removePanel(pane(ids[2]));
+    api.removePanel(pane(ids[3]));
+    const under = pane(ids[1]).group;
+    pane(ids[0]).api.moveTo({ group: under, position: "left", skipSetActive: true });
+    pane(ids[1]).api.updateParameters({ workerRow: "done", workerRowGroup: under.id });
+    return { under: under.id, left: pane(ids[0]).group.id };
+  }, { teamId: team.id, ids: workers.map(a => a.id) });
+  expect(setup.left).not.toBe(setup.under);
+  const groupOf = (id: string) => app.evaluate(async ({ teamId, id }) => {
+    const { boundApi, agentPanelId } = await import("/src/layout/panels.ts");
+    return boundApi(teamId)!.getPanel(agentPanelId(id))?.group.id ?? null;
+  }, { teamId: team.id, id });
+  const focus = (await paneOf(app, leader.name)).getByRole("tab", { name: "Terminal", exact: true });
+  await focus.focus();
+  await app.keyboard.press("Tab");
+  expect(await app.evaluate(() => {
+    document.activeElement?.setAttribute("data-worker-focus", "");
+    return !!document.activeElement;
+  })).toBe(true);
+  const emit = async (status: string) => {
+    const before = await app.evaluate(() => window.__dexCalls.filter(c => c.cmd === "delegation_list").length);
+    await app.evaluate(({ status, worker, leader, team }) => {
+      window.__dexFake = { ...window.__dexFake, delegation_list: [{
+        id: 1, fromAgent: leader, toAgent: worker, teamId: team, serviceTeamId: null, prompt: "test", status,
+        summary: "test", resultPath: null, taskId: null, createdAt: 1, updatedAt: 1, deliveredAt: 1,
+      }] };
+      const socket = window.__dexSockets!.filter(s => s.readyState === WebSocket.OPEN).at(-1)!;
+      socket.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ event: "delegations-changed", payload: null }) }));
+    }, { status, worker: workers[3].id, leader: leader.id, team: team.id });
+    await expect.poll(() => app.evaluate(() => window.__dexCalls.filter(c => c.cmd === "delegation_list").length)).toBeGreaterThan(before);
+    await app.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+  };
+  await emit("running");
+  await expect.poll(() => groupOf(workers[3].id)).toBe(setup.under);
+  await expect(app.locator("[data-worker-focus]")).toBeFocused();
+  const opened = await app.evaluate(async ({ teamId, ids }) => {
+    const { boundApi, agentPanelId } = await import("/src/layout/panels.ts");
+    const api = boundApi(teamId)!;
+    const anchor = api.getPanel(agentPanelId(ids[1]))!;
+    const left = api.getPanel(agentPanelId(ids[0]))!;
+    return { anchorOnScreen: anchor.api.isVisible, anchorRow: anchor.params?.workerRow, leftRow: left.params?.workerRow, newOnScreen: api.getPanel(agentPanelId(ids[3]))!.api.isVisible };
+  }, { teamId: team.id, ids: workers.map(a => a.id) });
+  expect(opened).toEqual({ anchorOnScreen: true, anchorRow: "working", leftRow: "done", newOnScreen: false });
+  await expect(app.locator(".office-fx")).toHaveCount(0);
+  await emit("done");
+  await expect.poll(() => groupOf(workers[3].id)).toBe(setup.left);
+  await expect(app.locator(".office-fx polyline")).toHaveCount(1);
+  await expect(app.locator("[data-worker-focus]")).toBeFocused();
+  expect(await groupOf(workers[1].id)).toBe(setup.under);
+  expect(await groupOf(workers[0].id)).toBe(setup.left);
+  expect(await groupOf(workers[2].id)).toBeNull();
 });
 
 test("geniş düzende yeni worker sağa bölünür ve işi bitince sola taşınır", async ({ app, dexd }) => {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { movePlaysFx, workerMoves, workerGroups } from "./workerGroups.ts";
+import { movePlaysFx, reconcileWorkerRows, workerGroups, workerMoves, workerStep } from "./workerGroups.ts";
 
 test("FIFO: yeni queued iş önceki işin running geçişini maskelemez", () => {
   const queued = [2, 3].map(id => ({ id, toAgent: "w", status: "queued" }));
@@ -49,4 +49,44 @@ test("taşıma efekti yalnız ekrandaki takımda ve hareket azaltılmamışken o
   assert.equal(movePlaysFx("main", "jezdev", false), false);
   assert.equal(movePlaysFx("main", "", false), false);
   assert.equal(movePlaysFx("main", "main", true), false);
+});
+
+// #2267: the patron's layout — Kernel-1 left (no role), Kernel-4 under the Kart with a "done" record from
+// days ago, Pixel-1 closed. The record contradicts the rule (under the Kart = working): geometry wins.
+test("Kart altındaki grubun eski 'bitti' kaydı atılır: o grup çalışan, solu bitti", () => {
+  const stale = { working: new Set<string>(), done: "7" };
+  assert.deepEqual(reconcileWorkerRows(stale, { working: new Set(["7"]), done: "3" }), { working: new Set(["7"]), done: "3" });
+  // No left neighbour: the stale "done" is not kept as the finished row either.
+  assert.deepEqual(reconcileWorkerRows(stale, { working: new Set(["7"]) }), { working: new Set(["7"]) });
+});
+
+test("geometriyle uyuşan kayıt olduğu gibi kalır (geniş düzende iki çalışan grup dahil)", () => {
+  const wide = { working: new Set(["a", "b"]), done: "d" };
+  assert.equal(reconcileWorkerRows(wide, { working: new Set(["b"]), done: "a" }), wide);
+  const noDone = { working: new Set(["a", "b"]) };
+  assert.equal(reconcileWorkerRows(noDone, { working: new Set(["b"]), done: "a" }), noDone); // "a" is a working group, not the finished row
+  assert.deepEqual(reconcileWorkerRows({ working: new Set(["b"]) }, { working: new Set(["b"]), done: "d" }), { working: new Set(["b"]), done: "d" });
+});
+
+test("geometri yokken (gizli takım, Kart altı boş) kayıt korunur", () => {
+  const rec = { working: new Set(["w"]), done: "d" };
+  assert.equal(reconcileWorkerRows(rec, undefined), rec);
+  assert.equal(reconcileWorkerRows(rec, { working: new Set() }), rec);
+});
+
+test("kayıtlı çalışan grup Kart altında değilse Kart altındaki kazanır; sol komşu yoksa eski bitti grubu kalır", () => {
+  assert.deepEqual(reconcileWorkerRows({ working: new Set(["x"]), done: "d" }, { working: new Set(["u"]) }), { working: new Set(["u"]), done: "d" });
+  assert.deepEqual(reconcileWorkerRows({ working: new Set(["x"]), done: "d" }, { working: new Set(["u"]), done: "l" }), { working: new Set(["u"]), done: "l" });
+});
+
+test("kapalı panel iş başlayınca açılır, bitince açılmaz; açık panel yalnız kendi sırasından taşınır", () => {
+  const rows = { working: new Set(["w"]), done: "d" };
+  assert.equal(workerStep(null, rows, false), "open"); // the regression: this was never a move
+  assert.equal(workerStep(null, rows, true), null);
+  assert.equal(workerStep("d", rows, false), "working");
+  assert.equal(workerStep("w", rows, false), null);
+  assert.equal(workerStep("w", rows, true), "done");
+  assert.equal(workerStep("d", rows, true), null);
+  assert.equal(workerStep("elsewhere", rows, false), null);
+  assert.equal(workerStep("elsewhere", rows, true), null);
 });
