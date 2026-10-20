@@ -100,3 +100,17 @@
 .pane-name { font: var(--fw-semibold) var(--fs-sm) var(--font-ui); }
 .pane-deleg { color: var(--red); font: var(--fw-semibold) var(--fs-xs) var(--font-mono); }
 .pane-ask { color: var(--amber); font: var(--fw-semibold) var(--fs-xs)/1 var(--font-mono); }
+
+/* #2258: a leader popped out to its own window — the panel keeps its place and offers the way back. */
+.pane-popped {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--sp-2);
+  color: var(--muted); font-size: var(--fs-sm);
+}
+.pane-popped-icon { width: 22px; height: 22px; color: var(--faint); }
+.pane-popped-actions { display: flex; gap: var(--sp-2); }
+.pane-popped-actions button {
+  height: var(--ctl-h); padding: 0 var(--sp-3); cursor: pointer;
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text);
+}
+.pane-popped-actions button:hover { background: var(--surface-3); border-color: var(--line-strong); }
+.dex-tab-action.on { opacity: 1; color: var(--team); }

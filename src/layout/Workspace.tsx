@@ -12,7 +12,7 @@ import {
   type GetTabContextMenuItemsParams, type resolveMessages,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
-import { Boxes, Brain, CircuitBoard, Cpu, History, Lock, NotebookPen, Play, Settings, Square, SquareKanban, SquareTerminal, Users, X } from "lucide-react";
+import { Boxes, Brain, CircuitBoard, Cpu, History, Lock, NotebookPen, PictureInPicture2, Play, Settings, Square, SquareKanban, SquareTerminal, Users, X } from "lucide-react";
 import { hostOf } from "../api/hosts";
 import { requestStart } from "../launcher";
 import { killPty } from "../pty";
@@ -31,7 +31,8 @@ import { PanelBoundary } from "./PanelBoundary";
 import { useLeaderPrompt, useNoteBody } from "./noteMarks";
 import { noteFilled } from "./notePrompts";
 import { OfficeBar } from "../office/OfficeBar";
-import { getSnapshot, resumableSession, setDock, shellPtyId, subscribe } from "./store";
+import { getSnapshot, isPoppedOut, resumableSession, setDock, shellPtyId, subscribe } from "./store";
+import { detachLeader, focusPopout, reattachLeader } from "./popoutWindows";
 import {
   agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isCatchup, isNotes, load, openPanel, openShell, reconcile,
   resetLayout, shellPanelId, unbindApi,
@@ -95,7 +96,23 @@ function AgentPanel({ api, params }: IDockviewPanelProps<{ agentId: string }>) {
   useEffect(() => {
     if (active && visible) markSeen(params.agentId);
   }, [active, visible, delegations, params.agentId]);
+  // #2258: a leader in its own window — the slot is parked, this panel holds its place and the way back.
+  const out = useSyncExternalStore(subscribe, () => isPoppedOut(params.agentId));
+  if (out) return <PoppedOutPanel agentId={params.agentId} />;
   return <SlotPanel slot={agentPanelId(params.agentId)} api={api} />;
+}
+
+function PoppedOutPanel({ agentId }: { agentId: string }) {
+  return (
+    <div className="panel-fill pane-popped" role="status">
+      <PictureInPicture2 className="pane-popped-icon" aria-hidden />
+      <span>Ayrı pencerede açık</span>
+      <div className="pane-popped-actions">
+        <button onClick={() => void focusPopout(agentId)} title="Ayrı pencereyi öne getir">Pencereye git</button>
+        <button onClick={() => void reattachLeader(agentId)} title="Pencereyi kapat, paneli buraya geri al">Geri al</button>
+      </div>
+    </div>
+  );
 }
 
 function ShellPanel({ api, params }: IDockviewPanelProps<{ shellId: string }>) {
@@ -166,8 +183,10 @@ const COMPONENTS = {
 
 /** Agent tab: status dot + name + the rack's marks, so a tabbed-away worker still shows its state. */
 function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }>) {
+  const { teamId } = useContext(WorkspaceCtx);
   const agentId = params?.agentId ?? api.id.slice("agent:".length);
   const status = useAgentStatus(agentId);
+  const out = useSyncExternalStore(subscribe, () => isPoppedOut(agentId));
   const agent = useTeams().agents.find(a => a.id === agentId);
   const name = agent?.name ?? api.title;
   const session = useSyncExternalStore(subscribe, () => agent ? resumableSession(agent.id, agent.engine) : null);
@@ -186,6 +205,14 @@ function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }
       {progress && <ProgressChip p={progress} />}
       {delegated > 0 && <span className="pane-deleg" title="Aktif devretmeler">⇢ {delegated}</span>}
       {pending > 0 && <span className="pane-ask" title="Worker soruları cevap bekliyor">? {pending}</span>}
+      {/* #2258: the leader's pane in its own window (PiP-like); the assistant stays a tab. */}
+      {agent?.kind === "leader" && agent.roleSlug !== "assistant" && (
+        <button className={`dex-tab-action${out ? " on" : ""}`} aria-pressed={out}
+          title={out ? "Ayrı pencereye git" : "Pencereye ayır"} aria-label={`${name}: ${out ? "ayrı pencereye git" : "pencereye ayır"}`}
+          onPointerDown={control} onClick={(e) => { control(e); void (out ? focusPopout(agentId) : detachLeader(teamId, agentId)); }}>
+          <PictureInPicture2 />
+        </button>
+      )}
       {status === "offline" ? (
         <button className="dex-tab-action" title={session ? "Oturumu sürdür" : "Claude'u başlat"}
           onPointerDown={control} onClick={(e) => { control(e); requestStart(agentId); }}><Play /></button>

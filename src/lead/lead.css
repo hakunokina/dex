@@ -1,0 +1,27 @@
+/* #2258: the leader pop-out window — a title bar (drag region, on-top switch, close) over one pane. */
+.lead-window { display: flex; flex-direction: column; height: 100vh; background: var(--bg); color: var(--text); }
+.lead-bar {
+  display: flex; align-items: center; gap: var(--sp-2); flex: none;
+  height: 32px; padding: 0 0 0 var(--sp-3); border-bottom: 1px solid var(--line); background: var(--surface-1);
+  -webkit-user-select: none; user-select: none;
+}
+.lead-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: var(--fw-semibold) var(--fs-sm) var(--font-ui); }
+.lead-pin {
+  display: inline-flex; align-items: center; gap: 4px; flex: none; height: var(--ctl-h-sm); padding: 0 var(--sp-2);
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: var(--fs-xs); cursor: pointer;
+}
+.lead-pin svg { width: 12px; height: 12px; }
+.lead-pin:hover { color: var(--text); background: var(--hover); }
+.lead-pin.on { color: var(--team); border-color: var(--team-line); background: var(--team-soft); }
+.lead-close {
+  display: inline-flex; align-items: center; justify-content: center; flex: none; align-self: stretch;
+  width: 40px; padding: 0; border: 0; background: none; color: var(--muted); cursor: pointer;
+}
+.lead-close svg { width: 14px; height: 14px; stroke-width: 1.5; }
+.lead-close:hover { color: var(--text); background: var(--red); }
+.lead-pin:focus-visible, .lead-close:focus-visible { outline: none; box-shadow: var(--ring); }
+.lead-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: var(--sp-1); }
+.lead-body > .pane { flex: 1; min-height: 0; }
+/* Small window: the pane's control row wraps instead of pushing the terminal's controls off screen. */
+.lead-window .pane-view-toggle { flex-wrap: wrap; }
+.lead-note { margin: auto; color: var(--muted); font-size: var(--fs-sm); }

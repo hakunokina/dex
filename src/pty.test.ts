@@ -89,3 +89,30 @@ test("an in-flight old attach failure follows the replacement subscription", asy
   assert.equal(await attaching, true, "an obsolete attachment failure cannot hide a live replacement");
   assert.equal(f.subscriptions.length, 2);
 });
+
+// #2258: ownership moves with the pane — detach: this window drops its subscription and takes no
+// new one; back: a view attaches again. The policy is the gate, `releasePty` the hand-over.
+test("popped-out leader: subscription released, online signals ignored, back on reattach", async () => {
+  const f = fixture();
+  const sink = { onData: () => {}, onExit: () => {} };
+  await f.api.capturePty("kaan", 0);
+  assert.equal(await f.api.attachPty("kaan", sink), true);
+  assert.equal(f.subscriptions.length, 1);
+
+  let out = new Set(["kaan"]);
+  f.api.setPtyPolicy((id) => !out.has(id));
+  await f.api.releasePty("kaan");
+  assert.deepEqual(f.detached, [0], "the main window's subscription is gone");
+  f.subscriptions[0].onData(new TextEncoder().encode("LATE"));
+  await f.api.capturePty("kaan", 0);
+  await f.api.capturePty("kaan", 1);
+  assert.equal(await f.api.attachPty("kaan", sink), false, "a popped-out pane never attaches here");
+  assert.equal(f.subscriptions.length, 1, "no new subscription while another window owns the PTY");
+  await f.api.capturePty("ece", 0);
+  assert.equal(f.subscriptions.length, 2, "other agents are unaffected");
+
+  out = new Set();
+  assert.equal(await f.api.attachPty("kaan", sink), true, "back in the main window: a fresh subscription");
+  assert.equal(f.subscriptions.length, 3);
+  await f.api.releasePty("nobody");
+});

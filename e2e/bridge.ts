@@ -248,6 +248,8 @@ export function installBridge(cfg: BridgeConfig) {
     if (cmd === "plugin:notification|is_permission_granted") return false;
     if (cmd === "plugin:notification|request_permission") return "denied";
     if (cmd === "plugin:dialog|open") return cfg.pick;
+    // #2260: the living windows; a test lists extra labels (e.g. `lead-<id>`) under `dex.e2e.windows`.
+    if (cmd === "plugin:window|get_all_windows") return ["main", ...(JSON.parse(localStorage.getItem("dex.e2e.windows") ?? "[]") as string[])];
     if (cmd.startsWith("plugin:window|")) return cmd.endsWith("|is_maximized") ? false : null;
     if (cmd.startsWith("plugin:")) return null;
     // #150: the core is the worker's dexd; #151: "not running" while LOCAL_DOWN_KEY is set.

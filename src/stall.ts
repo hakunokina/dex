@@ -10,6 +10,7 @@ import { callHost, qid, splitId } from "./api/hosts";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { findAgent, getStatus } from "./agents";
 import { pastePing, pingable } from "./delegations";
+import { POPOUT } from "./api/platform";
 import { kept, listenKept } from "./hot";
 import { soundEvent } from "./sound";
 
@@ -83,6 +84,7 @@ function fire(id: string) {
   const min = Math.round((Date.now() - w.last) / 60_000);
   stalled.set(id, min);
   changed();
+  if (POPOUT) return; // #2258: the mark shows here too; the note and the notification are the main window's
   soundEvent("agent_stalled");
   void tell(id, min);
 }

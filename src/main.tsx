@@ -5,16 +5,19 @@ import "@fontsource-variable/inter/opsz.css";
 import "@fontsource-variable/jetbrains-mono/wght.css";
 // S5-A: one shell per platform — the desktop workspace (dockview, panes, topbar) never loads in the
 // mobile bundle, and the mobile shell knows nothing of docks. Same fonts, same tokens.
-import { MOBILE } from "./api/platform";
+import { MOBILE, POPOUT } from "./api/platform";
 import { applyDensity } from "./density";
 
 // #34: `?snip` = a screenshot selection overlay window (src-tauri/src/snip.rs), not the workspace.
+// #2258: `?pane=lead&team=…&agent=…` = one leader's pane in its own window (src/lead/LeadWindow.tsx).
 const SNIP = new URLSearchParams(location.search).has("snip");
 const Root = SNIP
   ? lazy(() => import("./snip/SnipOverlay"))
-  : MOBILE
-    ? lazy(() => import("./mobile/MobileApp"))
-    : lazy(() => import("./App"));
+  : POPOUT
+    ? lazy(() => import("./lead/LeadWindow"))
+    : MOBILE
+      ? lazy(() => import("./mobile/MobileApp"))
+      : lazy(() => import("./App"));
 
 // #33: desktop density tokens before anything measures (the phone shell keeps its touch sizes).
 if (!MOBILE && !SNIP) applyDensity();

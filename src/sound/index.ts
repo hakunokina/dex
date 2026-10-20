@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from "react";
-import { MOBILE } from "../api/platform";
+import { MOBILE, POPOUT } from "../api/platform";
 import { onEvent } from "../api/hosts";
 import { kept } from "../hot";
 import { SOUND_LABELS, createSoundGate, normalizeSoundSettings, soundForEvent, type SoundEvent, type SoundKind, type SoundSettings } from "./model";
@@ -89,7 +89,7 @@ const failed = (error: unknown) => publish(box.view.settings, box.view.error, er
 
 /** Automatic events never queue old sounds behind an autoplay lock. Focus is irrelevant. */
 export function soundEvent(event: SoundEvent) {
-  if (MOBILE) return;
+  if (MOBILE || POPOUT) return; // #2258: the main window plays; a pop-out would double it
   const kind = soundForEvent(event);
   if (!kind || !box.accept(kind, box.view.settings, performance.now())) return;
   try {

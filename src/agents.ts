@@ -5,7 +5,7 @@ import { kept, listenKept } from "./hot";
 import { toast } from "./toast/store";
 import { callHost, hostOf, onHostUp, qid } from "./api/hosts";
 import { capturePty } from "./pty";
-import { MOBILE } from "./api/platform";
+import { MOBILE, POPOUT } from "./api/platform";
 import { soundEvent } from "./sound";
 
 const hot = import.meta.hot;
@@ -232,7 +232,7 @@ listenKept<{ agentId: string; text: string; resetAt?: string | null }>(hot, "dex
 });
 
 async function notifyChain(id: string, body: string) {
-  if (document.hasFocus()) return;
+  if (POPOUT || document.hasFocus()) return; // #2258: the main window notifies
   let ok = await isPermissionGranted();
   if (!ok) ok = (await requestPermission()) === "granted";
   if (ok) sendNotification({ title: `${findAgent(id)?.name ?? id}: motor zinciri`, body });
@@ -283,6 +283,7 @@ kept(hot, "statusUp", () =>
 );
 
 async function notifyWaiting(id: string) {
+  if (POPOUT) return; // #2258: the main window notifies
   soundEvent("agent_waiting");
   // Modern §6: Dex in front → an in-app toast instead of the desktop notification.
   if (document.hasFocus()) {
