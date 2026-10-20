@@ -42,7 +42,7 @@ test("offline ilk hook online olunca bir kez pıtlar", async ({ app, dexd }) => 
   await emit(app, "dex-hook", { agentId: worker.id, event: "SessionStart", status: null, sessionId: null });
   expect(await pulses(dot)).toBe(0);
   await emit(app, "agent-status", { agentId: worker.id, status: "idle" });
-  // The tab reads the status on its own 400 ms poll (Rack.tsx useStatuses); the pulse must follow it.
+  // The tab follows the status subscription (Rack.tsx useStatuses, #2248); the pulse must follow it.
   await expect(dot).toHaveClass(/idle/);
   await expect.poll(() => pulses(dot)).toBe(1);
   await dot.evaluate(el => (el as HeartbeatDot).heartbeatAnimations![0].finish());
@@ -68,21 +68,19 @@ test("online durum değişimi aynı nabzın 400 ms animasyonunu kesmez", async (
   await app.clock.install();
   await emit(app, "dex-hook", { agentId: worker.id, event: "UserPromptSubmit", status: "working", sessionId: null });
   await expect.poll(() => pulses(dot)).toBe(1);
-  // Freeze the real WAAPI animation mid-way before advancing JS timers (a pulse that already ran
-  // out under load is rewound the same way): a status poll must neither cancel nor restart it.
+  // Freeze the real WAAPI animation mid-way (a pulse that already ran out under load is rewound the
+  // same way): a status change — pushed, no timer to advance (#2248) — must neither cancel nor restart it.
   await dot.evaluate(el => {
     const animation = (el as HeartbeatDot).heartbeatAnimations![0];
     animation.pause();
     animation.currentTime = 100;
   });
-  await app.clock.runFor(400);
   await expect(dot).toHaveClass(/working/);
   expect(await dot.evaluate(el => {
     const animation = (el as HeartbeatDot).heartbeatAnimations![0];
     return el.getAnimations()[0] === animation && animation.playState === "paused" && animation.currentTime === 100;
   })).toBe(true);
   await emit(app, "agent-status", { agentId: worker.id, status: "idle" });
-  await app.clock.runFor(400);
   await expect(dot).toHaveClass(/idle/);
   expect(await dot.evaluate(el => el.getAnimations()[0]?.playState)).toBe("paused");
   expect(await dot.evaluate(el => el.getAnimations()[0]?.effect?.getTiming().duration)).toBe(400);
