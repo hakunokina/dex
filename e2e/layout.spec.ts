@@ -101,8 +101,11 @@ test("Notlar tek panel: eski iki sayfalı kayıtlı düzen tek Notlar'a göçer,
   const notesTabs = async () => (await groups(app)).map((g) => g.tabs.filter((t) => t.includes("Notlar"))).filter((t) => t.length);
   await expect.poll(notesTabs).toEqual([["Notlar"]]);
   const all = await groups(app);
-  expect(all.map((g) => g.tabs.length)).toEqual([1, 3]); // Kart | leader + Notlar + Sen yokken (#2235 bir kez eklenir) — the emptied group is gone
-  expect(all[1].tabs).toEqual([leader.name, "Notlar", "Sen yokken"].map((t) => expect.stringContaining(t)));
+  // Kart | leader + Notlar + Sen yokken (#2235 bir kez eklenir) — the emptied group is gone; #2266 adds the empty terminal group once, under the Kart.
+  expect(all.map((g) => g.tabs.length)).toEqual([1, 0, 3]);
+  expect(all[2].tabs).toEqual([leader.name, "Notlar", "Sen yokken"].map((t) => expect.stringContaining(t)));
+  expect(all[1].top).toBeGreaterThan(all[0].top + all[0].height - 1);
+  expect(all[1].left).toBe(all[0].left);
   const stageEl = app.locator(".team-stage:not(.hidden)");
   await stageEl.locator(".dv-tab", { hasText: "Notlar" }).click();
   await expect(stageEl.getByRole("heading", { name: /Ortak not/ })).toBeVisible();
@@ -117,7 +120,7 @@ test("Notlar tek panel: eski iki sayfalı kayıtlı düzen tek Notlar'a göçer,
   await expect.poll(notesTabs).toEqual([["Notlar"]]);
 });
 
-test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca paletten yenisi açılır", async ({ app, dexd }) => {
+test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca pane ve düğmeler kalır, yenisi aynı gruba açılır", async ({ app, dexd }) => {
   const team = await newTeam(dexd, `Terminal ${test.info().workerIndex}`);
   const leader = (await teamAgents(dexd, team.id)).find((a) => a.kind === "leader")!;
   await app.reload();
@@ -127,6 +130,8 @@ test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca
   await expect(rack.getByRole("button", { name: new RegExp(leader.name) })).toBeVisible();
   const stageEl = app.locator(".team-stage:not(.hidden)");
   const headerNew = stageEl.locator(".dex-group-action[aria-label='Yeni terminal']");
+  const headerProcs = stageEl.locator(".dex-group-action[aria-label='Süreçler']");
+  const emptyPane = stageEl.locator(".shell-empty");
 
   // #65: the default screen has a shell row at the bottom left, under the workers, with its "Yeni terminal".
   const shellGroups = async () => (await groups(app)).filter((g) => g.tabs.includes("Terminal"));
@@ -144,28 +149,47 @@ test("Terminal: yeni takım sol altta bir terminalle açılır; hepsi kapanınca
   await app.keyboard.press("Enter");
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([2]);
 
-  // All closed: no header action left, the palette still opens one at the bottom left.
+  // #2266: all closed — the group stays put at its size, header buttons and the empty pane in it.
   const close = app.getByRole("button", { name: "Terminali kapat" });
   while (await close.count()) await close.first().click();
   await expect.poll(shellGroups).toEqual([]);
-  await expect(headerNew).toHaveCount(0);
-  await expect(stageEl.getByRole("group", { name: "Kart araçları" }).getByRole("button", { name: "Yeni terminal" })).toHaveCount(0);
-  await app.keyboard.press("Control+Shift+P");
-  await app.getByPlaceholder(/Komut ara/).fill("Terminal aç");
+  const box = (g: { left: number; top: number; width: number; height: number }) => [g.left, g.top, g.width, g.height];
+  await expect.poll(async () => (await groups(app)).filter((g) => g.tabs.length === 0).map(box)).toEqual([box(sh)]);
+  await expect(headerNew).toHaveCount(1);
+  await expect(headerProcs).toHaveCount(1);
+  await expect(emptyPane).toBeVisible();
+  const open = emptyPane.getByRole("button", { name: "Terminal aç" });
+  await expect(open).toBeVisible();
+  // Keyboard: the empty pane's button opens the shell into this very group.
+  await open.focus();
   await app.keyboard.press("Enter");
   await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([1]);
-  const after = await groups(app);
-  const [sh2] = await shellGroups();
-  expect(sh2.left).toBe(kart.left);
-  expect(sh2.top + sh2.height).toBe(Math.max(...after.map((g) => g.top + g.height)));
-  // The header's "Yeni terminal" is back and tabs onto it.
-  await headerNew.click();
-  await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([2]);
+  expect(box((await shellGroups())[0])).toEqual(box(sh));
+  await expect(emptyPane).toHaveCount(0);
+
+  // The pane survives a reload empty, and the header's "Yeni terminal" refills it in place.
+  const saves = async () => (await calls(app)).filter((c) => c.cmd === "layout_save").length;
+  const saved = await saves();
+  await close.first().click();
+  await expect.poll(shellGroups).toEqual([]);
+  await expect(emptyPane).toBeVisible();
+  await expect.poll(saves).toBeGreaterThan(saved); // the debounced layout write landed before the reload
+  await app.reload();
+  await openTeam(app, team.name);
+  await paneOf(app, leader.name);
+  await expect(stageEl.locator(".shell-empty")).toBeVisible();
+  await expect.poll(async () => (await groups(app)).filter((g) => g.tabs.length === 0).map(box)).toEqual([box(sh)]);
+  await stageEl.locator(".dex-group-action[aria-label='Yeni terminal']").click();
+  await expect.poll(async () => (await shellGroups()).map((g) => g.tabs.length)).toEqual([1]);
+  expect(box((await shellGroups())[0])).toEqual(box(sh));
+  // Süreçler opens into the same group too.
+  await stageEl.locator(".dex-group-action[aria-label='Süreçler']").click();
+  await expect.poll(async () => (await shellGroups()).map((g) => g.tabs)).toEqual([["Terminal", "Süreçler"]]);
 
   // Close them: a live PowerShell holds the team workdir and the fixture could not remove its temp root.
   while (await close.count()) await close.first().click();
   await expect.poll(shellGroups).toEqual([]);
-  await expect.poll(async () => (await calls(app)).filter((c) => c.cmd === "pty_kill").length).toBe(4);
+  await expect.poll(async () => (await calls(app)).filter((c) => c.cmd === "pty_kill").length).toBe(1);
 });
 
 test("Üst çubuk: takım sekmeleri DEX logosunun solundan başlar, 1. takım logoya bitişik, sonrakiler sola", async ({ app, dexd }) => {
@@ -269,10 +293,13 @@ test("İki satırlı kayıtlı düzen: sağ-alt grup boşalınca üstündeki lid
   // #2086: the saved two pages came back as the one "Notlar" tab in their place; #2235 adds "Sen yokken" once.
   expect(lead.tabs).toEqual([leader.name, "Notlar", "Sen yokken"].map((t) => expect.stringContaining(t)));
   expect(Math.max(...all.map((g) => g.left + g.width))).toBe(lead.left + lead.width);
-  // The rest stays as it was, on the left: Kart over w1 + w2.
-  expect(all).toHaveLength(3);
+  // The rest stays as it was, on the left: Kart over w1 + w2 (#2266: plus the empty terminal group added once under them).
+  expect(all).toHaveLength(4);
   const kart = await tabsOf("Kart");
   const bottom = await tabsOf(w1.name);
+  const shell = all.find((g) => g.tabs.length === 0)!;
+  expect(shell.top).toBeGreaterThan(bottom.top + bottom.height - 1);
+  expect(shell.left + shell.width).toBeLessThan(lead.left);
   expect(kart.tabs).toEqual(["Kart"]);
   expect(bottom.tabs).toEqual([w1.name, w2.name].map((t) => expect.stringContaining(t)));
   expect(bottom.top).toBeGreaterThan(kart.top);

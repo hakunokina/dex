@@ -8,7 +8,7 @@ import { createContext, lazy, Suspense, useContext, useEffect, useState, useSync
 import {
   DockviewReact,
   type DockviewApi, type DockviewReadyEvent, type DockviewTheme,
-  type IDockviewHeaderActionsProps, type IDockviewPanelHeaderProps, type IDockviewPanelProps,
+  type IDockviewHeaderActionsProps, type IDockviewPanelHeaderProps, type IDockviewPanelProps, type IWatermarkPanelProps,
   type GetTabContextMenuItemsParams, type resolveMessages,
 } from "dockview-react";
 import "dockview-react/dist/styles/dockview.css";
@@ -31,12 +31,14 @@ import { PanelBoundary } from "./PanelBoundary";
 import { useLeaderPrompt, useNoteBody } from "./noteMarks";
 import { noteFilled } from "./notePrompts";
 import { OfficeBar } from "../office/OfficeBar";
-import { getSnapshot, isPoppedOut, resumableSession, setDock, shellPtyId, subscribe } from "./store";
+import { getSnapshot, isPoppedOut, resumableSession, setDock, shellGroupOf, shellPtyId, subscribe } from "./store";
 import { detachLeader, focusPopout, reattachLeader } from "./popoutWindows";
 import {
-  agentPanelId, bindApi, boundApi, closeShell, FIXED, growIntoCorner, isBulk, isCatchup, isNotes, load, openPanel, openShell, reconcile,
-  resetLayout, shellPanelId, unbindApi,
+  agentPanelId, bindApi, boundApi, closePanel, closeShell, ensureShellGroup, FIXED, growIntoCorner, isBulk, isCatchup, isNotes, load, openPanel,
+  openShell, reconcile, resetLayout, shellPanelId, unbindApi,
 } from "./panels";
+import { isShellPanel } from "./shellGroup";
+import { EmptyState } from "../EmptyState";
 import { ensureCatchup, useCatchup } from "../catchup/store";
 import { waitingCount } from "../catchup/model";
 import "../catchup/catchup.css";
@@ -142,9 +144,9 @@ function SettingsPanel() {
   return lazyPanel(<SettingsView host={hostOf(teamId)} teamId={teamId} />);
 }
 
-function TeamSettingsPanel({ api }: IDockviewPanelProps) {
+function TeamSettingsPanel({ api, containerApi }: IDockviewPanelProps) {
   const { teamId } = useContext(WorkspaceCtx);
-  return lazyPanel(<TeamPanel teamId={teamId} onClose={() => api.close()} onReset={() => resetLayout(teamId)} />);
+  return lazyPanel(<TeamPanel teamId={teamId} onClose={() => closeTab(containerApi, api.id)} onReset={() => resetLayout(teamId)} />);
 }
 
 function BoardPanel() {
@@ -156,7 +158,7 @@ function MemoryPanel() {
   return lazyPanel(<MemoryView teamId={teamId} />);
 }
 
-function ProcsPanel({ api }: IDockviewPanelProps) {
+function ProcsPanel({ api, containerApi }: IDockviewPanelProps) {
   const { teamId, active } = useContext(WorkspaceCtx);
   const [visible, setVisible] = useState(api.isVisible);
   useEffect(() => {
@@ -164,7 +166,22 @@ function ProcsPanel({ api }: IDockviewPanelProps) {
     const d = api.onDidVisibilityChange(e => setVisible(e.isVisible));
     return () => d.dispose();
   }, [api]);
-  return lazyPanel(<Procs host={hostOf(teamId)} active={active && visible} onClose={() => api.close()} />);
+  return lazyPanel(<Procs host={hostOf(teamId)} active={active && visible} onClose={() => closeTab(containerApi, api.id)} />);
+}
+
+/** #2266: the fixed terminal group with every tab closed — its pane stays; the other groups never sit empty. */
+function ShellWatermark({ group }: IWatermarkPanelProps) {
+  const { teamId, onFocus } = useContext(WorkspaceCtx);
+  const fixed = useSyncExternalStore(subscribe, () => shellGroupOf(teamId));
+  if (!group || group.id !== fixed) return null;
+  return (
+    <div className="shell-empty">
+      <EmptyState mood="team" title="Terminal yok"
+        actions={<button className="primary" onClick={() => { void openShell(teamId).then(id => { if (id) onFocus(id); }); }}>Terminal aç</button>}>
+        Bu alan terminallerin yeri; hepsi kapansa da burada bekler.
+      </EmptyState>
+    </div>
+  );
 }
 
 const COMPONENTS = {
@@ -182,7 +199,7 @@ const COMPONENTS = {
 };
 
 /** Agent tab: status dot + name + the rack's marks, so a tabbed-away worker still shows its state. */
-function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }>) {
+function AgentTab({ api, containerApi, params }: IDockviewPanelHeaderProps<{ agentId: string }>) {
   const { teamId } = useContext(WorkspaceCtx);
   const agentId = params?.agentId ?? api.id.slice("agent:".length);
   const status = useAgentStatus(agentId);
@@ -227,7 +244,7 @@ function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }
         onPointerDown={e => e.stopPropagation()}
         onClick={e => {
           e.stopPropagation();
-          api.close();
+          closeTab(containerApi, api.id);
         }}
       >
         <X />
@@ -236,7 +253,7 @@ function AgentTab({ api, params }: IDockviewPanelHeaderProps<{ agentId: string }
   );
 }
 
-function ShellTab({ api, params }: IDockviewPanelHeaderProps<{ shellId: string }>) {
+function ShellTab({ api, containerApi, params }: IDockviewPanelHeaderProps<{ shellId: string }>) {
   const shellId = params?.shellId ?? api.id.slice("shell:".length);
   const ptyId = shellPtyId(shellId);
   const running = useSyncExternalStore(subscribeShellRunning, () => isShellRunning(ptyId));
@@ -246,13 +263,13 @@ function ShellTab({ api, params }: IDockviewPanelHeaderProps<{ shellId: string }
       <span className="dex-tab-name">Terminal</span>
       {!running && <button className="dex-tab-action" title="Kabuğu yeniden başlat" onPointerDown={e => e.stopPropagation()}
         onClick={e => { e.stopPropagation(); restartShell(ptyId); }}><Play /></button>}
-      <TabClose api={api} title="Terminali kapat" />
+      <TabClose api={api} containerApi={containerApi} title="Terminali kapat" />
     </div>
   );
 }
 
 const FIXED_ICONS = { office: CircuitBoard, board: SquareKanban, settings: Settings, team: Users, memory: Brain, procs: Cpu } as const;
-function FixedTab({ api }: IDockviewPanelHeaderProps) {
+function FixedTab({ api, containerApi }: IDockviewPanelHeaderProps) {
   const Icon = FIXED_ICONS[api.id as keyof typeof FIXED_ICONS] ?? Boxes;
   // Favori varken Kart sabittir: × yerine kilit; sekme sürüklenmez (pointerdown dockview'a ulaşmaz, tıklama yine etkinleştirir).
   const hasFav = useSyncExternalStore(subscribe, () => getSnapshot().favorite !== null);
@@ -265,19 +282,25 @@ function FixedTab({ api }: IDockviewPanelHeaderProps) {
       <span className="dex-tab-name">{api.title}</span>
       {locked
         ? <span className="dex-tab-lock" title="Favori düzende sabit — kapatılamaz, taşınamaz"><Lock /></span>
-        : <TabClose api={api} title={`${api.title} panelini kapat`} />}
+        : <TabClose api={api} containerApi={containerApi} title={`${api.title} panelini kapat`} />}
     </div>
   );
 }
 
-function TabClose({ api, title }: { api: IDockviewPanelHeaderProps["api"]; title: string }) {
+type TabApis = Pick<IDockviewPanelHeaderProps, "api" | "containerApi">;
+function TabClose({ api, containerApi, title }: TabApis & { title: string }) {
   return <button className="dex-tab-close" title={title} aria-label={title} onPointerDown={e => e.stopPropagation()}
-    onClick={e => { e.stopPropagation(); api.close(); }}><X /></button>;
+    onClick={e => { e.stopPropagation(); closeTab(containerApi, api.id); }}><X /></button>;
+}
+/** Every close in Dex's own UI goes through `closePanel`: the fixed terminal group keeps its pane. */
+function closeTab(containerApi: DockviewApi, panelId: string) {
+  const p = containerApi.getPanel(panelId);
+  if (p) closePanel(containerApi, p);
 }
 
 /** #46: a free panel like the others; closed, the palette's "Notları aç" brings it back.
  *  #2040/#2086: the name is red while either note or one of the team's appends holds something. */
-function NotesTab({ api }: IDockviewPanelHeaderProps) {
+function NotesTab({ api, containerApi }: IDockviewPanelHeaderProps) {
   const { teamId } = useContext(WorkspaceCtx);
   const shared = useNoteBody("shared");
   const body = useNoteBody(teamId);
@@ -287,14 +310,14 @@ function NotesTab({ api }: IDockviewPanelHeaderProps) {
     <div className="dex-tab" title={`${api.title}${filled ? " · dolu" : " · boş"}`}>
       <NotebookPen className="dex-tab-icon" />
       <span className={`dex-tab-name notes-tab-name${filled ? " filled" : ""}`}>{api.title}</span>
-      <TabClose api={api} title={`${api.title} sekmesini kapat`} />
+      <TabClose api={api} containerApi={containerApi} title={`${api.title} sekmesini kapat`} />
     </div>
   );
 }
 
 /** #2235: the badge is the waiting count alone; the snapshot is fetched once for the team on
  *  screen (the store refreshes it on host events — no polling, each call scans the memory graph). */
-function CatchupTab({ api }: IDockviewPanelHeaderProps) {
+function CatchupTab({ api, containerApi }: IDockviewPanelHeaderProps) {
   const { teamId, active } = useContext(WorkspaceCtx);
   const entry = useCatchup(teamId);
   useEffect(() => { if (active) ensureCatchup(teamId); }, [active, teamId]);
@@ -304,7 +327,7 @@ function CatchupTab({ api }: IDockviewPanelHeaderProps) {
       <History className="dex-tab-icon" />
       <span className="dex-tab-name">{api.title}</span>
       {waiting > 0 && <span className="catchup-badge" role="status" aria-label={`${waiting} seni bekliyor`}>{waiting}</span>}
-      <TabClose api={api} title={`${api.title} sekmesini kapat`} />
+      <TabClose api={api} containerApi={containerApi} title={`${api.title} sekmesini kapat`} />
     </div>
   );
 }
@@ -320,9 +343,10 @@ function FallbackTab(props: IDockviewPanelHeaderProps) {
 }
 
 /** #46: a group holding a shell (or Süreçler) gets "Yeni terminal" and the Süreçler toggle on its header.
- *  #65: with no shell open there's no header — the palette opens both ("Yeni terminal", "Süreç panelini aç"). */
-function GroupActions({ panels, containerApi }: IDockviewHeaderActionsProps) {
+ *  #2266: the fixed terminal group keeps them whatever its tabs are, and while it is empty. */
+function GroupActions({ panels, containerApi, group }: IDockviewHeaderActionsProps) {
   const { teamId, onFocus } = useContext(WorkspaceCtx);
+  const fixed = useSyncExternalStore(subscribe, () => shellGroupOf(teamId));
   const [procsOpen, setProcsOpen] = useState(() => !!containerApi.getPanel(FIXED.procs.id));
   useEffect(() => {
     const sync = () => setProcsOpen(!!containerApi.getPanel(FIXED.procs.id));
@@ -330,7 +354,7 @@ function GroupActions({ panels, containerApi }: IDockviewHeaderActionsProps) {
     const subs = [containerApi.onDidAddPanel(sync), containerApi.onDidRemovePanel(sync)];
     return () => subs.forEach(d => d.dispose());
   }, [containerApi]);
-  if (!panels.some(p => p.id.startsWith("shell:") || p.id === FIXED.procs.id)) return null;
+  if (group.id !== fixed && !panels.some(p => isShellPanel(p.id))) return null;
   return (
     <div className="dex-group-actions">
       <button className="dex-group-action" title="Yeni terminal" aria-label="Yeni terminal"
@@ -346,7 +370,7 @@ function GroupActions({ panels, containerApi }: IDockviewHeaderActionsProps) {
         onPointerDown={e => e.stopPropagation()}
         onClick={() => {
           const p = containerApi.getPanel(FIXED.procs.id);
-          if (p) p.api.close(); else void openPanel(teamId, "procs");
+          if (p) closePanel(containerApi, p); else void openPanel(teamId, "procs");
         }}>
         <Cpu />
       </button>
@@ -365,8 +389,8 @@ function tabMenu({ panel, group, api: dock }: GetTabContextMenuItemsParams) {
     { label: "Yüzdür", action: () => dock.addFloatingGroup(panel), disabled: pinned || api.location.type === "floating" },
     { label: max ? "Geri yükle" : "Büyüt", action: () => max ? api.exitMaximized() : api.maximize(), disabled: !max && api.location.type !== "grid" },
     "separator" as const,
-    { label: "Kapat", action: () => api.close(), disabled: !!pinned },
-    { label: "Diğerlerini kapat", action: () => group.panels.filter(p => p !== panel && !(p.id === "office" && getSnapshot().favorite !== null)).forEach(p => p.api.close()), disabled: group.panels.length < 2 },
+    { label: "Kapat", action: () => closePanel(dock, panel), disabled: !!pinned },
+    { label: "Diğerlerini kapat", action: () => group.panels.filter(p => p !== panel && !(p.id === "office" && getSnapshot().favorite !== null)).forEach(p => closePanel(dock, p)), disabled: group.panels.length < 2 },
   ];
 }
 
@@ -419,6 +443,8 @@ export function Workspace(props: Props) {
     if (!api) return;
     const subs = [
       api.onDidLayoutChange(() => setDock(teamId, api.toJSON())),
+      // #2266: dockview drops a group its last tab was dragged out of; the fixed terminal group comes back.
+      api.onDidLayoutChange(() => { if (boundApi(teamId) === api) ensureShellGroup(teamId, api); }),
       growIntoCorner(teamId, api),
       // Closing a shell's tab (✕, middle click, "close others"…) ends the shell. A move between groups
       // may remove-then-add, so only a panel still gone a tick later counts.
@@ -456,6 +482,7 @@ export function Workspace(props: Props) {
         tabComponents={TABS}
         defaultTabComponent={FallbackTab}
         rightHeaderActionsComponent={GroupActions}
+        watermarkComponent={ShellWatermark}
         onReady={onReady}
         // HTML5 DnD is unreliable in WebView2 while Tauri's file-drop is on (see board/Board.tsx).
         dndStrategy="pointer"

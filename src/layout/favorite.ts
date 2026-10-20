@@ -32,7 +32,7 @@ function rewriteViews(node: GridNode | undefined, map: Map<string, string | null
   const d = node.data as { id?: string; views?: unknown; activeView?: string };
   if (node.type !== "leaf" || !Array.isArray(d.views)) return node; // float/özel düğüm: dokunma
   const views = (d.views as string[]).map(v => map.get(v) ?? v).filter(v => map.get(v) !== null);
-  if (!views.length) return null; // yuvası düşen grup budanır
+  if (!views.length && d.views.length) return null; // yuvası düşen grup budanır (#2266: boş kaydedilmiş sabit terminal grubu kalır)
   const moved = d.activeView ? (map.get(d.activeView) ?? d.activeView) : undefined;
   const activeView = moved && views.includes(moved) ? moved : views[0];
   return { ...node, data: { ...d, views, activeView } };

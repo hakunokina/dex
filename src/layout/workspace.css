@@ -114,3 +114,7 @@
 }
 .pane-popped-actions button:hover { background: var(--surface-3); border-color: var(--line-strong); }
 .dex-tab-action.on { opacity: 1; color: var(--team); }
+
+/* #2266: the fixed terminal group, every tab closed — its pane stays with "Terminal aç" in the middle. */
+.shell-empty { display: flex; align-items: center; justify-content: center; height: 100%; padding: var(--sp-4); overflow: auto; }
+.shell-empty .empty-state { max-width: 380px; }
