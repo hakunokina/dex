@@ -278,6 +278,13 @@ handlers! {
         "limits_get" => |core, _| ok(core.limits_get()),
         "limits_set" => |core, p| ok(core.limits_set(arg(p, "limits")?)),
         "note_get" => |core, p| ok(core.note_get(&arg::<String>(p, "scope")?)),
+        // Plan #124: "sen yokken" özeti. `since` verilmezse imleç (yoksa son 24 saat, en çok 7 gün);
+        // panel açıkken UI ilk `since`'yi geri verir (snapshot). ack yalnız imleci ilerletir.
+        "catchup" => |core, p| ok(core.catchup(&arg::<String>(p, "teamId")?, arg::<Option<i64>>(p, "since")?)),
+        "catchup_ack" => |core, p| {
+            let seen = core.catchup_ack(&arg::<String>(p, "teamId")?, arg(p, "at")?).map_err(Error::failed)?;
+            Ok(serde_json::json!({"seenAt": seen}))
+        },
         "note_set" => {
             |core, p| ok(core.note_set(&arg::<String>(p, "scope")?, &arg::<String>(p, "body")?))
         },
@@ -330,6 +337,30 @@ mod tests {
         let reply=call(&core,"push_register",&serde_json::json!({"token":"fcm-device-1","platform":"android"})).unwrap();
         assert_eq!(reply,serde_json::json!({"ok":true,"pushConfigured":false}));
         assert_eq!(call(&core,"push_unregister",&serde_json::json!({"token":"fcm-device-1"})).unwrap(),serde_json::json!({"ok":true}));
+        core.shutdown();
+    }
+
+    #[test]
+    fn catchup_rpc_buckets_cursor_and_ack() {
+        let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../../.dex/tmp/catchup-rpc-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let core=Core::start(Paths{data_dir:root.join("data"),config_dir:root.join("config")},Events::new(NullSink)).unwrap();
+        for m in ["catchup","catchup_ack"] { assert!(METHODS.contains(&m), "{m}"); }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let rpc = call(&core,"catchup",&serde_json::json!({"teamId":"default"})).unwrap();
+        assert_eq!(rpc["teamId"],"default");
+        assert_eq!(rpc["cursor"],Value::Null);
+        assert!(rpc["since"].as_i64().is_some_and(|s| (now - s - 24*3600*1000).abs() < 60_000), "{rpc}");
+        for b in ["waiting","changed","memories"] { assert_eq!(rpc[b],serde_json::json!({"items":[],"more":0}), "{b}"); }
+        // The RPC answers exactly what the in-app command (Core) returns.
+        assert_eq!(rpc, serde_json::to_value(core.catchup("default", rpc["since"].as_i64()).unwrap()).unwrap());
+        let acked = call(&core,"catchup_ack",&serde_json::json!({"teamId":"default","at":now})).unwrap();
+        assert!(acked["seenAt"].as_i64().is_some_and(|s| s <= now && now - s < 60_000), "{acked}");
+        assert_eq!(call(&core,"catchup",&serde_json::json!({"teamId":"default"})).unwrap()["cursor"], acked["seenAt"]);
+        // A later, older ack never moves the cursor back.
+        assert_eq!(call(&core,"catchup_ack",&serde_json::json!({"teamId":"default","at":1})).unwrap(), acked);
+        assert_eq!(call(&core,"catchup",&serde_json::json!({})).unwrap_err().code,"bad_request");
+        assert_eq!(call(&core,"catchup",&serde_json::json!({"teamId":"yok"})).unwrap_err().code,"failed");
+        assert_eq!(call(&core,"catchup_ack",&serde_json::json!({"teamId":"default","at":"x"})).unwrap_err().code,"bad_request");
         core.shutdown();
     }
 
