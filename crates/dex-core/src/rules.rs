@@ -61,12 +61,14 @@ Patron: insan, son söz onun. Lider işi böler ve devreder; worker devredilen i
 - Ekran görüntüsü/kanıt dosyası üretme (istenmedikçe).
 - Teslim = ne yaptın + koştuğun komutlar ve sonucu (geçti/kaldı, sayı) + açık risk/soru. Kısa.
 - Koşmadığın komutu koştum deme; koşamadıysan nedenini yaz.
+- Kapsam dışı bıraktığın/yapmadığın her kalemi raporda ne + neden + güvenli alternatifle açıkça yaz; sessizce düşürülen kalem olmasın.
 
 ## Hafıza
 Takım ortak: {shared} · Sana özel: {own}. İndeks oturum başında gelir; ayrıntı için dosyayı oku.
 - İşe başlarken ilgili konuda `memory_search` ile ara.
 - [-İnceleyici] Bir bilgi = bir .md; dosya adı = `name`. Frontmatter: name, description (tek satır), metadata.type (project|feedback|reference|user). [[slug]] ile bağla. MEMORY.md tutma.
 - [-İnceleyici] Yalnız kalıcı ve ileride işe yarayanı yaz: kök neden, karar+gerekçe, tuzak, tercih. Kodda/git'te olanı yazma.
+- [-İnceleyici] Hafızaya tekil vakayı değil onu yakalayan sınıf kuralını yaz; vaka yalnız kanıt/örnek olarak kalsın.
 - [-İnceleyici] Aynı konuda kayıt varsa güncelle; yanlışı sil. Takımı ilgilendiren ortak klasöre.
 - [-İnceleyici] İş bitince sor: \"Kalıcı ne öğrendim?\" Varsa yaz, yoksa geç.
 - [İnceleyici] Hafızaya yazma (salt okumasın, reddedilir); kalıcı bilgi varsa raporunun sonunda `## not` altına yaz, lider taşır.";
@@ -425,7 +427,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let c = db();
         let (s, o) = mem();
-        for (agent, expected) in [("timur", "251e76a106c9bffa005b7526f21b65fbe692d80eadddb6165b97302b9f6a0f11"), ("ayla", "45bc508726debaff9f101322d3c9f9997bcf588d5306c808f315fe522bcab209")] {
+        for (agent, expected) in [("timur", "396f55d6c18dded4b693f7d4d7758cd43129ab88393a5663b154ec3fac394375"), ("ayla", "823d4e5d928967943208a95e1f57a849f1fe193bff5ea2c37d3b9c411d966a4b")] {
             let t = system_prompt(&c, agent, Some((&s, &o)));
             assert_eq!(format!("{:x}", Sha256::digest(t.as_bytes())), expected, "{agent} prompt bytes changed");
         }
@@ -439,8 +441,8 @@ mod tests {
         c.execute("UPDATE agents SET role_slug='teacher' WHERE id='timur'",[]).unwrap();
         c.execute("UPDATE agents SET role_slug='visual-explainer' WHERE id='ayla'",[]).unwrap();
         let (s,o)=mem();
-        // Hashes rendered from HEAD's DEX_RULES and education_rules before #1697.
-        for (agent,expected) in [("timur","9eba00ea42973623fea350f314078e53cba7a0d59e99af034006966cc90498db"),("ayla","7315f32118b4d0279b07c8d05204240dfb39f224a20a27553352535ed6132f75")] {
+        // Baseline hashes; regenerate only on an intentional DEX_RULES change (#2232).
+        for (agent,expected) in [("timur","0b3390c583e65b19b81585b51df49b87913d53182e2d54a5939389bf3d2347ed"),("ayla","84e234dafd3efe94233cd55c0e4b26e3bf0bb9e6dc89cc29b3f639a82d3d852a")] {
             assert_eq!(format!("{:x}",Sha256::digest(system_prompt(&c,agent,Some((&s,&o))).as_bytes())),expected,"{agent}");
         }
     }
@@ -655,6 +657,7 @@ mod tests {
             assert!(!DEX_RULES.contains(w), "ortak kurallarda {w}\n{t}");
         }
         assert!(t.contains("Takım ortak: /m/shared · Sana özel: /m/agents/x"), "{t}");
+        assert!(t.contains("Kapsam dışı bıraktığın/yapmadığın her kalemi raporda ne + neden + güvenli alternatifle açıkça yaz; sessizce düşürülen kalem olmasın."), "{t}");
         assert!(!t.contains("{shared}") && !t.contains("{own}") && !t.contains("{roles}") && !t.contains("[Lider]") && !t.contains("[Worker]"), "{t}");
         for o in OLD {
             assert!(!t.contains(o), "eski ek: {o}\n{t}");
@@ -745,6 +748,7 @@ mod tests {
     const MEMORY_WRITE: &[&str] = &[
         "- Bir bilgi = bir .md; dosya adı = `name`.",
         "- Yalnız kalıcı ve ileride işe yarayanı yaz",
+        "- Hafızaya tekil vakayı değil onu yakalayan sınıf kuralını yaz",
         "- Aynı konuda kayıt varsa güncelle; yanlışı sil.",
         "- İş bitince sor: \"Kalıcı ne öğrendim?\" Varsa yaz, yoksa geç.",
     ];
@@ -866,7 +870,7 @@ Bu projede `.dex/stack.md` yok; tespit edilen: Godot. Patronla birlikte taslağ�
     fn no_memory_dir_drops_memory_section() {
         let t = dex_rules(Some("worker"), Some("backend"), None, "");
         assert!(!t.contains("## Hafıza") && !t.contains("{shared}"), "{t}");
-        assert!(t.ends_with("koştuğun komutlar ve sonucu (geçti/kaldı, sayı) + açık risk/soru. Kısa.\n- Koşmadığın komutu koştum deme; koşamadıysan nedenini yaz."), "{t}");
+        assert!(t.ends_with("koştuğun komutlar ve sonucu (geçti/kaldı, sayı) + açık risk/soru. Kısa.\n- Koşmadığın komutu koştum deme; koşamadıysan nedenini yaz.\n- Kapsam dışı bıraktığın/yapmadığın her kalemi raporda ne + neden + güvenli alternatifle açıkça yaz; sessizce düşürülen kalem olmasın."), "{t}");
     }
 
     #[test]
