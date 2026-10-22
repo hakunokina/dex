@@ -58,20 +58,14 @@ mod tests {
     use super::*;
     use dex_core::events::NullSink;
     use dex_core::{Core, Events, Paths};
-    use futures_util::{SinkExt, StreamExt};
-    use serde_json::{json, Value};
+    use serde_json::Value;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::Message;
 
-    async fn hello(req: impl IntoClientRequest + Unpin, token: &str) -> Value {
+    /// #2288: the challenge handshake (the token is proved over `port`, never sent). Err = the
+    /// client refused (a wrong token does not verify the server's proof) or the socket failed.
+    async fn hello(req: impl IntoClientRequest + Unpin, token: &str, port: u16) -> Result<Value, String> {
         let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-        let req = json!({"id": 1, "method": "auth.hello", "params": {"protocol": 1, "token": token}});
-        ws.send(Message::Text(req.to_string().into())).await.unwrap();
-        loop {
-            if let Some(Ok(Message::Text(t))) = ws.next().await {
-                return serde_json::from_str(t.as_str()).unwrap();
-            }
-        }
+        dexd::local::client_handshake(&mut ws, token, port, false).await
     }
 
     /// The endpoint is on loopback, and it opens with this process's token only.
@@ -86,11 +80,11 @@ mod tests {
         assert!(token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(token, LocalWs::start(core.clone()).unwrap().host.token, "random per start");
 
-        let ok = hello(url.as_str(), &token).await;
+        let port: u16 = url.rsplit(':').next().unwrap().parse().unwrap();
+        let ok = hello(url.as_str(), &token, port).await.unwrap();
         assert_eq!(ok["result"]["device"]["id"], "local", "{ok}");
         for bad in ["", "x", &token[..63], &token.to_uppercase()] {
-            let r = hello(url.as_str(), bad).await;
-            assert_eq!(r["error"]["code"], "unauthorized", "{bad:?}: {r}");
+            assert!(hello(url.as_str(), bad, port).await.is_err(), "{bad:?}");
         }
 
         // #192: a browser handshake from anywhere but this webview is refused before any frame.
@@ -105,7 +99,7 @@ mod tests {
                 other => panic!("{o}: {:?}", other.map(|_| ())),
             }
         }
-        let ok = hello(with_origin("http://tauri.localhost"), &token).await;
+        let ok = hello(with_origin("http://tauri.localhost"), &token, port).await.unwrap();
         assert_eq!(ok["result"]["device"]["id"], "local", "{ok}");
         core.shutdown();
         let _ = std::fs::remove_dir_all(&root);

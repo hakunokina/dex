@@ -21,15 +21,67 @@
 //! - #501: `core_quiet_cancel` takes back only a quiet wait ([`Life::quiet_cancel`]); a drain the
 //!   patron asked for stays.
 
+use crate::local_auth;
 use crate::server::Server;
 use crate::tailnet::TailnetState;
 use dex_core::Paths;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// #2288: a client's side of the local handshake over an open socket — what the desktop shell
+/// does with its own copy of `local_auth` (src-tauri/src/core_proc.rs). `port`: the one dialed.
+/// Ok = the final reply (`result.device.id == "local"`, or the server's `error`); Err = the socket
+/// failed, or the server's proof was wrong (nothing more is sent then).
+pub async fn client_handshake<S>(ws: &mut S, token: &str, port: u16, probe: bool) -> Result<Value, String>
+where
+    S: futures_util::Sink<Message> + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+{
+    use futures_util::{SinkExt, StreamExt};
+    async fn roundtrip<S>(ws: &mut S, id: u64, method: &str, params: Value) -> Result<Value, String>
+    where
+        S: futures_util::Sink<Message> + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+        <S as futures_util::Sink<Message>>::Error: std::fmt::Display,
+    {
+        ws.send(Message::Text(serde_json::json!({"id": id, "method": method, "params": params}).to_string().into())).await.map_err(|e| e.to_string())?;
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(t))) => {
+                    let v: Value = serde_json::from_str(t.as_str()).map_err(|e| e.to_string())?;
+                    if v["id"] == id {
+                        return Ok(v);
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Err("bağlantı kapandı".into()),
+            }
+        }
+    }
+    let key = local_auth::key(token);
+    let mut params = serde_json::json!({ "protocol": crate::protocol::PROTOCOL });
+    if probe {
+        params["probe"] = true.into();
+    }
+    let offer = roundtrip(ws, 1, "auth.hello", params).await?;
+    let (Some(challenge), Some(proof)) = (
+        offer["result"]["challenge"].as_str().and_then(local_auth::unhex32),
+        offer["result"]["proof"].as_str().and_then(local_auth::unhex32),
+    ) else {
+        return Ok(offer);
+    };
+    if !local_auth::ct_eq(&local_auth::server_proof(&key, &challenge, port), &proof) {
+        return Err("yerel çekirdek jetonu bilmiyor".into());
+    }
+    let proof = local_auth::hex(&local_auth::client_proof(&key, &challenge, port));
+    roundtrip(ws, 2, "auth.proof", serde_json::json!({ "proof": proof })).await
+}
 
 /// No window for this long → exit.
 pub const GRACE: Duration = Duration::from_secs(120);

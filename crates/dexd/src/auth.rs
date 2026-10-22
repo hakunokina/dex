@@ -4,6 +4,7 @@
 //! stolen DB gives neither a usable token nor a code. Revoking deletes the device row; open
 //! connections re-check their device periodically (the CLI can't reach into the server process).
 
+use crate::local_auth;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -121,21 +122,32 @@ impl Auth {
     }
 }
 
-/// #146 (A0): the desktop's own loopback endpoint. One random 256-bit token per process, handed
-/// to its webview in memory only — never a `devices` row, never on disk. Kept as a SHA-256 digest
-/// and compared in constant time (digests: the length of a guess tells nothing either).
+/// #146 (A0): the desktop's own loopback endpoint. One random 256-bit token per process, never a
+/// `devices` row; `dexd --local` writes it to its owner-only token file for the shell. Kept as a
+/// SHA-256 digest — #2288: that digest is the HMAC key of the handshake ([`crate::local_auth`]):
+/// the client proves it holds the token instead of sending it.
 pub struct LocalToken([u8; 32]);
 
 impl LocalToken {
-    /// The verifier and the token (the latter goes to the webview only).
+    /// The verifier and the token (the latter goes to the token file / the in-app webview only).
     pub fn new() -> Result<(Self, String), String> {
         let token = hex(&random::<32>()?);
-        Ok((Self(Sha256::digest(token.as_bytes()).into()), token))
+        Ok((Self(local_auth::key(&token)), token))
     }
 
-    pub fn verify(&self, token: &str) -> bool {
-        let guess: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        guess.iter().zip(self.0).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+    /// A fresh 32-byte challenge for one connection.
+    pub fn challenge() -> Result<[u8; 32], String> {
+        random::<32>()
+    }
+
+    /// This process's answer to its own challenge: the client checks it before proving anything.
+    pub fn server_proof(&self, challenge: &[u8; 32], port: u16) -> [u8; 32] {
+        local_auth::server_proof(&self.0, challenge, port)
+    }
+
+    /// Constant time: the client's proof over this challenge and the port it dialed.
+    pub fn verify_proof(&self, challenge: &[u8; 32], port: u16, proof: &[u8; 32]) -> bool {
+        local_auth::ct_eq(&local_auth::client_proof(&self.0, challenge, port), proof)
     }
 }
 
@@ -244,15 +256,22 @@ mod tests {
         assert!(!a.exists(&dev.id));
     }
 
+    /// #2288: the token is proved, not sent — only a proof over its own key, this challenge and
+    /// this port passes; the server's proof verifies with the client's file copy the same way.
     #[test]
-    fn local_token_verifies_only_itself() {
+    fn local_token_verifies_only_its_own_proof() {
         let (local, token) = LocalToken::new().unwrap();
         assert_eq!(token.len(), 64);
-        assert!(local.verify(&token));
-        assert!(!local.verify(&token[..63]));
-        assert!(!local.verify(""));
         let (_, other) = LocalToken::new().unwrap();
         assert_ne!(token, other, "random per process");
-        assert!(!local.verify(&other));
+        let c = LocalToken::challenge().unwrap();
+        assert_ne!(c, LocalToken::challenge().unwrap(), "random per connection");
+        let k = local_auth::key(&token);
+        assert!(local.verify_proof(&c, 4242, &local_auth::client_proof(&k, &c, 4242)));
+        assert!(!local.verify_proof(&c, 4243, &local_auth::client_proof(&k, &c, 4242)), "another port");
+        assert!(!local.verify_proof(&[0; 32], 4242, &local_auth::client_proof(&k, &c, 4242)), "another challenge");
+        assert!(!local.verify_proof(&c, 4242, &local_auth::client_proof(&local_auth::key(&other), &c, 4242)), "another token");
+        assert!(!local.verify_proof(&c, 4242, &local.server_proof(&c, 4242)), "its own proof is no client proof");
+        assert!(local_auth::ct_eq(&local.server_proof(&c, 4242), &local_auth::server_proof(&k, &c, 4242)));
     }
 }

@@ -168,8 +168,15 @@ function once(url: string, method: string, params: Record<string, unknown>): Pro
  *  core is not running (no discovery / no answer) — it does not come back by itself. */
 export type HostStatus = "connecting" | "connected" | "reconnecting" | "unauthorized" | "blocked" | "down";
 
-/** #150: the shell's `local_host` — the local core's endpoint, or why there is none. */
-export type LocalAnswer = { url: string; token: string } | { down: string };
+/**
+ * #150: the shell's `local_host` — the local core's endpoint, or why there is none. #2288: the
+ * shell gives the url only and keeps the token: the core's challenge is answered through its
+ * `local_proof`. A `token` here = an endpoint that takes the plain hello (the e2e bridge's
+ * device endpoint, an `inproc-core` shell).
+ */
+export type LocalAnswer = { url: string; token?: string } | { down: string };
+/** #2288: the shell's `local_proof` — the client's proof for the core's offer, or why it is refused. */
+export type Prove = (challenge: string, proof: string) => Promise<string>;
 
 export class WsTransport implements Transport {
   private ws: WebSocket | null = null;
@@ -195,7 +202,15 @@ export class WsTransport implements Transport {
    * port and token) — asked again before every reconnect (and first, with no `url`); no answer =
    * `down`, retried with the same backoff.
    */
-  constructor(private url: string, private token: string, private onStatus: (s: HostStatus) => void = () => {}, readonly remote = true, private locate?: () => Promise<LocalAnswer>) {
+  constructor(
+    private url: string,
+    private token: string,
+    private onStatus: (s: HostStatus) => void = () => {},
+    readonly remote = true,
+    private locate?: () => Promise<LocalAnswer>,
+    /** #2288: with no `token`, the local core's challenge is answered by the shell. */
+    private prove?: Prove,
+  ) {
     this.connect();
   }
 
@@ -231,7 +246,7 @@ export class WsTransport implements Transport {
         (h) => {
           if (this.closed) return;
           this.url = h.url;
-          this.token = h.token;
+          this.token = h.token ?? "";
           this.open(opened, failed);
         },
         (why) => {
@@ -256,9 +271,8 @@ export class WsTransport implements Transport {
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     ws.onopen = () => {
-      const id = this.nextId++;
-      this.pending.set(id, {
-        resolve: (v) => {
+      const done = {
+        resolve: (v: unknown) => {
           this.hello = v;
           this.retry = 0;
           opened();
@@ -266,8 +280,33 @@ export class WsTransport implements Transport {
           this.onStatus("connected");
         },
         reject: failed,
-      });
-      ws.send(JSON.stringify({ id, method: "auth.hello", params: { protocol: PROTOCOL, token: this.token } }));
+      };
+      const send = (method: string, params: Record<string, unknown>, p: typeof done) => {
+        const id = this.nextId++;
+        this.pending.set(id, p);
+        ws.send(JSON.stringify({ id, method, params }));
+      };
+      if (this.prove && !this.token) {
+        // #2288: the local core — no token here. `auth.hello` gets its challenge and its proof;
+        // the shell checks that proof with its token file (a listener that is not the core is
+        // refused there, and the socket dropped) and gives the proof `auth.proof` carries.
+        const prove = this.prove;
+        send("auth.hello", { protocol: PROTOCOL }, {
+          resolve: (offer) => {
+            const o = offer as { challenge?: unknown; proof?: unknown };
+            prove(String(o.challenge ?? ""), String(o.proof ?? "")).then(
+              (proof) => send("auth.proof", { proof }, done),
+              (why) => {
+                failed(String(why));
+                ws.close();
+              },
+            );
+          },
+          reject: failed,
+        });
+        return;
+      }
+      send("auth.hello", { protocol: PROTOCOL, token: this.token }, done);
     };
     ws.onmessage = (m) => (typeof m.data === "string" ? this.onText(m.data) : this.onBinary(m.data as ArrayBuffer));
     ws.onclose = (e) => {
@@ -462,11 +501,13 @@ export class LocalTransport implements Transport {
       return h;
     };
     const locate = () => invoke<LocalAnswer>("local_host").then(told);
+    // #2288: the core's challenge goes to the shell, which holds the token; this page never does.
+    const prove: Prove = (challenge, proof) => invoke<string>("local_proof", { challenge, proof });
     this.picked = invoke<LocalAnswer | null>("local_host").then(told).then(
       (h) => {
         if (!h) return this.tauri;
         const up = "url" in h ? h : { url: "", token: "" };
-        const ws = new WsTransport(up.url, up.token, status, false, locate);
+        const ws = new WsTransport(up.url, up.token ?? "", status, false, locate, prove);
         void ws.on("dexd.lagged", refetch);
         return (this.ws = ws);
       },

@@ -51,8 +51,14 @@ use tokio_tungstenite::tungstenite::Message;
 #[path = "../../crates/dex-core/src/private_fs.rs"]
 #[allow(dead_code)]
 mod private_fs;
+// #2288: the local handshake's arithmetic (the same file dexd compiles; sha2 only).
+#[path = "../../crates/dexd/src/local_auth.rs"]
+#[allow(dead_code)]
+mod local_auth;
 
 const DISCOVERY_FILE: &str = "dexd.local.json";
+/// #2288: the token's one trusted place — never a path the discovery file names.
+const TOKEN_FILE: &str = "dexd.local.token";
 /// Core start (DB open, hook receiver) plus the wait for a previous instance's lock.
 const START_TIMEOUT: Duration = Duration::from_secs(40);
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -63,9 +69,14 @@ const LOG_CAP: u64 = 1 << 20;
 
 pub(crate) type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// The endpoint for the webview: its url only. #2288: the token stays in the shell — the webview
+/// has the core's challenge answered here (`local_proof`) and never holds the token itself.
 #[derive(Clone, Serialize)]
 pub struct LocalHost {
     url: String,
+    #[serde(skip)]
+    port: u16,
+    #[serde(skip)]
     token: String,
 }
 
@@ -113,18 +124,20 @@ impl CoreProc {
         serde_json::from_slice(&std::fs::read(self.data_dir.join(DISCOVERY_FILE)).ok()?).ok()
     }
 
-    /// What the discovery file says (not checked).
+    /// #2288: the discovery file is advisory — any process of this user (a worker agent) can
+    /// rewrite it. Only its numeric `port` is used: the URL is always loopback, and the token is
+    /// read from the shell's own data dir (`TOKEN_FILE`), never from a path the file names.
     fn endpoint(&self) -> Option<(Value, LocalHost)> {
         let d = self.discovery()?;
-        let url = d["url"].as_str()?.to_string();
-        let token = std::fs::read_to_string(d["tokenFile"].as_str()?).ok()?.trim().to_string();
-        Some((d, LocalHost { url, token }))
+        let port = u16::try_from(d["port"].as_u64()?).ok().filter(|p| *p != 0)?;
+        let token = std::fs::read_to_string(self.data_dir.join(TOKEN_FILE)).ok()?.trim().to_string();
+        Some((d, LocalHost { url: format!("ws://127.0.0.1:{port}"), port, token }))
     }
 
-    /// The running core, if its discovery file is current and it answers with its token.
+    /// The running core, if its discovery file is current and it proves it holds the token.
     async fn find(&self) -> Option<(Value, LocalHost)> {
         let (d, h) = self.endpoint()?;
-        hello(&h.url, &h.token).await.ok()?;
+        hello(&h).await.ok()?;
         Some((d, h))
     }
 
@@ -168,7 +181,7 @@ impl CoreProc {
     /// without it (older than #501): look, then take back — that gap is its known risk.
     async fn cancel_quiet_wait(&self) -> Result<(), String> {
         let Some((_, h)) = self.endpoint() else { return Ok(()) };
-        let (mut ws, info) = hello(&h.url, &h.token).await?;
+        let (mut ws, info) = hello(&h).await?;
         if info["methods"].as_array().is_some_and(|m| m.iter().any(|m| m == "core_quiet_cancel")) {
             let r = request(&mut ws, "core_quiet_cancel").await?;
             return match r.get("error") {
@@ -203,7 +216,7 @@ impl CoreProc {
         }
         *conn = None;
         let (_, h) = self.endpoint()?;
-        let (mut ws, _) = hello(&h.url, &h.token).await.ok()?;
+        let (mut ws, _) = hello(&h).await.ok()?;
         let r = request(&mut ws, "core_life").await.ok()?;
         *conn = Some(ws);
         Some(r.get("result").cloned().unwrap_or_else(|| json!({})))
@@ -215,7 +228,7 @@ impl CoreProc {
         let found = {
             let _busy = self.busy.lock().await;
             match self.endpoint() {
-                Some((d, h)) => hello(&h.url, &h.token).await.ok().map(|(ws, info)| (d, ws, info)),
+                Some((d, h)) => hello(&h).await.ok().map(|(ws, info)| (d, ws, info)),
                 None => None,
             }
         };
@@ -252,7 +265,7 @@ impl CoreProc {
     /// #161: a drain taken back — the queue is delivered again.
     pub(crate) async fn drain_cancel(&self) -> Result<(), String> {
         let Some((_, h)) = self.endpoint() else { return Ok(()) };
-        let (mut ws, _) = hello(&h.url, &h.token).await?;
+        let (mut ws, _) = hello(&h).await?;
         let r = request(&mut ws, "core_drain_cancel").await?;
         match r.get("error") {
             Some(e) => Err(e["message"].as_str().unwrap_or("core_drain_cancel").to_string()),
@@ -322,7 +335,7 @@ impl CoreProc {
     pub(crate) async fn stop(&self) -> Result<(), String> {
         let _busy = self.busy.lock().await;
         let Some((d, h)) = self.find().await else { return Ok(()) };
-        let (mut ws, _) = hello(&h.url, &h.token).await?;
+        let (mut ws, _) = hello(&h).await?;
         let r = request(&mut ws, "core_shutdown").await?;
         if let Some(e) = r.get("error") {
             return Err(e["message"].as_str().unwrap_or("core_shutdown").to_string());
@@ -676,12 +689,23 @@ fn schtasks(exe: &Path, args: &[OsString]) -> Result<(), String> {
     r
 }
 
-/// A probe connection and the core's `auth.hello` answer (its build, its methods).
-async fn hello(url: &str, token: &str) -> Result<(Ws, Value), String> {
+/// A probe connection and the core's `auth.hello` answer (its build, its methods). #2288: the
+/// token is proved, not sent (crates/dexd/src/local_auth.rs): `auth.hello` carries none; the
+/// core answers a challenge and its own proof over it, checked first — so whatever listens on
+/// the port a tampered discovery file names gets nothing — then `auth.proof`.
+async fn hello(h: &LocalHost) -> Result<(Ws, Value), String> {
     let go = async {
-        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.map_err(|e| e.to_string())?;
-        let params = json!({"protocol": 1, "token": token, "probe": true});
+        let (mut ws, _) = tokio_tungstenite::connect_async(&h.url).await.map_err(|e| e.to_string())?;
+        let params = json!({"protocol": 1, "probe": true});
         ws.send(Message::Text(json!({"id": 1, "method": "auth.hello", "params": params}).to_string().into()))
+            .await
+            .map_err(|e| e.to_string())?;
+        let offer = reply(&mut ws).await?;
+        let (Some(challenge), Some(proof)) = (offer["result"]["challenge"].as_str(), offer["result"]["proof"].as_str()) else {
+            return Err(format!("yerel çekirdek reddetti: {}", offer["error"]["message"]));
+        };
+        let proof = answer(h, challenge, proof)?;
+        ws.send(Message::Text(json!({"id": 1, "method": "auth.proof", "params": {"proof": proof}}).to_string().into()))
             .await
             .map_err(|e| e.to_string())?;
         let r = reply(&mut ws).await?;
@@ -692,6 +716,20 @@ async fn hello(url: &str, token: &str) -> Result<(Ws, Value), String> {
         }
     };
     tokio::time::timeout(PROBE_TIMEOUT, go).await.map_err(|_| "yerel çekirdek cevap vermedi".to_string())?
+}
+
+/// #2288: the client's proof for the core's offer (`challenge`, `proof`: hex) — only once the
+/// offer verifies with this shell's token and the port it dialed; a peer that is not the core
+/// (another listener, a relay from another port) gets an error and nothing else.
+fn answer(h: &LocalHost, challenge: &str, proof: &str) -> Result<String, String> {
+    let (Some(challenge), Some(proof)) = (local_auth::unhex32(challenge), local_auth::unhex32(proof)) else {
+        return Err("yerel çekirdek bozuk teklif verdi".into());
+    };
+    let key = local_auth::key(&h.token);
+    if !local_auth::ct_eq(&local_auth::server_proof(&key, &challenge, h.port), &proof) {
+        return Err("yerel çekirdek jetonu bilmiyor".into());
+    }
+    Ok(local_auth::hex(&local_auth::client_proof(&key, &challenge, h.port)))
 }
 
 async fn request(ws: &mut Ws, method: &str) -> Result<Value, String> {
@@ -760,6 +798,14 @@ pub async fn local_host(proc: State<'_, Arc<CoreProc>>) -> Result<LocalAnswer, S
 #[tauri::command]
 pub async fn local_start(proc: State<'_, Arc<CoreProc>>) -> Result<LocalHost, String> {
     proc.ensure().await
+}
+
+/// #2288: the webview's side of the handshake, with the shell's token (the webview never holds
+/// it): the core's offer in, the client's proof out — or why the offer is not the running core's.
+#[tauri::command]
+pub async fn local_proof(proc: State<'_, Arc<CoreProc>>, challenge: String, proof: String) -> Result<String, String> {
+    let (_, h) = proc.endpoint().ok_or_else(|| "yerel çekirdek çalışmıyor".to_string())?;
+    answer(&h, &challenge, &proof)
 }
 
 #[tauri::command]
@@ -842,6 +888,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// A listener standing in for a planted `url`/`port`: the text frames it receives, and the
+    /// offer it makes (a bogus challenge and proof, as a peer without the token would).
+    fn fake_core(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut got = Vec::new();
+            let Ok(Ok((stream, _))) = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await else { return got };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return got };
+            while let Ok(Some(Ok(m))) = tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                match m {
+                    Message::Text(t) => {
+                        got.push(t.to_string());
+                        let offer = json!({"id": 1, "result": {"challenge": "11".repeat(32), "proof": "22".repeat(32)}});
+                        let _ = ws.send(Message::Text(offer.to_string().into())).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            got
+        })
+    }
+
+    /// #2288 (security audit HIGH): a discovery file a worker rewrote — `url` to its listener,
+    /// `tokenFile` to any file, `port` to another of its listeners — gives it nothing: the shell
+    /// dials `127.0.0.1:<port>` only, reads its own token file, sends no token in any frame, and
+    /// says nothing more to a peer whose proof is not the core's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tampered_discovery_file_leaks_no_token() {
+        let d = dir("tamper");
+        let p = proc_for(&d);
+        std::fs::create_dir_all(&p.data_dir).unwrap();
+        std::fs::write(p.data_dir.join(TOKEN_FILE), "real-token-0123456789abcdef\n").unwrap();
+        let planted = d.join("planted.token");
+        std::fs::write(&planted, "planted-token").unwrap();
+        let by_url = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let by_port = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (url_port, port) = (by_url.local_addr().unwrap().port(), by_port.local_addr().unwrap().port());
+        let (by_url, by_port) = (fake_core(by_url), fake_core(by_port));
+        let disc = json!({
+            "pid": 1, "port": port, "url": format!("ws://127.0.0.1:{url_port}"), "tokenFile": planted,
+            "commit": "x", "commitTime": 0, "startedAt": 0, "exe": "dexd.exe",
+        });
+        std::fs::write(p.data_dir.join(DISCOVERY_FILE), disc.to_string()).unwrap();
+
+        let (_, h) = p.endpoint().expect("a numeric port and the shell's own token file");
+        assert_eq!((h.url.as_str(), h.port), (format!("ws://127.0.0.1:{port}").as_str(), port), "url ignored");
+        assert_eq!(h.token, "real-token-0123456789abcdef", "tokenFile ignored");
+        assert!(!serde_json::to_string(&h).unwrap().contains("token"), "the webview gets the url only: {}", serde_json::to_string(&h).unwrap());
+
+        assert!(p.find().await.is_none(), "a peer that cannot prove the token is not the core");
+        let (by_url, by_port) = (by_url.await.unwrap(), by_port.await.unwrap());
+        assert!(by_url.is_empty(), "the planted url was dialed: {by_url:?}");
+        assert_eq!(by_port.len(), 1, "one frame — the hello; no proof for a bogus offer: {by_port:?}");
+        let hello: Value = serde_json::from_str(&by_port[0]).unwrap();
+        assert_eq!((hello["method"].as_str(), hello["params"]["probe"].as_bool()), (Some("auth.hello"), Some(true)), "{hello}");
+        assert!(hello["params"].get("token").is_none(), "{hello}");
+        for secret in ["real-token", "planted-token"] {
+            assert!(!by_port[0].contains(secret), "{secret} crossed the socket: {}", by_port[0]);
+        }
+        // The webview's path: the same check, the same refusal.
+        assert_eq!(answer(&h, &"11".repeat(32), &"22".repeat(32)).unwrap_err(), "yerel çekirdek jetonu bilmiyor");
+        assert!(answer(&h, "zz", "22").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #2288: no port, a port that is not a number, out of range, or 0 → no endpoint; the token
+    /// file missing → no endpoint (the discovery file alone names no credential).
+    #[test]
+    fn endpoint_needs_a_valid_port_and_the_shells_own_token_file() {
+        let d = dir("port");
+        let p = proc_for(&d);
+        std::fs::create_dir_all(&p.data_dir).unwrap();
+        let write = |disc: Value| std::fs::write(p.data_dir.join(DISCOVERY_FILE), disc.to_string()).unwrap();
+        write(json!({"port": 4242}));
+        assert!(p.endpoint().is_none(), "no token file");
+        std::fs::write(p.data_dir.join(TOKEN_FILE), "t").unwrap();
+        assert_eq!(p.endpoint().map(|(_, h)| (h.url, h.port, h.token)), Some(("ws://127.0.0.1:4242".into(), 4242, "t".into())));
+        for bad in [json!({}), json!({"port": "4242", "url": "ws://127.0.0.1:4242"}), json!({"port": 0}), json!({"port": 65536}), json!({"port": -1}), json!({"port": 42.5}), json!({"url": "ws://127.0.0.1:4242"})] {
+            write(bad.clone());
+            assert!(p.endpoint().is_none(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

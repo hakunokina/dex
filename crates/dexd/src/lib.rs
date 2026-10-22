@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod fs;
 pub mod local;
+pub mod local_auth;
 pub mod methods;
 pub mod protocol;
 pub mod server;

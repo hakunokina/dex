@@ -349,10 +349,10 @@ mod tests {
         let local = Server::local(core.clone(),verifier).unwrap();
         local.set_tailnet(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}",listener.local_addr().unwrap());
+        let local_port = listener.local_addr().unwrap().port();
         let local_task = tokio::spawn(crate::serve(listener,local.clone()));
-        let mut desktop = connect_async(url).await.unwrap().0;
-        assert!(call(&mut desktop,1,"auth.hello",json!({"protocol":1,"token":token})).await.get("result").is_some());
+        let mut desktop = connect_async(format!("ws://127.0.0.1:{local_port}")).await.unwrap().0;
+        assert!(crate::local::client_handshake(&mut desktop,&token,local_port,false).await.unwrap().get("result").is_some());
         let next = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let next_port = next.local_addr().unwrap().port();
         drop(next);
@@ -443,7 +443,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(crate::local::serve_until_exit(listener,server,life.clone()));
         let mut desktop = connect_async(format!("ws://{addr}")).await.unwrap().0;
-        assert!(call(&mut desktop,1,"auth.hello",json!({"protocol":1,"token":token})).await.get("result").is_some());
+        assert!(crate::local::client_handshake(&mut desktop,&token,addr.port(),false).await.unwrap().get("result").is_some());
         assert_eq!(life.clients(),1);
         assert_eq!(call(&mut desktop,2,method,json!({})).await,json!({"id":2,"result":result}));
         assert_eq!(tokio::time::timeout(Duration::from_secs(4),task).await.unwrap().unwrap(),exit);
@@ -529,10 +529,10 @@ mod tests {
         let local = Server::local(core.clone(),verifier).unwrap();
         local.set_tailnet(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let local_url = format!("ws://{}",listener.local_addr().unwrap());
+        let local_port = listener.local_addr().unwrap().port();
         let local_task = tokio::spawn(crate::serve(listener,local));
-        let mut desktop = connect_async(local_url).await.unwrap().0;
-        assert!(call(&mut desktop,1,"auth.hello",json!({"protocol":1,"token":local_token})).await.get("error").is_none());
+        let mut desktop = connect_async(format!("ws://127.0.0.1:{local_port}")).await.unwrap().0;
+        assert!(crate::local::client_handshake(&mut desktop,&local_token,local_port,false).await.unwrap().get("error").is_none());
         let mut phone = connect_async(&url).await.unwrap().0;
         assert!(call(&mut phone,1,"auth.hello",json!({"protocol":1,"token":token})).await.get("error").is_none());
         assert!(call(&mut phone,2,"pty.list",json!({})).await.get("error").is_none());

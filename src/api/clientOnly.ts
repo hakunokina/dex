@@ -6,6 +6,7 @@
 export const CLIENT_ONLY: readonly string[] = [
   "local_host",
   "local_start",
+  "local_proof",
   "local_status",
   "local_shutdown",
   "local_restart",
