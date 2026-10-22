@@ -121,6 +121,7 @@ pub fn run() {
     let builder = builder.plugin(core_proc::plugin()).invoke_handler(tauri::generate_handler![
         core_proc::local_host,
         core_proc::local_start,
+        core_proc::local_proof,
         core_proc::local_status,
         core_proc::local_shutdown,
         core_proc::local_restart,

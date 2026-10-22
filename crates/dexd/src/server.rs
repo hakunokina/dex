@@ -28,6 +28,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::auth::{Auth, Device, LocalToken};
 use crate::fs::Roots;
 use crate::local::{Exit, Life};
+use crate::local_auth;
 use crate::methods;
 use crate::protocol::{self, arg, Error, Request, PROTOCOL};
 use crate::sessions::Sessions;
@@ -296,6 +297,8 @@ fn close_frame(code: u16, reason: &str) -> Message {
 async fn connection(stream: TcpStream, srv: Arc<Server>, deadline: tokio::time::Instant, permit: OwnedSemaphorePermit) -> Result<(), String> {
     let mut shutdown = srv.shutdown.subscribe();
     let _ = stream.set_nodelay(true);
+    // #2288: the port this socket was accepted on — the local handshake's proofs are bound to it.
+    let port = stream.local_addr().map_err(|e| e.to_string())?.port();
     let origin_ok = |req: &HttpRequest, resp: Response| {
         if srv.admits_origin(req.headers().get(ORIGIN).map(|v| v.as_bytes())) {
             return Ok(resp);
@@ -348,7 +351,7 @@ async fn connection(stream: TcpStream, srv: Arc<Server>, deadline: tokio::time::
     let auth = tokio::select! {
         biased;
         _ = cancelled(&mut shutdown) => None,
-        auth = tokio::time::timeout_at(deadline, authenticate(&mut inp, &tx, &srv)) => auth.ok().flatten(),
+        auth = tokio::time::timeout_at(deadline, authenticate(&mut inp, &tx, &srv, port)) => auth.ok().flatten(),
     };
     let (device, probe) = match auth {
         Some(d) => d,
@@ -456,14 +459,11 @@ async fn finish_writer(mut writer: JoinSet<()>) {
     }
 }
 
-/// The first text frame decides. `None` = refused (the reply says why before the close). The flag:
-/// a local `probe` hello (the shell checking the core is up — not a window).
-async fn authenticate(
-    inp: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
-              + Unpin),
-    tx: &Tx,
-    srv: &Arc<Server>,
-) -> Option<(Device, bool)> {
+type Inp = dyn futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin + Send;
+
+/// The next text frame as a request. `None` = the socket ended or spoke something else; a frame
+/// that is not JSON-RPC is answered (`bad_request`) and refused the same way.
+async fn read_request(inp: &mut Inp, tx: &Tx) -> Option<Request> {
     let text = loop {
         match inp.next().await?.ok()? {
             Message::Text(t) => break t,
@@ -471,39 +471,79 @@ async fn authenticate(
             _ => return None,
         }
     };
-    let req: Request = match serde_json::from_str(text.as_str()) {
-        Ok(r) => r,
+    match serde_json::from_str(text.as_str()) {
+        Ok(r) => Some(r),
         Err(e) => {
-            let _ = tx.send(Message::Text(
-                protocol::reply(&Value::Null, Err(Error::bad_request(e.to_string()))).into(),
-            ));
+            let _ = tx.send(Message::Text(protocol::reply(&Value::Null, Err(Error::bad_request(e.to_string()))).into()));
+            None
+        }
+    }
+}
+
+/// The first text frame decides. `None` = refused (the reply says why before the close). The flag:
+/// a local `probe` hello (the shell checking the core is up — not a window).
+///
+/// #2288, a local endpoint: two frames — `auth.hello` (no token) is answered with a challenge and
+/// this process's proof over it; `auth.proof` must then carry the client's proof (crate::local_auth;
+/// bound to `port`, the one this socket was accepted on). The raw token is never accepted.
+async fn authenticate(inp: &mut Inp, tx: &Tx, srv: &Arc<Server>, port: u16) -> Option<(Device, bool)> {
+    let req = read_request(inp, tx).await?;
+    let Some(local) = srv.local.as_ref() else {
+        let srv2 = srv.clone();
+        let id = req.id.clone();
+        let r = tokio::task::spawn_blocking(move || auth_request(&srv2.auth, &req))
+            .await
+            .unwrap_or_else(|e| Err(Error::new("internal", e.to_string())));
+        let _ = tx.send(Message::Text(protocol::reply(&id, r.as_ref().map(|(v, _)| v.clone()).map_err(Clone::clone)).into()));
+        return r.ok().map(|(_, d)| (d, false));
+    };
+    let probe = req.params.get("probe").and_then(Value::as_bool).unwrap_or(false);
+    let challenge = match local_hello(&req).and_then(|()| LocalToken::challenge().map_err(|e| Error::new("internal", e))) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(Message::Text(protocol::reply(&req.id, Err(e)).into()));
             return None;
         }
     };
-    let srv2 = srv.clone();
-    let id = req.id.clone();
-    let probe = srv.local.is_some() && req.params.get("probe").and_then(Value::as_bool).unwrap_or(false);
-    let r = tokio::task::spawn_blocking(move || auth_request(&srv2.auth, srv2.local.as_ref(), &req))
-        .await
-        .unwrap_or_else(|e| Err(Error::new("internal", e.to_string())));
-    let _ = tx.send(Message::Text(
-        protocol::reply(
-            &id,
-            r.as_ref().map(|(v, _)| v.clone()).map_err(Clone::clone),
-        )
-        .into(),
-    ));
+    let offer = json!({ "challenge": local_auth::hex(&challenge), "proof": local_auth::hex(&local.server_proof(&challenge, port)) });
+    let _ = tx.send(Message::Text(protocol::reply(&req.id, Ok(offer)).into()));
+    let req = read_request(inp, tx).await?;
+    let r = local_proof(local, &req, &challenge, port);
+    let _ = tx.send(Message::Text(protocol::reply(&req.id, r.as_ref().map(|(v, _)| v.clone()).map_err(Clone::clone)).into()));
     r.ok().map(|(_, d)| (d, probe))
 }
 
-fn auth_request(auth: &Auth, local: Option<&LocalToken>, req: &Request) -> Result<(Value, Device), Error> {
-    let p = &req.params;
-    if !matches!(req.method.as_str(), "auth.hello" | "auth.pair") {
-        return Err(Error::new(
-            "unauthorized",
-            "önce auth.hello ya da auth.pair",
-        ));
+/// A local endpoint's first frame: `auth.hello {protocol, probe?}` — no token, in any form.
+fn local_hello(req: &Request) -> Result<(), Error> {
+    if req.method != "auth.hello" {
+        return Err(Error::new("unauthorized", "önce auth.hello"));
     }
+    protocol_check(&req.params)?;
+    if req.params.get("token").is_some() {
+        return Err(Error::new("unauthorized", "yerel uç jetonu düz gönderilmez: auth.hello → challenge → auth.proof"));
+    }
+    Ok(())
+}
+
+/// A local endpoint's second frame: `auth.proof {proof}` over the challenge just sent.
+fn local_proof(local: &LocalToken, req: &Request, challenge: &[u8; 32], port: u16) -> Result<(Value, Device), Error> {
+    if req.method != "auth.proof" {
+        return Err(Error::new("unauthorized", "auth.hello'dan sonra auth.proof"));
+    }
+    let proof = arg::<String>(&req.params, "proof")?;
+    let Some(proof) = local_auth::unhex32(&proof) else {
+        return Err(Error::bad_request("proof: 64 hex"));
+    };
+    if !local.verify_proof(challenge, port, &proof) {
+        return Err(Error::new("unauthorized", "yerel uç kanıtı geçersiz"));
+    }
+    let device = Device { id: "local".into(), name: "yerel".into(), created_at: 0, last_seen: None };
+    let mut v = server_info(true);
+    v["device"] = json!(device);
+    Ok((v, device))
+}
+
+fn protocol_check(p: &Value) -> Result<(), Error> {
     let client: u32 = arg(p, "protocol")?;
     if client != PROTOCOL {
         return Err(Error::new(
@@ -511,18 +551,24 @@ fn auth_request(auth: &Auth, local: Option<&LocalToken>, req: &Request) -> Resul
             format!("protokol sürümü uyuşmuyor: sunucu {PROTOCOL}, istemci {client}"),
         ));
     }
+    Ok(())
+}
+
+/// A device endpoint: `auth.hello {token}` / `auth.pair {code}` — unchanged by #2288.
+fn auth_request(auth: &Auth, req: &Request) -> Result<(Value, Device), Error> {
+    let p = &req.params;
+    if !matches!(req.method.as_str(), "auth.hello" | "auth.pair") {
+        return Err(Error::new(
+            "unauthorized",
+            "önce auth.hello ya da auth.pair",
+        ));
+    }
+    protocol_check(p)?;
     let hello = |device: &Device| {
-        let mut v = server_info(local.is_some());
+        let mut v = server_info(false);
         v["device"] = json!(device);
         v
     };
-    if let Some(local) = local {
-        if req.method != "auth.hello" || !local.verify(&arg::<String>(p, "token")?) {
-            return Err(Error::new("unauthorized", "yerel uç jetonu geçersiz"));
-        }
-        let device = Device { id: "local".into(), name: "yerel".into(), created_at: 0, last_seen: None };
-        return Ok((hello(&device), device));
-    }
     if req.method == "auth.pair" {
         let (device, token) = auth
             .pair(

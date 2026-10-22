@@ -4,6 +4,7 @@
 // `tauri dev` rebuilds only the app (its watcher never rebuilds dexd), so a core change lands
 // through this. No core running: just the build (the app starts this one next time).
 import { execFileSync } from "node:child_process";
+import { createHash, createHmac } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
@@ -26,9 +27,25 @@ if (!existsSync(discovery)) {
   process.exit(0);
 }
 const d = JSON.parse(readFileSync(discovery, "utf8"));
-const token = readFileSync(d.tokenFile, "utf8").trim();
+// #2288: the discovery file is advisory (any process of this user can rewrite it): only its
+// numeric port is used, the token comes from its fixed file, and it is proved, never sent
+// (crates/dexd/src/local_auth.rs — the same HMAC the shell and dexd compute).
+const port = Number(d.port);
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  console.error("dexd:dev: keşif dosyasında geçerli port yok — derlendi; uygulama açılınca bu sürüm başlar.");
+  process.exit(1);
+}
+const token = readFileSync(join(dataDir, "dexd.local.token"), "utf8").trim();
+const key = createHash("sha256").update(token).digest();
+const proof = (role, challenge) =>
+  createHmac("sha256", key)
+    .update(`dex-local-auth/1/${role}`)
+    .update(Buffer.from(challenge, "hex"))
+    .update(Buffer.from([port >> 8, port & 0xff]))
+    .digest("hex");
+const url = `ws://127.0.0.1:${port}`;
 
-const ws = new WebSocket(d.url);
+const ws = new WebSocket(url);
 let next = 1;
 const pending = new Map();
 const call = (method, params = {}) =>
@@ -45,13 +62,17 @@ ws.onmessage = (e) => {
   m.error ? p.fail(new Error(m.error.message ?? m.error.code)) : p.ok(m.result);
 };
 ws.onerror = () => {
-  console.error(`dexd:dev: çekirdeğe bağlanılamadı (${d.url}) — derlendi; uygulama açılınca bu sürüm başlar.`);
+  console.error(`dexd:dev: çekirdeğe bağlanılamadı (${url}) — derlendi; uygulama açılınca bu sürüm başlar.`);
   process.exit(0);
 };
 ws.onopen = async () => {
   try {
     // `probe`: not a window — it does not hold the core's no-window grace.
-    const hello = await call("auth.hello", { protocol: 1, token, probe: true });
+    const offer = await call("auth.hello", { protocol: 1, probe: true });
+    if (!/^[0-9a-f]{64}$/i.test(String(offer.challenge)) || offer.proof !== proof("server", offer.challenge)) {
+      throw new Error("dinleyen süreç çekirdeğin jetonunu bilmiyor (keşif dosyası kurcalanmış ya da çekirdek bu el sıkışmayı bilmiyor) — Ayarlar/tepsiden yeniden başlatın");
+    }
+    const hello = await call("auth.proof", { proof: proof("client", offer.challenge) });
     if (!hello.methods?.includes("core_drain_cancel")) {
       throw new Error("çalışan çekirdek bu güncellemeyi bilmiyor (C öncesi) — Ayarlar/tepsiden yeniden başlatın");
     }

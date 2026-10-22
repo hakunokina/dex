@@ -20,6 +20,8 @@ Bu mutlak süre TCP kabulünde başlar ve HTTP Upgrade'i de kapsar (eksik HTTP b
 | `auth.pair` | `{protocol, code, name?}` | `{protocol, server:"dexd", version, commit, commitTime, methods, device, token}` |
 | `auth.hello` | `{protocol, token}` | `{protocol, server:"dexd", version, commit, commitTime, methods, device}` |
 
+Yerel uçta (`dexd --local`, #2288) `auth.hello` jeton taşımaz; el sıkışma iki çerçevedir, aşağıda.
+
 #142 (additive, protokol 1 kalır): `commit` = derleme commit'i (kısa sha, git yoksa `unknown`), `commitTime` = commit'in unix saniyesi (0 = bilinmiyor), `methods` = sunucunun cevapladığı bütün metot adları. Aynısı doğrulanmış bağlantıda `server_info` ile de alınır; masaüstünün yerel çekirdeği aynı adlı Tauri komutunu `methods: null` ile verir. İstemci (`src/api/hosts.ts` `hostSupports`) listede olmayan özelliği gizler; alan yoksa (eski dexd) metot denenir, `bilinmeyen metot: <m>` yedek yolu geçerli.
 
 ## Yerel çekirdek: `dexd --local` (#150)
@@ -27,8 +29,14 @@ Bu mutlak süre TCP kabulünde başlar ve HTTP Upgrade'i de kapsar (eksik HTTP b
 Masaüstünün kendi çekirdeği ayrı bir süreç: `dexd --local --data-dir <uygulama veri dizini> [--config-dir …]` (uygulama başlatır: `src-tauri/src/core_proc.rs`; ayrıntı `crates/dexd/src/local.rs`).
 
 - Uygulamanın `dex.db`'si, tohumlu `Core::start`; veri dizini başına tek örnek (`dex.lock`; ikincisi hata verip çıkar).
-- Yalnız `127.0.0.1:<rastgele>`; kimlik: her başlangıçta yeni 256 bit jeton, `auth.hello {protocol, token, probe?}` → `device.id = "local"`. Eşleme/cihaz jetonu yok, kök denetimi yok (klasör seçici). Origin yalnız uygulamanın webview'ı ya da yok (#192).
-- Keşif: `<data_dir>/dexd.local.json` = `{pid, port, url, tokenFile, commit, commitTime, startedAt}`, jeton ayrı dosyada (`dexd.local.token`); ikisi de yalnız kullanıcıya açık (Windows: korumalı DACL, tek ACE), atomik yazılır, çıkışta silinir.
+- Yalnız `127.0.0.1:<rastgele>`; kimlik: her başlangıçta yeni 256 bit jeton. Eşleme/cihaz jetonu yok, kök denetimi yok (klasör seçici). Origin yalnız uygulamanın webview'ı ya da yok (#192).
+- El sıkışma (#2288, `crates/dexd/src/local_auth.rs`): jeton sokete hiç yazılmaz, kanıtlanır. `K = SHA-256(jeton)`, `port` = istemcinin aradığı / sunucunun kabul ettiği TCP portu (big-endian 2 bayt).
+  1. istemci → `auth.hello {protocol, probe?}` (jeton **yok**; `token` alanı gelirse `unauthorized`);
+  2. sunucu → `{challenge, proof}`: 32 baytlık rastgele meydan okuma ve `HMAC-SHA256(K, "dex-local-auth/1/server" ‖ challenge ‖ port)` (hex). İstemci önce bunu kendi jeton dosyasıyla doğrular; tutmazsa başka bir şey göndermez — kurcalanmış keşif dosyasının gösterdiği sahte dinleyici hiçbir şey öğrenemez, başka porttan aktaran (relay) da port bağından geçemez;
+  3. istemci → `auth.proof {proof}` = `HMAC-SHA256(K, "dex-local-auth/1/client" ‖ challenge ‖ port)`;
+  4. sunucu sabit zamanda doğrular → olağan hello cevabı, `device.id = "local"`; yanlış kanıt `unauthorized` + **4001**.
+- Keşif: `<data_dir>/dexd.local.json` = `{pid, port, url, tokenFile, commit, commitTime, startedAt, exe}`, jeton ayrı dosyada (`dexd.local.token`); ikisi de yalnız kullanıcıya açık (Windows: korumalı DACL, tek ACE), atomik yazılır, çıkışta silinir. **Dosya bilgilendiricidir** (#2288: aynı kullanıcının başka bir süreci — bir worker — üstüne yazabilir): istemci yalnız sayısal `port`'u kullanır (`ws://127.0.0.1:<port>`), `url`'ye güvenmez, jetonu `tokenFile`'dan değil `<data_dir>/dexd.local.token` sabit yolundan okur.
+- İstemciler: kabuk (`src-tauri/src/core_proc.rs`; webview'ın meydan okumasını da kabuk cevaplar — `local_proof`, jeton webview'a hiç verilmez), `scripts/dexd-dev.mjs`, Rust için `dexd::local::client_handshake`.
 - Ömür: bağlı pencere yokken **120 sn** sonra ajanları kapatıp çıkar (başlangıçta da sayar); bu sürede bağlanan pencere onu tutar. `probe: true` ile gelen hello (kabuğun "ayakta mı" yoklaması) pencere sayılmaz.
 - Yalnız yerel uçta (listede de yalnız orada): `core_shutdown`, `core_restart` (aynı ikilinin yeni örneği; eskisi veri dizinini bırakınca açılır), `tailnet_get`, `tailnet_set {enabled, port}`, `tailnet_pair_code`, `tailnet_devices`, `tailnet_device_revoke {id}` (tailnet dinleyicisi artık bu süreçte; o uçtan bağlananlar eşlenmiş cihaz, kök denetimi açık). Eşlenmiş cihaz bunları çağırırsa `local_only`.
 

@@ -39,6 +39,8 @@ dex-core = { path = "../crates/dex-core", optional = true }
 dexd = { path = "../crates/dexd", optional = true }
 # #150: the shell checks the local core is up (`auth.hello`) and asks it to stop (dexd's versions).
 tokio-tungstenite = "0.30"
+# #2288: the local handshake proves the token (HMAC-SHA256; crates/dexd/src/local_auth.rs, included by path).
+sha2 = "0.10"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 dirs = "6"
 tauri-plugin-opener = "2"

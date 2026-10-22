@@ -47,8 +47,15 @@ fn wait_discovery(dir: &Path, pid: Option<u32>) -> Value {
     }
 }
 
-fn token(d: &Value) -> String {
-    std::fs::read_to_string(d["tokenFile"].as_str().unwrap()).unwrap()
+/// #2288: the token is read from its fixed name under the data dir — never from a path the
+/// discovery file names (the shell does the same).
+fn token(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("dexd.local.token")).unwrap()
+}
+
+/// #2288: the endpoint is `127.0.0.1:<port>` from the discovery's numeric `port` only.
+fn port_of(d: &Value) -> u16 {
+    u16::try_from(d["port"].as_u64().unwrap()).unwrap()
 }
 
 fn exited_within(child: &mut Child, secs: u64) -> Option<std::process::ExitStatus> {
@@ -62,14 +69,11 @@ fn exited_within(child: &mut Child, secs: u64) -> Option<std::process::ExitStatu
     None
 }
 
-async fn connect(url: &str, token: &str, probe: bool) -> (Ws, Value) {
-    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
-    let mut params = json!({"protocol": 1, "token": token});
-    if probe {
-        params["probe"] = true.into();
-    }
-    ws.send(Message::Text(json!({"id": 1, "method": "auth.hello", "params": params}).to_string().into())).await.unwrap();
-    let r = reply(&mut ws).await;
+/// The challenge handshake (#2288) against the core `d` describes; the final reply with the socket.
+async fn connect(d: &Value, token: &str, probe: bool) -> (Ws, Value) {
+    let port = port_of(d);
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")).await.unwrap();
+    let r = dexd::local::client_handshake(&mut ws, token, port, probe).await.unwrap();
     (ws, r)
 }
 
@@ -103,10 +107,11 @@ async fn discovery_token_and_one_instance_per_data_dir() {
     assert_eq!(d["port"].as_u64().unwrap().to_string(), url.rsplit(':').next().unwrap());
     assert!(d["commit"].is_string() && d["commitTime"].is_i64() && d["startedAt"].is_i64(), "{d}");
     assert!(d.get("token").is_none(), "the token has its own file: {d}");
-    let tok = token(&d);
+    let tok = token(&dir);
     assert!(tok.len() == 64 && tok.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(d["tokenFile"].as_str().map(Path::new), Some(dir.join("dexd.local.token").as_path()), "{d}");
 
-    let (mut ws, ok) = connect(&url, &tok, false).await;
+    let (mut ws, ok) = connect(&d, &tok, false).await;
     assert_eq!(ok["result"]["device"]["id"], "local", "{ok}");
     let methods = ok["result"]["methods"].as_array().unwrap();
     for m in ["core_shutdown", "core_restart", "core_life", "tailnet_get", "team_list"] {
@@ -123,10 +128,20 @@ async fn discovery_token_and_one_instance_per_data_dir() {
     assert_eq!(l["pid"], first.id(), "{life}");
     assert_eq!((l["clients"].as_u64(), l["agents"].as_u64(), l["graceSecs"].as_u64()), (Some(1), Some(0), Some(60)), "{life}");
     assert!(l["shutdownInSecs"].is_null() && l["commit"] == d["commit"], "{life}");
+    // #2288: a wrong token never gets past the server's proof (the client sends nothing more);
+    // the raw token as the first frame, or a forged proof, is refused by the server.
     for bad in ["", "x", &tok[..63]] {
-        let (_, r) = connect(&url, bad, false).await;
-        assert_eq!(r["error"]["code"], "unauthorized", "{bad:?}: {r}");
+        let (mut wrong, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        assert!(dexd::local::client_handshake(&mut wrong, bad, port_of(&d), false).await.is_err(), "{bad:?}");
     }
+    let (mut plain, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    plain.send(Message::Text(json!({"id": 1, "method": "auth.hello", "params": {"protocol": 1, "token": tok}}).to_string().into())).await.unwrap();
+    assert_eq!(reply(&mut plain).await["error"]["code"], "unauthorized", "the plain hello is gone");
+    let (mut forged, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    forged.send(Message::Text(json!({"id": 1, "method": "auth.hello", "params": {"protocol": 1}}).to_string().into())).await.unwrap();
+    assert!(reply(&mut forged).await["result"]["challenge"].is_string());
+    forged.send(Message::Text(json!({"id": 2, "method": "auth.proof", "params": {"proof": "0".repeat(64)}}).to_string().into())).await.unwrap();
+    assert_eq!(reply(&mut forged).await["error"]["code"], "unauthorized", "a forged proof");
     // #192 kept: a page in the user's browser is refused at the handshake.
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut().insert("Origin", "https://evil.example".parse().unwrap());
@@ -151,16 +166,16 @@ async fn lives_while_a_window_is_connected_and_exits_after_the_grace() {
     let dir = data_dir("life");
     let mut child = start(&dir, 3);
     let d = wait_discovery(&dir, Some(child.id()));
-    let (url, tok) = (d["url"].as_str().unwrap().to_string(), token(&d));
+    let tok = token(&dir);
 
     // First window, kept past the grace.
-    let (ws, _) = connect(&url, &tok, false).await;
+    let (ws, _) = connect(&d, &tok, false).await;
     std::thread::sleep(Duration::from_secs(5));
     assert!(child.try_wait().unwrap().is_none(), "a connected window keeps it");
     // The window reloads: gone for a moment, back inside the grace.
     drop(ws);
     std::thread::sleep(Duration::from_secs(1));
-    let (ws, r) = connect(&url, &tok, false).await;
+    let (ws, r) = connect(&d, &tok, false).await;
     assert_eq!(r["result"]["device"]["id"], "local");
     std::thread::sleep(Duration::from_secs(5));
     assert!(child.try_wait().unwrap().is_none(), "came back in time");
@@ -168,7 +183,7 @@ async fn lives_while_a_window_is_connected_and_exits_after_the_grace() {
     drop(ws);
     let started = Instant::now();
     for _ in 0..4 {
-        let (_p, r) = connect(&url, &tok, true).await;
+        let (_p, r) = connect(&d, &tok, true).await;
         assert_eq!(r["result"]["device"]["id"], "local");
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -185,8 +200,8 @@ async fn core_restart_brings_up_a_new_instance_on_the_same_data_dir() {
     let dir = data_dir("restart");
     let mut child = start(&dir, 60);
     let d = wait_discovery(&dir, Some(child.id()));
-    let old_token = token(&d);
-    let (mut ws, _) = connect(d["url"].as_str().unwrap(), &old_token, false).await;
+    let old_token = token(&dir);
+    let (mut ws, _) = connect(&d, &old_token, false).await;
     let r = call(&mut ws, "core_restart").await;
     assert!(r.get("error").is_none(), "{r}");
     assert!(exited_within(&mut child, 15).is_some(), "the old one exits");
@@ -199,9 +214,9 @@ async fn core_restart_brings_up_a_new_instance_on_the_same_data_dir() {
         assert!(Instant::now() < until, "no new instance");
         std::thread::sleep(Duration::from_millis(100));
     };
-    let tok = token(&new);
+    let tok = token(&dir);
     assert_ne!(tok, old_token, "fresh token");
-    let (mut ws, ok) = connect(new["url"].as_str().unwrap(), &tok, false).await;
+    let (mut ws, ok) = connect(&new, &tok, false).await;
     assert_eq!(ok["result"]["device"]["id"], "local", "{ok}");
     // Clean up the detached one.
     let r = call(&mut ws, "core_shutdown").await;
@@ -246,7 +261,7 @@ async fn drained_restart_comes_back_as_the_new_build_and_keeps_the_queue() {
     let mut child = start(&dir, 60);
     let d = wait_discovery(&dir, Some(child.id()));
     assert_eq!(d["exe"], format!("dexd{}", std::env::consts::EXE_SUFFIX), "{d}");
-    let (mut ws, ok) = connect(d["url"].as_str().unwrap(), &token(&d), false).await;
+    let (mut ws, ok) = connect(&d, &token(&dir), false).await;
     assert!(ok["result"]["methods"].as_array().unwrap().iter().any(|m| m == "core_drain_cancel"), "{ok}");
     // A job for a worker that never takes it (no such agent): it stays queued wherever it is.
     let job = {
@@ -271,7 +286,7 @@ async fn drained_restart_comes_back_as_the_new_build_and_keeps_the_queue() {
     assert!(!dir.join("dex.restart.json").exists(), "the new core took the marker");
 
     // The patron's "Çekirdeği kapat": no marker — a later start fails the queue.
-    let (mut ws, _) = connect(new["url"].as_str().unwrap(), &token(&new), false).await;
+    let (mut ws, _) = connect(&new, &token(&dir), false).await;
     let r = call(&mut ws, "core_shutdown").await;
     assert!(r.get("error").is_none(), "{r}");
     let until = Instant::now() + Duration::from_secs(15);
@@ -284,7 +299,7 @@ async fn drained_restart_comes_back_as_the_new_build_and_keeps_the_queue() {
     let mut again = start(&dir, 60);
     let d = wait_discovery(&dir, Some(again.id()));
     assert_eq!(job_status(&dir, job), "failed", "a plain start fails the queue");
-    let (mut ws, _) = connect(d["url"].as_str().unwrap(), &token(&d), false).await;
+    let (mut ws, _) = connect(&d, &token(&dir), false).await;
     call(&mut ws, "core_shutdown").await;
     assert!(exited_within(&mut again, 15).is_some());
     let _ = std::fs::remove_file(&staged);
