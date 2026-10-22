@@ -41,7 +41,9 @@ export default defineConfig(() => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // IPv4 loopback: with a Tailscale exit node on, Windows blocks ::1 (EACCES) and `localhost` resolves there
+    // first, so `tauri dev` waits forever. devUrl stays localhost:1420 — dexd's LOCAL_ORIGINS trusts that origin.
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",
