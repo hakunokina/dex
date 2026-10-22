@@ -46,11 +46,13 @@ button.project-pick:disabled { opacity: 0.6; cursor: default; }
 button.project-pick svg { flex: none; width: 14px; height: 14px; color: var(--muted); }
 .project-pick-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-pick-pop {
-  position: fixed; z-index: var(--z-team-pop); overflow-y: auto; box-sizing: border-box;
+  position: fixed; z-index: var(--z-team-pop); overflow: hidden; box-sizing: border-box;
   width: min(240px, calc(100vw - 16px)); padding: var(--sp-1); display: flex; flex-direction: column; gap: 2px;
   background: var(--surface-pop); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: var(--shadow-pop);
 }
-.project-pick-pop ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+/* Only the project rows scroll: the "+" row (and hint/error) stays visible below a long list. */
+.project-pick-pop ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; }
+.project-pick-pop > :not(ul) { flex-shrink: 0; }
 .project-pick-item {
   display: flex; align-items: center; width: 100%; min-height: 28px; box-sizing: border-box; padding: 0 var(--sp-2);
   font: inherit; font-size: var(--fs-xs); color: var(--text); background: none; border: 1px solid transparent; border-radius: var(--r-sm);
