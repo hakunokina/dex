@@ -42,6 +42,11 @@
 }
 .team-pop h3 { margin: 0 0 2px; font-size: var(--fs-md); font-weight: var(--fw-semibold); display: flex; align-items: center; gap: var(--sp-2); }
 .team-pop h3 .close { margin-left: auto; }
+/* The create/copy form scrolls with a long member list: keep its title (and close button) in view. */
+.team-pop:not(.team-settings) h3 {
+  position: sticky; top: calc(-1 * var(--sp-3)); z-index: 1;
+  margin: calc(-1 * var(--sp-3)) calc(-1 * var(--sp-3)) 2px; padding: var(--sp-3) var(--sp-3) var(--sp-1); background: var(--surface-pop);
+}
 .team-pop label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: var(--fs-xs); }
 .team-pop input, .team-pop select {
   font-size: var(--fs-sm); color: var(--text); height: var(--ctl-h);

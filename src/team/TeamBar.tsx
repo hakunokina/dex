@@ -1,5 +1,6 @@
 // Top-bar team tabs, "+ new team" form and the active team's settings/member panel.
 import { Fragment, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createPortal } from "react-dom";
 import { hostName, hostStatus, hostSupports, LOCAL, onEvent, useHosts, useLocalStatus } from "../api/hosts";
 import { hasLocalCore } from "../api/platform";
 import { CoreDownReason, StartCoreButton } from "./CoreBanner";
@@ -318,7 +319,9 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
     } finally { setBusy(false); }
   }
 
-  return (
+  // Portal: the top bar's stacking context sits under the workspace's floating groups (Takım ayarları),
+  // so "Takımı kopyala" from that panel opened behind it.
+  return createPortal(
     <>
     <div className="team-create-backdrop" aria-hidden="true" />
     <form ref={formRef} tabIndex={-1} className="team-pop" role="dialog" aria-label={sourceId ? "Takımı kopyala" : "Yeni takım"} aria-modal="true" aria-busy={busy || loading} onSubmit={submit} onKeyDown={(e) => {
@@ -330,7 +333,9 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
         else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
       }
     }}>
-      <h3>{sourceId ? "Takımı kopyala" : "Yeni takım"}</h3>
+      <h3>{sourceId ? "Takımı kopyala" : "Yeni takım"}
+        <button type="button" className="icon-btn close" disabled={busy} onClick={onDone} aria-label="Kapat" title="Kapat (Esc)"><X /></button>
+      </h3>
       <fieldset className="team-form-fields" disabled={busy || loading}>
       <label>
         Ad
@@ -424,7 +429,8 @@ function NewTeamForm({ onDone, initialHost, sourceId }: { onDone: () => void; in
         <button type="submit" className="primary" disabled={busy || loading || (educationSelected && educationSupport !== true) || !name.trim() || (!!sourceId && !template) || template?.members.some(m => !m.name.trim() || !m.model) || (kind === "main" && !cwd && !projects)}>{busy ? "Oluşturuluyor…" : "Oluştur"}</button>
       </div>
     </form>
-    </>
+    </>,
+    document.body,
   );
 }
 
