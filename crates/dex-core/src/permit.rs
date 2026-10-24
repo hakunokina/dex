@@ -58,9 +58,6 @@ pub struct Ctx {
     pub job: Option<i64>,
     /// The reviewer's own Claude session output directory, from trusted session metadata.
     pub tool_results: Option<PathBuf>,
-    /// #2361: the checkout's effective git hooks directory (`core.hooksPath`), read by Dex from
-    /// the repository config — never tool input. Written by an agent it is code for every commit.
-    pub hooks: Vec<PathBuf>,
 }
 
 /// #288: why a code-review worker's call was denied.
@@ -498,7 +495,7 @@ fn write_path(p: &Path, ctx: &Ctx) -> Verdict {
         Verdict::Deny(format!("başka takımın klasörüne yazma: {}", p.display()))
     } else if !within(p, &ctx.write) {
         Verdict::Deny(format!("çalışma dizini dışına yazma: {}", p.display()))
-    } else if protected(p, &ctx.write, &ctx.hooks) {
+    } else if protected(p, &ctx.write) {
         Verdict::Deny(format!("ajan/git yapılandırması (korumalı): {}", p.display()))
     } else {
         Verdict::Allow
@@ -508,15 +505,11 @@ fn write_path(p: &Path, ctx: &Ctx) -> Verdict {
 /// #164 P2: hooks, settings, MCP servers, instructions, git hooks/config. Written by an agent they
 /// switch the policy off or plant code/instructions for the next session of any agent. Judged
 /// below the write root it is in (a root may itself sit under such a folder, e.g. a worktree).
-/// `hooks`: the checkout's effective hooks directory (#2361), protected wherever it points.
-fn protected(p: &Path, roots: &[PathBuf], hooks: &[PathBuf]) -> bool {
+fn protected(p: &Path, roots: &[PathBuf]) -> bool {
     let k = key(p);
     // Core merge policy/source must remain protected even under a broad write root,
     // or when a job's write root is the reserved scratch directory itself.
     if k.split('/').any(|c| c.split(':').next().unwrap_or("").trim_end_matches(['.', ' ']).eq_ignore_ascii_case(crate::merge_gate::SCRATCH_DIR)) {
-        return true;
-    }
-    if hooks.iter().any(|h| within(p, std::slice::from_ref(h))) {
         return true;
     }
     let Some(rel) = roots.iter().map(|r| key(r)).filter(|r| !r.is_empty()).find_map(|r| {
@@ -524,48 +517,16 @@ fn protected(p: &Path, roots: &[PathBuf], hooks: &[PathBuf]) -> bool {
     }) else {
         return false;
     };
-    protected_rel(&rel)
-}
-
-/// The repo-relative half of `protected`: agent/git configuration and the repo's own git hooks
-/// (`scripts/hooks`, run by every commit). Also what the merge gate treats as policy (#2361).
-pub fn protected_rel(rel: &str) -> bool {
     // Windows drops trailing dots/spaces and reads `name:stream` as `name`.
     let parts: Vec<String> = rel
-        .replace('\\', "/")
         .split('/')
         .map(|c| c.split(':').next().unwrap_or("").trim_end_matches(['.', ' ']).to_ascii_lowercase())
         .collect();
     let name = parts.last().map(String::as_str).unwrap_or("");
     let parent = parts.len().checked_sub(2).map(|i| parts[i].as_str());
     parts.iter().any(|c| matches!(c.as_str(), ".claude" | ".git" | ".codex"))
-        || parts.windows(2).any(|w| w[0] == "scripts" && w[1] == "hooks")
         || matches!(name, ".mcp.json" | "claude.md" | "claude.local.md" | "agents.md")
         || (name == "tasks.json" && parent == Some(".vscode"))
-}
-
-/// #2361: where git looks for hooks in the checkout at `cwd` — `core.hooksPath` resolved against
-/// the work tree root. Cached per checkout (a spawn per tool call would be too slow); the answer
-/// is a deny-only addition, so a stale entry costs a missed protection until restart at worst.
-pub fn hooks_dir(cwd: &Path) -> Option<PathBuf> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    let id = key(cwd);
-    if let Some(hit) = cache.lock().ok().and_then(|c| c.get(&id).cloned()) {
-        return hit;
-    }
-    let found = (|| {
-        let configured = crate::worktree::git(cwd, &["config", "--get", "core.hooksPath"]).ok().filter(|v| !v.is_empty())?;
-        let top = crate::worktree::git(cwd, &["rev-parse", "--show-toplevel"]).ok().filter(|v| !v.is_empty()).map_or_else(|| cwd.to_path_buf(), PathBuf::from);
-        let path = Path::new(&configured);
-        Some(if path.is_absolute() { path.to_path_buf() } else { top.join(path) })
-    })();
-    if let Ok(mut c) = cache.lock() {
-        c.insert(id, found.clone());
-    }
-    found
 }
 
 /// Deny beats leader beats allow.
@@ -2952,8 +2913,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// #2361: the repo's git hooks run on every commit — `scripts/hooks` and wherever
-    /// `core.hooksPath` points are as protected as `.git/hooks`.
     /// #2361: the Glob `pattern` is judged as a path, not only its `path` argument.
     #[test]
     fn glob_pattern_is_judged_as_a_path() {
@@ -2970,41 +2929,14 @@ mod tests {
         }
     }
 
+    /// #2384 (patron kararı): `scripts/hooks` ve `core.hooksPath` hedefi worker'a yazımda korumalı
+    /// değil — birleştirmede `scripts/hooks/` yine patron onayı ister (worktree POLICY_FILES);
+    /// worker'ın `git config core.hooksPath …` yazımı Deny kalır.
     #[test]
-    fn the_effective_hooks_directory_is_protected() {
+    fn repo_hooks_are_merge_policy_not_write_protected() {
         let c = ctx();
-        let write = |c: &Ctx, f: &str| decide("Write", &json!({ "file_path": f }), c);
-        for f in ["scripts/hooks/pre-commit", "scripts/hooks/lib/x.sh", "scripts\\hooks\\pre-commit", "scripts/hooks./pre-commit", "scripts/hooks/pre-commit::$DATA"] {
-            assert!(matches!(write(&c, f), Verdict::Deny(_)), "{f}: {:?}", write(&c, f));
-        }
-        deny("echo x > scripts/hooks/pre-commit");
-        for f in ["src/hooks.rs", "scripts/build.mjs", "docs/scripts/hooks.md", ".husky/pre-commit"] {
-            assert_eq!(write(&c, f), Verdict::Allow, "{f}");
-        }
-        // `core.hooksPath = .husky` (resolved by Dex against the checkout, never tool input).
-        let mut hooked = ctx();
-        hooked.hooks = vec![hooked.write[0].join(".husky")];
-        assert!(matches!(write(&hooked, ".husky/pre-commit"), Verdict::Deny(_)));
-        assert!(matches!(write(&hooked, ".husky/_/husky.sh"), Verdict::Deny(_)));
-        assert_eq!(write(&hooked, "src/hooks.rs"), Verdict::Allow);
-        assert!(protected_rel("scripts/hooks/pre-commit") && protected_rel(".github\\..\\.claude/x"));
-        assert!(!protected_rel("scripts/build.mjs") && !protected_rel("README.md"));
-    }
-
-    #[test]
-    fn hooks_dir_follows_core_hooks_path() {
-        let root = std::env::temp_dir().join(format!("dex-hooks-dir-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let git = |a: &[&str]| crate::worktree::git(&root, a).unwrap();
-        git(&["init", "-q"]);
-        assert_eq!(hooks_dir(&root), None);
-        git(&["config", "core.hooksPath", ".husky"]);
-        // The first answer is cached per checkout: ask a fresh checkout for the configured case.
-        let fresh = root.join("nested");
-        std::fs::create_dir_all(&fresh).unwrap();
-        let got = hooks_dir(&fresh).expect("relative core.hooksPath resolves");
-        assert!(key(&got).ends_with("/.husky"), "{got:?}");
-        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(decide("Write", &json!({ "file_path": "scripts/hooks/pre-commit" }), &c), Verdict::Allow);
+        deny("git config core.hooksPath x");
     }
 
     #[test]

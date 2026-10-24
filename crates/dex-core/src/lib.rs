@@ -1549,7 +1549,7 @@ impl Core {
         let tool = body.get("tool_name").and_then(Value::as_str)?;
         let input = body.get("tool_input").cloned().unwrap_or(Value::Null);
         let placed = with(&self.db, |c| Ok((self.permit_ctx(c, agent, body)?, running_job(c, agent)?)));
-        let (mut ctx, worker, running) = match placed {
+        let (ctx, worker, running) = match placed {
             Ok((Some((ctx, worker)), running)) => (ctx, worker, running),
             _ if self.hooks.is_fail_closed(agent) => {
                 diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "policy", "policy_unavailable", tool, &input, None, None));
@@ -1558,8 +1558,6 @@ impl Core {
             }
             _ => return None,
         };
-        // #2361: the checkout's effective hooks directory — read after the DB lock, git is a spawn.
-        ctx.hooks = ctx.cwd.as_deref().and_then(permit::hooks_dir).into_iter().collect();
         let answer = match permit::decide(tool, &input, &ctx) {
             permit::Verdict::Deny(why) if !worker => {
                 diagnostics::event("permit", diagnostics::permit_fields(agent, "deny", "deny", diagnostics::denial_rule(&why), tool, &input, Some(&ctx), None));
