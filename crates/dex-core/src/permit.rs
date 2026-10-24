@@ -182,9 +182,12 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
                     if !literal.is_empty() {
                         judged.push(read_path(Some(resolve(base.as_deref(), literal)), ctx, tool));
                     }
-                    let probe = resolve(base.as_deref(), &pat.replace(['*', '?', '[', ']', '{', '}'], "x"));
-                    if secret(&probe) {
-                        judged.push(Verdict::Deny(format!("sır/kimlik dosyası: {pat}")));
+                    match glob_probes(pat) {
+                        Some(probes) if probes.iter().any(|p| secret(&resolve(base.as_deref(), p))) => {
+                            judged.push(Verdict::Deny(format!("sır/kimlik dosyası: {pat}")));
+                        }
+                        Some(_) => {}
+                        None => judged.push(Verdict::Leader(tool.into())),
                     }
                     v = worst(std::iter::once(v).chain(judged));
                 }
@@ -201,6 +204,54 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
         },
         _ => Verdict::Leader(tool.into()),
     }
+}
+
+/// #2384: the names a Glob pattern stands for, as probes for `secret()` — brace alternatives and
+/// bracket members and `?` expanded (`{src,.ssh}`, `.ss[h]`, `id_rs?`), `*` as nothing and as a
+/// letter (`**/.env*` → `.env`). `None`: too many to try, the leader decides.
+fn glob_probes(pat: &str) -> Option<Vec<String>> {
+    const MAX: usize = 256;
+    let any = || ('a'..='z').chain('0'..='9').chain(['.', '_', '-']);
+    let mut done = Vec::new();
+    let mut todo = vec![pat.to_string()];
+    while let Some(p) = todo.pop() {
+        if done.len() + todo.len() > MAX {
+            return None;
+        }
+        let group = |open: char, close: char| p.find(open).and_then(|o| p[o + 1..].find(close).map(|c| (o, o + 1 + c)));
+        if let Some((o, c)) = group('{', '}') {
+            todo.extend(p[o + 1..c].split(',').map(|alt| format!("{}{alt}{}", &p[..o], &p[c + 1..])));
+            continue;
+        }
+        if let Some((o, c)) = group('[', ']') {
+            let set: Vec<char> = p[o + 1..c].chars().collect();
+            let mut members = Vec::new();
+            if set.is_empty() || matches!(set[0], '!' | '^') {
+                // A negated class matches nearly any name character.
+                members.extend(any());
+            } else {
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        members.extend(set[i]..=set[i + 2]);
+                        i += 3;
+                    } else {
+                        members.push(set[i]);
+                        i += 1;
+                    }
+                }
+            }
+            todo.extend(members.into_iter().map(|m| format!("{}{m}{}", &p[..o], &p[c + 1..])));
+            continue;
+        }
+        if let Some(q) = p.find('?') {
+            todo.extend(any().map(|m| format!("{}{m}{}", &p[..q], &p[q + 1..])));
+            continue;
+        }
+        done.push(p.replace("**/", "").replace('*', ""));
+        done.push(p.replace('*', "x"));
+    }
+    Some(done)
 }
 
 // ---- permit requests (in memory: a restart just makes the worker ask again) ----
@@ -1892,6 +1943,13 @@ fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String>
 /// arguments, stopping at the first plainly allowed command (`cmd /c echo git push` stays gray).
 fn scan_word_bodies(words: &[String], scan: &mut Scan, depth: usize) -> Scanned {
     let args = &words[1..];
+    // #2384: cmd reads `^x` as `x` (`cmd /c g^it push`): its words are read caret-free too.
+    if name(&words[0]) == "cmd" && args.iter().any(|a| a.contains('^')) {
+        let plain: Vec<String> = words.iter().map(|w| uncaret(w)).collect();
+        if let Scanned::Denied(why) = scan_word_bodies(&plain, scan, depth) {
+            return Scanned::Denied(why);
+        }
+    }
     let mut one = |text: &str, tail: Option<&[String]>| scan.text(text, depth, tail);
     if name(&words[0]) == "git" {
         for body in git_config_bodies(args) {
@@ -1926,6 +1984,16 @@ fn scan_word_bodies(words: &[String], scan: &mut Scan, depth: usize) -> Scanned 
         }
     }
     Scanned::Gray
+}
+
+/// cmd's escape: `^x` is `x`, `^^` is `^`.
+fn uncaret(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    let mut chars = w.chars();
+    while let Some(c) = chars.next() {
+        out.extend(if c == '^' { chars.next() } else { Some(c) });
+    }
+    out
 }
 
 /// One candidate body text as a whole (small) command chain: a denied segment is the finding, a
@@ -2927,6 +2995,14 @@ mod tests {
         for pat in ["src/**/*.rs", "**/*.rs", "*.md", "crates/*/Cargo.toml"] {
             assert_eq!(glob(pat), Verdict::Allow, "{pat}");
         }
+        // #2384: karakter sınıfı, brace ve boş eşleşen joker sır adını gizlemez.
+        for pat in ["**/.ss[h]/*", "**/.ss[a-z]/*", "**/.ss[!x]/*", "{src,.ssh}/*", "**/.env*", "**/id_rs?"] {
+            assert!(matches!(glob(pat), Verdict::Deny(_)), "{pat}: {:?}", glob(pat));
+        }
+        for pat in ["src/{a,b}/*.rs", "src/[ab].rs", "**/*.{ts,tsx}"] {
+            assert_eq!(glob(pat), Verdict::Allow, "{pat}");
+        }
+        assert!(matches!(glob("[!a][!a][!a][!a]/x"), Verdict::Leader(_)), "{:?}", glob("[!a][!a][!a][!a]/x"));
     }
 
     /// #2384 (patron kararı): `scripts/hooks` ve `core.hooksPath` hedefi worker'a yazımda korumalı
@@ -4020,6 +4096,10 @@ mod tests {
             r#"node -e "['git','push']""#,
             "timeout 5 git push origin HEAD",
             "cmd /c \"git replace HEAD other\"",
+            // #2384: cmd'nin `^` kaçışı.
+            "cmd /c g^it push origin HEAD",
+            r#"cmd /c "g^i^t pu^sh origin HEAD""#,
+            r#"node -e "require('child_process').execSync('cmd /c g^it push')""#,
         ] {
             deny(cmd);
         }
