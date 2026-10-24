@@ -383,10 +383,21 @@ fn within(p: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().map(|r| key(r)).any(|r| !r.is_empty() && (p == r || p.starts_with(&format!("{r}/"))))
 }
 
-/// Credentials and keys: no worker reads or writes them, whatever the folder.
+/// Credentials and keys: no worker reads or writes them, whatever the folder. Judged on the path
+/// as Windows reads it (same per-component spelling as `protected`) and, for an 8.3 short alias
+/// (`~`), on the long path too — only a deny comes from that second look.
 fn secret(p: &Path) -> bool {
+    if secret_rules(p) {
+        return true;
+    }
+    p.to_string_lossy().contains('~') && std::fs::canonicalize(p).is_ok_and(|real| secret_rules(&real))
+}
+
+fn secret_rules(p: &Path) -> bool {
+    // Windows drops trailing dots/spaces and reads `name:stream` as `name`.
     let k = key(p);
-    let name = k.rsplit('/').next().unwrap_or("");
+    let parts: Vec<&str> = k.split('/').map(|c| c.split(':').next().unwrap_or("").trim_end_matches(['.', ' '])).collect();
+    let name = parts.last().copied().unwrap_or("");
     let benign = [".example", ".sample", ".template", ".dist"].iter().any(|s| name.ends_with(s));
     let by_name = (name == ".env" || name.starts_with(".env."))
         || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"].iter().any(|s| name.ends_with(s))
@@ -397,7 +408,7 @@ fn secret(p: &Path) -> bool {
         || name.starts_with("dex-provider.")
         // #150: `dexd --local`'s endpoint token (crates/dexd/src/local.rs) — the core's own door.
         || name == "dexd.local.token";
-    let by_dir = ["/.ssh/", "/.aws/", "/.gnupg/", "/.azure/", "/.kube/", "/secrets/"].iter().any(|d| format!("{k}/").contains(d));
+    let by_dir = parts.iter().any(|c| matches!(*c, ".ssh" | ".aws" | ".gnupg" | ".azure" | ".kube" | "secrets"));
     (by_name && !benign) || by_dir
 }
 
@@ -1921,7 +1932,7 @@ fn git_config_bodies(args: &[String]) -> Vec<String> {
     // `git config [flags] alias.x v` — the key and the value are the first two operands.
     if args.get(i).is_some_and(|a| a == "config") {
         let ops = positional(&args[i + 1..], &["-f", "--file", "--value"], false);
-        if let ([k, v, ..]) = ops.as_slice() {
+        if let [k, v, ..] = ops.as_slice() {
             if k.to_ascii_lowercase().starts_with("alias.") {
                 out.push(body_of(v));
             }
@@ -2800,6 +2811,36 @@ mod tests {
 
     fn leader(c: &str) {
         assert!(matches!(bash(c), Verdict::Leader(_)), "{c}: {:?}", bash(c));
+    }
+
+    /// #2361: `secret()` reads the name the way Windows does (stream suffix, trailing dot/space,
+    /// 8.3 alias), like `protected()`.
+    #[test]
+    fn secret_name_spellings_name_the_same_file() {
+        let c = ctx();
+        for f in [".env", ".env ", ".env.", ".env::$DATA", "certs/server.pem.", "id_rsa.", "id_rsa::$DATA", ".ssh /config", ".aws./credentials"] {
+            for tool in ["Read", "Write", "Edit"] {
+                let v = decide(tool, &json!({ "file_path": f }), &c);
+                assert!(matches!(v, Verdict::Deny(_)), "{tool} {f}: {v:?}");
+            }
+        }
+        for cmd in [r#"cat ".env ""#, "cat .env::$DATA", "cp .env. out.txt", "cat certs/server.pem."] {
+            deny(cmd);
+        }
+        assert!(matches!(decide("Read", &json!({ "file_path": ".env.example" }), &c), Verdict::Allow));
+        assert!(matches!(decide("Read", &json!({ "file_path": "src/envelope.rs" }), &c), Verdict::Allow));
+        // An 8.3 alias of a secret folder: the long path decides.
+        let root = std::env::temp_dir().join(format!("dex-secret-83-{}", std::process::id()));
+        let real = root.join(".ssh");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("config"), "x").unwrap();
+        let alias = root.join("sshdir~1");
+        if crate::worktree::link_dir(&real, &alias) {
+            assert!(secret(&alias.join("config")), "8.3 alias of .ssh");
+        } else {
+            eprintln!("8.3 alias test unavailable on this host");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
