@@ -174,7 +174,25 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
             }) {
                 return Verdict::Allow;
             }
-            read_path(p.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone()), ctx, tool)
+            let base = p.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone());
+            let mut v = read_path(base.clone(), ctx, tool);
+            // #2361: a Glob `pattern` is a path too — `~/.ssh/*`, `C:/x/.aws/**` search elsewhere than
+            // `path`, and `**/.ssh/*` only names a secret behind a wildcard.
+            if tool == "Glob" {
+                if let Some(pat) = s("pattern") {
+                    let literal = pat.split(['*', '?', '[', '{']).next().unwrap_or("").trim_end_matches(['\\', '/']);
+                    let mut judged = Vec::new();
+                    if !literal.is_empty() {
+                        judged.push(read_path(Some(resolve(base.as_deref(), literal)), ctx, tool));
+                    }
+                    let probe = resolve(base.as_deref(), &pat.replace(['*', '?', '[', ']', '{', '}'], "x"));
+                    if secret(&probe) {
+                        judged.push(Verdict::Deny(format!("sır/kimlik dosyası: {pat}")));
+                    }
+                    v = worst(std::iter::once(v).chain(judged));
+                }
+            }
+            v
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => match s("file_path").or_else(|| s("notebook_path")) {
             Some(p) => write_path(&resolve(ctx.cwd.as_deref(), p), ctx),
@@ -2891,6 +2909,22 @@ mod tests {
 
     /// #2361: the repo's git hooks run on every commit — `scripts/hooks` and wherever
     /// `core.hooksPath` points are as protected as `.git/hooks`.
+    /// #2361: the Glob `pattern` is judged as a path, not only its `path` argument.
+    #[test]
+    fn glob_pattern_is_judged_as_a_path() {
+        let c = ctx();
+        let glob = |pat: &str| decide("Glob", &json!({ "pattern": pat }), &c);
+        for pat in [abs("/dex-fixture/.ssh/*"), "~/.ssh/*".into(), "../../.aws/**".into(), "**/.ssh/*".into(), "**/*.pem".into(), "secrets/**".into()] {
+            assert!(matches!(glob(&pat), Verdict::Deny(_)), "{pat}: {:?}", glob(&pat));
+        }
+        for pat in [abs("/w/other/**"), "../other/*.txt".into()] {
+            assert!(matches!(glob(&pat), Verdict::Leader(_)), "{pat}: {:?}", glob(&pat));
+        }
+        for pat in ["src/**/*.rs", "**/*.rs", "*.md", "crates/*/Cargo.toml"] {
+            assert_eq!(glob(pat), Verdict::Allow, "{pat}");
+        }
+    }
+
     #[test]
     fn the_effective_hooks_directory_is_protected() {
         let c = ctx();
