@@ -1836,13 +1836,17 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
 
 // ---- #2286: hard noes behind any wrapper ----
 
-/// How deep a body's own bodies are read (`cmd /c sh -c '…'`), and how many texts are lexed at
-/// most: an inline script of a dev machine stays gray as before, not a denial brute-forced out.
+/// How deep a body's own bodies are read (`cmd /c sh -c '…'`), and how many texts and bytes are
+/// lexed at most (tails make the bytes quadratic in the words: the hook's time bound). #2384: a body left unread for either is a worker's hard no ([`BODY_SHORT`]) — padding or
+/// nesting must not turn a denial back into a gray the leader may approve; the leader's own
+/// command stays gray as before.
 const BODY_DEPTH: usize = 4;
 const BODY_BUDGET: usize = 4000;
+const BODY_BYTES: usize = 1 << 21;
+const BODY_SHORT: &str = "gövde taranamadı: çok büyük/derin";
 
 /// #2286: what a body scan made of one word list.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Scanned {
     /// An allowlisted command: what follows it in the same list is its data.
     Allowed,
@@ -1852,12 +1856,54 @@ enum Scanned {
     Gray,
 }
 
+/// #2384: one body scan — its lex budget, whether a text was left unread (depth or budget), and
+/// what each text already made at which depth: a tail's own words and tails are the outer
+/// list's, so each is lexed once and the scan stays linear in the words (it was exponential).
+struct Scan<'a> {
+    d: Option<Dialect>,
+    ctx: &'a Ctx,
+    budget: usize,
+    bytes: usize,
+    short: bool,
+    seen: std::collections::HashMap<String, (usize, Scanned)>,
+}
+
+impl<'a> Scan<'a> {
+    fn new(d: Option<Dialect>, ctx: &'a Ctx) -> Self {
+        Scan { d, ctx, budget: BODY_BUDGET, bytes: BODY_BYTES, short: false, seen: Default::default() }
+    }
+
+    /// One candidate body text of a word list scanned `depth` deep; `tail` is the list's words it
+    /// was joined from, if any.
+    fn text(&mut self, text: &str, depth: usize, tail: Option<&[String]>) -> Scanned {
+        if let Some((seen, out)) = self.seen.get(text) {
+            if *seen >= depth {
+                return out.clone();
+            }
+        }
+        if depth == 0 || self.budget == 0 || self.bytes < text.len() {
+            self.short = true;
+            return Scanned::Gray;
+        }
+        self.budget -= 1;
+        self.bytes -= text.len();
+        let out = scan_text(text, self, depth - 1, tail);
+        self.seen.insert(text.to_string(), (depth, out.clone()));
+        out
+    }
+
+    /// A worker's denial for a body left unread.
+    fn short_denial(&self) -> Option<String> {
+        (self.short && !self.ctx.leader).then(|| BODY_SHORT.to_string())
+    }
+}
+
 /// Every gray segment's arguments are possible bodies — judged only for a deny (#480): an allow
 /// never comes from here, and the allow/gray path of the outer command is unchanged. A denied or
 /// allowlisted segment is skipped: the chain already denies, and an allowlisted command's
 /// arguments are its data (`git commit -m 'git push'`).
 fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String> {
-    let mut budget = BODY_BUDGET;
+    let mut scan = Scan::new(d, ctx);
     for seg in &lexed.segs {
         let words = strip_env(&seg.words);
         let Some(first) = words.first() else { continue };
@@ -1871,11 +1917,11 @@ fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String>
         ) {
             continue;
         }
-        if let Scanned::Denied(why) = scan_word_bodies(words, d, ctx, BODY_DEPTH, &mut budget) {
+        if let Scanned::Denied(why) = scan_word_bodies(words, &mut scan, BODY_DEPTH) {
             return Some(why);
         }
     }
-    None
+    scan.short_denial()
 }
 
 /// The bodies one gray command may run: for `git` only its config bodies (`-c alias.x=!cmd` →
@@ -1883,21 +1929,12 @@ fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String>
 /// other command: each word on its own (a quoted body re-splits when lexed alone; a script
 /// command hidden in punctuation `['git','push']` is flattened once), then every tail of the
 /// arguments, stopping at the first plainly allowed command (`cmd /c echo git push` stays gray).
-fn scan_word_bodies(words: &[String], d: Option<Dialect>, ctx: &Ctx, depth: usize, budget: &mut usize) -> Scanned {
-    if depth == 0 || *budget == 0 {
-        return Scanned::Gray;
-    }
+fn scan_word_bodies(words: &[String], scan: &mut Scan, depth: usize) -> Scanned {
     let args = &words[1..];
-    let mut one = |text: &str| -> Scanned {
-        if *budget == 0 {
-            return Scanned::Gray;
-        }
-        *budget -= 1;
-        scan_text(text, d, ctx, depth - 1, budget)
-    };
+    let mut one = |text: &str, tail: Option<&[String]>| scan.text(text, depth, tail);
     if name(&words[0]) == "git" {
         for body in git_config_bodies(args) {
-            if let Scanned::Denied(why) = one(&body) {
+            if let Scanned::Denied(why) = one(&body, None) {
                 return Scanned::Denied(why);
             }
         }
@@ -1910,18 +1947,18 @@ fn scan_word_bodies(words: &[String], d: Option<Dialect>, ctx: &Ctx, depth: usiz
     }
     texts.extend(args.iter().map(String::as_str));
     for t in &texts {
-        if let Scanned::Denied(why) = one(t) {
+        if let Scanned::Denied(why) = one(t, None) {
             return Scanned::Denied(why);
         }
         let flat: String = t.chars().map(|c| if "[]{},".contains(c) { ' ' } else { c }).collect();
         if flat != *t {
-            if let Scanned::Denied(why) = one(&flat) {
+            if let Scanned::Denied(why) = one(&flat, None) {
                 return Scanned::Denied(why);
             }
         }
     }
     for i in 0..args.len() {
-        match one(&args[i..].join(" ")) {
+        match one(&args[i..].join(" "), Some(&args[i..])) {
             Scanned::Denied(why) => return Scanned::Denied(why),
             Scanned::Allowed => break,
             Scanned::Gray => {}
@@ -1932,9 +1969,12 @@ fn scan_word_bodies(words: &[String], d: Option<Dialect>, ctx: &Ctx, depth: usiz
 
 /// One candidate body text as a whole (small) command chain: a denied segment is the finding, a
 /// gray one recurses into its own bodies, an allowlisted one says the text is plainly allowed.
-fn scan_text(text: &str, d: Option<Dialect>, ctx: &Ctx, depth: usize, budget: &mut usize) -> Scanned {
+/// #2384: a tail that lexes back to the words it was joined from has no bodies of its own but
+/// git's config bodies — its words and tails are the outer list's, read there (else cubic).
+fn scan_text(text: &str, scan: &mut Scan, depth: usize, tail: Option<&[String]>) -> Scanned {
+    let ctx = scan.ctx;
     let mut out = Scanned::Allowed;
-    let lexed = lex(text, d);
+    let lexed = lex(text, scan.d);
     if lexed.segs.is_empty() {
         return Scanned::Gray;
     }
@@ -1953,7 +1993,10 @@ fn scan_text(text: &str, d: Option<Dialect>, ctx: &Ctx, depth: usize, budget: &m
             Verdict::Allow => {}
             Verdict::Leader(_) => {
                 out = Scanned::Gray;
-                if let Scanned::Denied(why) = scan_word_bodies(words, d, ctx, depth, budget) {
+                if tail == Some(words) && name(&words[0]) != "git" {
+                    continue;
+                }
+                if let Scanned::Denied(why) = scan_word_bodies(words, scan, depth) {
                     return Scanned::Denied(why);
                 }
             }
@@ -2706,8 +2749,10 @@ impl Ro<'_> {
             // (`cmd /c '…'`) is a plain quoted word only here.
             Verdict::Leader(_) => {
                 self.gray = true;
-                let mut budget = BODY_BUDGET;
-                if let Scanned::Denied(why) = scan_word_bodies(&words, Some(self.d), self.ctx, BODY_DEPTH, &mut budget) {
+                let mut scan = Scan::new(Some(self.d), self.ctx);
+                if let Scanned::Denied(why) = scan_word_bodies(&words, &mut scan, BODY_DEPTH) {
+                    self.deny.get_or_insert(why);
+                } else if let Some(why) = scan.short_denial() {
                     self.deny.get_or_insert(why);
                 }
             }
@@ -4063,6 +4108,42 @@ mod tests {
         for cmd in ["cmd /c 'git push origin HEAD'", "cmd /c ‘git push origin HEAD’", "cmd /c ‘git commit -n -m x’"] {
             assert!(matches!(decide("PowerShell", &json!({ "command": cmd }), &ctx()), Verdict::Deny(_)), "{cmd}");
         }
+    }
+
+    /// #2384: gövde taraması bütçe ya da derinlik tükenince worker için fail-closed — dolgu ya da
+    /// iç içe sarmalama sert yasağı onaylanabilir griye geri düşürmez; lider eskisi gibi gri görür.
+    #[test]
+    fn an_unread_body_is_a_workers_hard_no() {
+        let lead = Ctx { leader: true, ..ctx() };
+        let run = |c: &str, x: &Ctx| decide("Bash", &json!({ "command": c }), x);
+        let short = |v: Verdict| matches!(v, Verdict::Deny(ref w) if w.starts_with(BODY_SHORT));
+        let push = r#""git push origin HEAD""#;
+        // Aynı sözcükle dolgu: bir kez okunur, push bulunur.
+        let same = format!("cmd /c {} {push}", vec!["a"; 4000].join(" "));
+        assert!(matches!(run(&same, &ctx()), Verdict::Deny(ref w) if w.starts_with("git push")), "{:?}", run(&same, &ctx()));
+        // Farklı sözcüklerle dolgu bütçeyi bitirir: push okunmadan kalır, worker için yine Deny.
+        let distinct = format!("cmd /c {} {push}", (0..BODY_BUDGET).map(|i| format!("a{i}")).collect::<Vec<_>>().join(" "));
+        assert!(short(run(&distinct, &ctx())));
+        assert!(matches!(decide("PowerShell", &json!({ "command": distinct }), &ctx()), Verdict::Deny(_)));
+        assert!(matches!(run(&distinct, &lead), Verdict::Leader(_)), "{:?}", run(&distinct, &lead));
+        // İç içe `cmd /c`: dört kat okunur (push bulunur), beşinci kat okunmaz (Deny yine).
+        let nest = |n: usize| (0..n).fold("git push origin HEAD".to_string(), |body, _| {
+            format!("cmd /c \"{}\"", body.replace('\\', "\\\\").replace('"', "\\\""))
+        });
+        assert!(matches!(run(&nest(4), &ctx()), Verdict::Deny(ref w) if w.starts_with("git push")), "{:?}", run(&nest(4), &ctx()));
+        assert!(short(run(&nest(5), &ctx())), "{}", nest(5));
+        assert!(matches!(run(&nest(5), &lead), Verdict::Leader(_)), "{:?}", run(&nest(5), &lead));
+        // Meşru uzun gri komut: her metin bir kez okunur — yüzlerce argüman gri kalır (eskiden
+        // tarama üsteldi, ~20 argüman bütçeyi bitiriyordu).
+        let files = |n: usize| (0..n).map(|i| format!("src/f{i}.ts")).collect::<Vec<_>>().join(" ");
+        leader(&format!("node scripts/fmt.mjs {}", files(300)));
+        // Bilinen yanlış pozitif (bilerek): bütçeyi aşan zararsız gri komut worker'da Deny (kısa
+        // dosya adlarıyla ~500+ argüman; kuyruklar baytı karesel büyütür). Bu boyda bir gri komut
+        // gerçekte nadir; okunmamış gövdeyi geçirmek atlatmayı geri açar. Lider için gri kalır;
+        // worker argümanları bölerek ya da bir dosya listesiyle koşar.
+        let long = format!("node scripts/fmt.mjs {}", files(1000));
+        assert!(short(run(&long, &ctx())));
+        assert!(matches!(run(&long, &lead), Verdict::Leader(_)));
     }
 
     #[test]
