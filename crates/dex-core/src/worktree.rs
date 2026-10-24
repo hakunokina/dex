@@ -808,13 +808,21 @@ pub fn prompt_line(w: &Wt) -> String {
 }
 
 /// Merged into the root's branch only: policy files the patron approves before they land.
-/// #2361: the core and daemon sources are whole directories — the permit, hook, merge-gate and
-/// session code reaches into most of them — and the dependency manifests run code on install.
-/// What `permit::protected_rel` guards against a worker's write (agent/git config, the repo's
-/// git hooks) is policy here too, see `is_policy_file`.
+/// #2361/#2384: only what enforces the permission and merge gates, file by file (patron: every
+/// guard here is the patron's work) — and the dependency manifests run code on install.
 const POLICY_FILES: &[&str] = &[
-    "crates/dex-core/src/",
-    "crates/dexd/src/",
+    "crates/dex-core/src/permit.rs",
+    "crates/dex-core/src/hooks.rs",
+    "crates/dex-core/src/pty.rs",
+    "crates/dex-core/src/merge_gate.rs",
+    "crates/dex-core/src/worktree.rs",
+    "crates/dex-core/src/lib.rs",
+    "crates/dex-core/src/mcp.rs",
+    "crates/dex-core/src/review.rs",
+    "crates/dex-core/src/test_budget.rs",
+    "crates/dexd/src/auth.rs",
+    "crates/dexd/src/server.rs",
+    "crates/dexd/src/local_auth.rs",
     ".gitleaks.toml",
     ".gitleaksignore",
     "scripts/hooks/",
@@ -828,11 +836,11 @@ const POLICY_FILES: &[&str] = &[
 ];
 
 fn is_policy_file(f: &str) -> bool {
-    POLICY_FILES.iter().any(|p| f == *p || (p.ends_with('/') && f.starts_with(p))) || crate::permit::protected_rel(f)
+    POLICY_FILES.iter().any(|p| f == *p || (p.ends_with('/') && f.starts_with(p)))
 }
 
 pub fn tools() -> Vec<Value> {
-    vec![json!({ "name": "delegation_merge", "description": "YALNIZ LİDER. Bitmiş bir devretmenin worker dalını (kendi git worktree'sinde çalıştıysa) takım dalına `git merge --no-ff` ile alır; başarılıysa worktree ve dal silinir. Çakışmada birleştirme geri alınır ve çakışan dosyalar döner. Yalnız dal ucunun kod incelemesi `onay` ise birleştirir: inceleme sürüyorsa ya da kararı `düzelt` ise merged:false ve önemli bulgular döner; incelenmemiş uca Dex inceleme açar. Takımda code-review üyesi yoksa yalnız inceleme kapısı yoktur. Birleştirme öncesi tüm gelen commitlerin sızıntı taraması ve author/committer e-posta denetimi zorunludur; gitleaks yoksa ya da bulgu varsa reddeder. forcePolicy/forceReview bu denetimi atlamaz. Projeye bağlı iş yalnız kendi projesinin ana checkout'u işin hedef dalındayken birleşir; başka dal/detached HEAD → merged:false, code project_branch_mismatch (otomatik checkout yok). Dal politika dosyalarına (dex-core ve dexd kaynağı, gitleaks, git hook'ları, CI, ajan/git yapılandırması, package.json/pnpm-lock.yaml) dokunuyorsa birleştirmez, patron onayı ister; onaydan sonra forcePolicy: true ile tekrar çağır.",
+    vec![json!({ "name": "delegation_merge", "description": "YALNIZ LİDER. Bitmiş bir devretmenin worker dalını (kendi git worktree'sinde çalıştıysa) takım dalına `git merge --no-ff` ile alır; başarılıysa worktree ve dal silinir. Çakışmada birleştirme geri alınır ve çakışan dosyalar döner. Yalnız dal ucunun kod incelemesi `onay` ise birleştirir: inceleme sürüyorsa ya da kararı `düzelt` ise merged:false ve önemli bulgular döner; incelenmemiş uca Dex inceleme açar. Takımda code-review üyesi yoksa yalnız inceleme kapısı yoktur. Birleştirme öncesi tüm gelen commitlerin sızıntı taraması ve author/committer e-posta denetimi zorunludur; gitleaks yoksa ya da bulgu varsa reddeder. forcePolicy/forceReview bu denetimi atlamaz. Projeye bağlı iş yalnız kendi projesinin ana checkout'u işin hedef dalındayken birleşir; başka dal/detached HEAD → merged:false, code project_branch_mismatch (otomatik checkout yok). Dal politika dosyalarına (izin/birleştirme kapısı kaynağı: permit/hooks/pty/merge_gate/worktree/lib/mcp/review/test_budget, dexd auth/server/local_auth; gitleaks, git hook'ları, CI, package.json/pnpm-lock.yaml) dokunuyorsa birleştirmez, patron onayı ister; onaydan sonra forcePolicy: true ile tekrar çağır.",
         "inputSchema": { "type": "object", "additionalProperties": false, "required": ["delegationId"], "properties": {
             "delegationId": { "type": "integer" },
             "forcePolicy": { "type": "boolean", "description": "Politika dosyası değişikliğini patron onayladıysa true" },
@@ -1483,21 +1491,25 @@ pub(crate) mod tests {
         assert!(notes.contains("pnpm install") && notes.contains("Rust"), "{notes}");
     }
 
-    /// #2361: the list covers the core, the daemon, the dependency manifests and everything the
-    /// permit policy keeps a worker from writing; ordinary sources stay out.
+    /// #2361/#2384: the list covers the permission and merge-gate sources file by file and the
+    /// dependency manifests; the rest of the core, the daemon and ordinary sources stay out.
     #[test]
-    fn policy_files_cover_the_core_and_what_permit_protects() {
+    fn policy_files_cover_the_permission_and_merge_gates() {
         for f in [
-            "crates/dex-core/src/lib.rs", "crates/dex-core/src/test_budget.rs", "crates/dex-core/src/worktree.rs",
-            "crates/dex-core/src/review.rs", "crates/dex-core/src/mcp.rs", "crates/dex-core/src/sub/new.rs",
-            "crates/dexd/src/server.rs", "package.json", "pnpm-lock.yaml", ".gitleaksignore",
-            "scripts/hooks/pre-commit", ".github/workflows/ci.yml",
-            ".claude/settings.json", ".codex/config.toml", ".mcp.json", "CLAUDE.md", "docs/AGENTS.md", ".vscode/tasks.json",
-            "scripts/hooks./pre-commit", ".git/hooks/pre-commit",
+            "crates/dex-core/src/permit.rs", "crates/dex-core/src/hooks.rs", "crates/dex-core/src/pty.rs",
+            "crates/dex-core/src/merge_gate.rs", "crates/dex-core/src/lib.rs", "crates/dex-core/src/test_budget.rs",
+            "crates/dex-core/src/worktree.rs", "crates/dex-core/src/review.rs", "crates/dex-core/src/mcp.rs",
+            "crates/dexd/src/auth.rs", "crates/dexd/src/server.rs", "crates/dexd/src/local_auth.rs",
+            "package.json", "pnpm-lock.yaml", ".gitleaksignore", ".gitleaks.toml", "scripts/hooks/pre-commit",
+            "scripts/install-hooks.mjs", ".github/workflows/ci.yml",
         ] {
             assert!(is_policy_file(f), "{f}");
         }
-        for f in ["README.md", "src/App.tsx", "src/hooks.rs", "crates/dex-core/Cargo.toml", "crates/dex-core/tests/x.rs", "docs/package.json.md", "scripts/build.mjs"] {
+        for f in [
+            "README.md", "src/App.tsx", "src/hooks.rs", "crates/dex-core/Cargo.toml", "crates/dex-core/tests/x.rs",
+            "docs/package.json.md", "scripts/build.mjs", "crates/dex-core/src/sub/new.rs", "crates/dex-core/src/db.rs",
+            "crates/dexd/src/sessions.rs", ".claude/settings.json", "CLAUDE.md",
+        ] {
             assert!(!is_policy_file(f), "{f}");
         }
     }
