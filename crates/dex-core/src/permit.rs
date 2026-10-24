@@ -974,6 +974,13 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     if wrapped_push || (lexed.dynamic && command.split('`').skip(1).step_by(2).any(push_body)) {
         verdicts.push(Verdict::Deny("git push (patronun işi)".into()));
     }
+    // #2286: hard noes survive any wrapper. A segment the policy hands to the leader runs an
+    // unknown program: every argument of it is a possible body (`cmd /c "…"`, `xargs …`,
+    // `node -e '…'`, `timeout …`, a git config alias) and is judged only for a deny — the
+    // allow and gray path of the outer command is unchanged.
+    if let Some(why) = bodies_denial(&lexed, d, ctx) {
+        verdicts.push(Verdict::Deny(why));
+    }
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
     }
@@ -1752,6 +1759,177 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
     if ok { Verdict::Allow } else { Verdict::Leader(String::new()) }
 }
 
+// ---- #2286: hard noes behind any wrapper ----
+
+/// How deep a body's own bodies are read (`cmd /c sh -c '…'`), and how many texts are lexed at
+/// most: an inline script of a dev machine stays gray as before, not a denial brute-forced out.
+const BODY_DEPTH: usize = 4;
+const BODY_BUDGET: usize = 4000;
+
+/// #2286: what a body scan made of one word list.
+#[derive(PartialEq)]
+enum Scanned {
+    /// An allowlisted command: what follows it in the same list is its data.
+    Allowed,
+    /// A hard no found inside the body.
+    Denied(String),
+    /// Nothing plain: the leader decides, as before.
+    Gray,
+}
+
+/// Every gray segment's arguments are possible bodies — judged only for a deny (#480): an allow
+/// never comes from here, and the allow/gray path of the outer command is unchanged. A denied or
+/// allowlisted segment is skipped: the chain already denies, and an allowlisted command's
+/// arguments are its data (`git commit -m 'git push'`).
+fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String> {
+    let mut budget = BODY_BUDGET;
+    for seg in &lexed.segs {
+        let words = strip_env(&seg.words);
+        let Some(first) = words.first() else { continue };
+        // A flag is not a command: a glued value (`--expression='r .netrc'` re-split) is data.
+        if first.starts_with('-') {
+            continue;
+        }
+        if !matches!(
+            segment(&Seg { words: words.to_vec(), redirs: Vec::new() }, &mut ctx.cwd.clone(), ctx),
+            Verdict::Leader(_)
+        ) {
+            continue;
+        }
+        if let Scanned::Denied(why) = scan_word_bodies(words, d, ctx, BODY_DEPTH, &mut budget) {
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// The bodies one gray command may run: for `git` only its config bodies (`-c alias.x=!cmd` →
+/// cmd, `alias.x=sub` → `git sub`, `config alias.x v`) — `git rm -r src` operands are data. Any
+/// other command: each word on its own (a quoted body re-splits when lexed alone; a script
+/// command hidden in punctuation `['git','push']` is flattened once), then every tail of the
+/// arguments, stopping at the first plainly allowed command (`cmd /c echo git push` stays gray).
+fn scan_word_bodies(words: &[String], d: Option<Dialect>, ctx: &Ctx, depth: usize, budget: &mut usize) -> Scanned {
+    if depth == 0 || *budget == 0 {
+        return Scanned::Gray;
+    }
+    let args = &words[1..];
+    let mut one = |text: &str| -> Scanned {
+        if *budget == 0 {
+            return Scanned::Gray;
+        }
+        *budget -= 1;
+        scan_text(text, d, ctx, depth - 1, budget)
+    };
+    if name(&words[0]) == "git" {
+        for body in git_config_bodies(args) {
+            if let Scanned::Denied(why) = one(&body) {
+                return Scanned::Denied(why);
+            }
+        }
+        return Scanned::Gray;
+    }
+    // A quoted script as the command itself (`execSync('git push …')` re-lexed): it holds spaces.
+    let mut texts: Vec<&str> = Vec::new();
+    if words[0].contains(char::is_whitespace) {
+        texts.push(&words[0]);
+    }
+    texts.extend(args.iter().map(String::as_str));
+    for t in &texts {
+        if let Scanned::Denied(why) = one(t) {
+            return Scanned::Denied(why);
+        }
+        let flat: String = t.chars().map(|c| if "[]{},".contains(c) { ' ' } else { c }).collect();
+        if flat != *t {
+            if let Scanned::Denied(why) = one(&flat) {
+                return Scanned::Denied(why);
+            }
+        }
+    }
+    for i in 0..args.len() {
+        match one(&args[i..].join(" ")) {
+            Scanned::Denied(why) => return Scanned::Denied(why),
+            Scanned::Allowed => break,
+            Scanned::Gray => {}
+        }
+    }
+    Scanned::Gray
+}
+
+/// One candidate body text as a whole (small) command chain: a denied segment is the finding, a
+/// gray one recurses into its own bodies, an allowlisted one says the text is plainly allowed.
+fn scan_text(text: &str, d: Option<Dialect>, ctx: &Ctx, depth: usize, budget: &mut usize) -> Scanned {
+    let mut out = Scanned::Allowed;
+    let lexed = lex(text, d);
+    if lexed.segs.is_empty() {
+        return Scanned::Gray;
+    }
+    for seg in &lexed.segs {
+        let words = strip_env(&seg.words);
+        let Some(first) = words.first() else {
+            out = Scanned::Gray;
+            continue;
+        };
+        if first.starts_with('-') {
+            out = Scanned::Gray;
+            continue;
+        }
+        match segment(&Seg { words: words.to_vec(), redirs: seg.redirs.clone() }, &mut ctx.cwd.clone(), ctx) {
+            Verdict::Deny(why) => return Scanned::Denied(why),
+            Verdict::Allow => {}
+            Verdict::Leader(_) => {
+                out = Scanned::Gray;
+                if let Scanned::Denied(why) = scan_word_bodies(words, d, ctx, depth, budget) {
+                    return Scanned::Denied(why);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `git`'s config bodies (values a worker can turn into a command): `-c alias.x=!cmd` → cmd,
+/// `alias.x=sub` → `git sub`, and the `config alias.x v` subcommand. Everything else a git
+/// invocation carries is data.
+fn git_config_bodies(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let body_of = |v: &str| match v.strip_prefix('!') {
+        Some(rest) => rest.to_string(),
+        None if v == "git" || v.starts_with("git ") => v.to_string(),
+        None => format!("git {v}"),
+    };
+    let alias = |v: &str| {
+        v.split_once('=').and_then(|(k, val)| {
+            k.to_ascii_lowercase().starts_with("alias.").then(|| body_of(val))
+        })
+    };
+    let valued = ["-C", "-c", "--config-env", "--git-dir", "--work-tree", "--namespace", "--super-prefix"];
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') {
+        let a = args[i].as_str();
+        if let Some(glued) = a.strip_prefix("-c").filter(|s| !s.is_empty()) {
+            out.extend(alias(glued));
+            i += 1;
+        } else if valued.contains(&a) {
+            if a == "-c" {
+                out.extend(args.get(i + 1).map(String::as_str).and_then(alias));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // `git config [flags] alias.x v` — the key and the value are the first two operands.
+    if args.get(i).is_some_and(|a| a == "config") {
+        let ops = positional(&args[i + 1..], &["-f", "--file", "--value"], false);
+        if let ([k, v, ..]) = ops.as_slice() {
+            if k.to_ascii_lowercase().starts_with("alias.") {
+                out.push(body_of(v));
+            }
+        }
+    }
+    out
+}
+
 // ---- #402/#495: the shell, read for real ----
 //
 // `lex` is blind to `& (…)`, braces and Unicode quotes, so an allow also needs this reader. It
@@ -2444,12 +2622,20 @@ impl Ro<'_> {
         if words.is_empty() && redirs.is_empty() {
             return;
         }
-        match segment(&Seg { words, redirs }, cwd, self.ctx) {
+        match segment(&Seg { words: words.clone(), redirs }, cwd, self.ctx) {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.deny.get_or_insert(why);
             }
-            Verdict::Leader(_) => self.gray = true,
+            // #2286: the same body scan in this reader too — a Unicode-quoted PowerShell body
+            // (`cmd /c '…'`) is a plain quoted word only here.
+            Verdict::Leader(_) => {
+                self.gray = true;
+                let mut budget = BODY_BUDGET;
+                if let Scanned::Denied(why) = scan_word_bodies(&words, Some(self.d), self.ctx, BODY_DEPTH, &mut budget) {
+                    self.deny.get_or_insert(why);
+                }
+            }
         }
     }
 }
@@ -3615,7 +3801,6 @@ mod tests {
     fn side_doors_of_allowlisted_commands_go_to_the_leader() {
         for c in [
             "git -c core.fsmonitor=./x status",
-            "git -c alias.p=push p",
             "git --config-env core.pager=X log",
             "git --exec-path=./x status",
             "git --git-dir=../other/.git log",
@@ -3645,6 +3830,8 @@ mod tests {
             leader(c);
         }
         deny("git -c x=y push");
+        // #2286: an alias body is a command the worker runs — a push behind it is a push.
+        deny("git -c alias.p=push p");
         for c in [
             "git --no-pager log -3",
             "git -C . diff --stat",
@@ -3666,6 +3853,50 @@ mod tests {
             "uniq -c a.txt",
         ] {
             allow(c);
+        }
+    }
+
+    /// #2286: sert yasaklar sarmalayıcı adından bağımsız. Gri segmentin argümanları gövde olarak
+    /// yalnız Deny için okunur; izinli komutun argümanı veridir, git'te yalnız config gövdesi
+    /// okunur, kuyruk taraması ilk izinli komutta durur.
+    #[test]
+    fn hard_noes_survive_any_wrapper() {
+        for cmd in [
+            r#"cmd /c "git push origin HEAD""#,
+            r#"cmd.exe /c "git commit -n -m x""#,
+            r#"cmd /k "git reset --hard""#,
+            r#"cmd.exe /c "git clean -fd""#,
+            "git -c alias.p='!git push origin HEAD' p",
+            "git -c alias.p=push p",
+            "git -cnote.x=1 -c alias.p='!git push' p",
+            "git config alias.p '!git push origin HEAD'",
+            "git -C . -c alias.p=push p",
+            "echo origin HEAD | xargs git push",
+            "xargs -t git push origin HEAD",
+            r#"node -e "require('child_process').execSync('git push origin HEAD')""#,
+            r#"python -c "import os; os.system('git push origin HEAD')""#,
+            r#"node -e "['git','push']""#,
+            "timeout 5 git push origin HEAD",
+            "cmd /c \"git replace HEAD other\"",
+        ] {
+            deny(cmd);
+        }
+        // Gövde değil veri: izinli komutun argümanları, kuyrukta ilk izinli komuttan sonrası,
+        // git'in config dışı operandları (`git rm -r src` toplu silme sayılmaz).
+        for cmd in [
+            "cmd /c echo git push",
+            "node scripts/build.mjs",
+            "git rm -r src",
+            "git -c user.email=x@y commit -m x",
+        ] {
+            leader(cmd);
+        }
+        allow("git commit -m 'git push'");
+        allow("echo rm -rf x");
+        leader("cmd /c cargo test");
+        // PowerShell'un Unicode tırnağı: gövde sözcüğünü yalnız gerçek okuyucu (parsed) görür.
+        for cmd in ["cmd /c 'git push origin HEAD'", "cmd /c ‘git push origin HEAD’", "cmd /c ‘git commit -n -m x’"] {
+            assert!(matches!(decide("PowerShell", &json!({ "command": cmd }), &ctx()), Verdict::Deny(_)), "{cmd}");
         }
     }
 
