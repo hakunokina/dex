@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -18,6 +19,10 @@ export const BINARY_SHA256 = {
   "darwin-arm64": "095bc4be1624239f52ebb90ff91668d1d3e78e0f8c5286e2d981887905c27561",
   "linux-x64": "8b6fd684fcd5b4ebe39b68abb072ce59e1063ce7ed4abd556157697845f1f088",
 };
+
+// Same reserved scratch as the Rust merge gate (merge_gate::SCRATCH_DIR): permit denies every
+// worker write below a path component with this name, wherever it sits.
+export const SCRATCH_DIR = "dex-core-merge-scan";
 
 export function gitEnvironment(env = process.env) {
   return { ...env, GIT_NO_REPLACE_OBJECTS: "1" };
@@ -53,9 +58,13 @@ export function scanner(root) {
 }
 
 export function scanContext(root, config) {
-  const parent = resolve(root, ".dex/tmp");
+  // Policy, ignore file, bare clone and index stay outside <root>/.dex/tmp, which every worker of
+  // the project may write: OS temp, random name, owner-only, so no concurrent worker can swap the
+  // scan inputs between their creation here and the scanner/git spawns below.
+  const parent = resolve(tmpdir(), SCRATCH_DIR);
   mkdirSync(parent, { recursive: true });
-  const dir = mkdtempSync(resolve(parent, "gitleaks-"));
+  const dir = resolve(parent, randomBytes(16).toString("hex"));
+  mkdirSync(dir, { mode: 0o700 });
   const configPath = resolve(dir, "policy.toml");
   const ignorePath = resolve(dir, "empty.gitleaksignore");
   const emptyGitConfig = resolve(dir, "empty.gitconfig");
@@ -82,6 +91,7 @@ export function scanContext(root, config) {
           // v8.30 also reads <source>/.gitleaksignore; a fresh bare clone has no such file.
           scanGit(["clone", "--bare", "--shared", "--quiet", "--template=", "--", root, source]);
         }
+        if (existsSync(resolve(source, ".gitleaksignore"))) throw new Error("Tarama deposunda .gitleaksignore reddedildi.");
         if (args.includes("--staged")) {
           // Pin the isolated copy to the worktree HEAD so --staged always diffs the
           // staged index against the true base, never against the clone default.

@@ -87,6 +87,9 @@ function main() {
     // Read Git's tree into an isolated index. No archive, CRLF conversion or mode loss in the published tree.
     git(root, ["read-tree", source], { env: indexEnv });
     const tree = git(root, ["write-tree"], { env: indexEnv });
+    // The scratch index is the only input of the published tree (--initial commit-tree below) and of
+    // the scan checkout; it must still be exactly the source tree.
+    if (tree !== git(root, ["rev-parse", "--verify", `${source}^{tree}`])) throw new Error("Yayin agaci kaynak agacla uyusmuyor; islem durduruldu.");
     let candidate = source, range;
     if (options.initial) {
       const date = `${Math.floor(Date.now() / 1000)} +0000`;
@@ -116,6 +119,12 @@ function main() {
     // This checkout is scan-only; the root commit above retains the original Git tree and modes.
     git(root, ["checkout-index", "--all", `--prefix=${scanTree.replaceAll("\\", "/")}/`], { env: indexEnv });
     context.scan(binary, ["dir", scanTree]);
+    // What the scanner read must be what is published: re-hash the scanned checkout (refresh hashes
+    // every stat-dirty entry; diff-index alone would only report them) and compare it with the tree.
+    for (const args of [["update-index", "--refresh", "-q"], ["diff-index", "--quiet", tree, "--"]]) {
+      const same = spawnSync("git", ["--work-tree", scanTree, ...args], { cwd: root, env: gitEnvironment(indexEnv), encoding: "utf8", stdio: ["ignore", "ignore", "ignore"] });
+      if (same.error || same.status !== 0) throw new Error("Taranan agac yayin agaciyla uyusmuyor; islem durduruldu.");
+    }
     console.log(`[Dex publish] ${commits.length} commit + agac + kimlik + mesaj: gecti.`);
     if (options.initial) console.log(`[Dex publish] root=${candidate}`);
     const pushArgs = ["-c", "push.followTags=false", "push", "--no-follow-tags", "--recurse-submodules=no", "--", url, `${candidate}:refs/heads/${options.target}`];
