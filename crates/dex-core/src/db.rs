@@ -484,6 +484,11 @@ const MIGRATIONS: &[&str] = &[
     // ROLLBACK. After commit, full undo: DELETE FROM role_skills WHERE skill IN
     // ('plan-check','eval-leak-check'); (the table and the other rows stay).
     PROCESS_SKILLS_46,
+    // 47 (#2387): vendored UI skills — frontend-design (design, frontend), ux-writing (design,
+    // frontend, mobile). Additive; INSERT OR IGNORE makes a second run a no-op. Before commit:
+    // ROLLBACK. After commit, full undo: DELETE FROM role_skills WHERE skill IN
+    // ('frontend-design','ux-writing'); (the table and the other rows stay).
+    UI_SKILLS_47,
 ];
 
 /// Migration 46. Idempotent on its own: the (role_slug, skill) PK + OR IGNORE
@@ -492,6 +497,14 @@ const PROCESS_SKILLS_46: &str = "INSERT OR IGNORE INTO role_skills (role_slug, s
     ('lead', 'plan-check'),
     ('explorer', 'eval-leak-check'),
     ('qa', 'eval-leak-check');";
+
+/// Migration 47. Idempotent on its own, same as 46.
+const UI_SKILLS_47: &str = "INSERT OR IGNORE INTO role_skills (role_slug, skill) VALUES
+    ('design', 'frontend-design'),
+    ('frontend', 'frontend-design'),
+    ('design', 'ux-writing'),
+    ('frontend', 'ux-writing'),
+    ('mobile', 'ux-writing');";
 
 const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK (closed_reason IN ('cancelled','superseded'));
     CREATE INDEX IF NOT EXISTS delegations_task ON delegations(task_id);
@@ -875,8 +888,8 @@ mod job_model_migration_tests {
         let count = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM role_skills", [], |r| r.get(0)).unwrap() };
         let before = count(&c);
         assert_eq!(before, 15); // migration 8 rows, untouched by 46
+        // Only 46 itself, twice: later skill migrations add their own rows (#2387).
         for _ in 0..2 {
-            migrate(&mut c).unwrap();
             c.execute_batch(PROCESS_SKILLS_46).unwrap();
             assert_eq!(count(&c), before + 3);
         }
@@ -884,11 +897,50 @@ mod job_model_migration_tests {
             let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE role_slug=?1 AND skill=?2", [role, skill], |r| r.get(0)).unwrap();
             assert_eq!(n, 1, "{role}/{skill}");
         }
+        c.pragma_update(None, "user_version", version + 1).unwrap();
+        for _ in 0..2 { migrate(&mut c).unwrap(); }
         let mut clean = Connection::open_in_memory().unwrap();
         for _ in 0..2 { migrate(&mut clean).unwrap(); }
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
-        assert_eq!(count(&clean), 18);
-        println!("process skills migration: before/after={before}/{}; v{version} + clean DB 2 runs", count(&c));
+        assert_eq!(count(&clean), count(&c));
+        println!("process skills migration: before/after={before}/{}; v{version} + clean DB 2 runs", before + 3);
+    }
+
+    #[test]
+    fn ui_skills_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let version = MIGRATIONS.iter().position(|sql| *sql == UI_SKILLS_47).unwrap();
+        for (i, sql) in MIGRATIONS[..version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        let count = |c: &Connection| -> i64 { c.query_row("SELECT COUNT(*) FROM role_skills", [], |r| r.get(0)).unwrap() };
+        let rows = |c: &Connection| -> Vec<(String, String)> {
+            let mut st = c.prepare("SELECT role_slug, skill FROM role_skills ORDER BY rowid").unwrap();
+            let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let mut out = Vec::new();
+            for r in it { out.push(r.unwrap()); }
+            out
+        };
+        let before = rows(&c);
+        assert_eq!(before.len(), 18); // migration 8 + 46 rows, untouched by 47
+        for _ in 0..2 {
+            c.execute_batch(UI_SKILLS_47).unwrap();
+            assert_eq!(count(&c), 18 + 5);
+            assert_eq!(rows(&c)[..18], before[..]);
+        }
+        for (role, skill) in [("design", "frontend-design"), ("frontend", "frontend-design"),
+                              ("design", "ux-writing"), ("frontend", "ux-writing"), ("mobile", "ux-writing")] {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE role_slug=?1 AND skill=?2", [role, skill], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1, "{role}/{skill}");
+        }
+        c.pragma_update(None, "user_version", version + 1).unwrap();
+        for _ in 0..2 { migrate(&mut c).unwrap(); }
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        assert_eq!(count(&clean), count(&c));
+        println!("ui skills migration: before/after={}/{}; v{version} + clean DB 2 runs", before.len(), 18 + 5);
     }
 
     #[test]

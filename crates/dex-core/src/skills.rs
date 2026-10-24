@@ -2,7 +2,8 @@
 //! per-role into Claude sessions.
 //!
 //! Only patron-approved skills are here (four at DEX-23; plan-check and
-//! eval-leak-check added at #2236); the roles' wider `preset.skills` lists are
+//! eval-leak-check added at #2236; the UI pair frontend-design and ux-writing,
+//! vendored upstream with their LICENSE files beside them, at #2387); the roles' wider `preset.skills` lists are
 //! deliberately NOT imported. Another skill later is: one `SKILL.md` dir + one
 //! `role_skills` row per role ("cımbızla ekleme").
 //!
@@ -25,6 +26,8 @@ pub const ALL: &[(&str, &str)] = &[
     ("one-three-one-rule", include_str!("../skills/one-three-one-rule/SKILL.md")),
     ("plan-check", include_str!("../skills/plan-check/SKILL.md")),
     ("eval-leak-check", include_str!("../skills/eval-leak-check/SKILL.md")),
+    ("frontend-design", include_str!("../skills/frontend-design/SKILL.md")),
+    ("ux-writing", include_str!("../skills/ux-writing/SKILL.md")),
 ];
 
 fn body(name: &str) -> Option<&'static str> {
@@ -158,7 +161,7 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// The patron-approved mapping (DEX-23; plan-check/eval-leak-check at #2236): skill → roles.
+    /// The patron-approved mapping (DEX-23; plan-check/eval-leak-check at #2236; UI skills at #2387): skill → roles.
     const EXPECTED: &[(&str, &[&str])] = &[
         ("systematic-debugging", &["backend", "frontend", "data-engineer", "devops", "qa", "code-automation"]),
         ("test-driven-development", &["backend", "frontend", "data-engineer", "code-automation"]),
@@ -166,6 +169,8 @@ mod tests {
         ("one-three-one-rule", &["lead", "pm"]),
         ("plan-check", &["lead"]),
         ("eval-leak-check", &["explorer", "qa"]),
+        ("frontend-design", &["design", "frontend"]),
+        ("ux-writing", &["design", "frontend", "mobile"]),
     ];
 
     #[test]
@@ -197,11 +202,11 @@ mod tests {
         assert!(skills_for_role(&c, "marketing").unwrap().is_empty());
         assert!(skills_for_role(&c, "yok").unwrap().is_empty());
         assert!(skills_for_agent(&c, "yok").unwrap().is_empty());
-        // Only the six approved skills exist anywhere in the table.
+        // Only the eight approved skills exist anywhere in the table.
         let n: i64 = c.query_row("SELECT COUNT(DISTINCT skill) FROM role_skills", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 6);
-        // The two new skills stay on their approved roles only.
-        for (skill, roles) in [("plan-check", 1), ("eval-leak-check", 2)] {
+        assert_eq!(n, 8);
+        // The newer skills stay on their approved roles only.
+        for (skill, roles) in [("plan-check", 1), ("eval-leak-check", 2), ("frontend-design", 2), ("ux-writing", 3)] {
             let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE skill = ?1", [skill], |r| r.get(0)).unwrap();
             assert_eq!(n, roles, "{skill}");
         }
@@ -217,6 +222,29 @@ mod tests {
         assert_eq!(skills_for_role(&c, "lead").unwrap(), vec!["one-three-one-rule", "plan-check"]);
         assert_eq!(skills_for_role(&c, "explorer").unwrap(), vec!["eval-leak-check"]);
         assert_eq!(skills_for_role(&c, "qa").unwrap(), vec!["systematic-debugging", "eval-leak-check"]);
+    }
+
+    #[test]
+    fn ui_roles_get_design_and_writing_skills() {
+        let c = crate::db::open(Path::new(":memory:")).unwrap();
+        assert_eq!(skills_for_role(&c, "design").unwrap(), vec!["frontend-design", "ux-writing"]);
+        assert_eq!(
+            skills_for_role(&c, "frontend").unwrap(),
+            vec!["systematic-debugging", "test-driven-development", "requesting-code-review", "frontend-design", "ux-writing"]
+        );
+        assert_eq!(skills_for_role(&c, "mobile").unwrap(), vec!["ux-writing"]);
+
+        let root = std::env::temp_dir().join(format!("dex-skills-ui-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let s = Skills { root: root.clone() };
+        let mobile = s.plugin_dir(&c, "mobile").unwrap().expect("mobile has skills");
+        assert!(mobile.join("skills").join("ux-writing").join("SKILL.md").is_file());
+        assert!(!mobile.join("skills").join("frontend-design").exists());
+        let design = s.plugin_dir(&c, "design").unwrap().expect("design has skills");
+        assert!(design.join("skills").join("frontend-design").join("SKILL.md").is_file());
+        assert!(design.join("skills").join("ux-writing").join("SKILL.md").is_file());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -276,6 +304,16 @@ mod tests {
         }
         for foreign in ["hate", "modelchk", "mandela"] {
             assert!(!plan_check.contains(foreign) && !eval_leak.contains(foreign), "foreign skill dependency: {foreign}");
+        }
+        // #2387 UI skills: license notes kept; ux-writing carries the Turkish section and
+        // no longer points at upstream files that are not embedded.
+        assert!(body("frontend-design").unwrap().contains("anthropics/skills @ dbd4588"));
+        let ux = body("ux-writing").unwrap();
+        for needle in ["## Türkçe arayüz (önce bunu uygula)", "text-transform: uppercase", "content-designer/ux-writing-skill @ 98cacde"] {
+            assert!(ux.contains(needle), "ux-writing missing {needle}");
+        }
+        for dangling in ["references/voice-chart-template.md", "templates/error-message-template.md"] {
+            assert!(!ux.contains(dangling), "ux-writing depends on non-embedded {dangling}");
         }
     }
 }
