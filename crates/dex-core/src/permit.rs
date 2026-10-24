@@ -171,7 +171,28 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
             }) {
                 return Verdict::Allow;
             }
-            read_path(p.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone()), ctx, tool)
+            let base = p.map(|p| resolve(ctx.cwd.as_deref(), p)).or_else(|| ctx.cwd.clone());
+            let mut v = read_path(base.clone(), ctx, tool);
+            // #2361: a Glob `pattern` is a path too — `~/.ssh/*`, `C:/x/.aws/**` search elsewhere than
+            // `path`, and `**/.ssh/*` only names a secret behind a wildcard.
+            if tool == "Glob" {
+                if let Some(pat) = s("pattern") {
+                    let literal = pat.split(['*', '?', '[', '{']).next().unwrap_or("").trim_end_matches(['\\', '/']);
+                    let mut judged = Vec::new();
+                    if !literal.is_empty() {
+                        judged.push(read_path(Some(resolve(base.as_deref(), literal)), ctx, tool));
+                    }
+                    match glob_probes(pat) {
+                        Some(probes) if probes.iter().any(|p| secret(&resolve(base.as_deref(), p))) => {
+                            judged.push(Verdict::Deny(format!("sır/kimlik dosyası: {pat}")));
+                        }
+                        Some(_) => {}
+                        None => judged.push(Verdict::Leader(tool.into())),
+                    }
+                    v = worst(std::iter::once(v).chain(judged));
+                }
+            }
+            v
         }
         "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => match s("file_path").or_else(|| s("notebook_path")) {
             Some(p) => write_path(&resolve(ctx.cwd.as_deref(), p), ctx),
@@ -183,6 +204,54 @@ fn judge(tool: &str, input: &Value, ctx: &Ctx) -> Verdict {
         },
         _ => Verdict::Leader(tool.into()),
     }
+}
+
+/// #2384: the names a Glob pattern stands for, as probes for `secret()` — brace alternatives and
+/// bracket members and `?` expanded (`{src,.ssh}`, `.ss[h]`, `id_rs?`), `*` as nothing and as a
+/// letter (`**/.env*` → `.env`). `None`: too many to try, the leader decides.
+fn glob_probes(pat: &str) -> Option<Vec<String>> {
+    const MAX: usize = 256;
+    let any = || ('a'..='z').chain('0'..='9').chain(['.', '_', '-']);
+    let mut done = Vec::new();
+    let mut todo = vec![pat.to_string()];
+    while let Some(p) = todo.pop() {
+        if done.len() + todo.len() > MAX {
+            return None;
+        }
+        let group = |open: char, close: char| p.find(open).and_then(|o| p[o + 1..].find(close).map(|c| (o, o + 1 + c)));
+        if let Some((o, c)) = group('{', '}') {
+            todo.extend(p[o + 1..c].split(',').map(|alt| format!("{}{alt}{}", &p[..o], &p[c + 1..])));
+            continue;
+        }
+        if let Some((o, c)) = group('[', ']') {
+            let set: Vec<char> = p[o + 1..c].chars().collect();
+            let mut members = Vec::new();
+            if set.is_empty() || matches!(set[0], '!' | '^') {
+                // A negated class matches nearly any name character.
+                members.extend(any());
+            } else {
+                let mut i = 0;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        members.extend(set[i]..=set[i + 2]);
+                        i += 3;
+                    } else {
+                        members.push(set[i]);
+                        i += 1;
+                    }
+                }
+            }
+            todo.extend(members.into_iter().map(|m| format!("{}{m}{}", &p[..o], &p[c + 1..])));
+            continue;
+        }
+        if let Some(q) = p.find('?') {
+            todo.extend(any().map(|m| format!("{}{m}{}", &p[..q], &p[q + 1..])));
+            continue;
+        }
+        done.push(p.replace("**/", "").replace('*', ""));
+        done.push(p.replace('*', "x"));
+    }
+    Some(done)
 }
 
 // ---- permit requests (in memory: a restart just makes the worker ask again) ----
@@ -383,10 +452,21 @@ fn within(p: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().map(|r| key(r)).any(|r| !r.is_empty() && (p == r || p.starts_with(&format!("{r}/"))))
 }
 
-/// Credentials and keys: no worker reads or writes them, whatever the folder.
+/// Credentials and keys: no worker reads or writes them, whatever the folder. Judged on the path
+/// as Windows reads it (same per-component spelling as `protected`) and, for an 8.3 short alias
+/// (`~`), on the long path too — only a deny comes from that second look.
 fn secret(p: &Path) -> bool {
+    if secret_rules(p) {
+        return true;
+    }
+    p.to_string_lossy().contains('~') && std::fs::canonicalize(p).is_ok_and(|real| secret_rules(&real))
+}
+
+fn secret_rules(p: &Path) -> bool {
+    // Windows drops trailing dots/spaces and reads `name:stream` as `name`.
     let k = key(p);
-    let name = k.rsplit('/').next().unwrap_or("");
+    let parts: Vec<&str> = k.split('/').map(|c| c.split(':').next().unwrap_or("").trim_end_matches(['.', ' '])).collect();
+    let name = parts.last().copied().unwrap_or("");
     let benign = [".example", ".sample", ".template", ".dist"].iter().any(|s| name.ends_with(s));
     let by_name = (name == ".env" || name.starts_with(".env."))
         || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks"].iter().any(|s| name.ends_with(s))
@@ -397,7 +477,7 @@ fn secret(p: &Path) -> bool {
         || name.starts_with("dex-provider.")
         // #150: `dexd --local`'s endpoint token (crates/dexd/src/local.rs) — the core's own door.
         || name == "dexd.local.token";
-    let by_dir = ["/.ssh/", "/.aws/", "/.gnupg/", "/.azure/", "/.kube/", "/secrets/"].iter().any(|d| format!("{k}/").contains(d));
+    let by_dir = parts.iter().any(|c| matches!(*c, ".ssh" | ".aws" | ".gnupg" | ".azure" | ".kube" | "secrets"));
     (by_name && !benign) || by_dir
 }
 
@@ -973,6 +1053,13 @@ fn shell(command: &str, d: Option<Dialect>, ctx: &Ctx) -> Verdict {
     });
     if wrapped_push || (lexed.dynamic && command.split('`').skip(1).step_by(2).any(push_body)) {
         verdicts.push(Verdict::Deny("git push (patronun işi)".into()));
+    }
+    // #2286: hard noes survive any wrapper. A segment the policy hands to the leader runs an
+    // unknown program: every argument of it is a possible body (`cmd /c "…"`, `xargs …`,
+    // `node -e '…'`, `timeout …`, a git config alias) and is judged only for a deny — the
+    // allow and gray path of the outer command is unchanged.
+    if let Some(why) = bodies_denial(&lexed, d, ctx) {
+        verdicts.push(Verdict::Deny(why));
     }
     for seg in &lexed.segs {
         verdicts.push(segment(seg, &mut cwd, ctx));
@@ -1704,6 +1791,13 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
     }) {
         return Verdict::Deny("hook atlatma yasak: core.hooksPath".into());
     }
+    // `git config core.hooksPath <dir>` points every later commit at other hooks (#2361).
+    if !ctx.leader
+        && sub == "config"
+        && positional(rest, &["-f", "--file", "--value"], false).first().is_some_and(|k| k.eq_ignore_ascii_case("core.hooksPath"))
+    {
+        return Verdict::Deny("hook atlatma yasak: core.hooksPath".into());
+    }
     if !ctx.leader && git_skips_hooks(sub, rest) {
         return Verdict::Deny("hook atlatma yasak: git --no-verify/-n".into());
     }
@@ -1750,6 +1844,237 @@ fn git(args: &[String], cwd: &mut Option<PathBuf>, ctx: &Ctx) -> Verdict {
         _ => false,
     };
     if ok { Verdict::Allow } else { Verdict::Leader(String::new()) }
+}
+
+// ---- #2286: hard noes behind any wrapper ----
+
+/// How deep a body's own bodies are read (`cmd /c sh -c '…'`), and how many texts and bytes are
+/// lexed at most (tails make the bytes quadratic in the words: the hook's time bound). #2384: a body left unread for either is a worker's hard no ([`BODY_SHORT`]) — padding or
+/// nesting must not turn a denial back into a gray the leader may approve; the leader's own
+/// command stays gray as before.
+const BODY_DEPTH: usize = 4;
+const BODY_BUDGET: usize = 4000;
+const BODY_BYTES: usize = 1 << 21;
+const BODY_SHORT: &str = "gövde taranamadı: çok büyük/derin";
+
+/// #2286: what a body scan made of one word list.
+#[derive(Clone, PartialEq)]
+enum Scanned {
+    /// An allowlisted command: what follows it in the same list is its data.
+    Allowed,
+    /// A hard no found inside the body.
+    Denied(String),
+    /// Nothing plain: the leader decides, as before.
+    Gray,
+}
+
+/// #2384: one body scan — its lex budget, whether a text was left unread (depth or budget), and
+/// what each text already made at which depth: a tail's own words and tails are the outer
+/// list's, so each is lexed once and the scan stays linear in the words (it was exponential).
+struct Scan<'a> {
+    d: Option<Dialect>,
+    ctx: &'a Ctx,
+    budget: usize,
+    bytes: usize,
+    short: bool,
+    seen: std::collections::HashMap<String, (usize, Scanned)>,
+}
+
+impl<'a> Scan<'a> {
+    fn new(d: Option<Dialect>, ctx: &'a Ctx) -> Self {
+        Scan { d, ctx, budget: BODY_BUDGET, bytes: BODY_BYTES, short: false, seen: Default::default() }
+    }
+
+    /// One candidate body text of a word list scanned `depth` deep; `tail` is the list's words it
+    /// was joined from, if any.
+    fn text(&mut self, text: &str, depth: usize, tail: Option<&[String]>) -> Scanned {
+        if let Some((seen, out)) = self.seen.get(text) {
+            if *seen >= depth {
+                return out.clone();
+            }
+        }
+        if depth == 0 || self.budget == 0 || self.bytes < text.len() {
+            self.short = true;
+            return Scanned::Gray;
+        }
+        self.budget -= 1;
+        self.bytes -= text.len();
+        let out = scan_text(text, self, depth - 1, tail);
+        self.seen.insert(text.to_string(), (depth, out.clone()));
+        out
+    }
+
+    /// A worker's denial for a body left unread.
+    fn short_denial(&self) -> Option<String> {
+        (self.short && !self.ctx.leader).then(|| BODY_SHORT.to_string())
+    }
+}
+
+/// Every gray segment's arguments are possible bodies — judged only for a deny (#480): an allow
+/// never comes from here, and the allow/gray path of the outer command is unchanged. A denied or
+/// allowlisted segment is skipped: the chain already denies, and an allowlisted command's
+/// arguments are its data (`git commit -m 'git push'`).
+fn bodies_denial(lexed: &Lexed, d: Option<Dialect>, ctx: &Ctx) -> Option<String> {
+    let mut scan = Scan::new(d, ctx);
+    for seg in &lexed.segs {
+        let words = strip_env(&seg.words);
+        let Some(first) = words.first() else { continue };
+        // A flag is not a command: a glued value (`--expression='r .netrc'` re-split) is data.
+        if first.starts_with('-') {
+            continue;
+        }
+        if !matches!(
+            segment(&Seg { words: words.to_vec(), redirs: Vec::new() }, &mut ctx.cwd.clone(), ctx),
+            Verdict::Leader(_)
+        ) {
+            continue;
+        }
+        if let Scanned::Denied(why) = scan_word_bodies(words, &mut scan, BODY_DEPTH) {
+            return Some(why);
+        }
+    }
+    scan.short_denial()
+}
+
+/// The bodies one gray command may run: for `git` only its config bodies (`-c alias.x=!cmd` →
+/// cmd, `alias.x=sub` → `git sub`, `config alias.x v`) — `git rm -r src` operands are data. Any
+/// other command: each word on its own (a quoted body re-splits when lexed alone; a script
+/// command hidden in punctuation `['git','push']` is flattened once), then every tail of the
+/// arguments, stopping at the first plainly allowed command (`cmd /c echo git push` stays gray).
+fn scan_word_bodies(words: &[String], scan: &mut Scan, depth: usize) -> Scanned {
+    let args = &words[1..];
+    // #2384: cmd reads `^x` as `x` (`cmd /c g^it push`): its words are read caret-free too.
+    if name(&words[0]) == "cmd" && args.iter().any(|a| a.contains('^')) {
+        let plain: Vec<String> = words.iter().map(|w| uncaret(w)).collect();
+        if let Scanned::Denied(why) = scan_word_bodies(&plain, scan, depth) {
+            return Scanned::Denied(why);
+        }
+    }
+    let mut one = |text: &str, tail: Option<&[String]>| scan.text(text, depth, tail);
+    if name(&words[0]) == "git" {
+        for body in git_config_bodies(args) {
+            if let Scanned::Denied(why) = one(&body, None) {
+                return Scanned::Denied(why);
+            }
+        }
+        return Scanned::Gray;
+    }
+    // A quoted script as the command itself (`execSync('git push …')` re-lexed): it holds spaces.
+    let mut texts: Vec<&str> = Vec::new();
+    if words[0].contains(char::is_whitespace) {
+        texts.push(&words[0]);
+    }
+    texts.extend(args.iter().map(String::as_str));
+    for t in &texts {
+        if let Scanned::Denied(why) = one(t, None) {
+            return Scanned::Denied(why);
+        }
+        let flat: String = t.chars().map(|c| if "[]{},".contains(c) { ' ' } else { c }).collect();
+        if flat != *t {
+            if let Scanned::Denied(why) = one(&flat, None) {
+                return Scanned::Denied(why);
+            }
+        }
+    }
+    for i in 0..args.len() {
+        match one(&args[i..].join(" "), Some(&args[i..])) {
+            Scanned::Denied(why) => return Scanned::Denied(why),
+            Scanned::Allowed => break,
+            Scanned::Gray => {}
+        }
+    }
+    Scanned::Gray
+}
+
+/// cmd's escape: `^x` is `x`, `^^` is `^`.
+fn uncaret(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    let mut chars = w.chars();
+    while let Some(c) = chars.next() {
+        out.extend(if c == '^' { chars.next() } else { Some(c) });
+    }
+    out
+}
+
+/// One candidate body text as a whole (small) command chain: a denied segment is the finding, a
+/// gray one recurses into its own bodies, an allowlisted one says the text is plainly allowed.
+/// #2384: a tail that lexes back to the words it was joined from has no bodies of its own but
+/// git's config bodies — its words and tails are the outer list's, read there (else cubic).
+fn scan_text(text: &str, scan: &mut Scan, depth: usize, tail: Option<&[String]>) -> Scanned {
+    let ctx = scan.ctx;
+    let mut out = Scanned::Allowed;
+    let lexed = lex(text, scan.d);
+    if lexed.segs.is_empty() {
+        return Scanned::Gray;
+    }
+    for seg in &lexed.segs {
+        let words = strip_env(&seg.words);
+        let Some(first) = words.first() else {
+            out = Scanned::Gray;
+            continue;
+        };
+        if first.starts_with('-') {
+            out = Scanned::Gray;
+            continue;
+        }
+        match segment(&Seg { words: words.to_vec(), redirs: seg.redirs.clone() }, &mut ctx.cwd.clone(), ctx) {
+            Verdict::Deny(why) => return Scanned::Denied(why),
+            Verdict::Allow => {}
+            Verdict::Leader(_) => {
+                out = Scanned::Gray;
+                if tail == Some(words) && name(&words[0]) != "git" {
+                    continue;
+                }
+                if let Scanned::Denied(why) = scan_word_bodies(words, scan, depth) {
+                    return Scanned::Denied(why);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `git`'s config bodies (values a worker can turn into a command): `-c alias.x=!cmd` → cmd,
+/// `alias.x=sub` → `git sub`, and the `config alias.x v` subcommand. Everything else a git
+/// invocation carries is data.
+fn git_config_bodies(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let body_of = |v: &str| match v.strip_prefix('!') {
+        Some(rest) => rest.to_string(),
+        None if v == "git" || v.starts_with("git ") => v.to_string(),
+        None => format!("git {v}"),
+    };
+    let alias = |v: &str| {
+        v.split_once('=').and_then(|(k, val)| {
+            k.to_ascii_lowercase().starts_with("alias.").then(|| body_of(val))
+        })
+    };
+    let valued = ["-C", "-c", "--config-env", "--git-dir", "--work-tree", "--namespace", "--super-prefix"];
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') {
+        let a = args[i].as_str();
+        if let Some(glued) = a.strip_prefix("-c").filter(|s| !s.is_empty()) {
+            out.extend(alias(glued));
+            i += 1;
+        } else if valued.contains(&a) {
+            if a == "-c" {
+                out.extend(args.get(i + 1).map(String::as_str).and_then(alias));
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    // `git config [flags] alias.x v` — the key and the value are the first two operands.
+    if args.get(i).is_some_and(|a| a == "config") {
+        let ops = positional(&args[i + 1..], &["-f", "--file", "--value"], false);
+        if let [k, v, ..] = ops.as_slice() {
+            if k.to_ascii_lowercase().starts_with("alias.") {
+                out.push(body_of(v));
+            }
+        }
+    }
+    out
 }
 
 // ---- #402/#495: the shell, read for real ----
@@ -2444,12 +2769,22 @@ impl Ro<'_> {
         if words.is_empty() && redirs.is_empty() {
             return;
         }
-        match segment(&Seg { words, redirs }, cwd, self.ctx) {
+        match segment(&Seg { words: words.clone(), redirs }, cwd, self.ctx) {
             Verdict::Allow => {}
             Verdict::Deny(why) => {
                 self.deny.get_or_insert(why);
             }
-            Verdict::Leader(_) => self.gray = true,
+            // #2286: the same body scan in this reader too — a Unicode-quoted PowerShell body
+            // (`cmd /c '…'`) is a plain quoted word only here.
+            Verdict::Leader(_) => {
+                self.gray = true;
+                let mut scan = Scan::new(Some(self.d), self.ctx);
+                if let Scanned::Denied(why) = scan_word_bodies(&words, &mut scan, BODY_DEPTH) {
+                    self.deny.get_or_insert(why);
+                } else if let Some(why) = scan.short_denial() {
+                    self.deny.get_or_insert(why);
+                }
+            }
         }
     }
 }
@@ -2614,6 +2949,70 @@ mod tests {
 
     fn leader(c: &str) {
         assert!(matches!(bash(c), Verdict::Leader(_)), "{c}: {:?}", bash(c));
+    }
+
+    /// #2361: `secret()` reads the name the way Windows does (stream suffix, trailing dot/space,
+    /// 8.3 alias), like `protected()`.
+    #[test]
+    fn secret_name_spellings_name_the_same_file() {
+        let c = ctx();
+        for f in [".env", ".env ", ".env.", ".env::$DATA", "certs/server.pem.", "id_rsa.", "id_rsa::$DATA", ".ssh /config", ".aws./credentials"] {
+            for tool in ["Read", "Write", "Edit"] {
+                let v = decide(tool, &json!({ "file_path": f }), &c);
+                assert!(matches!(v, Verdict::Deny(_)), "{tool} {f}: {v:?}");
+            }
+        }
+        for cmd in [r#"cat ".env ""#, "cat .env::$DATA", "cp .env. out.txt", "cat certs/server.pem."] {
+            deny(cmd);
+        }
+        assert!(matches!(decide("Read", &json!({ "file_path": ".env.example" }), &c), Verdict::Allow));
+        assert!(matches!(decide("Read", &json!({ "file_path": "src/envelope.rs" }), &c), Verdict::Allow));
+        // An 8.3 alias of a secret folder: the long path decides.
+        let root = std::env::temp_dir().join(format!("dex-secret-83-{}", std::process::id()));
+        let real = root.join(".ssh");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("config"), "x").unwrap();
+        let alias = root.join("sshdir~1");
+        if crate::worktree::link_dir(&real, &alias) {
+            assert!(secret(&alias.join("config")), "8.3 alias of .ssh");
+        } else {
+            eprintln!("8.3 alias test unavailable on this host");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// #2361: the Glob `pattern` is judged as a path, not only its `path` argument.
+    #[test]
+    fn glob_pattern_is_judged_as_a_path() {
+        let c = ctx();
+        let glob = |pat: &str| decide("Glob", &json!({ "pattern": pat }), &c);
+        for pat in [abs("/dex-fixture/.ssh/*"), "~/.ssh/*".into(), "../../.aws/**".into(), "**/.ssh/*".into(), "**/*.pem".into(), "secrets/**".into()] {
+            assert!(matches!(glob(&pat), Verdict::Deny(_)), "{pat}: {:?}", glob(&pat));
+        }
+        for pat in [abs("/w/other/**"), "../other/*.txt".into()] {
+            assert!(matches!(glob(&pat), Verdict::Leader(_)), "{pat}: {:?}", glob(&pat));
+        }
+        for pat in ["src/**/*.rs", "**/*.rs", "*.md", "crates/*/Cargo.toml"] {
+            assert_eq!(glob(pat), Verdict::Allow, "{pat}");
+        }
+        // #2384: karakter sınıfı, brace ve boş eşleşen joker sır adını gizlemez.
+        for pat in ["**/.ss[h]/*", "**/.ss[a-z]/*", "**/.ss[!x]/*", "{src,.ssh}/*", "**/.env*", "**/id_rs?"] {
+            assert!(matches!(glob(pat), Verdict::Deny(_)), "{pat}: {:?}", glob(pat));
+        }
+        for pat in ["src/{a,b}/*.rs", "src/[ab].rs", "**/*.{ts,tsx}"] {
+            assert_eq!(glob(pat), Verdict::Allow, "{pat}");
+        }
+        assert!(matches!(glob("[!a][!a][!a][!a]/x"), Verdict::Leader(_)), "{:?}", glob("[!a][!a][!a][!a]/x"));
+    }
+
+    /// #2384 (patron kararı): `scripts/hooks` ve `core.hooksPath` hedefi worker'a yazımda korumalı
+    /// değil — birleştirmede `scripts/hooks/` yine patron onayı ister (worktree POLICY_FILES);
+    /// worker'ın `git config core.hooksPath …` yazımı Deny kalır.
+    #[test]
+    fn repo_hooks_are_merge_policy_not_write_protected() {
+        let c = ctx();
+        assert_eq!(decide("Write", &json!({ "file_path": "scripts/hooks/pre-commit" }), &c), Verdict::Allow);
+        deny("git config core.hooksPath x");
     }
 
     #[test]
@@ -2817,6 +3216,11 @@ mod tests {
         leader("git -c core.autocrlf=false commit -m x");
         leader("git -c fixture.note=core.hooksPath commit -m x");
         leader("git -c core.hooksPathExtra=x commit -m x");
+        // #2361: writing the setting redirects every later commit's hooks.
+        deny("git config core.hooksPath disabled");
+        deny("git config --local core.hooksPath ./x");
+        deny("git config core.hookspath x");
+        leader("git config user.name x");
         leader("GIT_EXTERNAL_DIFF=./x git diff");
         leader("GIT_AUTHOR_EMAIL=alias@users.noreply.github.com git commit -m x");
         leader("GIT_CONFIG_GLOBAL=./config git status");
@@ -3615,7 +4019,6 @@ mod tests {
     fn side_doors_of_allowlisted_commands_go_to_the_leader() {
         for c in [
             "git -c core.fsmonitor=./x status",
-            "git -c alias.p=push p",
             "git --config-env core.pager=X log",
             "git --exec-path=./x status",
             "git --git-dir=../other/.git log",
@@ -3645,6 +4048,8 @@ mod tests {
             leader(c);
         }
         deny("git -c x=y push");
+        // #2286: an alias body is a command the worker runs — a push behind it is a push.
+        deny("git -c alias.p=push p");
         for c in [
             "git --no-pager log -3",
             "git -C . diff --stat",
@@ -3667,6 +4072,90 @@ mod tests {
         ] {
             allow(c);
         }
+    }
+
+    /// #2286: sert yasaklar sarmalayıcı adından bağımsız. Gri segmentin argümanları gövde olarak
+    /// yalnız Deny için okunur; izinli komutun argümanı veridir, git'te yalnız config gövdesi
+    /// okunur, kuyruk taraması ilk izinli komutta durur.
+    #[test]
+    fn hard_noes_survive_any_wrapper() {
+        for cmd in [
+            r#"cmd /c "git push origin HEAD""#,
+            r#"cmd.exe /c "git commit -n -m x""#,
+            r#"cmd /k "git reset --hard""#,
+            r#"cmd.exe /c "git clean -fd""#,
+            "git -c alias.p='!git push origin HEAD' p",
+            "git -c alias.p=push p",
+            "git -cnote.x=1 -c alias.p='!git push' p",
+            "git config alias.p '!git push origin HEAD'",
+            "git -C . -c alias.p=push p",
+            "echo origin HEAD | xargs git push",
+            "xargs -t git push origin HEAD",
+            r#"node -e "require('child_process').execSync('git push origin HEAD')""#,
+            r#"python -c "import os; os.system('git push origin HEAD')""#,
+            r#"node -e "['git','push']""#,
+            "timeout 5 git push origin HEAD",
+            "cmd /c \"git replace HEAD other\"",
+            // #2384: cmd'nin `^` kaçışı.
+            "cmd /c g^it push origin HEAD",
+            r#"cmd /c "g^i^t pu^sh origin HEAD""#,
+            r#"node -e "require('child_process').execSync('cmd /c g^it push')""#,
+        ] {
+            deny(cmd);
+        }
+        // Gövde değil veri: izinli komutun argümanları, kuyrukta ilk izinli komuttan sonrası,
+        // git'in config dışı operandları (`git rm -r src` toplu silme sayılmaz).
+        for cmd in [
+            "cmd /c echo git push",
+            "node scripts/build.mjs",
+            "git rm -r src",
+            "git -c user.email=x@y commit -m x",
+        ] {
+            leader(cmd);
+        }
+        allow("git commit -m 'git push'");
+        allow("echo rm -rf x");
+        leader("cmd /c cargo test");
+        // PowerShell'un Unicode tırnağı: gövde sözcüğünü yalnız gerçek okuyucu (parsed) görür.
+        for cmd in ["cmd /c 'git push origin HEAD'", "cmd /c ‘git push origin HEAD’", "cmd /c ‘git commit -n -m x’"] {
+            assert!(matches!(decide("PowerShell", &json!({ "command": cmd }), &ctx()), Verdict::Deny(_)), "{cmd}");
+        }
+    }
+
+    /// #2384: gövde taraması bütçe ya da derinlik tükenince worker için fail-closed — dolgu ya da
+    /// iç içe sarmalama sert yasağı onaylanabilir griye geri düşürmez; lider eskisi gibi gri görür.
+    #[test]
+    fn an_unread_body_is_a_workers_hard_no() {
+        let lead = Ctx { leader: true, ..ctx() };
+        let run = |c: &str, x: &Ctx| decide("Bash", &json!({ "command": c }), x);
+        let short = |v: Verdict| matches!(v, Verdict::Deny(ref w) if w.starts_with(BODY_SHORT));
+        let push = r#""git push origin HEAD""#;
+        // Aynı sözcükle dolgu: bir kez okunur, push bulunur.
+        let same = format!("cmd /c {} {push}", vec!["a"; 4000].join(" "));
+        assert!(matches!(run(&same, &ctx()), Verdict::Deny(ref w) if w.starts_with("git push")), "{:?}", run(&same, &ctx()));
+        // Farklı sözcüklerle dolgu bütçeyi bitirir: push okunmadan kalır, worker için yine Deny.
+        let distinct = format!("cmd /c {} {push}", (0..BODY_BUDGET).map(|i| format!("a{i}")).collect::<Vec<_>>().join(" "));
+        assert!(short(run(&distinct, &ctx())));
+        assert!(matches!(decide("PowerShell", &json!({ "command": distinct }), &ctx()), Verdict::Deny(_)));
+        assert!(matches!(run(&distinct, &lead), Verdict::Leader(_)), "{:?}", run(&distinct, &lead));
+        // İç içe `cmd /c`: dört kat okunur (push bulunur), beşinci kat okunmaz (Deny yine).
+        let nest = |n: usize| (0..n).fold("git push origin HEAD".to_string(), |body, _| {
+            format!("cmd /c \"{}\"", body.replace('\\', "\\\\").replace('"', "\\\""))
+        });
+        assert!(matches!(run(&nest(4), &ctx()), Verdict::Deny(ref w) if w.starts_with("git push")), "{:?}", run(&nest(4), &ctx()));
+        assert!(short(run(&nest(5), &ctx())), "{}", nest(5));
+        assert!(matches!(run(&nest(5), &lead), Verdict::Leader(_)), "{:?}", run(&nest(5), &lead));
+        // Meşru uzun gri komut: her metin bir kez okunur — yüzlerce argüman gri kalır (eskiden
+        // tarama üsteldi, ~20 argüman bütçeyi bitiriyordu).
+        let files = |n: usize| (0..n).map(|i| format!("src/f{i}.ts")).collect::<Vec<_>>().join(" ");
+        leader(&format!("node scripts/fmt.mjs {}", files(300)));
+        // Bilinen yanlış pozitif (bilerek): bütçeyi aşan zararsız gri komut worker'da Deny (kısa
+        // dosya adlarıyla ~500+ argüman; kuyruklar baytı karesel büyütür). Bu boyda bir gri komut
+        // gerçekte nadir; okunmamış gövdeyi geçirmek atlatmayı geri açar. Lider için gri kalır;
+        // worker argümanları bölerek ya da bir dosya listesiyle koşar.
+        let long = format!("node scripts/fmt.mjs {}", files(1000));
+        assert!(short(run(&long, &ctx())));
+        assert!(matches!(run(&long, &lead), Verdict::Leader(_)));
     }
 
     #[test]
