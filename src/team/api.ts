@@ -293,9 +293,11 @@ export interface WorkersOutcome {
   applied: string[];
   pending: string[];
 }
-export async function setWorkersModel(teamId: string, target: PendingModel): Promise<WorkersOutcome> {
+/** #2443: `ids` narrows it to those workers; without it the whole team (the call stays as before). */
+export async function setWorkersModel(teamId: string, target: PendingModel, ids?: string[]): Promise<WorkersOutcome> {
   const [host, raw] = splitId(teamId);
-  const out = await callHost<WorkersOutcome>(host, "team_set_workers_model", { teamId: raw, target });
+  const args = ids ? { teamId: raw, target, ids: ids.map((id) => splitId(id)[1]) } : { teamId: raw, target };
+  const out = await callHost<WorkersOutcome>(host, "team_set_workers_model", args);
   return { applied: out.applied.map((id) => qid(host, id)), pending: out.pending.map((id) => qid(host, id)) };
 }
 export function applyPending(id: string) {

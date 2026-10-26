@@ -179,6 +179,7 @@
 
 /* DEX-30: all-workers provider/model form (Kart popover'ında) + the row's "waiting for session end" tag. */
 .team-bulk { display: flex; flex-direction: column; gap: var(--sp-2); }
+.team-bulk[hidden] { display: none; }
 .team-warn { margin: 0; font-size: var(--fs-xs); color: var(--amber); }
 .team-pending { margin-left: var(--sp-1); font: var(--fw-semibold) 10px var(--font-mono); color: var(--amber); background: var(--amber-soft); border-radius: var(--r-xs); padding: 0 4px; }
 

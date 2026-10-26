@@ -1054,10 +1054,12 @@ fn apply_target(conn: &Connection, id: &str, t: &PendingModel) -> Result<(), Str
 /// DEX-30: every `worker` of the team gets `target`; leaders and the personal assistant are never touched. `live(id)` says
 /// whose session is open: those can't switch under a running CLI, so theirs is stored as pending
 /// and lands via [`apply_pending`] when the session ends. One transaction: all or nothing.
+/// #2443: `ids` narrows it to those agents (still workers only); `None` = the whole team.
 pub fn set_workers_model(
     conn: &Connection,
     team_id: &str,
     target: &PendingModel,
+    ids: Option<&[String]>,
     live: impl Fn(&str) -> bool,
 ) -> Result<WorkersOutcome, String> {
     let t = resolve_target(target)?;
@@ -1068,7 +1070,8 @@ pub fn set_workers_model(
     let workers: Vec<Agent> = list_agents(conn)?.into_iter().filter(|a| a.team_id == team_id).collect();
     let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
     let mut out = WorkersOutcome::default();
-    for a in workers.iter().filter(|a| a.kind == "worker" && a.role_slug.as_deref() != Some("assistant")) {
+    let picked = |a: &Agent| ids.is_none_or(|ids| ids.contains(&a.id));
+    for a in workers.iter().filter(|a| a.kind == "worker" && a.role_slug.as_deref() != Some("assistant") && picked(a)) {
         let same = a.engine == t.engine && a.model == t.model && t.provider.as_ref().is_none_or(|p| *p == a.provider);
         if !live(&a.id) {
             apply_target(&tx, &a.id, &t)?;
@@ -1904,7 +1907,7 @@ mod tests {
         let c = mem();
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let other = crew_of(&c, "default");
-        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), |_| false).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), None, |_| false).unwrap();
         let crew = crew_of(&c, &s.id);
         assert_eq!(out.applied.len(), 4);
         assert!(out.pending.is_empty());
@@ -1917,7 +1920,7 @@ mod tests {
         assert_eq!(crew_of(&c, "default").iter().map(|a| &a.model).collect::<Vec<_>>(), other.iter().map(|a| &a.model).collect::<Vec<_>>());
 
         // To GLM: provider travels with the change.
-        set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), |_| false).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), None, |_| false).unwrap();
         let w: Vec<_> = crew_of(&c, &s.id).into_iter().filter(|a| a.kind == "worker").collect();
         assert!(w.iter().all(|a| (a.engine.as_str(), a.provider.as_str(), a.model.as_str()) == ("claude", "glm", "GLM-5.3")));
     }
@@ -1929,7 +1932,7 @@ mod tests {
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let a: NewAgent = serde_json::from_value(serde_json::json!({"teamId": s.id, "name": "", "kind": "worker", "roleSlug": "assistant"})).unwrap();
         let echo = create_agent(&c, Path::new("/data"), a).unwrap();
-        let out = set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), |_| false).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), None, |_| false).unwrap();
         assert_eq!(out.applied.len(), 4);
         assert!(!out.applied.contains(&echo.id));
         let after = crew_of(&c, &s.id).into_iter().find(|a| a.id == echo.id).unwrap();
@@ -1942,11 +1945,11 @@ mod tests {
         let c = mem();
         let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
         let before: Vec<_> = crew_of(&c, &s.id).into_iter().map(|a| (a.engine, a.provider, a.model)).collect();
-        assert!(set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), |_| false).is_err(), "Codex motoru kaldırıldı");
-        assert!(set_workers_model(&c, &s.id, &target("claude", Some("glm"), "gpt-5.5"), |_| false).is_err());
-        assert!(set_workers_model(&c, &s.id, &target("claude", Some("muse"), "opus"), |_| false).is_err());
-        assert!(set_workers_model(&c, &s.id, &target("gemini", None, "x"), |_| false).is_err());
-        assert!(set_workers_model(&c, "yok", &target("claude", None, "haiku"), |_| false).is_err());
+        assert!(set_workers_model(&c, &s.id, &target("codex", None, "gpt-5.5"), None, |_| false).is_err(), "Codex motoru kaldırıldı");
+        assert!(set_workers_model(&c, &s.id, &target("claude", Some("glm"), "gpt-5.5"), None, |_| false).is_err());
+        assert!(set_workers_model(&c, &s.id, &target("claude", Some("muse"), "opus"), None, |_| false).is_err());
+        assert!(set_workers_model(&c, &s.id, &target("gemini", None, "x"), None, |_| false).is_err());
+        assert!(set_workers_model(&c, "yok", &target("claude", None, "haiku"), None, |_| false).is_err());
         let after: Vec<_> = crew_of(&c, &s.id).into_iter().map(|a| (a.engine, a.provider, a.model)).collect();
         assert_eq!(before, after);
     }
@@ -1959,7 +1962,7 @@ mod tests {
         let crew = crew_of(&c, &s.id);
         let (lead, busy, idle) = (&crew[0], &crew[1], &crew[2]);
         let live = |id: &str| id == busy.id || id == lead.id;
-        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), None, live).unwrap();
         assert_eq!(out.pending, [busy.id.clone()]);
         assert!(out.applied.contains(&idle.id) && !out.applied.contains(&lead.id));
 
@@ -1975,20 +1978,43 @@ mod tests {
         assert!(!apply_pending(&c, &busy.id).unwrap());
 
         // A newer bulk change replaces the pending one; asking for what already runs voids it.
-        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
-        set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), None, live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", Some("glm"), "GLM-5.3"), None, live).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, Some(target("claude", Some("glm"), "GLM-5.3")));
-        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "haiku"), None, live).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, None);
 
         // A hand edit overrides a waiting bulk change.
-        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), None, live).unwrap();
         update_agent(&c, &busy.id, serde_json::from_str(r#"{"engine":"claude","model":"sonnet"}"#).unwrap()).unwrap();
         assert_eq!(get_agent(&c, &busy.id).unwrap().pending, None);
 
         // Startup: nothing survives, everything pending lands.
-        set_workers_model(&c, &s.id, &target("claude", None, "opus"), live).unwrap();
+        set_workers_model(&c, &s.id, &target("claude", None, "opus"), None, live).unwrap();
         assert_eq!(apply_all_pending(&c).unwrap(), 1);
         assert_eq!(get_agent(&c, &busy.id).unwrap().model, "opus");
+    }
+
+    /// #2443: `ids` limits the change to the chosen workers; a listed leader is still spared and
+    /// a listed running worker gets the change as pending, like the whole-team call.
+    #[test]
+    fn workers_change_limited_to_ids() {
+        let c = mem();
+        let s = create_team(&c, Path::new("/data"), NewTeam { profile: None, name: "S".into(), kind: "service".into(), cwd: None, worker_roles: None, members: None }).unwrap();
+        let crew = crew_of(&c, &s.id);
+        let (lead, busy, idle, left) = (&crew[0], &crew[1], &crew[2], &crew[3]);
+        assert_eq!((lead.kind.as_str(), left.kind.as_str()), ("leader", "worker"));
+        let ids = [lead.id.clone(), busy.id.clone(), idle.id.clone()];
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "haiku"), Some(&ids), |id| id == busy.id).unwrap();
+        assert_eq!(out.applied, [idle.id.clone()]);
+        assert_eq!(out.pending, [busy.id.clone()]);
+        assert_eq!(get_agent(&c, &idle.id).unwrap().model, "haiku");
+        assert_eq!(get_agent(&c, &busy.id).unwrap().pending, Some(target("claude", Some("anthropic"), "haiku")));
+        assert_eq!(get_agent(&c, &left.id).unwrap().model, left.model, "unlisted worker untouched");
+        let l = get_agent(&c, &lead.id).unwrap();
+        assert_eq!((l.model.as_str(), l.pending.is_none()), (lead.model.as_str(), true), "listed leader untouched");
+        // An empty list changes nobody.
+        let out = set_workers_model(&c, &s.id, &target("claude", None, "opus"), Some(&[]), |_| false).unwrap();
+        assert!(out.applied.is_empty() && out.pending.is_empty());
     }
 }

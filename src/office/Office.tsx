@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { HoverCard } from "./hovercard";
 import { World } from "./world";
 import { advance, worldFor } from "./worlds";
-import { readOfficeTheme } from "./theme";
+import { readOfficeTheme, type OfficeTheme } from "./theme";
 import { readPalette } from "./companion/coreEngine";
 import { LitLayer } from "./litLayer";
 import { cardMaps } from "./assets";
@@ -16,6 +16,9 @@ import { getStatus, type Agent } from "../agents";
 import { playCircuit } from "./circuitFx";
 import { onceLog, revive } from "./frameLoop";
 import { EmptyState } from "../EmptyState";
+import { isAssignable } from "../team/rolePolicy";
+import { addPicks, getPick, picking, subscribePick, togglePick } from "./pickStore";
+import { chipsInRect, isDrag, rectFrom, type Rect } from "./workerPick";
 import "./office.css";
 
 interface Props {
@@ -36,6 +39,8 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
   const hoverIdRef = useRef<string | null>(null);
   const keyboardId = useRef<string | null>(null);
   const requestFrameRef = useRef(() => {});
+  // #2443: pick mode ("Seçili worker'lar") — the pointer's press point and, once it moved, the drag box (CSS px).
+  const dragRef = useRef<{ from: { x: number; y: number }; box: Rect | null } | null>(null);
   const activeRef = useRef(active);
   activeRef.current = active;
   useEffect(() => { requestFrameRef.current(); }, [active]);
@@ -46,6 +51,11 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
     worldFor(teamId).reduced = reduced;
     requestFrameRef.current();
   }, [teamId, reduced]);
+  useEffect(() => subscribePick(() => {
+    if (picking(teamId)) hoverIdRef.current = null; // no hover card while picking
+    else dragRef.current = null;
+    requestFrameRef.current();
+  }), [teamId]);
 
   useEffect(() => {
     const canvas = canvasRef.current!;
@@ -133,6 +143,7 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(scale, 0, 0, scale, ox, oy);
       const anchors = world.draw(ctx, keyboardId.current ?? focusedRef.current, theme, corePalette, !layer);
+      if (picking(teamId)) drawPicks(ctx, world, theme, scale, dpr, dragRef.current?.box ?? null);
       ctx.setTransform(1, 0, 0, 1, 0, 0);
       layer?.draw(world.scene, cssW, cssH, world.unit);
       setOfficeShown(shownToken, anchors.filter((anchor) => anchor.body).map((anchor) => anchor.agent.id));
@@ -229,7 +240,14 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
     };
   }, [teamId]);
 
+  /** #2443: only a team's assignable workers can be picked (leaders and Echo never). */
+  function pickable(agentId: string) {
+    const rec = membersOf(teamId).find((a) => a.id === agentId);
+    return !!rec && rec.kind === "worker" && isAssignable(rec);
+  }
+
   function onClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (picking(teamId)) return; // pointer up did it
     const agent = hitTest(e);
     if (!agent) return;
     selectAgent(agent);
@@ -270,7 +288,12 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       requestFrameRef.current();
     } else if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      selectAgent(chips[index].agent);
+      const agent = chips[index].agent;
+      if (!picking(teamId)) selectAgent(agent);
+      else if (pickable(agent.id)) {
+        togglePick(agent.id);
+        e.currentTarget.setAttribute("aria-label", `${agent.name} ${getPick().ids.has(agent.id) ? "seçildi" : "seçimden çıktı"}`);
+      }
     }
   }
 
@@ -303,13 +326,51 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
   }
 
   function onPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    const drag = dragRef.current;
+    if (drag && picking(teamId)) {
+      const at = local(e);
+      if (drag.box || isDrag(drag.from, at)) drag.box = rectFrom(drag.from, at);
+      requestFrameRef.current();
+      return;
+    }
     if (e.pointerType === "touch") return;
     const agent = hitTest(e);
     const { x, y } = toWorld(e);
     worldRef.current?.pointAt(x, y);
-    hoverIdRef.current = agent?.id ?? null;
-    if (worldRef.current) worldRef.current.hoverId = hoverIdRef.current;
-    e.currentTarget.style.cursor = agent ? "pointer" : "default";
+    const pick = picking(teamId);
+    hoverIdRef.current = pick ? null : agent?.id ?? null;
+    if (worldRef.current) worldRef.current.hoverId = pick ? null : hoverIdRef.current;
+    e.currentTarget.style.cursor = pick ? (agent && pickable(agent.id) ? "pointer" : "crosshair") : agent ? "pointer" : "default";
+    requestFrameRef.current();
+  }
+
+  /** The pointer in CSS px from the canvas' top-left. */
+  function local(e: React.PointerEvent<HTMLCanvasElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  // #2443: pick mode — a click toggles one worker, a drag adds every worker its box touches.
+  function onPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (e.pointerType === "touch") onMouseLeave();
+    if (!picking(teamId) || e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = { from: local(e), box: null };
+  }
+
+  function onPointerUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (!drag || !picking(teamId)) return;
+    if (drag.box) {
+      const { scale, ox, oy, dpr } = view.current;
+      const k = dpr / scale;
+      const box = { x: (drag.box.x * dpr - ox) / scale, y: (drag.box.y * dpr - oy) / scale, w: drag.box.w * k, h: drag.box.h * k };
+      addPicks(chipsInRect(worldRef.current?.chips ?? [], box).map((c) => c.agent.id).filter(pickable));
+    } else {
+      const agent = hitTest(e);
+      if (agent && pickable(agent.id)) togglePick(agent.id);
+    }
     requestFrameRef.current();
   }
 
@@ -338,7 +399,9 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
         onClick={onClick}
         onPointerMove={onPointerMove}
         onPointerLeave={onMouseLeave}
-        onPointerDown={e => { if (e.pointerType === "touch") onMouseLeave(); }}
+        onPointerDown={onPointerDown}
+        onPointerUp={onPointerUp}
+        onPointerCancel={() => { dragRef.current = null; requestFrameRef.current(); }}
         tabIndex={0}
         role="button"
         onKeyDown={onKeyDown}
@@ -355,6 +418,36 @@ export function Office({ teamId, focusedId, onSelect, active = true }: Props) {
       <EmptyTeam teamId={teamId} />
     </div>
   );
+}
+
+/**
+ * #2443: picked workers get a team-coloured ring around their chip; the drag box is drawn over the board.
+ * Called inside the frame's world transform; leaves it as it found it.
+ */
+function drawPicks(ctx: CanvasRenderingContext2D, world: World, theme: OfficeTheme, scale: number,
+  dpr: number, box: Rect | null) {
+  const ids = getPick().ids;
+  const px = dpr / scale; // one CSS px in world units
+  ctx.save();
+  ctx.strokeStyle = theme.teamHi;
+  ctx.fillStyle = theme.teamGlow;
+  ctx.lineWidth = 2 * px;
+  for (const chip of world.chips) {
+    if (!ids.has(chip.agent.id)) continue;
+    const pad = 4 * px;
+    ctx.beginPath();
+    ctx.roundRect(chip.x - chip.w / 2 - pad, chip.y - chip.h / 2 - pad, chip.w + 2 * pad, chip.h + 2 * pad, 6 * px);
+    ctx.fill();
+    ctx.stroke();
+  }
+  if (box) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.fillRect(box.x, box.y, box.w, box.h);
+    ctx.strokeRect(box.x + 0.5, box.y + 0.5, box.w, box.h);
+  }
+  ctx.restore();
 }
 
 /** Modern §6: a team without workers says so (Core sleeps, nothing is broken). Clicks pass through to the board but the button. */

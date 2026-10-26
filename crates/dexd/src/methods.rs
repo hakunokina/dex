@@ -143,7 +143,7 @@ handlers! {
         "model_news" => |core, _| ok(core.model_news()),
         "model_news_dismiss" => |core, p| ok(core.model_news_dismiss(arg(p, "keys")?)),
         "team_set_workers_model" => |core, p| {
-            ok(core.team_set_workers_model(&arg::<String>(p, "teamId")?, arg(p, "target")?))
+            ok(core.team_set_workers_model(&arg::<String>(p, "teamId")?, arg(p, "target")?, arg(p, "ids")?))
         },
         "agent_apply_pending" => |core, p| ok(core.agent_apply_pending(&arg::<String>(p, "id")?)),
         "chat_history" => |core, p| {

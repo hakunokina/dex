@@ -67,13 +67,15 @@ pub fn agent_delete(core: State<CoreState>, id: String) -> Result<(), String> {
 }
 
 /// DEX-30: all of a team's workers → one engine/provider/model (running ones: pending).
+/// #2443: `ids` narrows it to the chosen workers.
 #[tauri::command]
 pub fn team_set_workers_model(
     core: State<CoreState>,
     team_id: String,
     target: dex_core::teams::PendingModel,
+    ids: Option<Vec<String>>,
 ) -> Result<dex_core::teams::WorkersOutcome, String> {
-    core.team_set_workers_model(&team_id, target)
+    core.team_set_workers_model(&team_id, target, ids)
 }
 
 /// DEX-30: lands a pending change now (no-op while the agent's session runs).
