@@ -198,9 +198,10 @@ export async function chainBack(id: string) {
   await reload();
 }
 
-/** DEX-30: all of the team's workers (never leaders) → one engine/provider/model; running ones wait. */
-export async function setWorkersModel(teamId: string, target: api.PendingModel) {
-  const out = await api.setWorkersModel(teamId, target);
+/** DEX-30: all of the team's workers (never leaders) → one engine/provider/model; running ones wait.
+ * #2443: `ids` = only those workers. */
+export async function setWorkersModel(teamId: string, target: api.PendingModel, ids?: string[]) {
+  const out = await api.setWorkersModel(teamId, target, ids);
   await reload();
   return out;
 }
@@ -216,8 +217,10 @@ export async function freshAgent(id: string) {
  * means a new session (its transcript can't be resumed); same engine resumes on the new model.
  * Returns the ids that had no pane to start in (they stay stopped, already switched).
  */
-export async function restartPending(teamId: string): Promise<string[]> {
-  const ids = membersOf(teamId).filter(a => a.kind === "worker" && a.pending && isRunning(a.id)).map(a => a.id);
+export async function restartPending(teamId: string, only?: string[]): Promise<string[]> {
+  const ids = membersOf(teamId)
+    .filter(a => a.kind === "worker" && a.pending && isRunning(a.id) && (!only || only.includes(a.id)))
+    .map(a => a.id);
   const unstarted: string[] = [];
   for (const id of ids) {
     await killPty(id);

@@ -1257,8 +1257,15 @@ impl Core {
 
     /// DEX-30: one engine/provider/model for all of a team's workers (never its leaders). Running
     /// ones (live PTY — the backend's word, not the UI's) get it as pending. One `teams-changed`.
-    pub fn team_set_workers_model(&self, team_id: &str, target: teams::PendingModel) -> Result<teams::WorkersOutcome, String> {
-        let out = with(&self.db, |c| teams::set_workers_model(c, team_id, &target, |id| self.ptys.is_running(id)))?;
+    pub fn team_set_workers_model(
+        &self,
+        team_id: &str,
+        target: teams::PendingModel,
+        ids: Option<Vec<String>>,
+    ) -> Result<teams::WorkersOutcome, String> {
+        let out = with(&self.db, |c| {
+            teams::set_workers_model(c, team_id, &target, ids.as_deref(), |id| self.ptys.is_running(id))
+        })?;
         self.changed("teams-changed");
         Ok(out)
     }
