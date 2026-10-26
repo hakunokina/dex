@@ -8,7 +8,7 @@ import { LOCAL, onEvent } from "../api/hosts";
 import { openSettings } from "../layout/panels";
 import { askConfirm } from "../confirm";
 import {
-  listProviders, localStatus,
+  listProviders, localStatus, scopedWorkersSupported, SCOPED_UNSUPPORTED,
   type LocalStatus, type ProviderInfo,
 } from "./api";
 import { isRunning, membersOf, restartPending, setWorkersModel, useTeams } from "./store";
@@ -161,7 +161,7 @@ function WorkersBulkPopover({ teamId, onClose, anchorRef, back }: {
   const bar = view === "pick" ? anchorRef.current?.closest(".office-bar") : null;
 
   return <>{createPortal(
-    <div ref={popRef} className="workers-bulk-pop" role="dialog" aria-label="Tüm worker'lar"
+    <div ref={popRef} className="workers-bulk-pop" role="dialog" aria-label={title}
       data-above={spot?.above || undefined}
       style={{
         left: spot?.left ?? -9999, top: spot?.top ?? -9999, maxHeight: spot?.maxHeight,
@@ -249,6 +249,8 @@ function WorkersBulkForm({ teamId, providers, firstRef, onDone, scope, hidden, t
   const waiting = workers.filter((a) => a.pending && isRunning(a.id));
   const warn = tokenWarning(providers, provider);
   const noModels = !chosen ? "Bu sağlayıcının model listesi boş" : null;
+  // #2451: an older host would apply a scoped change to the whole team — don't send it.
+  const noScope = ids && !scopedWorkersSupported(teamId) ? SCOPED_UNSUPPORTED : null;
   useEffect(() => { firstRef.current?.focus(); }, [firstRef]);
   // A new scope: the last outcome was about another set of workers.
   useEffect(() => { setNote(null); setError(null); }, [scope]);
@@ -283,8 +285,8 @@ function WorkersBulkForm({ teamId, providers, firstRef, onDone, scope, hidden, t
           {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
         </select>
       </label>
-      <button className="primary" disabled={busy || !chosen || !workers.length}
-        title={noModels ?? (workers.length ? "Yalnız worker'lar değişir; lider(ler)e dokunulmaz"
+      <button className="primary" disabled={busy || !chosen || !workers.length || !!noScope}
+        title={noScope ?? noModels ?? (workers.length ? "Yalnız worker'lar değişir; lider(ler)e dokunulmaz"
           : all.length ? "Kapsamda worker yok" : "Takımda worker yok")}
         onClick={() => void act(async () => {
           const out = await setWorkersModel(teamId, { engine: "claude", provider, model: chosen }, ids ?? undefined);
@@ -320,6 +322,7 @@ function WorkersBulkForm({ teamId, providers, firstRef, onDone, scope, hidden, t
         </p>
       )}
       {noModels && <p className="team-warn" role="status">{noModels}</p>}
+      {noScope && <p className="team-warn" role="status">{noScope}</p>}
       {note && <p className="team-note" role="status">{note}</p>}
       {error && <p className="team-err" role="alert">{error}</p>}
     </section>
