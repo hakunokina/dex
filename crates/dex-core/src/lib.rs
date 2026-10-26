@@ -1749,8 +1749,9 @@ impl Core {
         };
         ctx.others = all.iter().filter(|t| t.id != team.id).filter_map(|t| t.cwd.clone()).map(Into::into).collect();
         // #293: the reviewer reads Dex's role skills and writes only its own report (permit.rs).
+        // #2442: every agent reads them (read only) — a folder skill's entry reads its tree there.
+        ctx.read.push(self.skills.root.clone());
         if ctx.read_only {
-            ctx.read.push(self.skills.root.clone());
             use rusqlite::OptionalExtension;
             let state = self.agent_states.get(agent);
             let saved: Option<(String, Option<String>)> = c.query_row(

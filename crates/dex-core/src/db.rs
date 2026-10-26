@@ -489,6 +489,11 @@ const MIGRATIONS: &[&str] = &[
     // ROLLBACK. After commit, full undo: DELETE FROM role_skills WHERE skill IN
     // ('frontend-design','ux-writing'); (the table and the other rows stay).
     UI_SKILLS_47,
+    // 48 (#2442): the vendored gamedev pack's router (a folder skill, skills.rs TREE_SKILLS) on the
+    // three game roles only; its 74 skills are files the router reads, never role skills. Additive;
+    // INSERT OR IGNORE makes a second run a no-op. Before commit: ROLLBACK. After commit, full undo:
+    // DELETE FROM role_skills WHERE skill = 'gamedev-router'; (the table and the other rows stay).
+    GAMEDEV_SKILLS_48,
 ];
 
 /// Migration 46. Idempotent on its own: the (role_slug, skill) PK + OR IGNORE
@@ -505,6 +510,12 @@ const UI_SKILLS_47: &str = "INSERT OR IGNORE INTO role_skills (role_slug, skill)
     ('design', 'ux-writing'),
     ('frontend', 'ux-writing'),
     ('mobile', 'ux-writing');";
+
+/// Migration 48. Idempotent on its own, same as 46.
+const GAMEDEV_SKILLS_48: &str = "INSERT OR IGNORE INTO role_skills (role_slug, skill) VALUES
+    ('game-designer', 'gamedev-router'),
+    ('gameplay-programmer', 'gamedev-router'),
+    ('technical-artist', 'gamedev-router');";
 
 const TASK_CLOSED: &str = "ALTER TABLE tasks ADD COLUMN closed_reason TEXT CHECK (closed_reason IN ('cancelled','superseded'));
     CREATE INDEX IF NOT EXISTS delegations_task ON delegations(task_id);
@@ -941,6 +952,48 @@ mod job_model_migration_tests {
         assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
         assert_eq!(count(&clean), count(&c));
         println!("ui skills migration: before/after={}/{}; v{version} + clean DB 2 runs", before.len(), 18 + 5);
+    }
+
+    #[test]
+    fn gamedev_skills_migration_twice_preserves_rows_and_clean_db() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let version = MIGRATIONS.iter().position(|sql| *sql == GAMEDEV_SKILLS_48).unwrap();
+        for (i, sql) in MIGRATIONS[..version].iter().enumerate() {
+            c.execute_batch(sql).unwrap();
+            c.pragma_update(None, "user_version", i + 1).unwrap();
+        }
+        let rows = |c: &Connection| -> Vec<(String, String)> {
+            let mut st = c.prepare("SELECT role_slug, skill FROM role_skills ORDER BY rowid").unwrap();
+            let it = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let mut out = Vec::new();
+            for r in it { out.push(r.unwrap()); }
+            out
+        };
+        let ours = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM role_skills WHERE skill = 'gamedev-router'", [], |r| r.get(0)).unwrap()
+        };
+        let before = rows(&c);
+        assert_eq!(ours(&c), 0);
+        for _ in 0..2 {
+            c.execute_batch(GAMEDEV_SKILLS_48).unwrap();
+            let after = rows(&c);
+            assert_eq!(after.len(), before.len() + 3);
+            assert_eq!(after[..before.len()], before[..]);
+            assert_eq!(ours(&c), 3);
+        }
+        for role in ["game-designer", "gameplay-programmer", "technical-artist"] {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM role_skills WHERE role_slug=?1 AND skill='gamedev-router'", [role], |r| r.get(0)).unwrap();
+            assert_eq!(n, 1, "{role}");
+        }
+        c.pragma_update(None, "user_version", version + 1).unwrap();
+        for _ in 0..2 { migrate(&mut c).unwrap(); }
+        assert_eq!(ours(&c), 3);
+        let mut clean = Connection::open_in_memory().unwrap();
+        for _ in 0..2 { migrate(&mut clean).unwrap(); }
+        assert_eq!(clean.query_row("PRAGMA user_version", [], |r| r.get::<_, usize>(0)).unwrap(), MIGRATIONS.len());
+        assert_eq!(ours(&clean), 3);
+        assert_eq!(rows(&clean), rows(&c));
+        println!("gamedev skills migration: before/after={}/{}; v{version} + clean DB 2 runs", before.len(), before.len() + 3);
     }
 
     #[test]

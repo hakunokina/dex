@@ -4334,6 +4334,15 @@ mod tests {
         assert_eq!(write("src/a.rs", &worker), Verdict::Allow);
         assert_eq!(write(&own_s, &worker), Verdict::Allow);
         assert!(matches!(decide("Read", &json!({ "file_path": skill }), &worker), Verdict::Leader(_)));
+        // #2442: with the skills root in its read set (lib.rs gives it to every agent), a worker reads a
+        // folder skill's nested file — Read and shell — and still cannot write there.
+        let worker = Ctx { read: vec![root.clone(), skills.clone()], ..reviewer_clone(&worker) };
+        let nested = skills.join("dex-gameplay-programmer").join("gamedev").join("skills").join("godot").join("SKILL.md");
+        let nested_s = nested.to_string_lossy().to_string();
+        assert_eq!(decide("Read", &json!({ "file_path": nested_s }), &worker), Verdict::Allow);
+        assert_eq!(decide("Bash", &json!({ "command": format!("cat '{nested_s}'") }), &worker), Verdict::Allow);
+        assert!(matches!(write(&nested_s, &worker), Verdict::Deny(ref w) if w.starts_with("çalışma dizini dışına yazma")));
+        assert!(matches!(decide("Edit", &json!({ "file_path": nested_s, "old_string": "a", "new_string": "b" }), &worker), Verdict::Deny(_)));
 
         // A link out of the team root: `.dex/results` must really be under it.
         #[cfg(unix)]
