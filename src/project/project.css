@@ -81,3 +81,13 @@ input.project-pick-item.add { cursor: text; justify-content: flex-start; color: 
 .project-add-row { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); }
 .project-add-row label:only-child { grid-column: 1 / -1; }
 @container (max-width: 520px) { .project-add-row { grid-template-columns: 1fr; } }
+/* #2464: the leader session's project choice (askLeaderProject) inside the shared dialog. */
+.leader-project-list { margin: 0 0 var(--sp-3); padding: 0; border: 0; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.leader-project-list legend { padding: 0; margin-bottom: var(--sp-1); font-size: var(--fs-xs); color: var(--muted); }
+.leader-project-opt { display: flex; align-items: center; gap: var(--sp-2); min-height: 32px; padding: 0 var(--sp-2); border-radius: var(--r-sm); font-size: var(--fs-sm); cursor: pointer; }
+.leader-project-opt:hover { background: var(--hover); }
+.leader-project-opt span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.leader-project-opt small { color: var(--muted); font-size: var(--fs-2xs); }
+.leader-project-opt input { margin: 0; accent-color: var(--red); }
+.leader-project-opt input:focus-visible { outline: 2px solid var(--text-2); outline-offset: 2px; }
+.leader-project-opt:has(input:disabled) { cursor: default; opacity: 0.55; }

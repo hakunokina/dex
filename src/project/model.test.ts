@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { workerProjectId, workerProjectTeam, blockedJob, projectState, showsProjects, projectErrorText, isUnknownMethod, folderName, leaderProjectMismatch, memoryRequest, memoryProjectId, projectCreateParams, folderCategoryReady, pickStep, type Project } from "./model.ts";
+import { workerProjectId, workerProjectTeam, blockedJob, projectState, showsProjects, projectErrorText, isUnknownMethod, folderName, memoryRequest, memoryProjectId, projectCreateParams, folderCategoryReady, pickStep, type Project } from "./model.ts";
 
 const project = (id: string, extra: Partial<Project> = {}): Project => ({
   id, host: "local", teamId: "t", name: id, rootPath: "/repo", rootKey: "/repo", repoKey: "git", defaultBranch: "main",
@@ -29,13 +29,6 @@ describe("proje göstergesi", () => {
     assert.equal(blockedJob(binding, jobs, "a", true)?.id, 2);
     assert.equal(blockedJob(binding, jobs, "a", false), null);
     assert.equal(blockedJob(binding, [...jobs, { id: 0, toAgent: "a", status: "queued", projectId: "p1" }], "a", true), null);
-  });
-  it("lider yalnız canlı ve seçimi farklıysa yeniden başlatma göstergesi alır", () => {
-    assert.equal(leaderProjectMismatch({ projectId: "p1", delegationId: null }, "p2", true), true);
-    assert.equal(leaderProjectMismatch({ projectId: null, delegationId: null }, "p2", true), true);
-    assert.equal(leaderProjectMismatch(undefined, "p2", true), false);
-    assert.equal(leaderProjectMismatch({ projectId: "p1", delegationId: null }, "p1", true), false);
-    assert.equal(leaderProjectMismatch({ projectId: "p1", delegationId: null }, "p2", false), false);
   });
 });
 describe("proje listesi ve hata", () => {

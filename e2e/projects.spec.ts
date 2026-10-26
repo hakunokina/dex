@@ -108,8 +108,9 @@ test("proje hafızası: tek grafikte yalnız seçili proje; oturum başlığı k
   const workerPane = await paneOf(app, worker.name);
   await expect(workerPane.locator(".project-chip")).toHaveText(p1.name);
   await pickProject(app, p2.name);
-  await expect(leaderPane).toContainText(`Lider ${p1.name} oturumunda`);
-  await expect(leaderPane.getByRole("button", { name: "Yeni projede temiz oturum" })).toBeVisible();
+  // #2464: a leader bound elsewhere than the default is normal — its chip names its own project, no banner.
+  await expect(leaderPane.locator(".project-chip")).toHaveText(p1.name);
+  await expect(leaderPane.getByRole("button", { name: "Yeni projede temiz oturum" })).toHaveCount(0);
   await expect(workerPane.locator(".project-chip")).toHaveText(p1.name);
   await app.getByRole("button", { name: "Görevler", exact: true }).click();
   await expect(app.locator(".board.open .board-card").filter({ hasText: "Proje görevi" }).locator(".project-chip")).toHaveText(p1.name);

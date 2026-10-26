@@ -123,6 +123,15 @@ handlers! {
         "leader_reset" => |core, p| {
             ok(core.leader_reset(&arg::<String>(p, "id")?, &arg::<String>(p, "action")?))
         },
+        // #2464: a leader's session in the patron's pick — own names, since an older dexd drops an
+        // unknown `projectId` and would start in the team default; this one it answers "bilinmeyen metot".
+        "leader_start" => |core, p| {
+            let options = arg::<Option<dex_core::agents::StartOptions>>(p, "options")?.unwrap_or_default();
+            ok(core.agent_start(&arg::<String>(p, "id")?, dex_core::agents::StartOptions { project_id: Some(arg(p, "projectId")?), ..options }))
+        },
+        "leader_reset_project" => |core, p| {
+            ok(core.leader_reset_project(&arg::<String>(p, "id")?, &arg::<String>(p, "projectId")?))
+        },
         "agent_first_reply_retry" => {
             |core, p| ok(core.agent_first_reply_retry(&arg::<String>(p, "id")?))
         },
