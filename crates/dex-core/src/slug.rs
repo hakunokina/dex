@@ -55,14 +55,20 @@ fn reserved(slug: &str) -> bool {
 
 /// The first free of `base`, `base-2`, `base-3`…: held by no other member and — when the memory
 /// root is known — no `agents/<slug>` folder on disk, so a deleted agent's memory is never handed on.
+/// #2463: a worker's private memory also sits in the team's project roots; those count too.
 /// A Windows device name becomes `<name>-agent` first (#475).
 fn pick(conn: &Connection, team_id: &str, id: &str, name: &str, root: Option<&Path>) -> Result<String, String> {
     let taken = taken(conn, team_id, id)?;
     let base = of(name);
     let base = if reserved(&base) { format!("{base}-agent") } else { base };
+    let mut roots: Vec<PathBuf> = root.map(Path::to_path_buf).into_iter().collect();
+    if root.is_some() {
+        let projects = crate::projects::list(conn, team_id, true).map_err(|e| e.to_string())?;
+        roots.extend(projects.into_iter().filter_map(|p| p.root_path).map(|p| Path::new(&p).join(".dex").join("memory")));
+    }
     Ok((1..)
         .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
-        .find(|c| !taken.contains(c) && !root.is_some_and(|r| r.join("agents").join(c).exists()))
+        .find(|c| !taken.contains(c) && !roots.iter().any(|r| r.join("agents").join(c).exists()))
         .expect("unbounded"))
 }
 

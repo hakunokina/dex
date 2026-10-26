@@ -356,6 +356,10 @@ impl ScopedRoots {
         if let Some((id, root)) = self.project_id.as_ref().zip(self.project.as_ref()).filter(|(_, root)| !same_dir(root, &self.team)) {
             out.push((format!("project/{id}"), root.as_path(), false));
         }
+        // #2463: the selected project's worker private folders; once when it is the team's own root.
+        if let Some((id, root)) = self.project_id.as_ref().zip(self.project.as_ref()).filter(|(_, root)| !same_dir(root, &self.private)) {
+            out.push((format!("private/project/{id}"), root.as_path(), true));
+        }
         out
     }
 }
@@ -449,8 +453,9 @@ fn scoped_graph(roots: &ScopedRoots) -> MemGraph {
 fn scoped_path(roots: &ScopedRoots, id: &str) -> Result<PathBuf, String> {
     for (prefix, root, private) in roots.scopes() {
         if let Some(rel) = id.strip_prefix(&format!("{prefix}/")) {
+            // A team id may itself be `project`: its prefix can also cover `private/project/…`.
             if rel.starts_with("agents/") != private {
-                break;
+                continue;
             }
             let path = path_of(root, rel)?;
             if private && !std::fs::read_to_string(&path).is_ok_and(|t| visible_in_project(&t, roots.project_id.as_deref())) {
