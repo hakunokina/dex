@@ -159,9 +159,6 @@ export function projectCreateParams(project: { name: string; worktrees?: boolean
   return { project, ...target, branch: branch || null };
 }
 
-export const leaderProjectMismatch = (bind: SessionProject | undefined, selected: string | null, live: boolean) =>
-  live && !!bind && bind.projectId !== selected;
-
 /** An archived or missing project must not retain its graph/read context. */
 export function memoryProjectId(list: readonly Project[], id: string | null): string | null {
   return list.some(p => p.id === id && p.archivedAt === null) ? id : null;

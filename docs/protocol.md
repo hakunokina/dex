@@ -89,7 +89,7 @@ Bağlantı düzeyi olaylar (nokta ad alanlı):
 |---|---|
 | Görev | `task_list {teamId?}`, `task_create {task}`, `task_update {id, patch}`, `task_delete {id}` |
 | Takım | `team_list`, `team_create {team}`, `team_update {id, patch}`, `team_delete {id}`, `team_set_workers_model {teamId, target}`, `team_set_workers_model_ids {teamId, target, ids}` — yalnız `ids` worker'larına (lider/asistan atlanır) |
-| Ajan | `agent_list`, `agent_create {agent}`, `agent_update {id, patch}`, `agent_delete {id}`, `agent_apply_pending {id}`, `agent_start {id, options?}`, `agent_status_list`, `agent_input {id, draft}`, `leader_reset {id, action}`, `role_list` |
+| Ajan | `agent_list`, `agent_create {agent}`, `agent_update {id, patch}`, `agent_delete {id}`, `agent_apply_pending {id}`, `agent_start {id, options?}`, `agent_status_list`, `agent_input {id, draft}`, `leader_reset {id, action}`, `leader_start {id, projectId, options?}` / `leader_reset_project {id, projectId}` — liderin oturumu seçilen projede (#2464), `role_list` |
 | Sohbet (S5-B) | `chat_history {agentId, before?, limit?}` — sayfalı transcript (`{messages, cursor, hasMore}`), `chat_send {agentId, text}` — kapalıysa `agent_start` ile başlatır, boştaysa yapıştırır, meşgulse kuyruğa alır (`started \| sent \| queued`), `chat_screen {agentId}` — PTY'nin görünen ekranı (bekleyen soru) |
 | Devretme | `delegation_list`, `delegation_seen {agentId}`, `delegation_stalled {agentId, minutes}`, `delegation_progress` (#2055: `[{agentId, delegationId, total, done, active, updatedAt}]`) — başlatma/kuyruk/teslim sunucu tarafındadır |
 | İlk yanıt (FIX-3) | `agent_first_reply_retry {id}`, `agent_first_reply_cancel {id}`, `first_reply_get`, `first_reply_set {provider, secs}` |

@@ -178,7 +178,8 @@ export function agentProjectName(agent: { id: string; teamId: string; kind: stri
   if (!teamShowsProjects(teamId)) return null;
   if (agent.kind === "leader") {
     if (getStatus(agent.id) !== "offline" && !bind) return "proje bağı bilinmiyor";
-    const id = getStatus(agent.id) !== "offline" ? bind?.projectId : selectedProject(agent.teamId)?.id;
+    // #2464: offline, the saved session's project (a plain start resumes it), else the default.
+    const id = getStatus(agent.id) !== "offline" ? bind?.projectId : bind?.projectId ?? selectedProject(agent.teamId)?.id;
     return projectName(getTeamProjects(teamId).list, id) ?? (id ? "proje kullanılamıyor" : "takım (proje seçili değil)");
   }
   const id = workerProjectId(bind, jobs, agent.id);

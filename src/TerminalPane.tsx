@@ -6,8 +6,8 @@ import { useTeams } from "./team/store";
 import { patronWritable } from "./team/rolePolicy";
 import { kept } from "./hot";
 import { attachPty, coreAnswered, detachPty, killPty, ptyFit, writePty, type PtySink } from "./pty";
-import { FOCUS_EVENT, START_EVENT, startAgent, type StartRequest } from "./launcher";
-import { callHost, onEvent, splitId, useHosts } from "./api/hosts";
+import { FOCUS_EVENT, START_EVENT, startAgent, startLeader, type StartRequest } from "./launcher";
+import { callHost, hostSupports, onEvent, splitId, useHosts } from "./api/hosts";
 import { chatSupported } from "./chat/api";
 import { cancelTurn, retryTurn, slowReply, useSlowReply } from "./firstReply";
 import { Lock, MessageSquareText, PencilLine, Play, RotateCcw, TerminalSquare, X } from "lucide-react";
@@ -15,8 +15,9 @@ import { termFont, termLineHeight, termTheme } from "./theme";
 import { bindZoom, termSize, zoomKey } from "./termZoom";
 import { clipboardKey } from "./termClipboard";
 import { getDelegations, isActive, useDelegations } from "./delegations";
-import { blockedJob, leaderProjectMismatch, projectErrorCode, projectErrorText, projectName, workerProjectTeam } from "./project/model";
-import { agentProjectName, getTeamProjects, refreshSessions, selectedProject, useSessions, useTeamProjects } from "./project/store";
+import { activeProjects, blockedJob, projectErrorCode, projectErrorText, projectName, workerProjectTeam } from "./project/model";
+import { agentProjectName, getSessions, getTeamProjects, refreshSessions, selectedProject, teamShowsProjects, useSessions, useTeamProjects } from "./project/store";
+import { askLeaderProject } from "./project/LeaderProjectDialog";
 import "./project/project.css";
 import { useAgentContext } from "./usage/contextStore";
 import { contextLevel } from "./usage/contextFormat";
@@ -278,12 +279,27 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
     return () => window.removeEventListener(FOCUS_EVENT, onFocusReq);
   }, [agent?.id]);
 
-  function start() {
-    return launch();
+  // #2464: a team with several open projects → the patron places the leader's new / renewed session
+  // (its saved project, else the team default, comes checked). An older dexd lacks `leader_start`.
+  const picksProject = () => agent?.kind === "leader" && teamShowsProjects(teamId) && hostSupports(agent.host, "leader_start");
+  function askProject(title: string, body: string[], confirmLabel: string) {
+    const projects = activeProjects(getTeamProjects(teamId).list);
+    const initial = [getSessions()[agent!.id]?.projectId, selectedProject(teamId)?.id]
+      .find((id) => projects.some((p) => p.id === id && p.rootPath)) ?? null;
+    return askLeaderProject({ title, body, confirmLabel, projects, initial });
   }
 
-  /** `fresh`: a new session instead of the saved one (#838: its project is gone). */
-  async function launch(fresh = false, automatic = false) {
+  async function start() {
+    if (!picksProject()) return launch();
+    const project = await askProject("Lider hangi projede açılsın?", [
+      `${agent!.name} seçtiğin projede çalışır; takımın varsayılan projesi değişmez.`,
+      "Kayıtlı oturum aynı projedeyse sürer, başka projede yeni oturum açılır.",
+    ], "Başlat");
+    if (project && !runningRef.current) await launch(false, false, project);
+  }
+
+  /** `fresh`: a new session instead of the saved one (#838: its project is gone). `project`: #2464's pick. */
+  async function launch(fresh = false, automatic = false, project?: string) {
     if (!agent) return;
     const term = termRef.current!;
     term.reset();
@@ -295,7 +311,7 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
     setStatus(getStatus(agent.id));
     try {
       const options = { cols: term.cols, rows: term.rows, ...(fresh ? { fresh } : {}) };
-      await startAgent(agent.id, options);
+      await (project ? startLeader(agent.id, project, options) : startAgent(agent.id, options));
       if (!(await attachPty(agent.id, sinkRef.current!))) throw new Error("PTY başlatıldı ancak bağlanamadı");
       sizeRef.current?.claim(true); // #62: started here, sized here
       // Automatic starts preserve keys in a team tab, menu or form, even if focus moved while awaiting the PTY.
@@ -345,16 +361,24 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
   async function resetSession() {
     if (!agent || reset || asking) return;
     const out = getDelegations().filter((d) => isActive(d) && d.fromAgent === agent.id).length;
-    const text = "Lider önce açık konuları ve kararları hafızasına devir notu olarak yazacak, sonra oturumu temiz açılacak; " +
-      "konuşma geçmişi yeni oturuma taşınmaz." +
-      (out ? `\n\nLider ${out} devretmenin sonucunu bekliyor; sonuçlar yeni oturuma teslim edilir ama bağlamı kaybolur.` : "") +
-      "\n\nDevam edilsin mi?";
-    if (!(await askConfirm(text, { title: "Temiz oturum açılsın mı?" }))) return;
+    const body = [
+      "Lider önce açık konuları ve kararları hafızasına devir notu olarak yazacak, sonra oturumu temiz açılacak; " +
+        "konuşma geçmişi yeni oturuma taşınmaz.",
+      ...(out ? [`Lider ${out} devretmenin sonucunu bekliyor; sonuçlar yeni oturuma teslim edilir ama bağlamı kaybolur.`] : []),
+    ];
+    let project: string | null = null;
+    if (picksProject()) {
+      project = await askProject("Temiz oturum hangi projede açılsın?", body, "Temiz oturum aç");
+      if (!project) return;
+    } else if (!(await askConfirm([...body, "Devam edilsin mi?"].join("\n\n"), { title: "Temiz oturum açılsın mı?" }))) return;
     setAsking(true);
     // No session: the core starts the fresh one at once.
     if (!runningRef.current) freshRef.current = true;
     try {
-      const v = await resetAct("begin");
+      const [host, raw] = splitId(agent.id);
+      const v = await (project
+        ? callHost<ResetView | null>(host, "leader_reset_project", { id: raw, projectId: splitId(project)[1] })
+        : resetAct("begin"));
       if (v?.phase) setReset(v);
     } catch (e) {
       setAgentError(agent.id, `Sıfırlanamadı: ${e}`);
@@ -393,7 +417,6 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
     if (agent) refreshSessions(agent.id);
   }, [agent?.id, offline]);
   const project = agent ? agentProjectName(agent, delegations) : null;
-  const leaderMismatch = agent?.kind === "leader" && leaderProjectMismatch(sessions[agent.id], selectedProject(teamId)?.id ?? null, !offline);
   const leaderUnknown = agent?.kind === "leader" && !offline && !sessions[agent.id] && getTeamProjects(teamId).list.filter(p => p.archivedAt === null).length > 1;
   const blocked = agent?.kind === "worker" ? blockedJob(sessions[agent.id], delegations, agent.id, !offline) : null;
   const projectNameOf = (id: string | null | undefined) => projectName(getTeamProjects(projectTeam).list, id) ?? "başka proje";
@@ -466,10 +489,6 @@ export function TerminalPane({ teamId, agentId, focused, onFocus }: Props) {
           <button className="pane-act" onClick={() => void launch(true)} title="Kayıtlı oturum sürdürülmez; yeni, bağsız oturum açılır">Temiz oturumla başlat</button>
         </div>
       )}
-      {leaderMismatch && <div className="pane-alert pane-slow" role="status">
-        <span>Lider {project ?? "takım"} oturumunda — yeni projede çalışmak için lideri yeniden başlat.</span>
-        <button className="pane-act" disabled={!!reset || asking} onClick={() => void resetSession()}>Yeni projede temiz oturum</button>
-      </div>}
       {leaderUnknown && <div className="pane-alert pane-slow" role="status">
         <span>Liderin proje bağı bilinmiyor.</span>
         <button className="pane-act" disabled={!!reset || asking} onClick={() => void resetSession()}>Temiz oturum aç</button>

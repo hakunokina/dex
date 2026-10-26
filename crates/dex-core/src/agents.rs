@@ -377,6 +377,11 @@ pub struct StartOptions {
     /// Dex's own, never from IPC.
     #[serde(skip)]
     pub launch: Option<Binding>,
+    /// #2464: the project the patron picked for a leader's session (a team with several): it binds
+    /// there instead of the saved session's or the team default. Set by `leader_start` /
+    /// `leader_reset_project` only — an older dexd's `agent_start` would drop it unseen.
+    #[serde(skip)]
+    pub project_id: Option<String>,
 }
 
 /// #838 D: what a session is launched for — project, job and folder. Written to `agent_sessions`
@@ -445,7 +450,8 @@ fn session_row(conn: &Connection, agent: &str) -> Result<Option<SessionRow>, Str
 
 /// #838 D: the start's binding, folder, env and resume. A job start (`options.delegation_id`)
 /// binds to that job; a respawn (`options.launch`) keeps its own; any other start continues the
-/// saved session's binding. A new leader session takes the team's default project with a root;
+/// saved session's binding. A new leader session takes the patron's pick (`options.project_id`)
+/// or the team's default project with a root;
 /// folderless legacy sessions and new workers without a job remain unbound. Nothing comes from the queue.
 fn launch_plan(
     conn: &Connection,
@@ -461,15 +467,24 @@ fn launch_plan(
     if job.as_ref().is_some_and(|d| d.to_agent != agent.id) {
         return Err(crate::projects::ProjectError::NotFound.to_string());
     }
+    // #2464: only a leader's session is the patron's to place; a worker's follows its job.
+    let chosen = options.project_id.as_deref();
+    if chosen.is_some() && agent.kind != "leader" {
+        return Err(crate::projects::ProjectError::NotFound.to_string());
+    }
     let mut binding = match (&job, &options.launch) {
         (Some(d), _) => Binding { project_id: d.project_id.clone(), delegation_id: Some(d.id), cwd: None },
         (None, Some(b)) => b.clone(),
-        (None, None) if !renew && saved.is_some() => saved.as_ref().unwrap().binding.clone(),
+        (None, None) if chosen.is_none() && !renew && saved.is_some() => saved.as_ref().unwrap().binding.clone(),
         (None, None) if agent.kind == "leader" => {
             let ctx = crate::project_context::resolve(conn, data_dir, crate::project_context::ResolveRequest {
                 team_id: &team.id, agent_id: Some(&agent.id), delegation_id: None,
-                project_id: team.default_project_id.as_deref(), mode: crate::project_context::ContextMode::Team,
+                project_id: chosen.or(team.default_project_id.as_deref()), mode: crate::project_context::ContextMode::Team,
             }).map_err(|e| e.to_string())?;
+            // A picked project without a folder would leave the session unbound (any saved one resumes).
+            if chosen.is_some() && ctx.project_root.is_none() {
+                return Err(crate::projects::ProjectError::Unavailable.to_string());
+            }
             Binding { project_id: ctx.project_id.filter(|_| ctx.project_root.is_some()), ..Default::default() }
         }
         (None, None) => Binding::default(),
@@ -506,7 +521,7 @@ fn launch_plan(
     let mut resume = if options.fresh { None } else { options.resume.clone().or_else(|| saved_resumable.map(|s| s.session.clone())) };
     // Never the saved session of another project: a caller-bound start opens a fresh one.
     let mut dropped = false;
-    if let (Some(s), None, true) = (saved_resumable, &options.resume, job.is_some() || options.launch.is_some()) {
+    if let (Some(s), None, true) = (saved_resumable, &options.resume, job.is_some() || options.launch.is_some() || chosen.is_some()) {
         if resume.is_some() && s.binding != binding && !binding_fits(conn, data_dir, &agent.id, &agent.team_id, &s.binding, binding.project_id.as_deref())? {
             resume = None;
             dropped = true;

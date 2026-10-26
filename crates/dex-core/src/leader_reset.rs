@@ -49,6 +49,8 @@ struct Reset {
     phase: Phase,
     sent: bool,
     prompt: String,
+    /// #2464: the project the fresh session binds to (none: the team default).
+    project: Option<String>,
 }
 
 pub struct Resets {
@@ -82,7 +84,7 @@ impl Core {
     /// `begin` | `force` | `cancel` | `get` — the patron's side (Tauri command / dexd method).
     pub fn leader_reset(&self, id: &str, action: &str) -> Result<Option<View>, String> {
         match action {
-            "begin" => self.leader_reset_begin(id),
+            "begin" => self.leader_reset_begin(id, None),
             "force" => {
                 let phase = self.leader_resets.map.lock().unwrap().get(id).map(|r| r.phase);
                 match phase {
@@ -109,18 +111,30 @@ impl Core {
         }
     }
 
-    fn leader_reset_begin(&self, id: &str) -> Result<Option<View>, String> {
+    /// #2464: `begin` whose fresh session binds to `project` (the patron's pick in a team with several).
+    pub fn leader_reset_project(&self, id: &str, project: &str) -> Result<Option<View>, String> {
+        self.leader_reset_begin(id, Some(project.into()))
+    }
+
+    fn leader_reset_begin(&self, id: &str, project: Option<String>) -> Result<Option<View>, String> {
         let memory = with(&self.db, |c| {
             let a = crate::teams::get_agent(c, id)?;
             if a.kind != "leader" {
                 return Err(format!("{} lider değil; temiz oturum yalnız liderler için", a.name));
             }
             let team = crate::teams::get_team(c, &self.paths.data_dir, &a.team_id)?;
+            // A pick that cannot start fails here, before the leader writes its note for nothing.
+            if let Some(p) = project.as_deref() {
+                let p = crate::projects::get(c, &team.id, p).map_err(|e| e.to_string())?;
+                if p.archived_at.is_some() || p.root_path.is_none() {
+                    return Err(crate::projects::ProjectError::Unavailable.to_string());
+                }
+            }
             team.memory_dir.map(|m| crate::slug::memory_dir(c, std::path::Path::new(&m), id).map(|p| p.to_string_lossy().into_owned())).transpose()
         })?;
         // No session: nothing to hand over, the fresh start is all there is.
         if !self.ptys.is_running(id) {
-            self.leader_reset_start(id)?;
+            self.leader_reset_start(id, project)?;
             return Ok(None);
         }
         static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -131,7 +145,7 @@ impl Core {
                 return Err("bu lider için sıfırlama zaten sürüyor".into());
             }
             let prompt = prompt(memory.as_deref().unwrap_or(".dex/memory/agents/<ad>/"));
-            map.insert(id.into(), Reset { gen, phase: Phase::Writing, sent: false, prompt });
+            map.insert(id.into(), Reset { gen, phase: Phase::Writing, sent: false, prompt, project });
         }
         self.emit_reset(id, None);
         self.leader_reset_deliver(id);
@@ -239,29 +253,31 @@ impl Core {
 
     /// Close the PTY (its exit settles synchronously, see `Ptys::kill`) and start fresh.
     fn leader_reset_restart(&self, id: &str) -> Result<(), String> {
-        {
+        let project = {
             let mut map = self.leader_resets.map.lock().unwrap();
             let Some(r) = map.get_mut(id) else { return Err("sıfırlama iptal edildi".into()) };
             r.phase = Phase::Restarting;
-        }
+            r.project.clone()
+        };
         self.emit_reset(id, None);
         self.ptys.kill(id);
         crate::diagnostics::event("pty_kill", serde_json::json!({"agent": id, "reason": "reset"}));
-        let result = self.leader_reset_start(id);
+        let result = self.leader_reset_start(id, project);
         self.leader_resets.map.lock().unwrap().remove(id);
         self.emit_reset(id, result.as_ref().err().cloned());
         result
     }
 
-    fn leader_reset_start(&self, id: &str) -> Result<(), String> {
+    fn leader_reset_start(&self, id: &str, project: Option<String>) -> Result<(), String> {
         #[cfg(test)]
         {
+            let _ = project;
             self.leader_resets.started.lock().unwrap().push(id.into());
             Ok(())
         }
         #[cfg(not(test))]
         {
-            self.agent_start(id, crate::agents::StartOptions { fresh: true, ..Default::default() }).map(|_| ())
+            self.agent_start(id, crate::agents::StartOptions { fresh: true, project_id: project, ..Default::default() }).map(|_| ())
         }
     }
 

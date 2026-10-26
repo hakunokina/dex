@@ -7,6 +7,12 @@ export function startAgent(agentId: string, options: { cols?: number; rows?: num
   return startOnce(agentId, () => callHost(host, "agent_start", { id, options }));
 }
 
+/** #2464: a leader's session in the patron's pick — its own method, an older dexd lacks it (`hostSupports`). */
+export function startLeader(agentId: string, projectId: string, options: { cols?: number; rows?: number; fresh?: boolean } = {}) {
+  const [host, id] = splitId(agentId);
+  return startOnce(agentId, () => callHost(host, "leader_start", { id, projectId: splitId(projectId)[1], options }));
+}
+
 export interface StartRequest {
   agentId: string;
   handled: boolean;
