@@ -1,5 +1,7 @@
 # Embedded with include_str!: frontmatter must start with an LF "---" line on every checkout
 crates/dex-core/skills/**/*.md text eol=lf
+# #2442: the vendored gamedev tree is embedded whole (scripts, yaml, LICENSE too): same bytes on every OS
+crates/dex-core/skills/gamedev/** text eol=lf
 # Copied to a Linux VM and run by bash/systemd: CRLF would break them
 scripts/deploy/** text eol=lf
 scripts/yayin/** text eol=lf
