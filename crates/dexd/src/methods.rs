@@ -145,6 +145,11 @@ handlers! {
         "team_set_workers_model" => |core, p| {
             ok(core.team_set_workers_model(&arg::<String>(p, "teamId")?, arg(p, "target")?, arg(p, "ids")?))
         },
+        // #2451: the scoped call has its own name — an older dexd drops an unknown `ids` key and
+        // would change the whole team; this one it answers with "bilinmeyen metot".
+        "team_set_workers_model_ids" => |core, p| {
+            ok(core.team_set_workers_model(&arg::<String>(p, "teamId")?, arg(p, "target")?, Some(arg(p, "ids")?)))
+        },
         "agent_apply_pending" => |core, p| ok(core.agent_apply_pending(&arg::<String>(p, "id")?)),
         "chat_history" => |core, p| {
             ok(core.chat_history(
