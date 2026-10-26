@@ -1069,13 +1069,15 @@ mod auth_tests {
         for i in 0..10 {
             put(&team.join(format!("shared/n{i}.md")), "---\nname: needle\ndescription: sığmadı\n---\nneedle");
         }
-        put(&team.join("agents/kaan/own.md"), "needle");
+        put(&team.join("agents/kaan/stale.md"), "needle");
         put(&team.join("agents/ayla/secret.md"), "needle");
         put(&team.join("agents/timur/leader.md"), "needle");
         let one = f.dir("one");
         let two = f.dir("two");
         put(&one.join(".dex/memory/shared/project.md"), "needle");
+        put(&one.join(".dex/memory/agents/kaan/own.md"), "needle");
         put(&two.join(".dex/memory/shared/foreign.md"), "needle");
+        put(&two.join(".dex/memory/agents/kaan/elsewhere.md"), "needle");
         let job = crate::db::with(&core.db, |c| {
             c.execute("UPDATE teams SET team_memory_root=?1,agent_memory_root=?1 WHERE id='default'", [team.to_string_lossy()]).unwrap();
             let create = |root: &Path, name: &str| {
@@ -1122,7 +1124,7 @@ mod auth_tests {
         let hits = results(&all);
         assert_eq!(hits.len(), 12);
         assert!(hits.iter().any(|h| h["slug"] == "project") && hits.iter().any(|h| h["slug"] == "own"));
-        assert!(!hits.iter().any(|h| matches!(h["slug"].as_str(), Some("secret" | "foreign" | "leader"))));
+        assert!(!hits.iter().any(|h| matches!(h["slug"].as_str(), Some("secret" | "foreign" | "leader" | "stale" | "elsewhere"))));
         assert!(hits.iter().all(|h| h["path"].is_string() && h["snippet"].is_string() && h["description"].is_string()));
         assert!(invalid.iter().all(|v| v["result"]["isError"] == true));
         assert_eq!(foreign_job["result"]["isError"], true);

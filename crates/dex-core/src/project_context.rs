@@ -199,9 +199,6 @@ pub fn resolve(
         .agent_memory_root
         .map(PathBuf::from)
         .unwrap_or_else(|| base.join("memory"));
-    let private_memory_dir = agent
-        .as_ref()
-        .map(|a| agent_memory_root.join("agents").join(&a.2));
     let (project_root, merge_branch, repo_key, worktrees) = match project.as_ref() {
         Some(p) => {
             if p.archived_at.is_some() {
@@ -229,6 +226,16 @@ pub fn resolve(
         }
         None => (None, None, None, false),
     };
+    let project_memory_root = project_root.as_ref().map(|p| p.join(".dex").join("memory"));
+    // #2463: a worker's private memory belongs to its own team's project; a leader's, a service
+    // job's and a project-less context's stay at the team anchor.
+    let agent_memory_root = match project_memory_root.as_ref() {
+        Some(root) if is_worker && project.as_ref().is_some_and(|p| p.team_id == team.id) => root.clone(),
+        _ => agent_memory_root,
+    };
+    let private_memory_dir = agent
+        .as_ref()
+        .map(|a| agent_memory_root.join("agents").join(&a.2));
     let saved_cwd = saved.and_then(|s| s.2).map(PathBuf::from);
     let cwd = job_cwd
         .map(PathBuf::from)
@@ -261,7 +268,7 @@ pub fn resolve(
         project_team_id: project.as_ref().map(|p| p.team_id.clone()),
         project_id: project.as_ref().map(|p| p.id.clone()),
         project_name: project.as_ref().map(|p| p.name.clone()),
-        project_memory_root: project_root.as_ref().map(|p| p.join(".dex").join("memory")),
+        project_memory_root,
         project_root,
         repo_key,
         merge_branch,
